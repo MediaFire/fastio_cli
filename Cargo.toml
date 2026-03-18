@@ -1,0 +1,58 @@
+[package]
+name = "fastio-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Command-line interface for the Fast.io cloud storage platform"
+license = "Apache-2.0"
+authors = ["Fast.io <support@fast.io>"]
+homepage = "https://fast.io"
+keywords = ["cli", "cloud-storage", "fast-io", "file-management", "mcp"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+# repository = "https://github.com/MediaFire/fastio_cli"
+
+[[bin]]
+name = "fastio"
+path = "src/bin/fastio/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+colored = "2"
+comfy-table = "7"
+csv = "1"
+dirs = "5"
+futures-util = "0.3"
+indicatif = "0.17"
+getrandom_crate = { package = "getrandom", version = "0.2" }
+open = "5"
+openssl = { version = "0.10", features = ["vendored"], optional = true }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+rmcp = { version = "0.16", features = ["server", "transport-io"] }
+schemars = "0.8"
+urlencoding = "2"
+
+[features]
+default = []
+vendored-openssl = ["openssl"]
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
