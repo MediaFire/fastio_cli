@@ -155,8 +155,11 @@ async fn dispatch(
         Commands::Configure(configure_cmd) => {
             commands::configure::execute(&configure_cmd, ctx.output)
         }
+        Commands::Skill => {
+            print!("{}", include_str!("../../../AGENTS.md"));
+            Ok(())
+        }
         Commands::Mcp { .. } => {
-            // Handled above before tracing init; unreachable.
             unreachable!("MCP mode is handled before this match")
         }
     }
