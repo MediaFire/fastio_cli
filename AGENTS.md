@@ -33,6 +33,20 @@ Other formats: `table` (human-readable), `csv` (spreadsheets). Default is `table
 
 Use `--quiet` to suppress all output (useful for write operations where you only care about exit code).
 
+## Important: Intelligence (AI) Setting
+
+Workspaces have an `intelligence` toggle. When **OFF** (default), the workspace is pure storage. When **ON**, documents are automatically indexed with embeddings for AI-powered search, chat, and summarization.
+
+**Only enable intelligence when you need to query the data.** Ingestion is expensive (per-page cost). For workspaces used only for file storage, sharing, or uploads, leave intelligence OFF.
+
+```bash
+# Create a workspace WITHOUT intelligence (default, recommended for storage)
+fastio workspace create --org ORG_ID --name "File Storage"
+
+# Create a workspace WITH intelligence (only for AI/RAG use cases)
+fastio workspace create --org ORG_ID --name "Knowledge Base" --intelligence true
+```
+
 ## Core Workflows
 
 ### List organizations and workspaces
@@ -105,8 +119,14 @@ fastio share guest-auth SHARE_ID
 ```
 
 ### AI queries
+
+**Important:** AI search and chat require `intelligence` to be enabled on the workspace. Enabling intelligence triggers document embedding/indexing which incurs significant per-page ingestion costs. Only enable it on workspaces where you intend to query the data — do not enable it by default for storage-only workspaces.
+
 ```bash
-# Search workspace content
+# Enable intelligence on a workspace (only when needed for AI queries)
+fastio workspace enable-workflow WS_ID
+
+# Search workspace content (requires intelligence enabled)
 fastio ai search --workspace WS_ID "your question" --format json
 
 # Chat with workspace files
