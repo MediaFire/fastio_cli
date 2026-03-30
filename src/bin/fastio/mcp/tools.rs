@@ -561,7 +561,16 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("description", "Description", false),
             ("access_options", "Access options", false),
             ("password", "Share password", false),
-            ("download_enabled", "Allow downloads (true/false)", false),
+            (
+                "download_enabled",
+                "Allow downloads (true/false, legacy — prefer download_security)",
+                false,
+            ),
+            (
+                "download_security",
+                "Download security: high, medium, or off",
+                false,
+            ),
             ("comments_enabled", "Allow comments (true/false)", false),
             (
                 "anonymous_uploads_enabled",
@@ -4179,6 +4188,7 @@ async fn handle_share_create(
             password: optional_str(args, "password"),
             anonymous_uploads_enabled: optional_bool(args, "anonymous_uploads_enabled"),
             intelligence: optional_bool(args, "intelligence"),
+            download_security: optional_str(args, "download_security"),
         },
     )
     .await
@@ -4222,6 +4232,7 @@ async fn handle_share_update(
             download_enabled: optional_bool(args, "download_enabled"),
             comments_enabled: optional_bool(args, "comments_enabled"),
             anonymous_uploads_enabled: optional_bool(args, "anonymous_uploads_enabled"),
+            download_security: optional_str(args, "download_security"),
         },
     )
     .await

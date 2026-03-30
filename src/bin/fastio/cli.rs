@@ -1482,6 +1482,9 @@ pub enum ShareCommands {
         /// Enable AI intelligence features.
         #[arg(long)]
         intelligence: Option<bool>,
+        /// Download security level: high, medium, or off.
+        #[arg(long, value_parser = ["high", "medium", "off"])]
+        download_security: Option<String>,
     },
     /// Get share details.
     Info {
@@ -1501,7 +1504,7 @@ pub enum ShareCommands {
         /// New access options.
         #[arg(long)]
         access_options: Option<String>,
-        /// Enable or disable downloads.
+        /// Enable or disable downloads (legacy — prefer --download-security).
         #[arg(long)]
         download_enabled: Option<bool>,
         /// Enable or disable comments.
@@ -1510,6 +1513,9 @@ pub enum ShareCommands {
         /// Enable or disable anonymous uploads.
         #[arg(long)]
         anonymous_uploads: Option<bool>,
+        /// Download security level: high, medium, or off.
+        #[arg(long, value_parser = ["high", "medium", "off"])]
+        download_security: Option<String>,
     },
     /// Delete a share. Permanent and irreversible.
     Delete {

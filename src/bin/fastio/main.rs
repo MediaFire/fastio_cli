@@ -949,6 +949,7 @@ fn map_share_command(cmd: cli::ShareCommands) -> ShareCommand {
             password,
             anonymous_uploads,
             intelligence,
+            download_security,
         } => ShareCommand::Create {
             workspace_id: workspace,
             name,
@@ -957,6 +958,7 @@ fn map_share_command(cmd: cli::ShareCommands) -> ShareCommand {
             password,
             anonymous_uploads,
             intelligence,
+            download_security,
         },
         cli::ShareCommands::Info { share_id } => ShareCommand::Info { share_id },
         cli::ShareCommands::Update {
@@ -967,6 +969,7 @@ fn map_share_command(cmd: cli::ShareCommands) -> ShareCommand {
             download_enabled,
             comments_enabled,
             anonymous_uploads,
+            download_security,
         } => ShareCommand::Update {
             share_id,
             name,
@@ -975,6 +978,7 @@ fn map_share_command(cmd: cli::ShareCommands) -> ShareCommand {
             download_enabled,
             comments_enabled,
             anonymous_uploads,
+            download_security,
         },
         cli::ShareCommands::Delete { share_id, confirm } => {
             ShareCommand::Delete { share_id, confirm }
