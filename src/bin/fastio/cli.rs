@@ -141,6 +141,9 @@ pub enum Commands {
     /// Manage CLI configuration and profiles.
     #[command(subcommand)]
     Configure(ConfigureCommands),
+
+    /// Print the agent skill guide (usage patterns for AI agents and automation).
+    Skill,
 }
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
