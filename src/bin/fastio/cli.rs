@@ -1402,6 +1402,58 @@ pub enum UploadCommands {
     Limits,
     /// Get restricted file extensions.
     Extensions,
+    /// Upload a file via streaming (no exact size required upfront).
+    Stream {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Path to the local file (use - for stdin).
+        file_path: String,
+        /// Destination folder node ID (defaults to root).
+        #[arg(long)]
+        folder: Option<String>,
+        /// Maximum upload size in bytes (defaults to plan limit).
+        #[arg(long)]
+        max_size: Option<u64>,
+        /// Override filename (required for stdin, derived from path otherwise).
+        #[arg(long)]
+        name: Option<String>,
+        /// Pre-computed hash of the file content for integrity verification.
+        #[arg(long, requires = "hash_algo")]
+        hash: Option<String>,
+        /// Hash algorithm used (e.g. sha256). Requires --hash.
+        #[arg(long, requires = "hash")]
+        hash_algo: Option<String>,
+    },
+    /// Create a streaming upload session manually.
+    #[command(name = "create-stream-session")]
+    CreateStreamSession {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Filename.
+        filename: String,
+        /// Destination folder node ID (defaults to root).
+        #[arg(long)]
+        folder: Option<String>,
+        /// Maximum upload size in bytes (defaults to plan limit).
+        #[arg(long)]
+        max_size: Option<u64>,
+    },
+    /// Send data to a streaming upload session (auto-finalizes).
+    #[command(name = "stream-send")]
+    StreamSend {
+        /// Upload key/ID from create-stream-session.
+        upload_key: String,
+        /// Path to data file.
+        file: String,
+        /// Pre-computed hash of the file content.
+        #[arg(long, requires = "hash_algo")]
+        hash: Option<String>,
+        /// Hash algorithm used (e.g. sha256). Requires --hash.
+        #[arg(long, requires = "hash")]
+        hash_algo: Option<String>,
+    },
 }
 
 // ─── Download ───────────────────────────────────────────────────────────────

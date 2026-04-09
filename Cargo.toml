@@ -1,6 +1,6 @@
 [package]
 name = "fastio-cli"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 description = "Command-line interface for the Fast.io cloud storage platform"
 license = "Apache-2.0"
@@ -18,6 +18,7 @@ path = "src/bin/fastio/main.rs"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"

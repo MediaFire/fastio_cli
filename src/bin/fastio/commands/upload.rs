@@ -118,9 +118,49 @@ pub enum UploadCommand {
     Limits,
     /// Get restricted extensions.
     Extensions,
+    /// Upload a local file via streaming (no exact size required upfront).
+    Stream {
+        /// Workspace ID.
+        workspace: String,
+        /// Path to the local file (use `-` for stdin).
+        file_path: String,
+        /// Destination folder node ID (defaults to root).
+        folder: Option<String>,
+        /// Maximum upload size in bytes (defaults to plan limit).
+        max_size: Option<u64>,
+        /// Override filename (required for stdin, derived from path otherwise).
+        name: Option<String>,
+        /// Pre-computed hash of the file content for integrity verification.
+        hash: Option<String>,
+        /// Hash algorithm used (e.g. sha256).
+        hash_algo: Option<String>,
+    },
+    /// Create a streaming upload session manually.
+    CreateStreamSession {
+        /// Workspace ID.
+        workspace: String,
+        /// Filename.
+        filename: String,
+        /// Destination folder node ID (defaults to root).
+        folder: Option<String>,
+        /// Maximum upload size in bytes (defaults to plan limit).
+        max_size: Option<u64>,
+    },
+    /// Send data to a streaming upload session (auto-finalizes).
+    StreamSend {
+        /// Upload key/ID from create-stream-session.
+        upload_key: String,
+        /// Path to data file.
+        file: String,
+        /// Pre-computed hash of the file content.
+        hash: Option<String>,
+        /// Hash algorithm used (e.g. sha256).
+        hash_algo: Option<String>,
+    },
 }
 
 /// Execute an upload subcommand.
+#[allow(clippy::too_many_lines)]
 pub async fn execute(command: &UploadCommand, ctx: &CommandContext<'_>) -> Result<()> {
     match command {
         UploadCommand::File {
@@ -192,6 +232,39 @@ pub async fn execute(command: &UploadCommand, ctx: &CommandContext<'_>) -> Resul
         UploadCommand::WebStatus { upload_id } => web_status(ctx, upload_id).await,
         UploadCommand::Limits => upload_limits(ctx).await,
         UploadCommand::Extensions => upload_extensions(ctx).await,
+        UploadCommand::Stream {
+            workspace,
+            file_path,
+            folder,
+            max_size,
+            name,
+            hash,
+            hash_algo,
+        } => {
+            stream_file(
+                ctx,
+                workspace,
+                file_path,
+                folder.as_deref().unwrap_or("root"),
+                *max_size,
+                name.as_deref(),
+                hash.as_deref(),
+                hash_algo.as_deref(),
+            )
+            .await
+        }
+        UploadCommand::CreateStreamSession {
+            workspace,
+            filename,
+            folder,
+            max_size,
+        } => create_stream_session(ctx, workspace, filename, folder.as_deref(), *max_size).await,
+        UploadCommand::StreamSend {
+            upload_key,
+            file,
+            hash,
+            hash_algo,
+        } => stream_send(ctx, upload_key, file, hash.as_deref(), hash_algo.as_deref()).await,
     }
 }
 
@@ -650,6 +723,214 @@ async fn upload_text(
         "size": file_size,
         "size_human": format_bytes(file_size),
     });
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Upload a file via streaming mode.
+///
+/// Creates a stream session (no exact size required), reads the file into
+/// memory, and POSTs the raw body to the `/stream/` endpoint which
+/// auto-finalizes on completion.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn stream_file(
+    ctx: &CommandContext<'_>,
+    workspace: &str,
+    file_path: &str,
+    folder: &str,
+    max_size: Option<u64>,
+    name_override: Option<&str>,
+    hash: Option<&str>,
+    hash_algo: Option<&str>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !workspace.trim().is_empty(),
+        "workspace ID must not be empty"
+    );
+
+    let (data, filename) = if file_path == "-" {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .context("failed to read from stdin")?;
+        let name = name_override
+            .ok_or_else(|| anyhow::anyhow!("--name is required when reading from stdin"))?;
+        (buf, name.to_owned())
+    } else {
+        let path = Path::new(file_path);
+        if !path.exists() {
+            anyhow::bail!("file not found: {file_path}");
+        }
+        // Check file size against max_size before reading into memory.
+        let metadata = std::fs::metadata(path).context("failed to read file metadata")?;
+        let file_size = metadata.len();
+        if let Some(limit) = max_size {
+            anyhow::ensure!(
+                file_size <= limit,
+                "file size ({}) exceeds --max-size limit ({})",
+                format_bytes(file_size),
+                format_bytes(limit),
+            );
+        }
+        let data = std::fs::read(path).context("failed to read file")?;
+        let derived = name_override.map_or_else(
+            || {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(String::from)
+                    .ok_or_else(|| anyhow::anyhow!("invalid filename"))
+            },
+            |n| Ok(n.to_owned()),
+        )?;
+        (data, derived)
+    };
+
+    let data_len = u64::try_from(data.len()).context("data size exceeds u64 range")?;
+    if let Some(limit) = max_size {
+        anyhow::ensure!(
+            data_len <= limit,
+            "data size ({}) exceeds --max-size limit ({})",
+            format_bytes(data_len),
+            format_bytes(limit),
+        );
+    }
+    let data_bytes = bytes::Bytes::from(data);
+    let token_str = resolve_auth(ctx.profile_name, ctx.flag_token, ctx.config_dir)?;
+    let client = ApiClient::new(ctx.api_base, Some(token_str.clone()))
+        .context("failed to create API client")?;
+
+    if !ctx.output.quiet {
+        eprintln!("Streaming upload {} ({})", filename, format_bytes(data_len));
+    }
+
+    let session =
+        api::upload::create_stream_session(&client, workspace, folder, &filename, max_size)
+            .await
+            .context("failed to create stream session")?;
+
+    let upload_id = session
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("stream session did not return an ID"))?
+        .to_owned();
+
+    // Use a spinner instead of a progress bar — the stream is sent in a
+    // single request so there is no incremental progress to report.
+    let spinner = if ctx.output.quiet {
+        ProgressBar::hidden()
+    } else {
+        let sp = ProgressBar::new_spinner();
+        let template = if ctx.output.no_color {
+            "{spinner} Uploading {msg}"
+        } else {
+            "{spinner:.green} Uploading {msg}"
+        };
+        sp.set_style(
+            ProgressStyle::with_template(template)
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        sp.set_message(format!("{} ({})", filename, format_bytes(data_len)));
+        sp.enable_steady_tick(std::time::Duration::from_millis(120));
+        sp
+    };
+
+    let result = api::upload::stream_upload(
+        &token_str,
+        ctx.api_base,
+        &upload_id,
+        data_bytes,
+        hash,
+        hash_algo,
+    )
+    .await
+    .context("failed to stream upload data");
+
+    match result {
+        Ok(_) => {
+            spinner.finish_with_message(format!(
+                "{} ({}) — complete",
+                filename,
+                format_bytes(data_len)
+            ));
+        }
+        Err(e) => {
+            spinner.finish_with_message("failed");
+            let _ = api::upload::cancel_upload(&client, &upload_id).await;
+            return Err(e);
+        }
+    }
+
+    let final_details = api::upload::get_upload_status(&client, &upload_id)
+        .await
+        .ok();
+    let final_status = final_details
+        .as_ref()
+        .and_then(|d| d.get("session"))
+        .and_then(|s| s.get("status"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let new_file_id = final_details
+        .as_ref()
+        .and_then(|d| d.get("session"))
+        .and_then(|s| s.get("new_file_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let value = json!({
+        "status": "uploaded",
+        "mode": "stream",
+        "filename": filename,
+        "size": data_len,
+        "size_human": format_bytes(data_len),
+        "upload_id": upload_id,
+        "new_file_id": new_file_id,
+        "final_status": final_status,
+    });
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Create a streaming upload session manually.
+async fn create_stream_session(
+    ctx: &CommandContext<'_>,
+    workspace: &str,
+    filename: &str,
+    folder: Option<&str>,
+    max_size: Option<u64>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !workspace.trim().is_empty(),
+        "workspace ID must not be empty"
+    );
+    let client = ctx.build_client()?;
+    let value = api::upload::create_stream_session(
+        &client,
+        workspace,
+        folder.unwrap_or("root"),
+        filename,
+        max_size,
+    )
+    .await
+    .context("failed to create stream session")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Send data to a streaming upload session (auto-finalizes).
+async fn stream_send(
+    ctx: &CommandContext<'_>,
+    upload_key: &str,
+    file: &str,
+    hash: Option<&str>,
+    hash_algo: Option<&str>,
+) -> Result<()> {
+    let token_str = resolve_auth(ctx.profile_name, ctx.flag_token, ctx.config_dir)?;
+    let data = bytes::Bytes::from(std::fs::read(file).context("failed to read data file")?);
+    let value =
+        api::upload::stream_upload(&token_str, ctx.api_base, upload_key, data, hash, hash_algo)
+            .await
+            .context("failed to stream upload data")?;
     ctx.output.render(&value)?;
     Ok(())
 }
