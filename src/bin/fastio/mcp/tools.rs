@@ -527,21 +527,47 @@ const TOOL_DEFS: &[ToolDef] = &[
             "web-status",
             "limits",
             "extensions",
+            "stream",
+            "create-stream-session",
+            "stream-send",
         ],
         params: &[
             ("workspace_id", "Workspace ID", false),
             ("folder", "Target folder ID (defaults to root)", false),
-            ("name", "Filename (text, create-session)", false),
-            ("content", "Text content (text upload)", false),
+            (
+                "name",
+                "Filename (text, create-session, create-stream-session, stream)",
+                false,
+            ),
+            (
+                "content",
+                "Text content (text upload) or raw data (stream, stream-send)",
+                false,
+            ),
             ("url", "Source URL (url import)", false),
             (
                 "upload_key",
-                "Upload key/ID (finalize, status, cancel, chunk-status, chunk-delete)",
+                "Upload key/ID (finalize, status, cancel, chunk-status, chunk-delete, stream-send)",
                 false,
             ),
             ("filesize", "File size in bytes (create-session)", false),
             ("chunk_num", "Chunk number (chunk-delete)", false),
             ("upload_id", "Upload ID (web-cancel, web-status)", false),
+            (
+                "max_size",
+                "Max upload size in bytes (create-stream-session, stream)",
+                false,
+            ),
+            (
+                "hash",
+                "Pre-computed hash of file content (stream, stream-send)",
+                false,
+            ),
+            (
+                "hash_algo",
+                "Hash algorithm e.g. sha256 (stream, stream-send)",
+                false,
+            ),
         ],
     },
     ToolDef {
@@ -4018,6 +4044,9 @@ async fn handle_upload(
         "web-status" => handle_upload_web_status(state, args).await,
         "limits" => handle_upload_limits(state, args).await,
         "extensions" => handle_upload_extensions(state, args).await,
+        "stream" => handle_upload_stream(state, args).await,
+        "create-stream-session" => handle_upload_create_stream_session(state, args).await,
+        "stream-send" => handle_upload_stream_send(state, args).await,
         _ => Ok(error_text(&format!("Unknown upload action: {action}"))),
     }
 }
@@ -4267,6 +4296,125 @@ async fn handle_upload_extensions(
 ) -> Result<CallToolResult, McpError> {
     let client = state.client().read().await;
     match api::upload::upload_extensions(&client).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// Stream upload: create stream session, push content, auto-finalize.
+async fn handle_upload_stream(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let ws_id = match required_str(args, "workspace_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let name = match required_str(args, "name") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let content = match required_str(args, "content") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let folder = optional_str(args, "folder").unwrap_or("root");
+    let max_size = optional_str(args, "max_size").and_then(|s| s.parse::<u64>().ok());
+    let hash = optional_str(args, "hash");
+    let hash_algo = optional_str(args, "hash_algo");
+
+    let token = match client.get_token() {
+        Some(t) => t.to_owned(),
+        None => return Ok(error_text("No authentication token available")),
+    };
+
+    let content_bytes = bytes::Bytes::from(content.as_bytes().to_vec());
+    match api::upload::create_stream_session(&client, ws_id, folder, name, max_size).await {
+        Ok(session) => {
+            let upload_id = session.get("id").and_then(Value::as_str).unwrap_or("");
+            if upload_id.is_empty() {
+                return Ok(error_text(
+                    "Failed to create stream session: no ID returned",
+                ));
+            }
+            match api::upload::stream_upload(
+                &token,
+                state.api_base(),
+                upload_id,
+                content_bytes,
+                hash,
+                hash_algo,
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => {
+                    // Best-effort cleanup of the orphaned session.
+                    let _ = api::upload::cancel_upload(&client, upload_id).await;
+                    Ok(cli_err_to_result(&e))
+                }
+            }
+        }
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// Create a streaming upload session (manual, no data sent).
+async fn handle_upload_create_stream_session(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let ws_id = match required_str(args, "workspace_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let name = match required_str(args, "name") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let folder = optional_str(args, "folder").unwrap_or("root");
+    let max_size = optional_str(args, "max_size").and_then(|s| s.parse::<u64>().ok());
+    match api::upload::create_stream_session(&client, ws_id, folder, name, max_size).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// Send data to an existing streaming upload session (auto-finalizes).
+async fn handle_upload_stream_send(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let upload_key = match required_str(args, "upload_key") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let content = match required_str(args, "content") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let hash = optional_str(args, "hash");
+    let hash_algo = optional_str(args, "hash_algo");
+
+    let token = match client.get_token() {
+        Some(t) => t.to_owned(),
+        None => return Ok(error_text("No authentication token available")),
+    };
+
+    let content_bytes = bytes::Bytes::from(content.as_bytes().to_vec());
+    match api::upload::stream_upload(
+        &token,
+        state.api_base(),
+        upload_key,
+        content_bytes,
+        hash,
+        hash_algo,
+    )
+    .await
+    {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }

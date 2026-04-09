@@ -870,6 +870,7 @@ fn map_file_lock_command(lk: cli::FileLockCommands) -> FileLockCommand {
 }
 
 /// Convert clap-parsed upload commands to the internal enum.
+#[allow(clippy::too_many_lines)]
 fn map_upload_command(cmd: cli::UploadCommands) -> UploadCommand {
     match cmd {
         cli::UploadCommands::File {
@@ -943,6 +944,45 @@ fn map_upload_command(cmd: cli::UploadCommands) -> UploadCommand {
         cli::UploadCommands::WebStatus { upload_id } => UploadCommand::WebStatus { upload_id },
         cli::UploadCommands::Limits => UploadCommand::Limits,
         cli::UploadCommands::Extensions => UploadCommand::Extensions,
+        cli::UploadCommands::Stream {
+            workspace,
+            file_path,
+            folder,
+            max_size,
+            name,
+            hash,
+            hash_algo,
+        } => UploadCommand::Stream {
+            workspace,
+            file_path,
+            folder,
+            max_size,
+            name,
+            hash,
+            hash_algo,
+        },
+        cli::UploadCommands::CreateStreamSession {
+            workspace,
+            filename,
+            folder,
+            max_size,
+        } => UploadCommand::CreateStreamSession {
+            workspace,
+            filename,
+            folder,
+            max_size,
+        },
+        cli::UploadCommands::StreamSend {
+            upload_key,
+            file,
+            hash,
+            hash_algo,
+        } => UploadCommand::StreamSend {
+            upload_key,
+            file,
+            hash,
+            hash_algo,
+        },
     }
 }
 
