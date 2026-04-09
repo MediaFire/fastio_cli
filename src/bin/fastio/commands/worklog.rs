@@ -60,6 +60,27 @@ pub enum WorklogCommand {
         /// Entity ID (defaults to workspace ID).
         entity_id: Option<String>,
     },
+    /// Get worklog entry details.
+    Details {
+        /// Worklog entry ID.
+        entry_id: String,
+    },
+    /// List unacknowledged interjections for an entity.
+    ListInterjections {
+        /// Entity type (profile, task, or `task_list`).
+        entity_type: String,
+        /// Entity ID.
+        entity_id: String,
+        /// Max results.
+        limit: Option<u32>,
+        /// Offset for pagination.
+        offset: Option<u32>,
+    },
+    /// Acknowledge a worklog interjection.
+    Acknowledge {
+        /// Worklog entry ID to acknowledge.
+        entry_id: String,
+    },
 }
 
 /// Execute a worklog subcommand.
@@ -96,6 +117,14 @@ pub async fn execute(command: &WorklogCommand, ctx: &CommandContext<'_>) -> Resu
             let eid = entity_id.as_deref().unwrap_or(workspace.as_str());
             interject(ctx, etype, eid, message).await
         }
+        WorklogCommand::Details { entry_id } => details(ctx, entry_id).await,
+        WorklogCommand::ListInterjections {
+            entity_type,
+            entity_id,
+            limit,
+            offset,
+        } => list_interjections(ctx, entity_type, entity_id, *limit, *offset).await,
+        WorklogCommand::Acknowledge { entry_id } => acknowledge(ctx, entry_id).await,
     }
 }
 
@@ -155,6 +184,45 @@ async fn interject(
     let value = api::workflow::interject_worklog(&client, entity_type, entity_id, content)
         .await
         .context("failed to create worklog interjection")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Get worklog entry details.
+async fn details(ctx: &CommandContext<'_>, entry_id: &str) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::workflow::worklog_details(&client, entry_id)
+        .await
+        .context("failed to get worklog entry details")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// List unacknowledged interjections for an entity.
+async fn list_interjections(
+    ctx: &CommandContext<'_>,
+    entity_type: &str,
+    entity_id: &str,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<()> {
+    validate_entity_type(entity_type)?;
+
+    let client = ctx.build_client()?;
+    let value =
+        api::workflow::unacknowledged_worklogs(&client, entity_type, entity_id, limit, offset)
+            .await
+            .context("failed to list unacknowledged interjections")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Acknowledge a worklog interjection.
+async fn acknowledge(ctx: &CommandContext<'_>, entry_id: &str) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::workflow::acknowledge_worklog(&client, entry_id)
+        .await
+        .context("failed to acknowledge worklog interjection")?;
     ctx.output.render(&value)?;
     Ok(())
 }

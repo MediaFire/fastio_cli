@@ -25,6 +25,8 @@ pub mod invitation;
 pub mod locking;
 /// Organization and workspace member endpoints.
 pub mod member;
+/// Metadata extraction and template management endpoints.
+pub mod metadata;
 /// Organization management endpoints.
 pub mod org;
 /// File preview endpoints.
@@ -33,6 +35,8 @@ pub mod preview;
 pub mod share;
 /// Low-level storage node endpoints.
 pub mod storage;
+/// System health and status endpoints.
+pub mod system;
 /// Shared API response and request types.
 pub mod types;
 /// Upload session endpoints.

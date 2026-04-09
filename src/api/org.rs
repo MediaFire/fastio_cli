@@ -671,6 +671,30 @@ pub async fn delete_org_asset(
     client.delete(&path).await
 }
 
+/// List billing invoices.
+///
+/// `GET /org/{org_id}/billing/invoices/`
+pub async fn billing_invoices(
+    client: &ApiClient,
+    org_id: &str,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Value, CliError> {
+    let mut params = HashMap::new();
+    if let Some(l) = limit {
+        params.insert("limit".to_owned(), l.to_string());
+    }
+    if let Some(o) = offset {
+        params.insert("offset".to_owned(), o.to_string());
+    }
+    let path = format!("/org/{}/billing/invoices/", urlencoding::encode(org_id),);
+    if params.is_empty() {
+        client.get(&path).await
+    } else {
+        client.get_with_params(&path, &params).await
+    }
+}
+
 /// Create a workspace in an org.
 ///
 /// `POST /workspace/create/`

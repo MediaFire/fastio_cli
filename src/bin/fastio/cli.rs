@@ -124,6 +124,14 @@ pub enum Commands {
     #[command(subcommand)]
     Lock(LockCommands),
 
+    /// Metadata extraction and template management.
+    #[command(subcommand)]
+    Metadata(MetadataCommands),
+
+    /// System health and status checks (no auth required).
+    #[command(subcommand)]
+    System(SystemCommands),
+
     /// Start the MCP (Model Context Protocol) server over stdio.
     Mcp {
         /// Optional comma-separated list of tools to enable (default: all).
@@ -224,6 +232,14 @@ pub enum AuthCommands {
     /// OAuth session management.
     #[command(subcommand)]
     Oauth(OauthCommands),
+    /// Check the scopes and capabilities of the current token.
+    Scopes,
+    /// Check whether a password reset code is valid.
+    #[command(name = "password-reset-check")]
+    PasswordResetCheck {
+        /// The reset code to check.
+        code: String,
+    },
 }
 
 /// 2FA subcommands.
@@ -381,6 +397,23 @@ pub enum UserCommands {
     /// User asset management.
     #[command(subcommand)]
     Asset(UserAssetCommands),
+    /// Enable or disable photo auto-sync from SSO providers.
+    Autosync {
+        /// State: "enable" or "disable".
+        #[arg(value_parser = ["enable", "disable"])]
+        state: String,
+    },
+    /// Get support PIN and identity verification hash.
+    Pin,
+    /// Validate a phone number.
+    Phone {
+        /// Country code (e.g. "1" for US).
+        #[arg(long)]
+        country_code: String,
+        /// Phone number (e.g. "5551234567").
+        #[arg(long)]
+        phone_number: String,
+    },
 }
 
 /// User invitations subcommands.
@@ -414,6 +447,27 @@ pub enum UserAssetCommands {
     Delete {
         /// Asset type name.
         asset_type: String,
+    },
+    /// Upload a user asset (e.g. `profile_pic`).
+    Upload {
+        /// Asset type name (e.g. `profile_pic`).
+        #[arg(long)]
+        asset_type: String,
+        /// Path to the file to upload.
+        #[arg(long)]
+        file: String,
+    },
+    /// Read/download a user asset binary.
+    Read {
+        /// User ID.
+        #[arg(long)]
+        user_id: String,
+        /// Asset type name (e.g. `profile_pic`).
+        #[arg(long)]
+        asset_type: String,
+        /// Output file path.
+        #[arg(long)]
+        output: String,
     },
 }
 
@@ -696,6 +750,17 @@ pub enum OrgBillingCommands {
         #[arg(long)]
         plan_id: Option<String>,
     },
+    /// List billing invoices.
+    Invoices {
+        /// Organization ID.
+        org_id: String,
+        /// Maximum number of results per page.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
 }
 
 /// Org members subcommands.
@@ -913,6 +978,12 @@ pub enum WorkspaceCommands {
     /// Enable workflow features on a workspace.
     #[command(name = "enable-workflow")]
     EnableWorkflow {
+        /// Workspace ID.
+        workspace_id: String,
+    },
+    /// Disable workflow features on a workspace.
+    #[command(name = "disable-workflow")]
+    DisableWorkflow {
         /// Workspace ID.
         workspace_id: String,
     },
@@ -1482,6 +1553,9 @@ pub enum ShareCommands {
         /// Enable AI intelligence features.
         #[arg(long)]
         intelligence: Option<bool>,
+        /// Download security level (high, medium, or off).
+        #[arg(long, value_parser = ["high", "medium", "off"])]
+        download_security: Option<String>,
     },
     /// Get share details.
     Info {
@@ -1510,6 +1584,9 @@ pub enum ShareCommands {
         /// Enable or disable anonymous uploads.
         #[arg(long)]
         anonymous_uploads: Option<bool>,
+        /// Download security level (high, medium, or off).
+        #[arg(long, value_parser = ["high", "medium", "off"])]
+        download_security: Option<String>,
     },
     /// Delete a share. Permanent and irreversible.
     Delete {
@@ -1770,6 +1847,38 @@ pub enum EventCommands {
         /// Max seconds the server will hold the connection (1-95).
         #[arg(long)]
         wait: Option<u32>,
+    },
+    /// Acknowledge an event.
+    Ack {
+        /// Event ID to acknowledge.
+        event_id: String,
+    },
+    /// Get an AI-powered summary of events.
+    Summarize {
+        /// Filter by workspace ID.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Filter by share ID.
+        #[arg(long)]
+        share: Option<String>,
+        /// Filter by event name.
+        #[arg(long)]
+        event: Option<String>,
+        /// Filter by category.
+        #[arg(long)]
+        category: Option<String>,
+        /// Filter by subcategory.
+        #[arg(long)]
+        subcategory: Option<String>,
+        /// Free-text context for the AI summarizer.
+        #[arg(long)]
+        user_context: Option<String>,
+        /// Maximum number of events to include.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
     },
 }
 
@@ -2046,6 +2155,55 @@ pub enum TaskCommands {
         /// Task ID.
         task_id: String,
     },
+    /// Move a task to a different list.
+    Move {
+        /// Source task list ID.
+        #[arg(long)]
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+        /// Target task list ID.
+        #[arg(long)]
+        target_list_id: String,
+        /// Sort order in the target list.
+        #[arg(long)]
+        sort_order: Option<u32>,
+    },
+    /// Bulk change status for multiple tasks in a list.
+    #[command(name = "bulk-status")]
+    BulkStatus {
+        /// Task list ID.
+        #[arg(long)]
+        list_id: String,
+        /// Comma-separated task IDs.
+        #[arg(long)]
+        task_ids: String,
+        /// New status: pending, `in_progress`, complete, blocked.
+        #[arg(long, value_parser = ["pending", "in_progress", "complete", "blocked"])]
+        status: String,
+    },
+    /// Reorder tasks within a list.
+    Reorder {
+        /// Task list ID.
+        #[arg(long)]
+        list_id: String,
+        /// Comma-separated task IDs in desired order.
+        #[arg(long)]
+        task_ids: String,
+    },
+    /// Reorder task lists in a workspace or share.
+    #[command(name = "reorder-lists")]
+    ReorderLists {
+        /// Profile type: workspace or share.
+        #[arg(long, default_value = "workspace")]
+        profile_type: String,
+        /// Workspace or share ID.
+        #[arg(long)]
+        profile_id: String,
+        /// Comma-separated list IDs in desired order.
+        #[arg(long)]
+        list_ids: String,
+    },
     /// Manage task lists.
     #[command(subcommand)]
     Lists(TaskListCommands),
@@ -2055,11 +2213,14 @@ pub enum TaskCommands {
 #[derive(Subcommand, Debug)]
 #[non_exhaustive]
 pub enum TaskListCommands {
-    /// List all task lists in a workspace.
+    /// List all task lists in a workspace or share.
     List {
         /// Workspace ID.
-        #[arg(long)]
-        workspace: String,
+        #[arg(long, required_unless_present = "share")]
+        workspace: Option<String>,
+        /// Share ID (alternative to workspace).
+        #[arg(long, conflicts_with = "workspace")]
+        share: Option<String>,
         /// Maximum number of results.
         #[arg(long)]
         limit: Option<u32>,
@@ -2067,11 +2228,14 @@ pub enum TaskListCommands {
         #[arg(long)]
         offset: Option<u32>,
     },
-    /// Create a new task list.
+    /// Create a new task list in a workspace or share.
     Create {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace: String,
+        /// Profile type: workspace or share.
+        #[arg(long, default_value = "workspace")]
+        profile_type: String,
+        /// Workspace or share ID (alias: --workspace).
+        #[arg(long, alias = "workspace")]
+        profile_id: String,
         /// Task list name.
         name: String,
         /// Task list description.
@@ -2148,6 +2312,32 @@ pub enum WorklogCommands {
         #[arg(long)]
         entity_id: Option<String>,
     },
+    /// Get worklog entry details.
+    Details {
+        /// Worklog entry ID.
+        entry_id: String,
+    },
+    /// List unacknowledged interjections for an entity.
+    #[command(name = "list-interjections")]
+    ListInterjections {
+        /// Entity type (profile, task, `task_list`).
+        #[arg(long, value_parser = ["profile", "task", "task_list"])]
+        entity_type: String,
+        /// Entity ID.
+        #[arg(long)]
+        entity_id: String,
+        /// Maximum number of results.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Acknowledge a worklog interjection.
+    Acknowledge {
+        /// Worklog entry ID to acknowledge.
+        entry_id: String,
+    },
 }
 
 // ─── Approval ───────────────────────────────────────────────────────────────
@@ -2212,11 +2402,14 @@ pub enum ApprovalCommands {
 #[derive(Subcommand, Debug)]
 #[non_exhaustive]
 pub enum TodoCommands {
-    /// List todos in a workspace.
+    /// List todos in a workspace or share.
     List {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace: String,
+        /// Profile type: workspace or share.
+        #[arg(long, default_value = "workspace")]
+        profile_type: String,
+        /// Workspace or share ID (alias: --workspace).
+        #[arg(long, alias = "workspace")]
+        profile_id: String,
         /// Maximum number of results.
         #[arg(long)]
         limit: Option<u32>,
@@ -2224,11 +2417,14 @@ pub enum TodoCommands {
         #[arg(long)]
         offset: Option<u32>,
     },
-    /// Create a new todo.
+    /// Create a new todo in a workspace or share.
     Create {
         /// Workspace ID.
-        #[arg(long)]
-        workspace: String,
+        #[arg(long, required_unless_present = "share")]
+        workspace: Option<String>,
+        /// Share ID (alternative to workspace).
+        #[arg(long, conflicts_with = "workspace")]
+        share: Option<String>,
         /// Todo title.
         title: String,
         /// Assignee profile ID.
@@ -2258,6 +2454,22 @@ pub enum TodoCommands {
     Delete {
         /// Todo ID.
         todo_id: String,
+    },
+    /// Bulk toggle todo completion in a workspace or share.
+    #[command(name = "bulk-toggle")]
+    BulkToggle {
+        /// Workspace ID.
+        #[arg(long, required_unless_present = "share")]
+        workspace: Option<String>,
+        /// Share ID (alternative to workspace).
+        #[arg(long, conflicts_with = "workspace")]
+        share: Option<String>,
+        /// Comma-separated todo IDs.
+        #[arg(long)]
+        todo_ids: String,
+        /// Set completion state (true = done, false = not done).
+        #[arg(long, default_value = "true")]
+        done: bool,
     },
 }
 
@@ -2637,6 +2849,126 @@ pub enum LockCommands {
         #[arg(long)]
         lock_token: String,
     },
+    /// Renew (heartbeat) an existing lock on a file.
+    Heartbeat {
+        /// Context type: workspace or share.
+        #[arg(long, default_value = "workspace")]
+        context_type: String,
+        /// Context ID (workspace or share ID).
+        #[arg(long)]
+        context_id: String,
+        /// File node ID.
+        node_id: String,
+        /// Lock token returned by the acquire command.
+        #[arg(long)]
+        lock_token: String,
+    },
+}
+
+// ─── Metadata ─────────────────────────────────────────────────────────────────
+
+/// Metadata extraction subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum MetadataCommands {
+    /// List files eligible for metadata extraction.
+    Eligible {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Maximum number of results.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Add files to a metadata template.
+    #[command(name = "add-nodes")]
+    AddNodes {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Template ID.
+        #[arg(long)]
+        template_id: String,
+        /// JSON-encoded array of node IDs.
+        #[arg(long)]
+        node_ids: String,
+    },
+    /// Remove files from a metadata template.
+    #[command(name = "remove-nodes")]
+    RemoveNodes {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Template ID.
+        #[arg(long)]
+        template_id: String,
+        /// JSON-encoded array of node IDs.
+        #[arg(long)]
+        node_ids: String,
+    },
+    /// List files mapped to a metadata template.
+    #[command(name = "list-nodes")]
+    ListNodes {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Template ID.
+        #[arg(long)]
+        template_id: String,
+        /// Maximum number of results.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// AI-based file matching for a template.
+    #[command(name = "auto-match")]
+    AutoMatch {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Template ID.
+        #[arg(long)]
+        template_id: String,
+    },
+    /// Batch extract metadata for all files in a template.
+    #[command(name = "extract-all")]
+    ExtractAll {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Template ID.
+        #[arg(long)]
+        template_id: String,
+    },
+    /// Extract metadata from a single file.
+    Extract {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// File node ID.
+        #[arg(long)]
+        node_id: String,
+        /// Template ID to extract against.
+        #[arg(long)]
+        template_id: String,
+    },
+}
+
+// ─── System ───────────────────────────────────────────────────────────────────
+
+/// System health subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum SystemCommands {
+    /// Health check (no authentication required).
+    Ping,
+    /// System status (no authentication required).
+    Status,
 }
 
 // ─── Manual Debug impls (redact sensitive fields) ────────────────────────────
@@ -2706,6 +3038,11 @@ impl fmt::Debug for AuthCommands {
                 .field("email", email)
                 .finish(),
             Self::Oauth(cmds) => f.debug_tuple("Oauth").field(cmds).finish(),
+            Self::Scopes => write!(f, "Scopes"),
+            Self::PasswordResetCheck { code } => f
+                .debug_struct("PasswordResetCheck")
+                .field("code", code)
+                .finish(),
             #[allow(unreachable_patterns)]
             _ => write!(f, "AuthCommands(<unknown variant>)"),
         }

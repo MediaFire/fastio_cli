@@ -99,6 +99,42 @@ pub enum TaskCommand {
         /// Task ID.
         task_id: String,
     },
+    /// Move a task to a different list.
+    Move {
+        /// Source task list ID.
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+        /// Target task list ID.
+        target_list_id: String,
+        /// Sort order in the target list.
+        sort_order: Option<u32>,
+    },
+    /// Bulk change status for multiple tasks in a list.
+    BulkStatus {
+        /// Task list ID.
+        list_id: String,
+        /// Comma-separated task IDs.
+        task_ids: String,
+        /// New status.
+        status: String,
+    },
+    /// Reorder tasks within a list.
+    Reorder {
+        /// Task list ID.
+        list_id: String,
+        /// Comma-separated task IDs in desired order.
+        task_ids: String,
+    },
+    /// Reorder task lists in a workspace or share.
+    ReorderLists {
+        /// Profile type: workspace or share.
+        profile_type: String,
+        /// Workspace or share ID.
+        profile_id: String,
+        /// Comma-separated list IDs in desired order.
+        list_ids: String,
+    },
     /// Manage task lists.
     Lists(TaskListCommand),
 }
@@ -107,19 +143,23 @@ pub enum TaskCommand {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum TaskListCommand {
-    /// List all task lists.
+    /// List all task lists in a workspace or share.
     List {
-        /// Workspace ID.
-        workspace: String,
+        /// Profile type: workspace or share.
+        profile_type: String,
+        /// Workspace or share ID.
+        profile_id: String,
         /// Max results.
         limit: Option<u32>,
         /// Offset for pagination.
         offset: Option<u32>,
     },
-    /// Create a task list.
+    /// Create a task list in a workspace or share.
     Create {
-        /// Workspace ID.
-        workspace: String,
+        /// Profile type: workspace or share.
+        profile_type: String,
+        /// Workspace or share ID.
+        profile_id: String,
         /// List name.
         name: String,
         /// List description.
@@ -200,6 +240,23 @@ pub async fn execute(command: &TaskCommand, ctx: &CommandContext<'_>) -> Result<
             assignee_id,
         } => assign(ctx, list_id, task_id, assignee_id.as_deref()).await,
         TaskCommand::Complete { list_id, task_id } => complete(ctx, list_id, task_id).await,
+        TaskCommand::Move {
+            list_id,
+            task_id,
+            target_list_id,
+            sort_order,
+        } => move_task(ctx, list_id, task_id, target_list_id, *sort_order).await,
+        TaskCommand::BulkStatus {
+            list_id,
+            task_ids,
+            status,
+        } => bulk_status(ctx, list_id, task_ids, status).await,
+        TaskCommand::Reorder { list_id, task_ids } => reorder(ctx, list_id, task_ids).await,
+        TaskCommand::ReorderLists {
+            profile_type,
+            profile_id,
+            list_ids,
+        } => reorder_lists(ctx, profile_type, profile_id, list_ids).await,
         TaskCommand::Lists(cmd) => lists(cmd, ctx).await,
     }
 }
@@ -354,30 +411,117 @@ async fn complete(ctx: &CommandContext<'_>, list_id: &str, task_id: &str) -> Res
     Ok(())
 }
 
+/// Move a task to a different list.
+async fn move_task(
+    ctx: &CommandContext<'_>,
+    list_id: &str,
+    task_id: &str,
+    target_list_id: &str,
+    sort_order: Option<u32>,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::workflow::move_task(&client, list_id, task_id, target_list_id, sort_order)
+        .await
+        .context("failed to move task")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Bulk change status for multiple tasks.
+async fn bulk_status(
+    ctx: &CommandContext<'_>,
+    list_id: &str,
+    task_ids_csv: &str,
+    status: &str,
+) -> Result<()> {
+    let ids: Vec<String> = task_ids_csv
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .collect();
+    anyhow::ensure!(!ids.is_empty(), "task_ids must not be empty");
+
+    let client = ctx.build_client()?;
+    let value = api::workflow::bulk_status_tasks(&client, list_id, &ids, status)
+        .await
+        .context("failed to bulk-update task statuses")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Reorder tasks within a list.
+async fn reorder(ctx: &CommandContext<'_>, list_id: &str, task_ids_csv: &str) -> Result<()> {
+    let ids: Vec<String> = task_ids_csv
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .collect();
+    anyhow::ensure!(!ids.is_empty(), "task_ids must not be empty");
+
+    let client = ctx.build_client()?;
+    let value = api::workflow::reorder_tasks(&client, list_id, &ids)
+        .await
+        .context("failed to reorder tasks")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Reorder task lists in a workspace or share.
+async fn reorder_lists(
+    ctx: &CommandContext<'_>,
+    profile_type: &str,
+    profile_id: &str,
+    list_ids_csv: &str,
+) -> Result<()> {
+    let ids: Vec<String> = list_ids_csv
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .collect();
+    anyhow::ensure!(!ids.is_empty(), "list_ids must not be empty");
+
+    let client = ctx.build_client()?;
+    let value = api::workflow::reorder_task_lists(&client, profile_type, profile_id, &ids)
+        .await
+        .context("failed to reorder task lists")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
 /// Handle task list subcommands.
 async fn lists(cmd: &TaskListCommand, ctx: &CommandContext<'_>) -> Result<()> {
     let client = ctx.build_client()?;
 
     match cmd {
         TaskListCommand::List {
-            workspace,
+            profile_type,
+            profile_id,
             limit,
             offset,
         } => {
-            let value = api::workflow::list_task_lists(&client, workspace, *limit, *offset)
-                .await
-                .context("failed to list task lists")?;
+            let value = api::workflow::list_task_lists_ctx(
+                &client,
+                profile_type,
+                profile_id,
+                *limit,
+                *offset,
+            )
+            .await
+            .context("failed to list task lists")?;
             ctx.output.render(&value)?;
         }
         TaskListCommand::Create {
-            workspace,
+            profile_type,
+            profile_id,
             name,
             description,
         } => {
-            let value =
-                api::workflow::create_task_list(&client, workspace, name, description.as_deref())
-                    .await
-                    .context("failed to create task list")?;
+            let value = api::workflow::create_task_list_ctx(
+                &client,
+                profile_type,
+                profile_id,
+                name,
+                description.as_deref(),
+            )
+            .await
+            .context("failed to create task list")?;
             ctx.output.render(&value)?;
         }
         TaskListCommand::Update {

@@ -23,12 +23,14 @@ use commands::import::ImportCommand;
 use commands::invitation::InvitationCommand;
 use commands::lock::LockCommand;
 use commands::member::MemberCommand;
+use commands::metadata::MetadataCommand;
 use commands::org::{
     BillingCommand, DiscoverCommand, OrgAssetCommand, OrgCommand, OrgInvitationsCommand,
     OrgMembersCommand, OrgTransferTokenCommand,
 };
 use commands::preview::PreviewCommand;
 use commands::share::{ShareCommand, ShareFilesCommand, ShareMembersCommand};
+use commands::system::SystemCommand;
 use commands::task::{TaskCommand, TaskListCommand};
 use commands::todo::TodoCommand;
 use commands::upload::UploadCommand;
@@ -148,6 +150,8 @@ async fn dispatch(
         Commands::Apps(c) => commands::apps::execute(&map_apps_command(&c), ctx).await,
         Commands::Import(c) => commands::import::execute(&map_import_command(&c), ctx).await,
         Commands::Lock(c) => commands::lock::execute(&map_lock_command(&c), ctx).await,
+        Commands::Metadata(c) => commands::metadata::execute(&map_metadata_command(c), ctx).await,
+        Commands::System(c) => commands::system::execute(&map_system_command(&c), ctx).await,
         Commands::Completions { shell } => {
             generate_completions(shell);
             Ok(())
@@ -235,6 +239,8 @@ fn map_auth_command(cmd: AuthCommands) -> AuthCommand {
             cli::OauthCommands::Revoke { session_id } => OauthCommand::Revoke { session_id },
             cli::OauthCommands::RevokeAll => OauthCommand::RevokeAll,
         }),
+        AuthCommands::Scopes => AuthCommand::Scopes,
+        AuthCommands::PasswordResetCheck { code } => AuthCommand::PasswordResetCheck { code },
     }
 }
 
@@ -285,7 +291,28 @@ fn map_user_command(cmd: cli::UserCommands) -> UserCommand {
             cli::UserAssetCommands::Delete { asset_type } => {
                 UserAssetCommand::Delete { asset_type }
             }
+            cli::UserAssetCommands::Upload { asset_type, file } => {
+                UserAssetCommand::Upload { asset_type, file }
+            }
+            cli::UserAssetCommands::Read {
+                user_id,
+                asset_type,
+                output,
+            } => UserAssetCommand::Read {
+                user_id,
+                asset_type,
+                output,
+            },
         }),
+        cli::UserCommands::Autosync { state } => UserCommand::Autosync { state },
+        cli::UserCommands::Pin => UserCommand::Pin,
+        cli::UserCommands::Phone {
+            country_code,
+            phone_number,
+        } => UserCommand::Phone {
+            country_code,
+            phone_number,
+        },
     }
 }
 
@@ -470,6 +497,15 @@ fn map_org_billing_command(b: cli::OrgBillingCommands) -> BillingCommand {
         cli::OrgBillingCommands::Create { org_id, plan_id } => {
             BillingCommand::Create { org_id, plan_id }
         }
+        cli::OrgBillingCommands::Invoices {
+            org_id,
+            limit,
+            offset,
+        } => BillingCommand::Invoices {
+            org_id,
+            limit,
+            offset,
+        },
     }
 }
 
@@ -571,6 +607,9 @@ fn map_workspace_command(cmd: cli::WorkspaceCommands) -> WorkspaceCommand {
         },
         cli::WorkspaceCommands::EnableWorkflow { workspace_id } => {
             WorkspaceCommand::EnableWorkflow { workspace_id }
+        }
+        cli::WorkspaceCommands::DisableWorkflow { workspace_id } => {
+            WorkspaceCommand::DisableWorkflow { workspace_id }
         }
         cli::WorkspaceCommands::Search {
             workspace_id,
@@ -949,6 +988,7 @@ fn map_share_command(cmd: cli::ShareCommands) -> ShareCommand {
             password,
             anonymous_uploads,
             intelligence,
+            download_security,
         } => ShareCommand::Create {
             workspace_id: workspace,
             name,
@@ -957,6 +997,7 @@ fn map_share_command(cmd: cli::ShareCommands) -> ShareCommand {
             password,
             anonymous_uploads,
             intelligence,
+            download_security,
         },
         cli::ShareCommands::Info { share_id } => ShareCommand::Info { share_id },
         cli::ShareCommands::Update {
@@ -967,6 +1008,7 @@ fn map_share_command(cmd: cli::ShareCommands) -> ShareCommand {
             download_enabled,
             comments_enabled,
             anonymous_uploads,
+            download_security,
         } => ShareCommand::Update {
             share_id,
             name,
@@ -975,6 +1017,7 @@ fn map_share_command(cmd: cli::ShareCommands) -> ShareCommand {
             download_enabled,
             comments_enabled,
             anonymous_uploads,
+            download_security,
         },
         cli::ShareCommands::Delete { share_id, confirm } => {
             ShareCommand::Delete { share_id, confirm }
@@ -1142,6 +1185,26 @@ fn map_event_command(cmd: cli::EventCommands) -> EventCommand {
             entity_id,
             lastactivity,
             wait,
+        },
+        cli::EventCommands::Ack { event_id } => EventCommand::Ack { event_id },
+        cli::EventCommands::Summarize {
+            workspace,
+            share,
+            event,
+            category,
+            subcategory,
+            user_context,
+            limit,
+            offset,
+        } => EventCommand::Summarize {
+            workspace,
+            share,
+            event,
+            category,
+            subcategory,
+            user_context,
+            limit,
+            offset,
         },
     }
 }
@@ -1337,6 +1400,38 @@ fn map_task_command(cmd: cli::TaskCommands) -> TaskCommand {
         cli::TaskCommands::Complete { list_id, task_id } => {
             TaskCommand::Complete { list_id, task_id }
         }
+        cli::TaskCommands::Move {
+            list_id,
+            task_id,
+            target_list_id,
+            sort_order,
+        } => TaskCommand::Move {
+            list_id,
+            task_id,
+            target_list_id,
+            sort_order,
+        },
+        cli::TaskCommands::BulkStatus {
+            list_id,
+            task_ids,
+            status,
+        } => TaskCommand::BulkStatus {
+            list_id,
+            task_ids,
+            status,
+        },
+        cli::TaskCommands::Reorder { list_id, task_ids } => {
+            TaskCommand::Reorder { list_id, task_ids }
+        }
+        cli::TaskCommands::ReorderLists {
+            profile_type,
+            profile_id,
+            list_ids,
+        } => TaskCommand::ReorderLists {
+            profile_type,
+            profile_id,
+            list_ids,
+        },
         cli::TaskCommands::Lists(lists_cmd) => TaskCommand::Lists(map_task_list_command(lists_cmd)),
     }
 }
@@ -1346,19 +1441,26 @@ fn map_task_list_command(cmd: cli::TaskListCommands) -> TaskListCommand {
     match cmd {
         cli::TaskListCommands::List {
             workspace,
+            share,
             limit,
             offset,
-        } => TaskListCommand::List {
-            workspace,
-            limit,
-            offset,
-        },
+        } => {
+            let (profile_type, profile_id) = resolve_todo_profile(workspace, share);
+            TaskListCommand::List {
+                profile_type,
+                profile_id,
+                limit,
+                offset,
+            }
+        }
         cli::TaskListCommands::Create {
-            workspace,
+            profile_type,
+            profile_id,
             name,
             description,
         } => TaskListCommand::Create {
-            workspace,
+            profile_type,
+            profile_id,
             name,
             description,
         },
@@ -1413,6 +1515,19 @@ fn map_worklog_command(cmd: cli::WorklogCommands) -> WorklogCommand {
             entity_type,
             entity_id,
         },
+        cli::WorklogCommands::Details { entry_id } => WorklogCommand::Details { entry_id },
+        cli::WorklogCommands::ListInterjections {
+            entity_type,
+            entity_id,
+            limit,
+            offset,
+        } => WorklogCommand::ListInterjections {
+            entity_type,
+            entity_id,
+            limit,
+            offset,
+        },
+        cli::WorklogCommands::Acknowledge { entry_id } => WorklogCommand::Acknowledge { entry_id },
     }
 }
 
@@ -1464,23 +1579,30 @@ fn map_approval_command(cmd: cli::ApprovalCommands) -> ApprovalCommand {
 fn map_todo_command(cmd: cli::TodoCommands) -> TodoCommand {
     match cmd {
         cli::TodoCommands::List {
-            workspace,
+            profile_type,
+            profile_id,
             limit,
             offset,
         } => TodoCommand::List {
-            workspace,
+            profile_type,
+            profile_id,
             limit,
             offset,
         },
         cli::TodoCommands::Create {
             workspace,
+            share,
             title,
             assignee_id,
-        } => TodoCommand::Create {
-            workspace,
-            title,
-            assignee_id,
-        },
+        } => {
+            let (profile_type, profile_id) = resolve_todo_profile(workspace, share);
+            TodoCommand::Create {
+                profile_type,
+                profile_id,
+                title,
+                assignee_id,
+            }
+        }
         cli::TodoCommands::Update {
             todo_id,
             title,
@@ -1494,6 +1616,37 @@ fn map_todo_command(cmd: cli::TodoCommands) -> TodoCommand {
         },
         cli::TodoCommands::Toggle { todo_id } => TodoCommand::Toggle { todo_id },
         cli::TodoCommands::Delete { todo_id } => TodoCommand::Delete { todo_id },
+        cli::TodoCommands::BulkToggle {
+            workspace,
+            share,
+            todo_ids,
+            done,
+        } => {
+            let (profile_type, profile_id) = resolve_todo_profile(workspace, share);
+            let ids: Vec<String> = todo_ids.split(',').map(|s| s.trim().to_owned()).collect();
+            TodoCommand::BulkToggle {
+                profile_type,
+                profile_id,
+                todo_ids: ids,
+                done,
+            }
+        }
+    }
+}
+
+/// Resolve workspace/share options into a `(profile_type, profile_id)` pair.
+///
+/// Clap ensures at least one of `workspace` or `share` is present via
+/// `required_unless_present`. If both are `None` (should not happen), returns
+/// an empty workspace profile ID which will fail server-side.
+fn resolve_todo_profile(workspace: Option<String>, share: Option<String>) -> (String, String) {
+    if let Some(sid) = share {
+        ("share".to_owned(), sid)
+    } else if let Some(wid) = workspace {
+        ("workspace".to_owned(), wid)
+    } else {
+        // Defensive: clap should prevent reaching here.
+        ("workspace".to_owned(), String::new())
     }
 }
 
@@ -1712,5 +1865,91 @@ fn map_lock_command(cmd: &cli::LockCommands) -> LockCommand {
             node_id: node_id.clone(),
             lock_token: lock_token.clone(),
         },
+        cli::LockCommands::Heartbeat {
+            context_type,
+            context_id,
+            node_id,
+            lock_token,
+        } => LockCommand::Heartbeat {
+            context_type: context_type.clone(),
+            context_id: context_id.clone(),
+            node_id: node_id.clone(),
+            lock_token: lock_token.clone(),
+        },
+    }
+}
+
+/// Convert clap-parsed metadata commands to the internal enum.
+fn map_metadata_command(cmd: cli::MetadataCommands) -> MetadataCommand {
+    match cmd {
+        cli::MetadataCommands::Eligible {
+            workspace,
+            limit,
+            offset,
+        } => MetadataCommand::Eligible {
+            workspace,
+            limit,
+            offset,
+        },
+        cli::MetadataCommands::AddNodes {
+            workspace,
+            template_id,
+            node_ids,
+        } => MetadataCommand::AddNodes {
+            workspace,
+            template_id,
+            node_ids,
+        },
+        cli::MetadataCommands::RemoveNodes {
+            workspace,
+            template_id,
+            node_ids,
+        } => MetadataCommand::RemoveNodes {
+            workspace,
+            template_id,
+            node_ids,
+        },
+        cli::MetadataCommands::ListNodes {
+            workspace,
+            template_id,
+            limit,
+            offset,
+        } => MetadataCommand::ListNodes {
+            workspace,
+            template_id,
+            limit,
+            offset,
+        },
+        cli::MetadataCommands::AutoMatch {
+            workspace,
+            template_id,
+        } => MetadataCommand::AutoMatch {
+            workspace,
+            template_id,
+        },
+        cli::MetadataCommands::ExtractAll {
+            workspace,
+            template_id,
+        } => MetadataCommand::ExtractAll {
+            workspace,
+            template_id,
+        },
+        cli::MetadataCommands::Extract {
+            workspace,
+            node_id,
+            template_id,
+        } => MetadataCommand::Extract {
+            workspace,
+            node_id,
+            template_id,
+        },
+    }
+}
+
+/// Convert clap-parsed system commands to the internal enum.
+fn map_system_command(cmd: &cli::SystemCommands) -> SystemCommand {
+    match cmd {
+        cli::SystemCommands::Ping => SystemCommand::Ping,
+        cli::SystemCommands::Status => SystemCommand::Status,
     }
 }

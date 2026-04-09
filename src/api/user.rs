@@ -4,11 +4,24 @@
 ///
 /// Maps to the endpoints documented in `/current/user/`.
 use std::collections::HashMap;
+use std::path::Path;
+use std::time::Duration;
 
+use reqwest::header::{AUTHORIZATION, USER_AGENT};
+use reqwest::multipart;
 use serde_json::Value;
 
 use crate::client::ApiClient;
 use crate::error::CliError;
+
+/// User-Agent string for user asset requests.
+const USER_ASSET_USER_AGENT: &str = concat!("fastio-cli/", env!("CARGO_PKG_VERSION"));
+
+/// Timeout for user asset upload requests.
+const ASSET_UPLOAD_TIMEOUT_SECS: u64 = 120;
+
+/// Connect timeout for user asset requests.
+const ASSET_CONNECT_TIMEOUT_SECS: u64 = 30;
 
 /// Get the current user's profile details.
 ///
@@ -47,25 +60,95 @@ pub async fn update_user(
     client.post("/user/update/", &form).await
 }
 
-/// Upload a user asset (e.g. avatar).
+/// Upload a user asset (e.g. avatar) via multipart form data.
 ///
 /// `POST /user/{user_id}/assets/{asset_name}/`
 ///
-/// Note: This endpoint requires multipart form data, which is not yet
-/// supported by the basic client. Returns an error directing the user
-/// to use the web interface for avatar uploads.
-pub fn upload_user_asset(
+/// This uses a raw reqwest client because the API expects `multipart/form-data`
+/// with a binary file field.
+pub async fn upload_user_asset(
     client: &ApiClient,
     user_id: &str,
     asset_name: &str,
-    _file_path: &str,
+    file_path: &str,
 ) -> Result<Value, CliError> {
-    let _ = client;
-    let _ = user_id;
-    let _ = asset_name;
-    Err(CliError::Config(
-        "Avatar upload is not available in this version of the CLI.".to_owned(),
-    ))
+    let token = client
+        .get_token()
+        .ok_or_else(|| CliError::Config("authentication required for asset upload".to_owned()))?
+        .to_owned();
+    let base = client.base_url();
+    let url = format!(
+        "{}/user/{}/assets/{}/",
+        base.trim_end_matches('/'),
+        urlencoding::encode(user_id),
+        urlencoding::encode(asset_name),
+    );
+
+    let path = Path::new(file_path);
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("asset")
+        .to_owned();
+    let file_bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| CliError::Config(format!("failed to read file {file_path}: {e}")))?;
+
+    let part = multipart::Part::bytes(file_bytes).file_name(file_name);
+    let form = multipart::Form::new().part("file", part);
+
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(ASSET_UPLOAD_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(ASSET_CONNECT_TIMEOUT_SECS))
+        .build()
+        .map_err(CliError::Http)?;
+
+    let resp = http_client
+        .post(&url)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .header(USER_AGENT, USER_ASSET_USER_AGENT)
+        .multipart(form)
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await.map_err(CliError::Http)?;
+
+    if !status.is_success() {
+        let msg = body
+            .get("error")
+            .and_then(|e| e.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("asset upload failed");
+        return Err(CliError::Api(crate::error::ApiError {
+            code: 0,
+            error_code: None,
+            message: msg.to_owned(),
+            http_status: status.as_u16(),
+        }));
+    }
+
+    // Unwrap the API response envelope per convention.
+    let result = body.get("result").and_then(|v| v.as_str());
+    if result == Some("yes") {
+        if let Some(inner) = body.get("response") {
+            Ok(inner.clone())
+        } else {
+            Ok(body)
+        }
+    } else {
+        let msg = body
+            .get("error")
+            .and_then(|e| e.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("asset upload failed");
+        Err(CliError::Api(crate::error::ApiError {
+            code: 0,
+            error_code: None,
+            message: msg.to_owned(),
+            http_status: status.as_u16(),
+        }))
+    }
 }
 
 /// Delete a user asset (e.g. avatar).
@@ -189,4 +272,91 @@ pub async fn user_org_limits(client: &ApiClient) -> Result<Value, CliError> {
 /// `GET /shares/all/`
 pub async fn list_user_shares(client: &ApiClient) -> Result<Value, CliError> {
     client.get("/shares/all/").await
+}
+
+/// Enable or disable photo auto-sync from SSO providers.
+///
+/// `GET /user/me/autosync/{state}/`
+///
+/// State must be `"enable"` or `"disable"`.
+pub async fn autosync(client: &ApiClient, state: &str) -> Result<Value, CliError> {
+    let path = format!("/user/me/autosync/{}/", urlencoding::encode(state));
+    client.get(&path).await
+}
+
+/// Read the binary content of a user asset.
+///
+/// `GET /user/{user_id}/assets/{asset_name}/read/`
+///
+/// Downloads the asset to the given output path. Returns the number of bytes written.
+pub async fn read_user_asset(
+    client: &ApiClient,
+    user_id: &str,
+    asset_name: &str,
+    output_path: &Path,
+) -> Result<u64, CliError> {
+    let token = client
+        .get_token()
+        .ok_or_else(|| CliError::Config("authentication required for asset read".to_owned()))?
+        .to_owned();
+    let base = client.base_url();
+    let url = format!(
+        "{}/user/{}/assets/{}/read/",
+        base.trim_end_matches('/'),
+        urlencoding::encode(user_id),
+        urlencoding::encode(asset_name),
+    );
+
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(ASSET_CONNECT_TIMEOUT_SECS))
+        .build()
+        .map_err(CliError::Http)?;
+
+    let resp = http_client
+        .get(&url)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .header(USER_AGENT, USER_ASSET_USER_AGENT)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(CliError::Api(crate::error::ApiError {
+            code: 0,
+            error_code: None,
+            message: format!("asset read failed with HTTP {status}: {body}"),
+            http_status: status,
+        }));
+    }
+
+    let bytes = resp.bytes().await.map_err(CliError::Http)?;
+    tokio::fs::write(output_path, &bytes)
+        .await
+        .map_err(|e| CliError::Config(format!("failed to write file: {e}")))?;
+
+    Ok(bytes.len() as u64)
+}
+
+/// Get the user's support PIN and identity verification hash.
+///
+/// `GET /user/pin/`
+pub async fn get_pin(client: &ApiClient) -> Result<Value, CliError> {
+    client.get("/user/pin/").await
+}
+
+/// Validate a phone number and country code combination.
+///
+/// `GET /user/phone/{country_code}-{phone_number}/`
+pub async fn validate_phone(
+    client: &ApiClient,
+    country_code: &str,
+    phone_number: &str,
+) -> Result<Value, CliError> {
+    let path = format!(
+        "/user/phone/{}-{}/",
+        urlencoding::encode(country_code),
+        urlencoding::encode(phone_number),
+    );
+    client.get(&path).await
 }

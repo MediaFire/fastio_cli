@@ -74,12 +74,16 @@ pub mod invitation;
 pub mod lock;
 /// Organization and workspace member commands.
 pub mod member;
+/// Metadata extraction and template management commands.
+pub mod metadata;
 /// Organization management commands.
 pub mod org;
 /// File preview commands.
 pub mod preview;
 /// Share link management commands.
 pub mod share;
+/// System health and status commands.
+pub mod system;
 /// Task management commands.
 pub mod task;
 /// To-do item commands.
