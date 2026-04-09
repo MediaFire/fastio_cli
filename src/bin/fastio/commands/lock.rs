@@ -40,6 +40,17 @@ pub enum LockCommand {
         /// Lock token returned by the acquire command.
         lock_token: String,
     },
+    /// Renew (heartbeat) an existing lock on a file.
+    Heartbeat {
+        /// Context type: workspace or share.
+        context_type: String,
+        /// Context ID.
+        context_id: String,
+        /// File node ID.
+        node_id: String,
+        /// Lock token returned by the acquire command.
+        lock_token: String,
+    },
 }
 
 /// Execute a lock subcommand.
@@ -76,6 +87,23 @@ pub async fn execute(command: &LockCommand, ctx: &CommandContext<'_>) -> Result<
                 api::locking::lock_release(&client, context_type, context_id, node_id, lock_token)
                     .await
                     .context("failed to release lock")?;
+            ctx.output.render(&v)?;
+        }
+        LockCommand::Heartbeat {
+            context_type,
+            context_id,
+            node_id,
+            lock_token,
+        } => {
+            let v = api::locking::lock_heartbeat(
+                &client,
+                context_type,
+                context_id,
+                node_id,
+                lock_token,
+            )
+            .await
+            .context("failed to renew lock")?;
             ctx.output.render(&v)?;
         }
     }

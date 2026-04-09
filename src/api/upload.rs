@@ -36,6 +36,143 @@ const CHUNK_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
 /// Maximum backoff delay for chunk upload retries.
 const CHUNK_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Maximum file size for single-call uploads (4 MB).
+pub const SINGLE_CALL_MAX_SIZE: u64 = 4 * 1024 * 1024;
+
+/// Upload a small file in a single API call (≤ 4 MB).
+///
+/// `POST /upload/` with multipart form including the file data as the `chunk` field.
+/// Returns the unwrapped response payload with `new_file_id` — no separate assembly
+/// or polling step required. Includes retry logic with exponential backoff for
+/// transient failures (429, 502-504, timeouts, network errors).
+#[allow(clippy::too_many_lines)]
+pub async fn single_call_upload(
+    token: &str,
+    api_base: &str,
+    workspace_id: &str,
+    folder_id: &str,
+    filename: &str,
+    file_data: Vec<u8>,
+) -> Result<Value, CliError> {
+    let file_size = file_data.len();
+    let url = format!("{}/upload/", api_base.trim_end_matches('/'));
+
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(CHUNK_UPLOAD_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(CHUNK_CONNECT_TIMEOUT_SECS))
+        .build()
+        .map_err(CliError::Http)?;
+
+    let mut attempt: u32 = 0;
+    let mut backoff = CHUNK_INITIAL_BACKOFF;
+
+    loop {
+        let part = multipart::Part::bytes(file_data.clone()).file_name(filename.to_owned());
+        let form = multipart::Form::new()
+            .text("name", filename.to_owned())
+            .text("size", file_size.to_string())
+            .text("action", "create")
+            .text("instance_id", workspace_id.to_owned())
+            .text("folder_id", folder_id.to_owned())
+            .text("profile_type", "workspace")
+            .part("chunk", part);
+
+        let send_result = http_client
+            .post(&url)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header(USER_AGENT, UPLOAD_USER_AGENT)
+            .multipart(form)
+            .send()
+            .await;
+
+        match send_result {
+            Ok(resp) => {
+                let status = resp.status();
+
+                // Handle 429 rate limiting with retry.
+                if status.as_u16() == 429 && attempt < CHUNK_MAX_RETRIES {
+                    let retry_secs = parse_rate_limit_expiry(&resp);
+                    attempt += 1;
+                    eprintln!(
+                        "{} Upload rate limited (attempt {}/{CHUNK_MAX_RETRIES}). \
+                         Waiting {retry_secs} seconds.",
+                        "warning:".yellow().bold(),
+                        attempt,
+                    );
+                    tokio::time::sleep(Duration::from_secs(retry_secs)).await;
+                    continue;
+                }
+
+                // Retry on server errors.
+                if status.is_server_error() && attempt < CHUNK_MAX_RETRIES {
+                    attempt += 1;
+                    eprintln!(
+                        "{} Upload server error (HTTP {}, attempt {}/{CHUNK_MAX_RETRIES}). \
+                         Retrying in {} seconds.",
+                        "warning:".yellow().bold(),
+                        status.as_u16(),
+                        attempt,
+                        backoff.as_secs(),
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff.saturating_mul(2), CHUNK_MAX_BACKOFF);
+                    continue;
+                }
+
+                let body: Value = resp.json().await.map_err(|e| {
+                    CliError::Parse(format!("failed to parse single-call upload response: {e}"))
+                })?;
+
+                let result_ok = match body.get("result") {
+                    Some(Value::String(s)) => s == "yes",
+                    Some(Value::Bool(b)) => *b,
+                    _ => false,
+                };
+
+                if result_ok {
+                    // Unwrap envelope: prefer "response" sub-object, fall back
+                    // to top level sans metadata keys.
+                    let payload = if let Some(response_obj) = body.get("response") {
+                        response_obj.clone()
+                    } else {
+                        let mut map = body;
+                        if let Some(obj) = map.as_object_mut() {
+                            obj.remove("result");
+                            obj.remove("current_api_version");
+                        }
+                        map
+                    };
+                    return Ok(payload);
+                }
+
+                let message = body
+                    .get("error")
+                    .and_then(|e| e.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Single-call upload failed");
+                return Err(CliError::Api(crate::error::ApiError {
+                    code: u32::try_from(
+                        body.get("error")
+                            .and_then(|e| e.get("code"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    )
+                    .unwrap_or(0),
+                    error_code: None,
+                    message: message.to_owned(),
+                    http_status: status.as_u16(),
+                }));
+            }
+            Err(err) => {
+                if should_retry_network_error(&err, 0, &mut attempt, &mut backoff).await {
+                    continue;
+                }
+                return Err(err.into());
+            }
+        }
+    }
+}
+
 /// Create a new chunked upload session.
 ///
 /// `POST /upload/`

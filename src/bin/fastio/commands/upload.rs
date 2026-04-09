@@ -575,6 +575,10 @@ async fn poll_upload_completion(
 }
 
 /// Upload a local file with chunking and progress bar.
+///
+/// Files ≤ 4 MB use a single-call upload (one request, immediate result).
+/// Larger files use the multi-step chunked flow.
+#[allow(clippy::too_many_lines)]
 async fn upload_file(
     ctx: &CommandContext<'_>,
     workspace: &str,
@@ -598,12 +602,72 @@ async fn upload_file(
         .ok_or_else(|| anyhow::anyhow!("invalid filename"))?;
 
     let token_str = resolve_auth(ctx.profile_name, ctx.flag_token, ctx.config_dir)?;
-    let client = ApiClient::new(ctx.api_base, Some(token_str.clone()))
-        .context("failed to create API client")?;
 
     if !ctx.output.quiet {
         eprintln!("Uploading {} ({})", filename, format_bytes(file_size));
     }
+
+    // Use single-call upload for small files (≤ 4 MB)
+    if file_size <= api::upload::SINGLE_CALL_MAX_SIZE {
+        let file_data = std::fs::read(path).context("failed to read file")?;
+        let client = ApiClient::new(ctx.api_base, Some(token_str.clone()))
+            .context("failed to create API client")?;
+
+        let resp = api::upload::single_call_upload(
+            &token_str,
+            ctx.api_base,
+            workspace,
+            folder,
+            filename,
+            file_data,
+        )
+        .await
+        .context("single-call upload failed")?;
+
+        let upload_id = resp
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+
+        // The API may return new_file_id immediately or after brief processing.
+        // Poll if not immediately available.
+        let mut new_file_id = resp
+            .get("new_file_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        if new_file_id.is_none() && !upload_id.is_empty() {
+            let final_status = poll_upload_completion(&client, &upload_id, 30).await?;
+            if final_status == "stored" || final_status == "complete" {
+                let details = api::upload::get_upload_status(&client, &upload_id)
+                    .await
+                    .ok();
+                new_file_id = details
+                    .as_ref()
+                    .and_then(|d| d.get("session"))
+                    .and_then(|s| s.get("new_file_id"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+            }
+        }
+
+        let value = json!({
+            "status": "uploaded",
+            "filename": filename,
+            "size": file_size,
+            "size_human": format_bytes(file_size),
+            "upload_id": if upload_id.is_empty() { None } else { Some(&upload_id) },
+            "new_file_id": new_file_id.as_deref().unwrap_or("unknown"),
+            "final_status": "stored",
+        });
+        ctx.output.render(&value)?;
+        return Ok(());
+    }
+
+    // Multi-step chunked upload for larger files
+    let client = ApiClient::new(ctx.api_base, Some(token_str.clone()))
+        .context("failed to create API client")?;
 
     let session =
         api::upload::create_upload_session(&client, workspace, folder, filename, file_size)
@@ -662,6 +726,9 @@ async fn upload_file(
 }
 
 /// Upload text content as a file.
+///
+/// Text content ≤ 4 MB uses a single-call upload. Larger content falls back
+/// to the multi-step chunked flow.
 async fn upload_text(
     ctx: &CommandContext<'_>,
     workspace: &str,
@@ -674,8 +741,6 @@ async fn upload_text(
         "workspace ID must not be empty"
     );
     let token_str = resolve_auth(ctx.profile_name, ctx.flag_token, ctx.config_dir)?;
-    let client = ApiClient::new(ctx.api_base, Some(token_str.clone()))
-        .context("failed to create API client")?;
 
     let content_bytes = content.as_bytes();
     let file_size = u64::try_from(content_bytes.len()).context("content size exceeds u64 range")?;
@@ -684,7 +749,63 @@ async fn upload_text(
         eprintln!("Uploading text file {} ({})", name, format_bytes(file_size));
     }
 
-    // Create session
+    // Use single-call upload for small content (≤ 4 MB)
+    if file_size <= api::upload::SINGLE_CALL_MAX_SIZE {
+        let client = ApiClient::new(ctx.api_base, Some(token_str.clone()))
+            .context("failed to create API client")?;
+
+        let resp = api::upload::single_call_upload(
+            &token_str,
+            ctx.api_base,
+            workspace,
+            folder,
+            name,
+            content_bytes.to_vec(),
+        )
+        .await
+        .context("single-call upload failed")?;
+
+        let upload_id = resp
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+
+        let mut new_file_id = resp
+            .get("new_file_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        if new_file_id.is_none() && !upload_id.is_empty() {
+            let final_status = poll_upload_completion(&client, &upload_id, 30).await?;
+            if final_status == "stored" || final_status == "complete" {
+                let details = api::upload::get_upload_status(&client, &upload_id)
+                    .await
+                    .ok();
+                new_file_id = details
+                    .as_ref()
+                    .and_then(|d| d.get("session"))
+                    .and_then(|s| s.get("new_file_id"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+            }
+        }
+
+        let value = json!({
+            "status": "uploaded",
+            "filename": name,
+            "size": file_size,
+            "size_human": format_bytes(file_size),
+            "new_file_id": new_file_id.as_deref().unwrap_or("unknown"),
+        });
+        ctx.output.render(&value)?;
+        return Ok(());
+    }
+
+    // Multi-step chunked upload for larger content
+    let client = ApiClient::new(ctx.api_base, Some(token_str.clone()))
+        .context("failed to create API client")?;
+
     let session = api::upload::create_upload_session(&client, workspace, folder, name, file_size)
         .await
         .context("failed to create upload session")?;
@@ -712,7 +833,6 @@ async fn upload_text(
 
     let final_status = poll_upload_completion(&client, &upload_id, 30).await?;
 
-    // Only attempt session cleanup for non-terminal-success states.
     if final_status != "stored" {
         let _ = api::upload::cancel_upload(&client, &upload_id).await;
     }

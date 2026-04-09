@@ -64,6 +64,11 @@ pub enum WorkspaceCommand {
         /// Workspace ID.
         workspace_id: String,
     },
+    /// Disable workflow features.
+    DisableWorkflow {
+        /// Workspace ID.
+        workspace_id: String,
+    },
     /// Search workspace content.
     Search {
         /// Workspace ID.
@@ -129,6 +134,9 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
         } => delete(ctx, workspace_id, confirm).await,
         WorkspaceCommand::EnableWorkflow { workspace_id } => {
             enable_workflow(ctx, workspace_id).await
+        }
+        WorkspaceCommand::DisableWorkflow { workspace_id } => {
+            disable_workflow(ctx, workspace_id).await
         }
         WorkspaceCommand::Search {
             workspace_id,
@@ -249,6 +257,16 @@ async fn enable_workflow(ctx: &CommandContext<'_>, workspace_id: &str) -> Result
     let value = api::workspace::enable_workflow(&client, workspace_id)
         .await
         .context("failed to enable workflow features")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Disable workflow features.
+async fn disable_workflow(ctx: &CommandContext<'_>, workspace_id: &str) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::workspace::disable_workflow(&client, workspace_id)
+        .await
+        .context("failed to disable workflow features")?;
     ctx.output.render(&value)?;
     Ok(())
 }

@@ -135,7 +135,7 @@ struct ToolDef {
 const TOOL_DEFS: &[ToolDef] = &[
     ToolDef {
         name: "auth",
-        description: "Authentication: sign in, sign out, check status, manage API keys, 2FA, OAuth sessions, email/password management.",
+        description: "Authentication: sign in, sign out, check status, manage API keys, 2FA, OAuth sessions, email/password management, token introspection.",
         actions: &[
             "signin",
             "signout",
@@ -151,6 +151,8 @@ const TOOL_DEFS: &[ToolDef] = &[
             "email-check",
             "password-reset-request",
             "password-reset",
+            "password-reset-check",
+            "scopes",
             "2fa-status",
             "2fa-send",
             "2fa-verify-setup",
@@ -182,7 +184,11 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "API key ID (api-key-delete, api-key-get, api-key-update)",
                 false,
             ),
-            ("code", "Reset code (password-reset)", false),
+            (
+                "code",
+                "Reset code (password-reset, password-reset-check)",
+                false,
+            ),
             ("password1", "New password (password-reset)", false),
             ("password2", "Confirm password (password-reset)", false),
             (
@@ -200,7 +206,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "user",
-        description: "User profile: view, update, search users, manage invitations and assets.",
+        description: "User profile: view, update, search users, manage invitations and assets, autosync, support PIN, phone validation.",
         actions: &[
             "info",
             "update",
@@ -217,6 +223,11 @@ const TOOL_DEFS: &[ToolDef] = &[
             "asset-types",
             "asset-list",
             "asset-delete",
+            "asset-upload",
+            "asset-read",
+            "autosync",
+            "pin",
+            "phone",
         ],
         params: &[
             ("first_name", "First name (update)", false),
@@ -224,13 +235,30 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("display_name", "Display name (update)", false),
             ("query", "Search query (search)", false),
             ("confirmation", "Confirmation string (close)", false),
-            ("user_id", "User ID (details, asset-list)", false),
+            (
+                "user_id",
+                "User ID (details, asset-list, asset-read)",
+                false,
+            ),
             (
                 "invitation_id",
                 "Invitation ID (invitations-details)",
                 false,
             ),
-            ("asset_type", "Asset type name (asset-delete)", false),
+            (
+                "asset_type",
+                "Asset type name (asset-delete, asset-upload, asset-read)",
+                false,
+            ),
+            ("file", "File path for upload (asset-upload)", false),
+            ("output", "Output file path (asset-read)", false),
+            (
+                "state",
+                "Autosync state: enable or disable (autosync)",
+                false,
+            ),
+            ("country_code", "Country code e.g. 1 for US (phone)", false),
+            ("phone_number", "Phone number (phone)", false),
         ],
     },
     ToolDef {
@@ -250,6 +278,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             "billing-reset",
             "billing-members",
             "billing-create",
+            "billing-invoices",
             "members-list",
             "members-invite",
             "members-remove",
@@ -587,7 +616,16 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("description", "Description", false),
             ("access_options", "Access options", false),
             ("password", "Share password", false),
-            ("download_enabled", "Allow downloads (true/false)", false),
+            (
+                "download_enabled",
+                "Allow downloads (true/false, legacy — prefer download_security)",
+                false,
+            ),
+            (
+                "download_security",
+                "Download security: high, medium, or off",
+                false,
+            ),
             ("comments_enabled", "Allow comments (true/false)", false),
             (
                 "anonymous_uploads_enabled",
@@ -733,11 +771,12 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "event",
-        description: "Events: search, summarize, details, activity-list, activity-poll.",
+        description: "Events: search, summarize, details, ack, activity-list, activity-poll.",
         actions: &[
             "search",
             "summarize",
             "details",
+            "ack",
             "activity-list",
             "activity-poll",
         ],
@@ -746,7 +785,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("share_id", "Share ID", false),
             ("user_id", "User ID", false),
             ("org_id", "Organization ID", false),
-            ("event_id", "Event ID (details)", false),
+            ("event_id", "Event ID (details, ack)", false),
             ("event", "Event type filter", false),
             ("category", "Category filter", false),
             ("subcategory", "Subcategory filter", false),
@@ -1021,13 +1060,45 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "lock",
-        description: "File locking: acquire, status, release exclusive locks on files in workspaces or shares.",
-        actions: &["acquire", "status", "release"],
+        description: "File locking: acquire, status, release, heartbeat (renew) exclusive locks on files in workspaces or shares.",
+        actions: &["acquire", "status", "release", "heartbeat"],
         params: &[
             ("context_type", "Context: workspace or share", false),
             ("context_id", "Workspace or share ID", false),
             ("node_id", "File node ID", false),
+            ("lock_token", "Lock token (release, heartbeat)", false),
         ],
+    },
+    ToolDef {
+        name: "metadata",
+        description: "Metadata extraction: list eligible files, manage template-file mappings, AI-based matching, batch and single-file extraction.",
+        actions: &[
+            "eligible",
+            "add-nodes",
+            "remove-nodes",
+            "list-nodes",
+            "auto-match",
+            "extract-all",
+            "extract",
+        ],
+        params: &[
+            ("workspace_id", "Workspace ID", false),
+            ("template_id", "Metadata template ID", false),
+            ("node_id", "File node ID (extract)", false),
+            (
+                "node_ids",
+                "JSON-encoded array of node IDs (add-nodes, remove-nodes)",
+                false,
+            ),
+            ("limit", "Pagination limit", false),
+            ("offset", "Pagination offset", false),
+        ],
+    },
+    ToolDef {
+        name: "system",
+        description: "System health: ping (health check) and status (system status). No authentication required.",
+        actions: &["ping", "status"],
+        params: &[],
     },
 ];
 
@@ -1095,6 +1166,8 @@ impl ToolRouter {
             "apps" => handle_apps(&self.state, action, &args).await,
             "import" => handle_import(&self.state, action, &args).await,
             "lock" => handle_lock(&self.state, action, &args).await,
+            "metadata" => handle_metadata(&self.state, action, &args).await,
+            "system" => handle_system(&self.state, action, &args).await,
             _ => Ok(error_text(&format!("Unknown tool: {name}"))),
         }
     }
@@ -1130,6 +1203,8 @@ async fn handle_auth(
         "oauth-details" => handle_auth_oauth_details(state, args).await,
         "oauth-revoke" => handle_auth_oauth_revoke(state, args).await,
         "oauth-revoke-all" => handle_auth_oauth_revoke_all(state, args).await,
+        "scopes" => handle_auth_scopes(state, args).await,
+        "password-reset-check" => handle_auth_password_reset_check(state, args).await,
         _ => Ok(error_text(&format!("Unknown auth action: {action}"))),
     }
 }
@@ -1536,6 +1611,36 @@ async fn handle_auth_oauth_revoke_all(
     }
 }
 
+async fn handle_auth_scopes(
+    state: &McpState,
+    _args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    if let Err(e) = require_auth(state).await {
+        return Ok(e);
+    }
+    let client = state.client().read().await;
+    match api::auth::scopes(&client).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+async fn handle_auth_password_reset_check(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let code = match required_str(args, "code") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    // No auth required for this endpoint
+    let client = state.client().read().await;
+    match api::auth::password_reset_check(&client, code).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
 /// User tool handler.
 async fn handle_user(
     state: &McpState,
@@ -1561,6 +1666,11 @@ async fn handle_user(
         "asset-types" => handle_user_asset_types(state, args).await,
         "asset-list" => handle_user_asset_list(state, args).await,
         "asset-delete" => handle_user_asset_delete(state, args).await,
+        "asset-upload" => handle_user_asset_upload(state, args).await,
+        "asset-read" => handle_user_asset_read(state, args).await,
+        "autosync" => handle_user_autosync(state, args).await,
+        "pin" => handle_user_pin(state, args).await,
+        "phone" => handle_user_phone(state, args).await,
         _ => Ok(error_text(&format!("Unknown user action: {action}"))),
     }
 }
@@ -1776,6 +1886,112 @@ async fn handle_user_asset_delete(
     }
 }
 
+async fn handle_user_asset_upload(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let asset_type = match required_str(args, "asset_type") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let file = match required_str(args, "file") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let me = match api::user::get_me(&client).await {
+        Ok(v) => v,
+        Err(e) => return Ok(cli_err_to_result(&e)),
+    };
+    let user_id = me
+        .get("id")
+        .or_else(|| me.get("profile_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if user_id.is_empty() {
+        return Ok(error_text("Could not determine user ID"));
+    }
+    match api::user::upload_user_asset(&client, user_id, asset_type, file).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+async fn handle_user_asset_read(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let user_id = match required_str(args, "user_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let asset_type = match required_str(args, "asset_type") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let output = match required_str(args, "output") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::user::read_user_asset(&client, user_id, asset_type, std::path::Path::new(output))
+        .await
+    {
+        Ok(bytes) => Ok(success_json(&json!({
+            "status": "downloaded",
+            "asset_type": asset_type,
+            "output": output,
+            "bytes": bytes,
+        }))),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+async fn handle_user_autosync(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let sync_state = match required_str(args, "state") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::user::autosync(&client, sync_state).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+async fn handle_user_pin(
+    state: &McpState,
+    _args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    match api::user::get_pin(&client).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+async fn handle_user_phone(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let country_code = match required_str(args, "country_code") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let phone_number = match required_str(args, "phone_number") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::user::validate_phone(&client, country_code, phone_number).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
 /// Org tool handler.
 async fn handle_org(
     state: &McpState,
@@ -1805,6 +2021,7 @@ async fn handle_org(
         "billing-reset" => handle_org_billing_reset(state, args).await,
         "billing-members" => handle_org_billing_members(state, args).await,
         "billing-create" => handle_org_billing_create(state, args).await,
+        "billing-invoices" => handle_org_billing_invoices(state, args).await,
         "members-details" => handle_org_members_details(state, args).await,
         "members-leave" => handle_org_members_leave(state, args).await,
         "members-join" => handle_org_members_join(state, args).await,
@@ -2173,6 +2390,28 @@ async fn handle_org_billing_create(
         Err(e) => return Ok(e),
     };
     match api::org::billing_create(&client, org_id, optional_str(args, "plan_id")).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+async fn handle_org_billing_invoices(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let org_id = match required_str(args, "org_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::org::billing_invoices(
+        &client,
+        org_id,
+        optional_u32(args, "limit"),
+        optional_u32(args, "offset"),
+    )
+    .await
+    {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -4327,6 +4566,7 @@ async fn handle_share_create(
             password: optional_str(args, "password"),
             anonymous_uploads_enabled: optional_bool(args, "anonymous_uploads_enabled"),
             intelligence: optional_bool(args, "intelligence"),
+            download_security: optional_str(args, "download_security"),
         },
     )
     .await
@@ -4370,6 +4610,7 @@ async fn handle_share_update(
             download_enabled: optional_bool(args, "download_enabled"),
             comments_enabled: optional_bool(args, "comments_enabled"),
             anonymous_uploads_enabled: optional_bool(args, "anonymous_uploads_enabled"),
+            download_security: optional_str(args, "download_security"),
         },
     )
     .await
@@ -5573,6 +5814,7 @@ async fn handle_comment_linked(
 }
 
 /// Event tool handler.
+#[allow(clippy::too_many_lines)]
 async fn handle_event(
     state: &McpState,
     action: &str,
@@ -5632,6 +5874,16 @@ async fn handle_event(
                 Err(e) => return Ok(e),
             };
             match api::event::get_event_details(&client, event_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "ack" => {
+            let event_id = match required_str(args, "event_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::event::acknowledge_event(&client, event_id).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -7200,6 +7452,188 @@ async fn handle_lock(
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
+        "heartbeat" => {
+            let lock_token = match required_str(args, "lock_token") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::locking::lock_heartbeat(&client, ctx_type, ctx_id, node_id, lock_token).await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
         _ => Ok(error_text(&format!("Unknown lock action: {action}"))),
+    }
+}
+
+/// Metadata tool handler.
+#[allow(clippy::too_many_lines)]
+async fn handle_metadata(
+    state: &McpState,
+    action: &str,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    if let Err(e) = require_auth(state).await {
+        return Ok(e);
+    }
+    let client = state.client().read().await;
+    match action {
+        "eligible" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::metadata::list_eligible(
+                &client,
+                workspace_id,
+                optional_u32(args, "limit"),
+                optional_u32(args, "offset"),
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "add-nodes" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let template_id = match required_str(args, "template_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let node_ids = match required_str(args, "node_ids") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::metadata::add_nodes_to_template(&client, workspace_id, template_id, node_ids)
+                .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "remove-nodes" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let template_id = match required_str(args, "template_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let node_ids = match required_str(args, "node_ids") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::metadata::remove_nodes_from_template(
+                &client,
+                workspace_id,
+                template_id,
+                node_ids,
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "list-nodes" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let template_id = match required_str(args, "template_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::metadata::list_template_nodes(
+                &client,
+                workspace_id,
+                template_id,
+                optional_u32(args, "limit"),
+                optional_u32(args, "offset"),
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "auto-match" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let template_id = match required_str(args, "template_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::metadata::auto_match_template(&client, workspace_id, template_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "extract-all" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let template_id = match required_str(args, "template_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::metadata::extract_all(&client, workspace_id, template_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "extract" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let node_id = match required_str(args, "node_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let template_id = match required_str(args, "template_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::metadata::extract_node_metadata(&client, workspace_id, node_id, template_id)
+                .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        _ => Ok(error_text(&format!("Unknown metadata action: {action}"))),
+    }
+}
+
+/// System health tool handler.
+///
+/// System tools do not require authentication.
+async fn handle_system(
+    state: &McpState,
+    action: &str,
+    _args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    // System endpoints do not require authentication, but we still need a client.
+    let client = state.client().read().await;
+    match action {
+        "ping" => match api::system::ping(&client).await {
+            Ok(v) => Ok(success_json(&v)),
+            Err(e) => Ok(cli_err_to_result(&e)),
+        },
+        "status" => match api::system::system_status(&client).await {
+            Ok(v) => Ok(success_json(&v)),
+            Err(e) => Ok(cli_err_to_result(&e)),
+        },
+        _ => Ok(error_text(&format!("Unknown system action: {action}"))),
     }
 }
