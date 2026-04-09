@@ -105,7 +105,7 @@ pub struct UpdateShareParams<'a> {
     pub description: Option<&'a str>,
     /// New access options.
     pub access_options: Option<&'a str>,
-    /// Enable/disable downloads.
+    /// Enable/disable downloads (legacy — prefer `download_security`).
     pub download_enabled: Option<bool>,
     /// Enable/disable comments.
     pub comments_enabled: Option<bool>,

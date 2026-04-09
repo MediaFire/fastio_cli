@@ -52,7 +52,7 @@ pub enum ShareCommand {
         description: Option<String>,
         /// New access options.
         access_options: Option<String>,
-        /// Enable/disable downloads.
+        /// Enable/disable downloads (legacy — prefer `download_security`).
         download_enabled: Option<bool>,
         /// Enable/disable comments.
         comments_enabled: Option<bool>,

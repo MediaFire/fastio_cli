@@ -149,6 +149,9 @@ pub enum Commands {
     /// Manage CLI configuration and profiles.
     #[command(subcommand)]
     Configure(ConfigureCommands),
+
+    /// Print the agent skill guide (usage patterns for AI agents and automation).
+    Skill,
 }
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
@@ -1575,7 +1578,7 @@ pub enum ShareCommands {
         /// New access options.
         #[arg(long)]
         access_options: Option<String>,
-        /// Enable or disable downloads.
+        /// Enable or disable downloads (legacy — prefer --download-security).
         #[arg(long)]
         download_enabled: Option<bool>,
         /// Enable or disable comments.
