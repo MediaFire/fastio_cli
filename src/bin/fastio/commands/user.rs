@@ -53,6 +53,20 @@ pub enum UserCommand {
     Invitations(UserInvitationsCommand),
     /// User asset subcommands.
     Asset(UserAssetCommand),
+    /// Enable or disable photo auto-sync.
+    Autosync {
+        /// State: "enable" or "disable".
+        state: String,
+    },
+    /// Get support PIN and identity hash.
+    Pin,
+    /// Validate a phone number.
+    Phone {
+        /// Country code (e.g. "1").
+        country_code: String,
+        /// Phone number (e.g. "5551234567").
+        phone_number: String,
+    },
 }
 
 /// User invitations subcommand variants.
@@ -85,6 +99,22 @@ pub enum UserAssetCommand {
     Delete {
         /// Asset type name.
         asset_type: String,
+    },
+    /// Upload a user asset.
+    Upload {
+        /// Asset type name (e.g. `profile_pic`).
+        asset_type: String,
+        /// Path to the file to upload.
+        file: String,
+    },
+    /// Read/download a user asset binary.
+    Read {
+        /// User ID.
+        user_id: String,
+        /// Asset type name (e.g. `profile_pic`).
+        asset_type: String,
+        /// Output file path.
+        output: String,
     },
 }
 
@@ -193,6 +223,12 @@ pub async fn execute(command: &UserCommand, ctx: &CommandContext<'_>) -> Result<
         }
         UserCommand::Invitations(cmd) => user_invitations(cmd, ctx).await,
         UserCommand::Asset(cmd) => user_asset(cmd, ctx).await,
+        UserCommand::Autosync { state } => autosync(ctx, state).await,
+        UserCommand::Pin => pin(ctx).await,
+        UserCommand::Phone {
+            country_code,
+            phone_number,
+        } => phone(ctx, country_code, phone_number).await,
     }
 }
 
@@ -256,6 +292,41 @@ async fn user_asset(cmd: &UserAssetCommand, ctx: &CommandContext<'_>) -> Result<
             });
             ctx.output.render(&value)?;
         }
+        UserAssetCommand::Upload { asset_type, file } => {
+            let me = api::user::get_me(&client)
+                .await
+                .context("failed to get current user")?;
+            let user_id = me
+                .get("id")
+                .or_else(|| me.get("profile_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("could not determine user ID"))?;
+            let value = api::user::upload_user_asset(&client, user_id, asset_type, file)
+                .await
+                .context("failed to upload user asset")?;
+            ctx.output.render(&value)?;
+        }
+        UserAssetCommand::Read {
+            user_id,
+            asset_type,
+            output,
+        } => {
+            let bytes = api::user::read_user_asset(
+                &client,
+                user_id,
+                asset_type,
+                std::path::Path::new(output.as_str()),
+            )
+            .await
+            .context("failed to read user asset")?;
+            let value = json!({
+                "status": "downloaded",
+                "asset_type": asset_type,
+                "output": output,
+                "bytes": bytes,
+            });
+            ctx.output.render(&value)?;
+        }
     }
     Ok(())
 }
@@ -308,6 +379,7 @@ async fn avatar(cmd: &AvatarCommand, ctx: &CommandContext<'_>) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("could not determine user ID"))?;
 
             let value = api::user::upload_user_asset(&client, user_id, "profile_pic", file)
+                .await
                 .context("failed to upload avatar")?;
             ctx.output.render(&value)?;
         }
@@ -360,5 +432,35 @@ async fn settings(cmd: &SettingsCommand, ctx: &CommandContext<'_>) -> Result<()>
             ctx.output.render(&value)?;
         }
     }
+    Ok(())
+}
+
+/// Enable or disable photo auto-sync.
+async fn autosync(ctx: &CommandContext<'_>, state: &str) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::user::autosync(&client, state)
+        .await
+        .context("failed to set autosync state")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Get support PIN and identity hash.
+async fn pin(ctx: &CommandContext<'_>) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::user::get_pin(&client)
+        .await
+        .context("failed to get support PIN")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Validate a phone number.
+async fn phone(ctx: &CommandContext<'_>, country_code: &str, phone_number: &str) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::user::validate_phone(&client, country_code, phone_number)
+        .await
+        .context("failed to validate phone number")?;
+    ctx.output.render(&value)?;
     Ok(())
 }

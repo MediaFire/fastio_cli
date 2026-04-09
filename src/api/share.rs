@@ -48,7 +48,7 @@ pub struct CreateShareParams<'a> {
     pub anonymous_uploads_enabled: Option<bool>,
     /// Enable AI intelligence features.
     pub intelligence: Option<bool>,
-    /// Download security level: "high", "medium", or "off".
+    /// Download security level ("high", "medium", or "off").
     pub download_security: Option<&'a str>,
 }
 
@@ -111,7 +111,7 @@ pub struct UpdateShareParams<'a> {
     pub comments_enabled: Option<bool>,
     /// Enable/disable anonymous uploads.
     pub anonymous_uploads_enabled: Option<bool>,
-    /// Download security level: "high", "medium", or "off".
+    /// Download security level ("high", "medium", or "off").
     pub download_security: Option<&'a str>,
 }
 

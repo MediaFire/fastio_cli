@@ -34,7 +34,7 @@ pub enum ShareCommand {
         anonymous_uploads: Option<bool>,
         /// Enable AI intelligence features.
         intelligence: Option<bool>,
-        /// Download security level: "high", "medium", or "off".
+        /// Download security level ("high", "medium", or "off").
         download_security: Option<String>,
     },
     /// Get share details.
@@ -58,7 +58,7 @@ pub enum ShareCommand {
         comments_enabled: Option<bool>,
         /// Enable/disable anonymous uploads.
         anonymous_uploads: Option<bool>,
-        /// Download security level: "high", "medium", or "off".
+        /// Download security level ("high", "medium", or "off").
         download_security: Option<String>,
     },
     /// Delete a share.
@@ -381,7 +381,7 @@ async fn update(
         && download_security.is_none()
     {
         anyhow::bail!(
-            "at least one update field is required (--name, --description, --access-options, --download-enabled, --download-security, --comments-enabled, --anonymous-uploads)"
+            "at least one update field is required (--name, --description, --access-options, --download-enabled, --comments-enabled, --anonymous-uploads, --download-security)"
         );
     }
     let client = ctx.build_client()?;

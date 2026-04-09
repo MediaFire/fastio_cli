@@ -341,3 +341,24 @@ pub async fn oauth_revoke_all(client: &ApiClient) -> Result<Value, CliError> {
 pub async fn session_info(client: &ApiClient) -> Result<Value, CliError> {
     client.get("/user/me/details/").await
 }
+
+/// Token scope introspection.
+///
+/// `GET /auth/scopes/`
+///
+/// Returns the current token's auth type, scopes, agent status,
+/// and whether the token has full access.
+pub async fn scopes(client: &ApiClient) -> Result<Value, CliError> {
+    client.get("/auth/scopes/").await
+}
+
+/// Check whether a password reset code is valid.
+///
+/// `GET /user/password/{code}/details/`
+///
+/// Returns the email associated with the reset code, or an error
+/// if the code is invalid, expired, or mismatched.
+pub async fn password_reset_check(client: &ApiClient, code: &str) -> Result<Value, CliError> {
+    let path = format!("/user/password/{}/details/", urlencoding::encode(code),);
+    client.get(&path).await
+}
