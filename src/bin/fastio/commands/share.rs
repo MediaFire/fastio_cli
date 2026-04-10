@@ -34,6 +34,8 @@ pub enum ShareCommand {
         anonymous_uploads: Option<bool>,
         /// Enable AI intelligence features.
         intelligence: Option<bool>,
+        /// Download security level ("high", "medium", or "off").
+        download_security: Option<String>,
     },
     /// Get share details.
     Info {
@@ -50,12 +52,14 @@ pub enum ShareCommand {
         description: Option<String>,
         /// New access options.
         access_options: Option<String>,
-        /// Download security level ("high", "medium", or "off").
-        download_security: Option<String>,
+        /// Enable/disable downloads (legacy — prefer `download_security`).
+        download_enabled: Option<bool>,
         /// Enable/disable comments.
         comments_enabled: Option<bool>,
         /// Enable/disable anonymous uploads.
         anonymous_uploads: Option<bool>,
+        /// Download security level ("high", "medium", or "off").
+        download_security: Option<String>,
     },
     /// Delete a share.
     Delete {
@@ -220,6 +224,7 @@ pub async fn execute(command: &ShareCommand, ctx: &CommandContext<'_>) -> Result
             password,
             anonymous_uploads,
             intelligence,
+            download_security,
         } => {
             create(
                 ctx,
@@ -230,6 +235,7 @@ pub async fn execute(command: &ShareCommand, ctx: &CommandContext<'_>) -> Result
                 password.as_deref(),
                 *anonymous_uploads,
                 *intelligence,
+                download_security.as_deref(),
             )
             .await
         }
@@ -242,9 +248,10 @@ pub async fn execute(command: &ShareCommand, ctx: &CommandContext<'_>) -> Result
             name,
             description,
             access_options,
-            download_security,
+            download_enabled,
             comments_enabled,
             anonymous_uploads,
+            download_security,
         } => {
             validate_share_id(share_id)?;
             update(
@@ -253,9 +260,10 @@ pub async fn execute(command: &ShareCommand, ctx: &CommandContext<'_>) -> Result
                 name.as_deref(),
                 description.as_deref(),
                 access_options.as_deref(),
-                download_security.as_deref(),
+                *download_enabled,
                 *comments_enabled,
                 *anonymous_uploads,
+                download_security.as_deref(),
             )
             .await
         }
@@ -319,6 +327,7 @@ async fn create(
     password: Option<&str>,
     anonymous_uploads: Option<bool>,
     intelligence: Option<bool>,
+    download_security: Option<&str>,
 ) -> Result<()> {
     let client = ctx.build_client()?;
     let value = api::share::create_share(
@@ -331,6 +340,7 @@ async fn create(
             password,
             anonymous_uploads_enabled: anonymous_uploads,
             intelligence,
+            download_security,
         },
     )
     .await
@@ -357,19 +367,21 @@ async fn update(
     name: Option<&str>,
     description: Option<&str>,
     access_options: Option<&str>,
-    download_security: Option<&str>,
+    download_enabled: Option<bool>,
     comments_enabled: Option<bool>,
     anonymous_uploads: Option<bool>,
+    download_security: Option<&str>,
 ) -> Result<()> {
     if name.is_none()
         && description.is_none()
         && access_options.is_none()
-        && download_security.is_none()
+        && download_enabled.is_none()
         && comments_enabled.is_none()
         && anonymous_uploads.is_none()
+        && download_security.is_none()
     {
         anyhow::bail!(
-            "at least one update field is required (--name, --description, --access-options, --download-security, --comments-enabled, --anonymous-uploads)"
+            "at least one update field is required (--name, --description, --access-options, --download-enabled, --comments-enabled, --anonymous-uploads, --download-security)"
         );
     }
     let client = ctx.build_client()?;
@@ -380,9 +392,10 @@ async fn update(
             name,
             description,
             access_options,
-            download_security,
+            download_enabled,
             comments_enabled,
             anonymous_uploads_enabled: anonymous_uploads,
+            download_security,
         },
     )
     .await

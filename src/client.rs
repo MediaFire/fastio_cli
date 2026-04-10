@@ -86,6 +86,12 @@ impl ApiClient {
             .map(secrecy::ExposeSecret::expose_secret)
     }
 
+    /// Return the base URL for this client.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Build the full URL for a relative path.
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)

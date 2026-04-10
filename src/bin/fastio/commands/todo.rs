@@ -11,19 +11,23 @@ use fastio_cli::api;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum TodoCommand {
-    /// List todos in a workspace.
+    /// List todos in a workspace or share.
     List {
-        /// Workspace ID.
-        workspace: String,
+        /// Profile type ("workspace" or "share").
+        profile_type: String,
+        /// Profile ID (workspace or share ID).
+        profile_id: String,
         /// Max results.
         limit: Option<u32>,
         /// Offset for pagination.
         offset: Option<u32>,
     },
-    /// Create a new todo.
+    /// Create a new todo in a workspace or share.
     Create {
-        /// Workspace ID.
-        workspace: String,
+        /// Profile type ("workspace" or "share").
+        profile_type: String,
+        /// Profile ID (workspace or share ID).
+        profile_id: String,
         /// Todo title.
         title: String,
         /// Assignee profile ID.
@@ -50,21 +54,34 @@ pub enum TodoCommand {
         /// Todo ID.
         todo_id: String,
     },
+    /// Bulk toggle todo completion in a workspace or share.
+    BulkToggle {
+        /// Profile type ("workspace" or "share").
+        profile_type: String,
+        /// Profile ID (workspace or share ID).
+        profile_id: String,
+        /// Todo IDs to toggle.
+        todo_ids: Vec<String>,
+        /// Completion state to set.
+        done: bool,
+    },
 }
 
 /// Execute a todo subcommand.
 pub async fn execute(command: &TodoCommand, ctx: &CommandContext<'_>) -> Result<()> {
     match command {
         TodoCommand::List {
-            workspace,
+            profile_type,
+            profile_id,
             limit,
             offset,
-        } => list(ctx, workspace, *limit, *offset).await,
+        } => list(ctx, profile_type, profile_id, *limit, *offset).await,
         TodoCommand::Create {
-            workspace,
+            profile_type,
+            profile_id,
             title,
             assignee_id,
-        } => create(ctx, workspace, title, assignee_id.as_deref()).await,
+        } => create(ctx, profile_type, profile_id, title, assignee_id.as_deref()).await,
         TodoCommand::Update {
             todo_id,
             title,
@@ -82,28 +99,36 @@ pub async fn execute(command: &TodoCommand, ctx: &CommandContext<'_>) -> Result<
         }
         TodoCommand::Toggle { todo_id } => toggle(ctx, todo_id).await,
         TodoCommand::Delete { todo_id } => delete(ctx, todo_id).await,
+        TodoCommand::BulkToggle {
+            profile_type,
+            profile_id,
+            todo_ids,
+            done,
+        } => bulk_toggle(ctx, profile_type, profile_id, todo_ids, *done).await,
     }
 }
 
-/// List todos.
+/// List todos in a workspace or share.
 async fn list(
     ctx: &CommandContext<'_>,
-    workspace: &str,
+    profile_type: &str,
+    profile_id: &str,
     limit: Option<u32>,
     offset: Option<u32>,
 ) -> Result<()> {
     let client = ctx.build_client()?;
-    let value = api::workflow::list_todos(&client, workspace, limit, offset)
+    let value = api::workflow::list_todos_ctx(&client, profile_type, profile_id, limit, offset)
         .await
         .context("failed to list todos")?;
     ctx.output.render(&value)?;
     Ok(())
 }
 
-/// Create a todo.
+/// Create a todo in a workspace or share.
 async fn create(
     ctx: &CommandContext<'_>,
-    workspace: &str,
+    profile_type: &str,
+    profile_id: &str,
     title: &str,
     assignee_id: Option<&str>,
 ) -> Result<()> {
@@ -112,9 +137,10 @@ async fn create(
     }
 
     let client = ctx.build_client()?;
-    let value = api::workflow::create_todo(&client, workspace, title, assignee_id)
-        .await
-        .context("failed to create todo")?;
+    let value =
+        api::workflow::create_todo_ctx(&client, profile_type, profile_id, title, assignee_id)
+            .await
+            .context("failed to create todo")?;
     ctx.output.render(&value)?;
     Ok(())
 }
@@ -165,6 +191,26 @@ async fn delete(ctx: &CommandContext<'_>, todo_id: &str) -> Result<()> {
         "status": "deleted",
         "todo_id": todo_id,
     });
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Bulk toggle todo completion.
+async fn bulk_toggle(
+    ctx: &CommandContext<'_>,
+    profile_type: &str,
+    profile_id: &str,
+    todo_ids: &[String],
+    done: bool,
+) -> Result<()> {
+    if todo_ids.is_empty() {
+        anyhow::bail!("at least one todo ID is required");
+    }
+
+    let client = ctx.build_client()?;
+    let value = api::workflow::bulk_toggle_todos(&client, profile_type, profile_id, todo_ids, done)
+        .await
+        .context("failed to bulk toggle todos")?;
     ctx.output.render(&value)?;
     Ok(())
 }

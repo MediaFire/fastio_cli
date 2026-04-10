@@ -218,6 +218,15 @@ pub enum BillingCommand {
         /// Plan ID.
         plan_id: Option<String>,
     },
+    /// List billing invoices.
+    Invoices {
+        /// Organization ID.
+        org_id: String,
+        /// Max results per page.
+        limit: Option<u32>,
+        /// Offset for pagination.
+        offset: Option<u32>,
+    },
 }
 
 /// Org members subcommand variants.
@@ -636,6 +645,16 @@ async fn billing(cmd: &BillingCommand, ctx: &CommandContext<'_>) -> Result<()> {
             let value = api::org::billing_create(&client, org_id, plan_id.as_deref())
                 .await
                 .context("failed to create billing subscription")?;
+            ctx.output.render(&value)?;
+        }
+        BillingCommand::Invoices {
+            org_id,
+            limit,
+            offset,
+        } => {
+            let value = api::org::billing_invoices(&client, org_id, *limit, *offset)
+                .await
+                .context("failed to list billing invoices")?;
             ctx.output.render(&value)?;
         }
     }

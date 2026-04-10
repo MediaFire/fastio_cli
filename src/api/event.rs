@@ -114,6 +114,16 @@ pub async fn poll_activity(
     }
 }
 
+/// Acknowledge an event.
+///
+/// `POST /event/{event_id}/ack/`
+pub async fn acknowledge_event(client: &ApiClient, event_id: &str) -> Result<Value, CliError> {
+    let path = format!("/event/{}/ack/", urlencoding::encode(event_id));
+    let mut body = HashMap::new();
+    body.insert("event_id".to_owned(), event_id.to_owned());
+    client.post(&path, &body).await
+}
+
 /// Parameters for [`summarize_events`].
 #[derive(Default)]
 pub struct SummarizeEventsParams<'a> {

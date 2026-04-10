@@ -65,6 +65,8 @@ pub async fn execute(
             password2,
         } => password_reset(ctx, code, password1, password2).await,
         AuthCommand::Oauth(cmd) => oauth(cmd, ctx).await,
+        AuthCommand::Scopes => scopes(ctx).await,
+        AuthCommand::PasswordResetCheck { code } => password_reset_check(ctx, code).await,
     }
 }
 
@@ -130,6 +132,13 @@ pub enum AuthCommand {
     },
     /// OAuth session subcommands.
     Oauth(OauthCommand),
+    /// Token scope introspection.
+    Scopes,
+    /// Check password reset code validity.
+    PasswordResetCheck {
+        /// Reset code to check.
+        code: String,
+    },
 }
 
 /// 2FA subcommand variants.
@@ -800,5 +809,25 @@ async fn oauth(cmd: &OauthCommand, ctx: &CommandContext<'_>) -> Result<()> {
             ctx.output.render(&value)?;
         }
     }
+    Ok(())
+}
+
+/// Token scope introspection.
+async fn scopes(ctx: &CommandContext<'_>) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::auth::scopes(&client)
+        .await
+        .context("token scope introspection failed")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Check password reset code validity.
+async fn password_reset_check(ctx: &CommandContext<'_>, code: &str) -> Result<()> {
+    let client = ApiClient::new(ctx.api_base, None).context("failed to create API client")?;
+    let value = api::auth::password_reset_check(&client, code)
+        .await
+        .context("password reset check failed")?;
+    ctx.output.render(&value)?;
     Ok(())
 }

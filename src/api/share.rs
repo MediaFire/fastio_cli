@@ -48,6 +48,8 @@ pub struct CreateShareParams<'a> {
     pub anonymous_uploads_enabled: Option<bool>,
     /// Enable AI intelligence features.
     pub intelligence: Option<bool>,
+    /// Download security level ("high", "medium", or "off").
+    pub download_security: Option<&'a str>,
 }
 
 /// Create a new share on a workspace.
@@ -75,6 +77,9 @@ pub async fn create_share(
     if let Some(v) = params.intelligence {
         form.insert("intelligence".to_owned(), v.to_string());
     }
+    if let Some(v) = params.download_security {
+        form.insert("download_security".to_owned(), v.to_owned());
+    }
     let path = format!(
         "/workspace/{}/create/share/",
         urlencoding::encode(params.workspace_id),
@@ -100,12 +105,14 @@ pub struct UpdateShareParams<'a> {
     pub description: Option<&'a str>,
     /// New access options.
     pub access_options: Option<&'a str>,
-    /// Download security level ("high", "medium", or "off").
-    pub download_security: Option<&'a str>,
+    /// Enable/disable downloads (legacy — prefer `download_security`).
+    pub download_enabled: Option<bool>,
     /// Enable/disable comments.
     pub comments_enabled: Option<bool>,
     /// Enable/disable anonymous uploads.
     pub anonymous_uploads_enabled: Option<bool>,
+    /// Download security level ("high", "medium", or "off").
+    pub download_security: Option<&'a str>,
 }
 
 /// Update share settings.
@@ -125,14 +132,17 @@ pub async fn update_share(
     if let Some(v) = params.access_options {
         form.insert("access_options".to_owned(), v.to_owned());
     }
-    if let Some(v) = params.download_security {
-        form.insert("download_security".to_owned(), v.to_owned());
+    if let Some(v) = params.download_enabled {
+        form.insert("download_enabled".to_owned(), v.to_string());
     }
     if let Some(v) = params.comments_enabled {
         form.insert("comments_enabled".to_owned(), v.to_string());
     }
     if let Some(v) = params.anonymous_uploads_enabled {
         form.insert("anonymous_uploads_enabled".to_owned(), v.to_string());
+    }
+    if let Some(v) = params.download_security {
+        form.insert("download_security".to_owned(), v.to_owned());
     }
     let path = format!("/share/{}/update/", urlencoding::encode(params.share_id),);
     client.post(&path, &form).await
