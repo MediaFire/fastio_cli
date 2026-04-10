@@ -975,11 +975,13 @@ fn map_upload_command(cmd: cli::UploadCommands) -> UploadCommand {
         cli::UploadCommands::StreamSend {
             upload_key,
             file,
+            max_size,
             hash,
             hash_algo,
         } => UploadCommand::StreamSend {
             upload_key,
             file,
+            max_size,
             hash,
             hash_algo,
         },

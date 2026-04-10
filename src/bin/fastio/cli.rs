@@ -1521,6 +1521,9 @@ pub enum UploadCommands {
         upload_key: String,
         /// Path to data file.
         file: String,
+        /// Maximum file size in bytes (rejects before reading if exceeded).
+        #[arg(long)]
+        max_size: Option<u64>,
         /// Pre-computed hash of the file content.
         #[arg(long, requires = "hash_algo")]
         hash: Option<String>,
