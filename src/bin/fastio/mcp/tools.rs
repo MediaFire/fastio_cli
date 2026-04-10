@@ -4569,6 +4569,14 @@ async fn handle_share_create(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let download_security = optional_str(args, "download_security");
+    if let Some(ds) = download_security
+        && !matches!(ds, "high" | "medium" | "off")
+    {
+        return Ok(error_text(
+            "Invalid download_security value: must be \"high\", \"medium\", or \"off\"",
+        ));
+    }
     match api::share::create_share(
         &client,
         &api::share::CreateShareParams {
@@ -4579,7 +4587,7 @@ async fn handle_share_create(
             password: optional_str(args, "password"),
             anonymous_uploads_enabled: optional_bool(args, "anonymous_uploads_enabled"),
             intelligence: optional_bool(args, "intelligence"),
-            download_security: optional_str(args, "download_security"),
+            download_security,
         },
     )
     .await

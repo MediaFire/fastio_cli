@@ -1084,7 +1084,17 @@ async fn stream_send(
             format_bytes(limit),
         );
     }
-    let data = bytes::Bytes::from(std::fs::read(file).context("failed to read data file")?);
+    let raw = std::fs::read(file).context("failed to read data file")?;
+    // Post-read size check guards against TOCTOU (file grew between stat and read).
+    if let Some(limit) = max_size {
+        anyhow::ensure!(
+            raw.len() as u64 <= limit,
+            "file size ({}) exceeds --max-size limit ({})",
+            format_bytes(raw.len() as u64),
+            format_bytes(limit),
+        );
+    }
+    let data = bytes::Bytes::from(raw);
     let value =
         api::upload::stream_upload(&token_str, ctx.api_base, upload_key, data, hash, hash_algo)
             .await
