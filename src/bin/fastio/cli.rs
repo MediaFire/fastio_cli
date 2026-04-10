@@ -1447,6 +1447,9 @@ pub enum UploadCommands {
         upload_key: String,
         /// Path to data file.
         file: String,
+        /// Maximum file size in bytes (rejects before reading if exceeded).
+        #[arg(long)]
+        max_size: Option<u64>,
         /// Pre-computed hash of the file content.
         #[arg(long, requires = "hash_algo")]
         hash: Option<String>,
@@ -1553,9 +1556,9 @@ pub enum ShareCommands {
         /// New access options.
         #[arg(long)]
         access_options: Option<String>,
-        /// Enable or disable downloads.
-        #[arg(long)]
-        download_enabled: Option<bool>,
+        /// Download security level: "high" (disabled), "medium" (preview only for guests), or "off" (no restrictions).
+        #[arg(long, alias = "download-enabled", value_parser = ["high", "medium", "off"])]
+        download_security: Option<String>,
         /// Enable or disable comments.
         #[arg(long)]
         comments_enabled: Option<bool>,

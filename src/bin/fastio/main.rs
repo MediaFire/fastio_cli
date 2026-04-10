@@ -933,11 +933,13 @@ fn map_upload_command(cmd: cli::UploadCommands) -> UploadCommand {
         cli::UploadCommands::StreamSend {
             upload_key,
             file,
+            max_size,
             hash,
             hash_algo,
         } => UploadCommand::StreamSend {
             upload_key,
             file,
+            max_size,
             hash,
             hash_algo,
         },
@@ -1004,7 +1006,7 @@ fn map_share_command(cmd: cli::ShareCommands) -> ShareCommand {
             name,
             description,
             access_options,
-            download_enabled,
+            download_security,
             comments_enabled,
             anonymous_uploads,
         } => ShareCommand::Update {
@@ -1012,7 +1014,7 @@ fn map_share_command(cmd: cli::ShareCommands) -> ShareCommand {
             name,
             description,
             access_options,
-            download_enabled,
+            download_security,
             comments_enabled,
             anonymous_uploads,
         },

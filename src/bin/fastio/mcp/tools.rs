@@ -512,7 +512,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             (
                 "content",
-                "Text content (text upload) or raw data (stream, stream-send)",
+                "Text/UTF-8 content (text upload, stream, stream-send). Binary data is not supported via MCP.",
                 false,
             ),
             ("url", "Source URL (url import)", false),
@@ -587,7 +587,11 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("description", "Description", false),
             ("access_options", "Access options", false),
             ("password", "Share password", false),
-            ("download_enabled", "Allow downloads (true/false)", false),
+            (
+                "download_security",
+                "Download security level: high (disabled), medium (preview only for guests), off (no restrictions)",
+                false,
+            ),
             ("comments_enabled", "Allow comments (true/false)", false),
             (
                 "anonymous_uploads_enabled",
@@ -4067,7 +4071,6 @@ async fn handle_upload_stream(
     state: &McpState,
     args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
     let ws_id = match required_str(args, "workspace_id") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -4085,13 +4088,21 @@ async fn handle_upload_stream(
     let hash = optional_str(args, "hash");
     let hash_algo = optional_str(args, "hash_algo");
 
-    let token = match client.get_token() {
-        Some(t) => t.to_owned(),
-        None => return Ok(error_text("No authentication token available")),
+    // Acquire the read lock, extract what we need, then drop it before the
+    // potentially long-running stream upload so we don't block token refreshes.
+    let (token, session_result) = {
+        let client = state.client().read().await;
+        let token = match client.get_token() {
+            Some(t) => t.to_owned(),
+            None => return Ok(error_text("No authentication token available")),
+        };
+        let result =
+            api::upload::create_stream_session(&client, ws_id, folder, name, max_size).await;
+        (token, result)
     };
 
     let content_bytes = bytes::Bytes::from(content.as_bytes().to_vec());
-    match api::upload::create_stream_session(&client, ws_id, folder, name, max_size).await {
+    match session_result {
         Ok(session) => {
             let upload_id = session.get("id").and_then(Value::as_str).unwrap_or("");
             if upload_id.is_empty() {
@@ -4111,7 +4122,9 @@ async fn handle_upload_stream(
             {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => {
-                    // Best-effort cleanup of the orphaned session.
+                    // Best-effort cleanup — the server may have already
+                    // finalized the stream data before returning an error.
+                    let client = state.client().read().await;
                     let _ = api::upload::cancel_upload(&client, upload_id).await;
                     Ok(cli_err_to_result(&e))
                 }
@@ -4148,7 +4161,6 @@ async fn handle_upload_stream_send(
     state: &McpState,
     args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
     let upload_key = match required_str(args, "upload_key") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -4160,9 +4172,14 @@ async fn handle_upload_stream_send(
     let hash = optional_str(args, "hash");
     let hash_algo = optional_str(args, "hash_algo");
 
-    let token = match client.get_token() {
-        Some(t) => t.to_owned(),
-        None => return Ok(error_text("No authentication token available")),
+    // Extract token then drop the read guard before the potentially
+    // long-running stream upload so we don't block token refreshes.
+    let token = {
+        let client = state.client().read().await;
+        match client.get_token() {
+            Some(t) => t.to_owned(),
+            None => return Ok(error_text("No authentication token available")),
+        }
     };
 
     let content_bytes = bytes::Bytes::from(content.as_bytes().to_vec());
@@ -4360,6 +4377,14 @@ async fn handle_share_update(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let download_security = optional_str(args, "download_security");
+    if let Some(ds) = download_security
+        && !matches!(ds, "high" | "medium" | "off")
+    {
+        return Ok(error_text(
+            "Invalid download_security value: must be \"high\", \"medium\", or \"off\"",
+        ));
+    }
     match api::share::update_share(
         &client,
         &api::share::UpdateShareParams {
@@ -4367,7 +4392,7 @@ async fn handle_share_update(
             name: optional_str(args, "name"),
             description: optional_str(args, "description"),
             access_options: optional_str(args, "access_options"),
-            download_enabled: optional_bool(args, "download_enabled"),
+            download_security,
             comments_enabled: optional_bool(args, "comments_enabled"),
             anonymous_uploads_enabled: optional_bool(args, "anonymous_uploads_enabled"),
         },

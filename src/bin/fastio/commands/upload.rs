@@ -152,6 +152,8 @@ pub enum UploadCommand {
         upload_key: String,
         /// Path to data file.
         file: String,
+        /// Maximum file size in bytes (rejects before reading if exceeded).
+        max_size: Option<u64>,
         /// Pre-computed hash of the file content.
         hash: Option<String>,
         /// Hash algorithm used (e.g. sha256).
@@ -262,9 +264,20 @@ pub async fn execute(command: &UploadCommand, ctx: &CommandContext<'_>) -> Resul
         UploadCommand::StreamSend {
             upload_key,
             file,
+            max_size,
             hash,
             hash_algo,
-        } => stream_send(ctx, upload_key, file, hash.as_deref(), hash_algo.as_deref()).await,
+        } => {
+            stream_send(
+                ctx,
+                upload_key,
+                file,
+                *max_size,
+                hash.as_deref(),
+                hash_algo.as_deref(),
+            )
+            .await
+        }
     }
 }
 
@@ -750,12 +763,26 @@ async fn stream_file(
 
     let (data, filename) = if file_path == "-" {
         use std::io::Read;
-        let mut buf = Vec::new();
-        std::io::stdin()
-            .read_to_end(&mut buf)
-            .context("failed to read from stdin")?;
         let name = name_override
             .ok_or_else(|| anyhow::anyhow!("--name is required when reading from stdin"))?;
+        let mut buf = Vec::new();
+        if let Some(limit) = max_size {
+            // Read at most `limit + 1` bytes so we can detect overflow
+            // without consuming unbounded memory.
+            let mut handle = std::io::stdin().take(limit.saturating_add(1));
+            handle
+                .read_to_end(&mut buf)
+                .context("failed to read from stdin")?;
+            anyhow::ensure!(
+                u64::try_from(buf.len()).unwrap_or(u64::MAX) <= limit,
+                "stdin data exceeds --max-size limit ({})",
+                format_bytes(limit),
+            );
+        } else {
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .context("failed to read from stdin")?;
+        }
         (buf, name.to_owned())
     } else {
         let path = Path::new(file_path);
@@ -922,10 +949,21 @@ async fn stream_send(
     ctx: &CommandContext<'_>,
     upload_key: &str,
     file: &str,
+    max_size: Option<u64>,
     hash: Option<&str>,
     hash_algo: Option<&str>,
 ) -> Result<()> {
     let token_str = resolve_auth(ctx.profile_name, ctx.flag_token, ctx.config_dir)?;
+    // Check file size before reading into memory.
+    let metadata = std::fs::metadata(file).context("failed to read file metadata")?;
+    if let Some(limit) = max_size {
+        anyhow::ensure!(
+            metadata.len() <= limit,
+            "file size ({}) exceeds --max-size limit ({})",
+            format_bytes(metadata.len()),
+            format_bytes(limit),
+        );
+    }
     let data = bytes::Bytes::from(std::fs::read(file).context("failed to read data file")?);
     let value =
         api::upload::stream_upload(&token_str, ctx.api_base, upload_key, data, hash, hash_algo)

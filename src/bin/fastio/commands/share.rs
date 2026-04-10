@@ -50,8 +50,8 @@ pub enum ShareCommand {
         description: Option<String>,
         /// New access options.
         access_options: Option<String>,
-        /// Enable/disable downloads.
-        download_enabled: Option<bool>,
+        /// Download security level ("high", "medium", or "off").
+        download_security: Option<String>,
         /// Enable/disable comments.
         comments_enabled: Option<bool>,
         /// Enable/disable anonymous uploads.
@@ -242,7 +242,7 @@ pub async fn execute(command: &ShareCommand, ctx: &CommandContext<'_>) -> Result
             name,
             description,
             access_options,
-            download_enabled,
+            download_security,
             comments_enabled,
             anonymous_uploads,
         } => {
@@ -253,7 +253,7 @@ pub async fn execute(command: &ShareCommand, ctx: &CommandContext<'_>) -> Result
                 name.as_deref(),
                 description.as_deref(),
                 access_options.as_deref(),
-                *download_enabled,
+                download_security.as_deref(),
                 *comments_enabled,
                 *anonymous_uploads,
             )
@@ -357,19 +357,19 @@ async fn update(
     name: Option<&str>,
     description: Option<&str>,
     access_options: Option<&str>,
-    download_enabled: Option<bool>,
+    download_security: Option<&str>,
     comments_enabled: Option<bool>,
     anonymous_uploads: Option<bool>,
 ) -> Result<()> {
     if name.is_none()
         && description.is_none()
         && access_options.is_none()
-        && download_enabled.is_none()
+        && download_security.is_none()
         && comments_enabled.is_none()
         && anonymous_uploads.is_none()
     {
         anyhow::bail!(
-            "at least one update field is required (--name, --description, --access-options, --download-enabled, --comments-enabled, --anonymous-uploads)"
+            "at least one update field is required (--name, --description, --access-options, --download-security, --comments-enabled, --anonymous-uploads)"
         );
     }
     let client = ctx.build_client()?;
@@ -380,7 +380,7 @@ async fn update(
             name,
             description,
             access_options,
-            download_enabled,
+            download_security,
             comments_enabled,
             anonymous_uploads_enabled: anonymous_uploads,
         },
