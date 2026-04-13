@@ -98,6 +98,9 @@ impl ApiError {
             401 => Some("Authentication failed. Run `fastio auth login` to sign in."),
             403 => Some("Permission denied. Check that your account has the required role."),
             404 => Some("Resource not found. Verify the ID or path is correct."),
+            409 => Some(
+                "A conflicting request is in progress for this resource. Wait a moment and retry.",
+            ),
             429 => Some("Rate limited. Wait a moment and try again."),
             500..=599 => Some("Server error. The Fast.io API may be experiencing issues."),
             _ => None,

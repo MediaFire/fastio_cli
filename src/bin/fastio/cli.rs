@@ -990,6 +990,12 @@ pub enum WorkspaceCommands {
         /// Workspace ID.
         workspace_id: String,
     },
+    /// List active background jobs (poll after async metadata extract).
+    #[command(name = "jobs-status")]
+    JobsStatus {
+        /// Workspace ID.
+        workspace_id: String,
+    },
     /// Search workspace content.
     Search {
         /// Workspace ID.
@@ -2982,6 +2988,12 @@ pub enum MetadataCommands {
         /// Offset for pagination.
         #[arg(long)]
         offset: Option<u32>,
+        /// Template field name to sort by (optional).
+        #[arg(long)]
+        sort_field: Option<String>,
+        /// Sort direction when --sort-field is set (asc or desc).
+        #[arg(long, value_parser = ["asc", "desc"], requires = "sort_field")]
+        sort_dir: Option<String>,
     },
     /// AI-based file matching for a template.
     #[command(name = "auto-match")]
@@ -3003,7 +3015,12 @@ pub enum MetadataCommands {
         #[arg(long)]
         template_id: String,
     },
-    /// Extract metadata from a single file.
+    /// Enqueue an async metadata extraction for a single file. Usually
+    /// returns a `job_id`; poll `workspace jobs-status` until status is
+    /// "completed", then read values from the metadata details endpoint.
+    /// A full-row call whose effective scope is empty (every template
+    /// field has `autoextract: false`) responds successfully without
+    /// enqueueing a job — do not assume a `job_id` is always present.
     Extract {
         /// Workspace ID.
         #[arg(long)]
@@ -3014,6 +3031,58 @@ pub enum MetadataCommands {
         /// Template ID to extract against.
         #[arg(long)]
         template_id: String,
+        /// JSON-encoded array of field names for partial extraction
+        /// (omit for full-row extraction).
+        #[arg(long)]
+        fields: Option<String>,
+    },
+    /// Preview files that would match a proposed template name + description.
+    #[command(name = "preview-match")]
+    PreviewMatch {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Proposed template name (1-255 chars).
+        #[arg(long)]
+        name: String,
+        /// Natural-language description of the view/template.
+        #[arg(long)]
+        description: String,
+    },
+    /// Suggest custom columns for a proposed template (AI-assisted).
+    #[command(name = "suggest-fields")]
+    SuggestFields {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// JSON-encoded array of 1-25 sample node IDs from preview-match.
+        #[arg(long)]
+        node_ids: String,
+        /// View description (also passed to preview-match).
+        #[arg(long)]
+        description: String,
+        /// Optional short hint ("photo collection", max 64 chars, letters/numbers/spaces).
+        #[arg(long)]
+        user_context: Option<String>,
+    },
+    /// Create a metadata template (a.k.a. "view").
+    #[command(name = "create-template")]
+    CreateTemplate {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Template name (shown as "view name" in the UI).
+        #[arg(long)]
+        name: String,
+        /// Template description.
+        #[arg(long)]
+        description: String,
+        /// Template category.
+        #[arg(long)]
+        category: String,
+        /// JSON-encoded array of column definitions (compatible with suggest-fields output).
+        #[arg(long)]
+        fields: String,
     },
 }
 
