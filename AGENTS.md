@@ -23,13 +23,13 @@ fastio org list
 
 ## Output Format
 
-Always use `--format json` when parsing output programmatically:
+Use `--format json` when parsing output programmatically:
 ```bash
 fastio org list --format json
 fastio files list --workspace ID --format json
 ```
 
-Other formats: `table` (human-readable), `csv` (spreadsheets). Default is `table` for TTY, `json` for pipes.
+Other formats: `table` (human-readable), `csv` (spreadsheets), `markdown` (GitHub-flavored; `md` alias also accepted). Default is `table` for TTY, `markdown` for pipes (changed from `json` on 2026-04-15 to benefit LLM consumers; pass `--format json` for the old shape).
 
 Use `--quiet` to suppress all output (useful for write operations where you only care about exit code).
 

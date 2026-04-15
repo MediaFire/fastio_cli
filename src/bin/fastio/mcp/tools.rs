@@ -1,8 +1,16 @@
-/// MCP tool definitions and action-based routing for the Fast.io CLI.
-///
-/// Each tool corresponds to an API domain (auth, org, workspace, etc.)
-/// and uses an `action` parameter to select the specific operation.
-/// All tool handlers delegate to the existing `src/api/` functions.
+// `CallToolResult` is the standard MCP error payload and is shared by
+// every handler in this module; propagating it by-value in `Result::Err`
+// is the ergonomic API that rmcp expects. Boxing it would cascade
+// through ~200 handlers for no runtime benefit. Suppress the
+// `result_large_err` lint at the module level.
+#![allow(clippy::result_large_err)]
+
+//! MCP tool definitions and action-based routing for the Fast.io CLI.
+//!
+//! Each tool corresponds to an API domain (auth, org, workspace, etc.)
+//! and uses an `action` parameter to select the specific operation.
+//! All tool handlers delegate to the existing `src/api/` functions.
+
 use std::sync::Arc;
 
 use rmcp::ErrorData as McpError;
@@ -19,8 +27,14 @@ use super::McpState;
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Build a successful MCP tool result from a JSON value.
+///
+/// Returns markdown-formatted content by default, byte-equivalent to the
+/// server-side `?output=markdown` contract. Markdown is roughly 3–5×
+/// more token-efficient for LLM consumers than pretty-printed JSON
+/// across typical Fast.io list/details payloads, so MCP tool responses
+/// use it by default.
 fn success_json(value: &Value) -> CallToolResult {
-    let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    let text = fastio_cli::output::markdown::to_markdown(value);
     CallToolResult::success(vec![Content::text(text)])
 }
 
