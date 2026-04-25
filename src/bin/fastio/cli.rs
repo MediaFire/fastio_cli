@@ -1145,13 +1145,25 @@ pub enum FilesCommands {
         #[arg(long)]
         cursor: Option<String>,
     },
-    /// Get details for a file or folder.
+    /// Get details for one or more files or folders.
+    ///
+    /// A single node ID (after dedup) returns the existing single-node
+    /// response shape (`{node: {...}}`). Two or more unique IDs
+    /// auto-route to the bulk `/storage/{ids}/details/` endpoint and
+    /// return `{count_*, nodes: [...], errors: [...]}` (per-id errors
+    /// are normal). Calls with more than 25 IDs are chunked
+    /// client-side. The CLI accepts at most 1000 IDs per invocation
+    /// to bound wall-time and rate-limit footprint — going over
+    /// produces a clear error message (the runtime cap is enforced
+    /// in `info()` rather than at clap-parse time so the message
+    /// can include the actual count).
     Info {
         /// Workspace ID.
         #[arg(long)]
         workspace: String,
-        /// Storage node ID.
-        node_id: String,
+        /// One or more storage node IDs (positional).
+        #[arg(required = true, num_args = 1..)]
+        node_ids: Vec<String>,
     },
     /// Create a new folder.
     #[command(name = "create-folder")]

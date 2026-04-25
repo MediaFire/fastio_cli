@@ -730,9 +730,13 @@ fn map_files_command(cmd: cli::FilesCommands) -> FilesCommand {
             page_size,
             cursor,
         },
-        cli::FilesCommands::Info { workspace, node_id } => {
-            FilesCommand::Info { workspace, node_id }
-        }
+        cli::FilesCommands::Info {
+            workspace,
+            node_ids,
+        } => FilesCommand::Info {
+            workspace,
+            node_ids,
+        },
         cli::FilesCommands::CreateFolder {
             workspace,
             name,

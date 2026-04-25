@@ -27,12 +27,16 @@ pub enum FilesCommand {
         /// Cursor for next page.
         cursor: Option<String>,
     },
-    /// Get details for a file or folder.
+    /// Get details for one or more files or folders.
+    ///
+    /// `node_ids.len() == 1` keeps the single-node endpoint (shape
+    /// `{node: {...}}`); 2+ ids route to the bulk endpoint and return
+    /// `{nodes: [...], errors: [...]}`.
     Info {
         /// Workspace ID.
         workspace: String,
-        /// Node ID.
-        node_id: String,
+        /// One or more storage node IDs.
+        node_ids: Vec<String>,
     },
     /// Create a new folder.
     CreateFolder {
@@ -208,19 +212,56 @@ pub enum FileLockCommand {
 /// Allowed page sizes for storage list endpoints.
 const VALID_PAGE_SIZES: &[u32] = &[100, 250, 500];
 
-/// Validate that a node ID is not empty or whitespace-only.
-fn validate_node_id(node_id: &str, label: &str) -> Result<()> {
-    anyhow::ensure!(!node_id.trim().is_empty(), "{label} must not be empty");
+/// Maximum accepted length for a node or workspace identifier.
+///
+/// Real Fast.io node IDs are short (~32 chars including hyphens) and
+/// workspace IDs are 19-digit numerics; the cap is generous but rejects
+/// pathological inputs that would otherwise round-trip unchanged into
+/// the URL path.
+const MAX_ID_LEN: usize = 128;
+
+/// Validate that an identifier is non-empty, within length, and uses
+/// only the opaque-ID alphabet `[A-Za-z0-9_-]`.
+///
+/// Storage node and workspace IDs are documented (CLAUDE.md gotchas
+/// #2/#3) as opaque alphanumeric strings (workspaces are 19-digit
+/// numerics; nodes use hyphenated tokens like `2yxh5-ojakx-r3mwz`).
+/// Special pseudo-IDs (`root`, `trash`) also fit the alphabet.
+/// Rejecting anything else closes path-injection (`..`, `/`),
+/// comma-smuggling (a node id containing `,` would split into two ids
+/// after the proxy decodes `%2C` in some configurations), and
+/// terminal-spoofing (control / bidi / zero-width codepoints).
+///
+/// Whitespace is rejected outright (no implicit `.trim()`) — round-2
+/// review caught a defect where validation trimmed but the original
+/// padded string flowed downstream into the URL and the dedup key,
+/// producing two distinct ids that the server then handled
+/// inconsistently. Length is byte-counted (safe because the alphabet
+/// is ASCII; if the alphabet ever widens this needs to switch to
+/// `chars().count()`).
+fn validate_opaque_id(id: &str, label: &str) -> Result<()> {
+    anyhow::ensure!(!id.is_empty(), "{label} must not be empty");
+    anyhow::ensure!(
+        id.len() <= MAX_ID_LEN,
+        "{label} must be at most {MAX_ID_LEN} characters (got {})",
+        id.len()
+    );
+    anyhow::ensure!(
+        id.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "{label} must only contain ASCII letters, digits, '-', and '_'"
+    );
     Ok(())
 }
 
-/// Validate that a workspace ID is not empty or whitespace-only.
+/// Validate a storage node ID (delegates to [`validate_opaque_id`]).
+fn validate_node_id(node_id: &str, label: &str) -> Result<()> {
+    validate_opaque_id(node_id, label)
+}
+
+/// Validate a workspace ID (delegates to [`validate_opaque_id`]).
 fn validate_workspace_id(workspace: &str) -> Result<()> {
-    anyhow::ensure!(
-        !workspace.trim().is_empty(),
-        "workspace ID must not be empty"
-    );
-    Ok(())
+    validate_opaque_id(workspace, "workspace ID")
 }
 
 /// Validate that a page size, if provided, is one of the accepted values.
@@ -235,6 +276,7 @@ fn validate_page_size(page_size: Option<u32>) -> Result<()> {
 }
 
 /// Execute a files subcommand.
+#[allow(clippy::too_many_lines)]
 pub async fn execute(command: &FilesCommand, ctx: &CommandContext<'_>) -> Result<()> {
     match command {
         FilesCommand::List {
@@ -257,7 +299,10 @@ pub async fn execute(command: &FilesCommand, ctx: &CommandContext<'_>) -> Result
             )
             .await
         }
-        FilesCommand::Info { workspace, node_id } => info(ctx, workspace, node_id).await,
+        FilesCommand::Info {
+            workspace,
+            node_ids,
+        } => info(ctx, workspace, node_ids).await,
         FilesCommand::CreateFolder {
             workspace,
             name,
@@ -401,15 +446,228 @@ async fn list(
     Ok(())
 }
 
-/// Get file/folder details.
-async fn info(ctx: &CommandContext<'_>, workspace: &str, node_id: &str) -> Result<()> {
+/// Get file/folder details for one or more nodes.
+///
+/// One id keeps the single-node endpoint shape; 2+ ids route through
+/// the bulk endpoint with client-side chunking at
+/// `api::storage::BULK_DETAILS_MAX_IDS`.
+/// Runtime cap on positional node IDs per `fastio files info` invocation.
+///
+/// Bounds wall-time and rate-limit footprint. Enforced here (rather
+/// than via clap `num_args = 1..=N`) so the error message can include
+/// the actual count.
+const INFO_MAX_NODE_IDS: usize = 1000;
+
+async fn info(ctx: &CommandContext<'_>, workspace: &str, node_ids: &[String]) -> Result<()> {
+    use std::collections::HashSet;
+
     validate_workspace_id(workspace)?;
-    validate_node_id(node_id, "node ID")?;
+    anyhow::ensure!(!node_ids.is_empty(), "at least one node ID is required");
+    anyhow::ensure!(
+        node_ids.len() <= INFO_MAX_NODE_IDS,
+        "at most {INFO_MAX_NODE_IDS} node IDs accepted per call (got {})",
+        node_ids.len()
+    );
+    for id in node_ids {
+        validate_node_id(id, "node ID")?;
+    }
+
+    // Dedupe first (case-insensitive, matching server normalization)
+    // — `unique.len()` is the right thing to test for the single-id
+    // short-circuit, not the original argv length.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut unique: Vec<String> = Vec::with_capacity(node_ids.len());
+    for id in node_ids {
+        if seen.insert(id.to_ascii_lowercase()) {
+            unique.push(id.clone());
+        }
+    }
+
     let client = ctx.build_client()?;
-    let value = api::storage::get_file_details(&client, workspace, node_id)
-        .await
-        .context("failed to get file details")?;
-    ctx.output.render(&value)?;
+
+    if unique.len() == 1 {
+        let value = api::storage::get_file_details(&client, workspace, &unique[0])
+            .await
+            .context("failed to get file details")?;
+        ctx.output.render(&value)?;
+        return Ok(());
+    }
+
+    let aggregated = run_bulk_info(&client, workspace, &unique).await?;
+
+    let succeeded = aggregated.succeeded.len();
+    let errored = aggregated.errored.len();
+
+    render_bulk_info(ctx, &aggregated)?;
+
+    // Per platform docs: a 200 with non-empty errors is NOT a request
+    // failure. Only exit nonzero when every requested id failed —
+    // OR when the server returned nothing for any of them (a
+    // hostile / buggy zero-zero response that would otherwise look
+    // like silent success; round-2 review N3 / N6).
+    if succeeded == 0 && errored > 0 {
+        anyhow::bail!("all {errored} node id(s) failed; see errors output for details");
+    }
+    if succeeded == 0 && errored == 0 && aggregated.total > 0 {
+        anyhow::bail!(
+            "server returned no nodes and no errors for {} requested id(s); response was empty",
+            aggregated.total
+        );
+    }
+    Ok(())
+}
+
+/// Aggregated result of a bulk-info run: per-id success/failure
+/// outcome plus the total requested-input count for the
+/// `count_*` fields. `total` is captured separately because dedup
+/// can drop ids before the server ever sees them.
+struct BulkInfoAggregate {
+    total: usize,
+    succeeded: Vec<serde_json::Value>,
+    errored: Vec<serde_json::Value>,
+}
+
+/// Issue the chunked bulk-info calls and aggregate per-id outcomes.
+///
+/// Network I/O lives here; aggregation is delegated to
+/// [`aggregate_chunks`] so the dedup and exit-code logic can be
+/// tested without an HTTP client.
+async fn run_bulk_info(
+    client: &fastio_cli::client::ApiClient,
+    workspace: &str,
+    unique: &[String],
+) -> Result<BulkInfoAggregate> {
+    let chunk_size = api::storage::BULK_DETAILS_MAX_IDS;
+    let mut chunks: Vec<api::storage::BulkDetailsResponse> = Vec::new();
+    for chunk in unique.chunks(chunk_size) {
+        let resp = api::storage::get_bulk_node_details(client, workspace, chunk)
+            .await
+            .context("failed to fetch bulk node details")?;
+        chunks.push(resp);
+    }
+    Ok(aggregate_chunks(unique.len(), chunks))
+}
+
+/// Aggregate per-chunk responses into a single result.
+///
+/// Server-returned nodes are deduplicated by id (a hostile or buggy
+/// server returning the same node twice can't inflate the success
+/// count), and per-id errors are deduplicated case-insensitively by
+/// the echoed `node_id`. Both invariants protect the `count_*` fields
+/// from going larger than `total`.
+fn aggregate_chunks(
+    total: usize,
+    chunks: Vec<api::storage::BulkDetailsResponse>,
+) -> BulkInfoAggregate {
+    use std::collections::HashSet;
+
+    let mut succeeded: Vec<serde_json::Value> = Vec::new();
+    let mut errored: Vec<serde_json::Value> = Vec::new();
+    let mut succeeded_lc: HashSet<String> = HashSet::new();
+    let mut errored_lc: HashSet<String> = HashSet::new();
+
+    for resp in chunks {
+        for node in resp.nodes {
+            // The server is the authority on node id; use the
+            // returned object's `id` field to dedupe. Falls back
+            // through `node_id` and `nid` for forward compat with
+            // shape changes; absent any id field we keep the row.
+            let key = node
+                .get("id")
+                .or_else(|| node.get("node_id"))
+                .or_else(|| node.get("nid"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_ascii_lowercase);
+            if let Some(k) = key
+                && !succeeded_lc.insert(k)
+            {
+                tracing::warn!(node = %node, "dropping duplicate node id from server response");
+                continue;
+            }
+            succeeded.push(node);
+        }
+        for err in resp.errors {
+            if errored_lc.insert(err.node_id.to_ascii_lowercase()) {
+                errored.push(json!({
+                    "node_id": err.node_id,
+                    "code": err.code,
+                    "message": err.message,
+                }));
+            }
+        }
+    }
+
+    BulkInfoAggregate {
+        total,
+        succeeded,
+        errored,
+    }
+}
+
+/// Render the aggregated bulk-info result.
+///
+/// Output format dispatch:
+/// - JSON: emit the full `{count_*, nodes, errors}` map.
+/// - Table / CSV: render the `nodes` array directly. Without
+///   `serde_json/preserve_order`, `Value::Object` is a `BTreeMap`, so
+///   `output::flatten_response` (`src/output/mod.rs:133`) walks keys
+///   alphabetically and returns the first array-valued key. With
+///   our key set `{count_errored, count_succeeded, count_total,
+///   errors, nodes}`, alphabetical iteration lands on `errors`
+///   first (E < N), which would silently hide the resolved nodes —
+///   caught in correctness review A2. Passing an array directly
+///   bypasses the heuristic and the renderer treats it as the
+///   primary row data. Per-error summary lines are written to
+///   stderr (suppressed in `--quiet`).
+fn render_bulk_info(ctx: &CommandContext<'_>, agg: &BulkInfoAggregate) -> Result<()> {
+    use fastio_cli::output::OutputFormat;
+
+    let succeeded = agg.succeeded.len();
+    let errored = agg.errored.len();
+    let total = agg.total;
+
+    if matches!(ctx.output.format, OutputFormat::Json) {
+        let aggregated = json!({
+            "count_total": total,
+            "count_succeeded": succeeded,
+            "count_errored": errored,
+            "nodes": agg.succeeded,
+            "errors": agg.errored,
+        });
+        ctx.output.render(&aggregated)?;
+        return Ok(());
+    }
+
+    // Table / CSV: render nodes directly.
+    ctx.output
+        .render(&serde_json::Value::Array(agg.succeeded.clone()))?;
+    if !agg.errored.is_empty() && !ctx.output.quiet {
+        eprintln!("--- {errored} of {total} id(s) failed ---");
+        for err in &agg.errored {
+            let raw_nid = err
+                .get("node_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            // Server-supplied `node_id` is left empty by the parser
+            // when missing (no synthetic placeholder); render
+            // `<no id>` only at the presentation layer so the data
+            // layer stays clean (round-2 review N3).
+            let nid = if raw_nid.is_empty() {
+                "<no id>"
+            } else {
+                raw_nid
+            };
+            let code = err
+                .get("code")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let msg = err
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            eprintln!("  {nid}: [{code}] {msg}");
+        }
+    }
     Ok(())
 }
 
@@ -682,4 +940,172 @@ async fn quickshare(ctx: &CommandContext<'_>, workspace: &str, node_id: &str) ->
         .context("failed to get quickshare")?;
     ctx.output.render(&value)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{aggregate_chunks, validate_node_id, validate_opaque_id};
+    use fastio_cli::api::storage::{BulkDetailsResponse, parse_bulk_details_response};
+    use serde_json::json;
+
+    fn make_chunk(body: &serde_json::Value) -> BulkDetailsResponse {
+        parse_bulk_details_response(body).expect("test body should parse")
+    }
+
+    #[test]
+    fn aggregate_chunks_dedupes_repeated_node_ids_from_server() {
+        // Hostile/buggy server returns the same node twice across two
+        // chunks (different casings). count_succeeded must NOT exceed
+        // total.
+        let chunk_a = make_chunk(&json!({
+            "format": "multi",
+            "nodes": [{"id": "ABC", "name": "a.txt"}],
+            "errors": []
+        }));
+        let chunk_b = make_chunk(&json!({
+            "format": "multi",
+            "nodes": [{"id": "abc", "name": "a.txt"}],
+            "errors": []
+        }));
+        let agg = aggregate_chunks(2, vec![chunk_a, chunk_b]);
+        assert_eq!(agg.succeeded.len(), 1);
+        assert!(agg.errored.is_empty());
+    }
+
+    #[test]
+    fn aggregate_chunks_dedupes_repeated_error_node_ids() {
+        let chunk = make_chunk(&json!({
+            "format": "multi",
+            "nodes": [],
+            "errors": [
+                {"node_id": "X", "code": 133_123, "message": "missing"},
+                {"node_id": "x", "code": 133_123, "message": "missing"}
+            ]
+        }));
+        let agg = aggregate_chunks(1, vec![chunk]);
+        assert!(agg.succeeded.is_empty());
+        assert_eq!(agg.errored.len(), 1);
+    }
+
+    #[test]
+    fn aggregate_chunks_keeps_nodes_without_id_field() {
+        // No `id`/`node_id`/`nid` field — nothing to dedupe on, so
+        // both rows pass through (better than silently dropping).
+        let chunk = make_chunk(&json!({
+            "format": "multi",
+            "nodes": [{"name": "a"}, {"name": "b"}],
+            "errors": []
+        }));
+        let agg = aggregate_chunks(2, vec![chunk]);
+        assert_eq!(agg.succeeded.len(), 2);
+    }
+
+    #[test]
+    fn aggregate_chunks_partial_success_yields_both_lists() {
+        let chunk = make_chunk(&json!({
+            "format": "multi",
+            "nodes": [{"id": "ok"}],
+            "errors": [{"node_id": "missing", "code": 133_123, "message": "missing"}]
+        }));
+        let agg = aggregate_chunks(2, vec![chunk]);
+        assert_eq!(agg.succeeded.len(), 1);
+        assert_eq!(agg.errored.len(), 1);
+        assert_eq!(agg.total, 2);
+    }
+
+    #[test]
+    fn aggregate_chunks_all_errored() {
+        let chunk = make_chunk(&json!({
+            "format": "multi",
+            "nodes": [],
+            "errors": [
+                {"node_id": "a", "code": 133_123, "message": "missing"},
+                {"node_id": "b", "code": 191_878, "message": "invalid"}
+            ]
+        }));
+        let agg = aggregate_chunks(2, vec![chunk]);
+        assert!(agg.succeeded.is_empty());
+        assert_eq!(agg.errored.len(), 2);
+    }
+
+    #[test]
+    fn aggregate_chunks_dedupes_node_id_alias_field() {
+        // Server uses `node_id` instead of `id` on a node row — the
+        // alias-aware dedup still catches the duplicate.
+        let chunk = make_chunk(&json!({
+            "format": "multi",
+            "nodes": [
+                {"node_id": "abc", "name": "a"},
+                {"node_id": "ABC", "name": "a"}
+            ],
+            "errors": []
+        }));
+        let agg = aggregate_chunks(1, vec![chunk]);
+        assert_eq!(agg.succeeded.len(), 1);
+    }
+
+    #[test]
+    fn validate_opaque_id_accepts_real_node_ids() {
+        // Hyphenated tokens like 2yxh5-ojakx-r3mwz-ty6tv-k66cj-nqsw,
+        // 19-digit workspace numerics, and pseudo-IDs (root, trash).
+        validate_opaque_id("2yxh5-ojakx-r3mwz-ty6tv-k66cj-nqsw", "node ID").unwrap();
+        validate_opaque_id("4467703271501769252", "workspace ID").unwrap();
+        validate_opaque_id("root", "node ID").unwrap();
+        validate_opaque_id("trash", "node ID").unwrap();
+    }
+
+    #[test]
+    fn validate_opaque_id_rejects_path_smuggling_chars() {
+        for bad in [",", "..", "/", "abc/def", "a,b", "abc..def"] {
+            let err =
+                validate_node_id(bad, "node ID").expect_err(&format!("should reject {bad:?}"));
+            assert!(
+                err.to_string().contains("ASCII letters"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_opaque_id_rejects_control_and_bidi() {
+        for bad in [
+            "abc\u{0000}",    // NUL
+            "a\nb",           // embedded LF
+            "abc\u{202E}xyz", // RLO bidi override
+            "abc\u{200B}xyz", // zero-width space
+            "abc\u{FEFF}",    // BOM
+        ] {
+            assert!(
+                validate_node_id(bad, "node ID").is_err(),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_opaque_id_rejects_whitespace_anywhere() {
+        // Round-2: ANY whitespace (leading, trailing, embedded, NBSP)
+        // is rejected outright. The previous version trimmed for
+        // validation but then forwarded the untrimmed string,
+        // creating a path/dedup mismatch.
+        for bad in [
+            "  abc",       // leading space
+            "abc  ",       // trailing space
+            "ab cd",       // embedded space
+            "\tabc",       // leading tab
+            "\u{00A0}abc", // NBSP (would also slip through trim)
+        ] {
+            assert!(
+                validate_node_id(bad, "node ID").is_err(),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_opaque_id_rejects_empty_and_oversize() {
+        assert!(validate_node_id("", "node ID").is_err());
+        let huge = "a".repeat(super::MAX_ID_LEN + 1);
+        assert!(validate_node_id(&huge, "node ID").is_err());
+    }
 }

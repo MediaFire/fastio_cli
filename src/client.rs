@@ -242,6 +242,28 @@ impl ApiClient {
         .await
     }
 
+    /// Perform a GET request and return the parsed JSON body for both
+    /// HTTP 200 and HTTP 404 responses, without unwrapping the
+    /// `result`/`response` envelope.
+    ///
+    /// Bulk-resource endpoints (e.g. `/storage/{ids}/details/`) signal
+    /// "all items errored" with HTTP 404 but still return a useful
+    /// per-item body (`{nodes: [], errors: [...]}`); the caller needs to
+    /// see that body to surface per-id outcomes. Other 4xx and unrecoverable
+    /// 5xx responses are still converted to `CliError::Api` via the
+    /// standard error envelope.
+    pub async fn get_partial_envelope(&self, path: &str) -> Result<(u16, Value), CliError> {
+        tracing::trace!(method = "GET", path, "api request (partial envelope)");
+        self.send_with_retry_partial(|| {
+            let mut req = self.inner.get(self.url(path));
+            if let Some(auth) = self.auth_header() {
+                req = req.header(AUTHORIZATION, auth);
+            }
+            req
+        })
+        .await
+    }
+
     /// Perform a DELETE request and unwrap the API envelope.
     pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T, CliError> {
         tracing::trace!(method = "DELETE", path, "api request");
@@ -384,6 +406,110 @@ impl ApiClient {
                     }
 
                     return self.handle_response_raw(resp).await;
+                }
+                Err(e) if Self::is_retryable_error(&e) && attempt < MAX_RETRIES => {
+                    tracing::warn!(error = %e, "transient network error, will retry");
+                    last_error = Some(CliError::Http(e));
+                }
+                Err(e) => return Err(CliError::Http(e)),
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| CliError::Parse("request failed: all retries exhausted".to_owned())))
+    }
+
+    /// Send a request with retry, returning `(http_status, body)` for both
+    /// HTTP 200 and HTTP 404 responses without envelope unwrapping. Used
+    /// by `get_partial_envelope`; see that method for the contract.
+    async fn send_with_retry_partial<F>(&self, build_request: F) -> Result<(u16, Value), CliError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let mut last_error: Option<CliError> = None;
+
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let backoff = INITIAL_BACKOFF * 2u32.saturating_pow(attempt - 1);
+                tracing::warn!(
+                    attempt,
+                    backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+                    "retrying request after transient failure"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+
+            let req = build_request();
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+
+                    if matches!(status.as_u16(), 502..=504) && attempt < MAX_RETRIES {
+                        tracing::warn!(
+                            status = status.as_u16(),
+                            "received transient server error, will retry"
+                        );
+                        if let Err(e) = resp.error_for_status() {
+                            last_error = Some(CliError::Http(e));
+                        }
+                        continue;
+                    }
+
+                    if status.as_u16() == 429 {
+                        let retry_secs = Self::parse_rate_limit_expiry(&resp);
+                        Self::emit_rate_limit_error(retry_secs);
+                        return Err(CliError::RateLimit {
+                            retry_after_secs: retry_secs,
+                        });
+                    }
+
+                    Self::check_rate_limit(&resp);
+
+                    // Non-200/404 responses may legitimately have a
+                    // non-JSON body (proxy HTML error pages, empty
+                    // 401s); fall back to an empty Value so
+                    // `extract_error` can still return its default
+                    // message rather than collapsing to a parse error.
+                    let body: Value = if matches!(status.as_u16(), 200 | 404) {
+                        resp.json().await.map_err(|e| {
+                            CliError::Parse(format!(
+                                "failed to parse {} response body: {e}",
+                                status.as_u16()
+                            ))
+                        })?
+                    } else {
+                        resp.json().await.unwrap_or_default()
+                    };
+                    tracing::trace!(body = %body, "api response body (partial envelope)");
+
+                    if matches!(status.as_u16(), 200 | 404) {
+                        // The bulk-details contract uses the HTTP status
+                        // and `result: "no"` together: a 404 with
+                        // `result: "no"` is the all-errored success
+                        // case, but a 200 with `result: "no"` (or
+                        // either status with a top-level `error` and
+                        // no bulk shape) is an authoritative envelope
+                        // failure that must NOT be parsed as a bulk
+                        // body. Detect via "no `nodes`/`errors` arrays
+                        // and no non-null `node` object". A literal
+                        // `node: null` does NOT count as bulk shape —
+                        // treating it as such would let `result: "no"`
+                        // + null-node masquerade as a successful
+                        // empty result (round-2 review N3).
+                        let payload = body.get("response").unwrap_or(&body);
+                        let has_bulk_shape = payload.get("nodes").is_some_and(Value::is_array)
+                            || payload.get("errors").is_some_and(Value::is_array)
+                            || payload.get("node").is_some_and(|n| !n.is_null());
+                        let result_no = matches!(
+                            body.get("result"),
+                            Some(Value::String(s)) if s == "no"
+                        );
+                        if result_no && !has_bulk_shape {
+                            return Err(Self::extract_error(&body, status.as_u16()).into());
+                        }
+                        return Ok((status.as_u16(), body));
+                    }
+                    return Err(Self::extract_error(&body, status.as_u16()).into());
                 }
                 Err(e) if Self::is_retryable_error(&e) && attempt < MAX_RETRIES => {
                     tracing::warn!(error = %e, "transient network error, will retry");
