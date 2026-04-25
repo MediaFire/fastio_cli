@@ -878,12 +878,18 @@ fn map_upload_command(cmd: cli::UploadCommands) -> UploadCommand {
     match cmd {
         cli::UploadCommands::File {
             workspace,
-            file_path,
+            file_paths,
             folder,
+            preserve_tree,
+            allow_partial,
+            creator,
         } => UploadCommand::File {
             workspace,
-            file_path,
+            file_paths,
             folder,
+            preserve_tree,
+            allow_partial,
+            creator,
         },
         cli::UploadCommands::Text {
             workspace,

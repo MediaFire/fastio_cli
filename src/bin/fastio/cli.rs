@@ -1366,16 +1366,36 @@ pub enum FileLockCommands {
 #[derive(Subcommand, Debug)]
 #[non_exhaustive]
 pub enum UploadCommands {
-    /// Upload a local file with progress bar.
+    /// Upload one or more local files.
+    ///
+    /// A single path uses the single-file pipeline (single-call for ≤ 4 MB,
+    /// chunked otherwise). Two or more paths auto-route through the batch
+    /// endpoint (`/upload/batch/`): small files are packed into sequential
+    /// batches of ≤ 200 files / ≤ 100 MB, oversize files (> 4 MB) fall back
+    /// to the chunked pipeline per file.
     File {
         /// Workspace ID.
         #[arg(long)]
         workspace: String,
-        /// Path to the local file.
-        file_path: String,
+        /// One or more local files to upload.
+        #[arg(num_args = 1.., required_unless_present = "preserve_tree")]
+        file_paths: Vec<String>,
         /// Destination folder node ID (defaults to root).
         #[arg(long)]
         folder: Option<String>,
+        /// Upload an entire directory tree, preserving sub-folder structure
+        /// via per-file `relative_path`. Mutually exclusive with positional
+        /// file paths.
+        #[arg(long, value_name = "DIR", conflicts_with = "file_paths")]
+        preserve_tree: Option<String>,
+        /// Exit 0 even if some files in a batch errored. Without this flag,
+        /// any per-file error causes a nonzero exit with a summary.
+        #[arg(long)]
+        allow_partial: bool,
+        /// Optional echo-back correlation tag (1-150 chars, alphanumeric and
+        /// hyphens only). Passed through to the server on batch uploads.
+        #[arg(long)]
+        creator: Option<String>,
     },
     /// Upload text content as a file.
     Text {
