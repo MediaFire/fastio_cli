@@ -1123,6 +1123,47 @@ const TOOL_DEFS: &[ToolDef] = &[
         ],
     },
     ToolDef {
+        name: "instructions",
+        description: "AI instructions (markdown blob, max 65,536 raw bytes) per profile. Scopes: user (self only), org/workspace/share (profile-wide admin slot + per-user override at /me/). User has no /me/ variant. clear-* maps to DELETE; setting empty content is equivalent.",
+        actions: &[
+            "get-user",
+            "set-user",
+            "clear-user",
+            "get-org",
+            "set-org",
+            "clear-org",
+            "get-org-user",
+            "set-org-user",
+            "clear-org-user",
+            "get-workspace",
+            "set-workspace",
+            "clear-workspace",
+            "get-workspace-user",
+            "set-workspace-user",
+            "clear-workspace-user",
+            "get-share",
+            "set-share",
+            "clear-share",
+            "get-share-user",
+            "set-share-user",
+            "clear-share-user",
+        ],
+        params: &[
+            ("org_id", "Org ID (org / org-user actions)", false),
+            (
+                "workspace_id",
+                "Workspace ID (workspace / workspace-user actions)",
+                false,
+            ),
+            ("share_id", "Share ID (share / share-user actions)", false),
+            (
+                "content",
+                "Markdown content for set-* actions (max 65,536 raw bytes)",
+                false,
+            ),
+        ],
+    },
+    ToolDef {
         name: "system",
         description: "System health: ping (health check) and status (system status). No authentication required.",
         actions: &["ping", "status"],
@@ -1195,6 +1236,7 @@ impl ToolRouter {
             "import" => handle_import(&self.state, action, &args).await,
             "lock" => handle_lock(&self.state, action, &args).await,
             "metadata" => handle_metadata(&self.state, action, &args).await,
+            "instructions" => handle_instructions(&self.state, action, &args).await,
             "system" => handle_system(&self.state, action, &args).await,
             _ => Ok(error_text(&format!("Unknown tool: {name}"))),
         }
@@ -7779,6 +7821,255 @@ async fn handle_metadata(
             }
         }
         _ => Ok(error_text(&format!("Unknown metadata action: {action}"))),
+    }
+}
+
+/// AI instructions tool handler.
+#[allow(clippy::too_many_lines)]
+async fn handle_instructions(
+    state: &McpState,
+    action: &str,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    if let Err(e) = require_auth(state).await {
+        return Ok(e);
+    }
+    let client = state.client().read().await;
+    match action {
+        "get-user" => match api::instructions::get_user_instructions(&client).await {
+            Ok(v) => Ok(success_json(&v)),
+            Err(e) => Ok(cli_err_to_result(&e)),
+        },
+        "set-user" => {
+            let content = match required_str(args, "content") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::set_user_instructions(&client, content).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "clear-user" => match api::instructions::delete_user_instructions(&client).await {
+            Ok(v) => Ok(success_json(&v)),
+            Err(e) => Ok(cli_err_to_result(&e)),
+        },
+
+        "get-org" => {
+            let org_id = match required_str(args, "org_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::get_org_instructions(&client, org_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "set-org" => {
+            let org_id = match required_str(args, "org_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let content = match required_str(args, "content") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::set_org_instructions(&client, org_id, content).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "clear-org" => {
+            let org_id = match required_str(args, "org_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::delete_org_instructions(&client, org_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "get-org-user" => {
+            let org_id = match required_str(args, "org_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::get_org_user_instructions(&client, org_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "set-org-user" => {
+            let org_id = match required_str(args, "org_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let content = match required_str(args, "content") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::set_org_user_instructions(&client, org_id, content).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "clear-org-user" => {
+            let org_id = match required_str(args, "org_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::delete_org_user_instructions(&client, org_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+
+        "get-workspace" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::get_workspace_instructions(&client, workspace_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "set-workspace" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let content = match required_str(args, "content") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::set_workspace_instructions(&client, workspace_id, content)
+                .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "clear-workspace" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::delete_workspace_instructions(&client, workspace_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "get-workspace-user" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::get_workspace_user_instructions(&client, workspace_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "set-workspace-user" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let content = match required_str(args, "content") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::set_workspace_user_instructions(&client, workspace_id, content)
+                .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "clear-workspace-user" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::delete_workspace_user_instructions(&client, workspace_id).await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+
+        "get-share" => {
+            let share_id = match required_str(args, "share_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::get_share_instructions(&client, share_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "set-share" => {
+            let share_id = match required_str(args, "share_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let content = match required_str(args, "content") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::set_share_instructions(&client, share_id, content).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "clear-share" => {
+            let share_id = match required_str(args, "share_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::delete_share_instructions(&client, share_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "get-share-user" => {
+            let share_id = match required_str(args, "share_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::get_share_user_instructions(&client, share_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "set-share-user" => {
+            let share_id = match required_str(args, "share_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let content = match required_str(args, "content") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::set_share_user_instructions(&client, share_id, content).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "clear-share-user" => {
+            let share_id = match required_str(args, "share_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::delete_share_user_instructions(&client, share_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+
+        _ => Ok(error_text(&format!(
+            "Unknown instructions action: {action}"
+        ))),
     }
 }
 

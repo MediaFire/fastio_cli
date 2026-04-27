@@ -128,6 +128,10 @@ pub enum Commands {
     #[command(subcommand)]
     Metadata(MetadataCommands),
 
+    /// AI instructions for user / org / workspace / share profiles.
+    #[command(subcommand)]
+    Instructions(InstructionsCommands),
+
     /// System health and status checks (no auth required).
     #[command(subcommand)]
     System(SystemCommands),
@@ -3133,6 +3137,183 @@ pub enum MetadataCommands {
         /// JSON-encoded array of column definitions (compatible with suggest-fields output).
         #[arg(long)]
         fields: String,
+    },
+}
+
+// ─── Instructions ─────────────────────────────────────────────────────────────
+
+/// AI instructions subcommands.
+///
+/// `content` is a markdown blob up to 65,536 raw bytes (multibyte chars
+/// count for more than one). Setting an empty string is equivalent to
+/// `clear`. Profile-wide writes (`set-org`, `set-workspace`, `set-share`)
+/// require admin/owner privilege; the `*-user` variants write the
+/// caller's own per-user override.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum InstructionsCommands {
+    /// Get the calling user's self-scoped AI instructions.
+    #[command(name = "get-user")]
+    GetUser,
+    /// Set the calling user's self-scoped AI instructions.
+    #[command(name = "set-user")]
+    SetUser {
+        /// Markdown content (up to 65,536 raw bytes).
+        #[arg(long, allow_hyphen_values = true)]
+        content: String,
+    },
+    /// Clear the calling user's self-scoped AI instructions.
+    #[command(name = "clear-user")]
+    ClearUser,
+
+    /// Get the org-wide AI instructions.
+    #[command(name = "get-org")]
+    GetOrg {
+        /// Org ID.
+        #[arg(long)]
+        org_id: String,
+    },
+    /// Set the org-wide AI instructions (owner / admin only).
+    #[command(name = "set-org")]
+    SetOrg {
+        /// Org ID.
+        #[arg(long)]
+        org_id: String,
+        /// Markdown content (up to 65,536 raw bytes).
+        #[arg(long, allow_hyphen_values = true)]
+        content: String,
+    },
+    /// Clear the org-wide AI instructions (owner / admin only).
+    #[command(name = "clear-org")]
+    ClearOrg {
+        /// Org ID.
+        #[arg(long)]
+        org_id: String,
+    },
+    /// Get the calling user's per-user override of an org's instructions.
+    #[command(name = "get-org-user")]
+    GetOrgUser {
+        /// Org ID.
+        #[arg(long)]
+        org_id: String,
+    },
+    /// Set the calling user's per-user override of an org's instructions.
+    #[command(name = "set-org-user")]
+    SetOrgUser {
+        /// Org ID.
+        #[arg(long)]
+        org_id: String,
+        /// Markdown content (up to 65,536 raw bytes).
+        #[arg(long, allow_hyphen_values = true)]
+        content: String,
+    },
+    /// Clear the calling user's per-user override of an org's instructions.
+    #[command(name = "clear-org-user")]
+    ClearOrgUser {
+        /// Org ID.
+        #[arg(long)]
+        org_id: String,
+    },
+
+    /// Get the workspace-wide AI instructions.
+    #[command(name = "get-workspace")]
+    GetWorkspace {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace_id: String,
+    },
+    /// Set the workspace-wide AI instructions (owner / admin only).
+    #[command(name = "set-workspace")]
+    SetWorkspace {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace_id: String,
+        /// Markdown content (up to 65,536 raw bytes).
+        #[arg(long, allow_hyphen_values = true)]
+        content: String,
+    },
+    /// Clear the workspace-wide AI instructions (owner / admin only).
+    #[command(name = "clear-workspace")]
+    ClearWorkspace {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace_id: String,
+    },
+    /// Get the calling user's per-user override of a workspace's instructions.
+    #[command(name = "get-workspace-user")]
+    GetWorkspaceUser {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace_id: String,
+    },
+    /// Set the calling user's per-user override of a workspace's instructions.
+    /// Blocked for guests.
+    #[command(name = "set-workspace-user")]
+    SetWorkspaceUser {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace_id: String,
+        /// Markdown content (up to 65,536 raw bytes).
+        #[arg(long, allow_hyphen_values = true)]
+        content: String,
+    },
+    /// Clear the calling user's per-user override of a workspace's instructions.
+    #[command(name = "clear-workspace-user")]
+    ClearWorkspaceUser {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace_id: String,
+    },
+
+    /// Get the share-wide AI instructions.
+    #[command(name = "get-share")]
+    GetShare {
+        /// Share ID.
+        #[arg(long)]
+        share_id: String,
+    },
+    /// Set the share-wide AI instructions (owner / admin only).
+    #[command(name = "set-share")]
+    SetShare {
+        /// Share ID.
+        #[arg(long)]
+        share_id: String,
+        /// Markdown content (up to 65,536 raw bytes).
+        #[arg(long, allow_hyphen_values = true)]
+        content: String,
+    },
+    /// Clear the share-wide AI instructions (owner / admin only).
+    #[command(name = "clear-share")]
+    ClearShare {
+        /// Share ID.
+        #[arg(long)]
+        share_id: String,
+    },
+    /// Get the calling user's per-user override of a share's instructions.
+    /// Registered share members only — anonymous/link guests blocked.
+    #[command(name = "get-share-user")]
+    GetShareUser {
+        /// Share ID.
+        #[arg(long)]
+        share_id: String,
+    },
+    /// Set the calling user's per-user override of a share's instructions.
+    /// Registered share members only.
+    #[command(name = "set-share-user")]
+    SetShareUser {
+        /// Share ID.
+        #[arg(long)]
+        share_id: String,
+        /// Markdown content (up to 65,536 raw bytes).
+        #[arg(long, allow_hyphen_values = true)]
+        content: String,
+    },
+    /// Clear the calling user's per-user override of a share's instructions.
+    #[command(name = "clear-share-user")]
+    ClearShareUser {
+        /// Share ID.
+        #[arg(long)]
+        share_id: String,
     },
 }
 

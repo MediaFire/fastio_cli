@@ -19,6 +19,8 @@ pub mod download;
 pub mod event;
 /// External storage import endpoints.
 pub mod import;
+/// AI instructions endpoints (user / org / workspace / share).
+pub mod instructions;
 /// Workspace invitation endpoints.
 pub mod invitation;
 /// File locking endpoints.
