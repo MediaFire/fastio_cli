@@ -11,6 +11,296 @@ use serde_json::Value;
 use crate::client::ApiClient;
 use crate::error::CliError;
 
+/// Server-enforced cap on the number of node ids per bulk metadata-details
+/// request.
+///
+/// Going over this returns HTTP 406 with sub-code 109184. Callers with
+/// more than this many ids must chunk on the client side.
+pub const BULK_METADATA_DETAILS_MAX_IDS: usize = 25;
+
+/// Per-id error returned by the bulk metadata-details endpoint.
+///
+/// The server echoes back the input casing of `node_id` (the input is
+/// normalized internally but the error retains what the caller sent),
+/// so callers matching results to inputs must compare case-insensitively.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct MetadataFetchError {
+    /// Node id the error applies to (echoes input casing).
+    pub node_id: String,
+    /// Numeric API error code. Common values:
+    /// - `147_196` invalid storage node id format
+    /// - `196_136` literal root sentinel was supplied
+    /// - `191_049` storage node not found (also returned for ids that
+    ///   exist in another workspace — workspace scoping)
+    /// - `190_770` backend error retrieving the storage node (transient
+    ///   — safe to retry)
+    /// - `150_183` storage node exists but is not a file or note (e.g.
+    ///   a folder)
+    /// - `157_684` backend error retrieving the metadata key/value rows
+    ///   (transient — safe to retry)
+    pub code: u32,
+    /// Human-readable error message.
+    pub message: String,
+}
+
+impl MetadataFetchError {
+    fn from_value(v: &Value) -> Self {
+        let node_id = v.get("node_id").and_then(Value::as_str).map(str::to_owned);
+        if node_id.is_none() {
+            tracing::warn!(error_row = %v, "bulk metadata-details error row missing node_id");
+        }
+        let code_raw = v.get("code");
+        let code = code_raw
+            .and_then(Value::as_u64)
+            .and_then(|c| u32::try_from(c).ok());
+        if code.is_none() && code_raw.is_some_and(|c| !c.is_null()) {
+            tracing::warn!(code = ?code_raw, "bulk metadata-details error row code not a u32");
+        }
+        let message = v.get("message").and_then(Value::as_str).map(str::to_owned);
+        if message.is_none() {
+            tracing::warn!(error_row = %v, "bulk metadata-details error row missing message");
+        }
+        Self {
+            node_id: sanitize_terminal_string(&node_id.unwrap_or_default()),
+            code: code.unwrap_or(0),
+            message: sanitize_terminal_string(&message.unwrap_or_default()),
+        }
+    }
+}
+
+/// Strip C0/C1 control codepoints and Unicode bidi/zero-width/BOM
+/// codepoints from a server-supplied string before it reaches a
+/// terminal. Mirrors the Trojan-Source defense applied by the
+/// markdown sanitizer (CLAUDE.md gotcha #14).
+fn sanitize_terminal_string(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            if c.is_control() && *c != '\t' && *c != '\n' && *c != '\r' {
+                return false;
+            }
+            let cp = *c as u32;
+            !matches!(
+                cp,
+                0x200B..=0x200F | 0x202A..=0x202E | 0x2066..=0x2069 | 0xFEFF
+            )
+        })
+        .collect()
+}
+
+/// Bulk metadata-details response: zero or more resolved objects, the
+/// hoisted template definition map, and per-id errors.
+///
+/// Both HTTP 200 (≥1 id resolved) and HTTP 404 (all ids errored) carry
+/// this same shape; partial results are normal and a non-empty `errors`
+/// list at HTTP 200 must NOT be treated as a request-level failure.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct BulkMetadataDetailsResponse {
+    /// Successfully resolved metadata objects. Server does NOT preserve
+    /// input order. Each entry has the single-id response shape:
+    /// `{instance_id, object_id, template_id, node_id, template_metadata,
+    /// custom_metadata, autoextractable}`.
+    pub objects: Vec<Value>,
+    /// Map of `template_id` → template definition, deduplicated across
+    /// all objects in this response. Always present (empty map when no
+    /// template applies).
+    pub templates: serde_json::Map<String, Value>,
+    /// Per-id errors. May be non-empty even at HTTP 200.
+    pub errors: Vec<MetadataFetchError>,
+}
+
+/// Get metadata details for one or more storage nodes.
+///
+/// `GET /workspace/{workspace_id}/storage/{id1},{id2},.../metadata/details/`
+///
+/// The server distinguishes single vs bulk shape by the presence of a
+/// comma in the URL segment. This function joins the input ids with
+/// literal commas and returns a unified
+/// [`BulkMetadataDetailsResponse`]: single-format responses surface
+/// their lone object as `objects[0]`, multi-format responses pass
+/// through `objects[]`, `templates{}`, and `errors[]` as-is.
+///
+/// Constraints:
+/// - 1..=`BULK_METADATA_DETAILS_MAX_IDS` ids per call (callers needing
+///   more must chunk; the server dedupes case-insensitively, so 25
+///   *unique* ids is the cap).
+/// - All ids must belong to the same `workspace_id` (cross-workspace
+///   ids surface as per-id `191_049` not-found, not a 4xx).
+/// - Commas between ids must NOT be URL-encoded (the server splits on
+///   `,`).
+///
+/// Both HTTP 200 (some ok) and HTTP 404 (all errored) return a
+/// populated [`BulkMetadataDetailsResponse`]; HTTP 406 (empty segment
+/// or over-cap) and other 4xx/5xx surface as `CliError::Api`.
+pub async fn get_bulk_node_metadata_details(
+    client: &ApiClient,
+    workspace_id: &str,
+    node_ids: &[String],
+) -> Result<BulkMetadataDetailsResponse, CliError> {
+    let path = build_bulk_metadata_details_path(workspace_id, node_ids)?;
+    let (_status, body) = client.get_partial_envelope(&path).await?;
+    parse_bulk_metadata_details_response(&body)
+}
+
+/// Build the bulk metadata-details URL path. Extracted as a free
+/// function so chunking and validation can be unit-tested without an
+/// HTTP client.
+fn build_bulk_metadata_details_path(
+    workspace_id: &str,
+    node_ids: &[String],
+) -> Result<String, CliError> {
+    if node_ids.is_empty() {
+        return Err(CliError::Parse(
+            "bulk metadata details requires at least one id".to_owned(),
+        ));
+    }
+    if node_ids.len() > BULK_METADATA_DETAILS_MAX_IDS {
+        return Err(CliError::Parse(format!(
+            "bulk metadata details accepts at most {BULK_METADATA_DETAILS_MAX_IDS} ids per call (got {})",
+            node_ids.len()
+        )));
+    }
+    let encoded: Vec<String> = node_ids
+        .iter()
+        .map(|id| urlencoding::encode(id).into_owned())
+        .collect();
+    // For chunks of exactly one id, duplicate the id with a literal
+    // comma so the response always arrives in multi shape (the server
+    // dedupes case-insensitively, so this is still one lookup).
+    // Without this, a 1-id trailing chunk in a chunked run hits the
+    // single-id endpoint, and a server-side 4xx on that single id
+    // would abort the whole run and discard objects accumulated in
+    // earlier chunks.
+    let segment = if encoded.len() == 1 {
+        format!("{0},{0}", encoded[0])
+    } else {
+        encoded.join(",")
+    };
+    Ok(format!(
+        "/workspace/{}/storage/{}/metadata/details/",
+        urlencoding::encode(workspace_id),
+        segment,
+    ))
+}
+
+/// Parse the metadata-details response body into a unified
+/// [`BulkMetadataDetailsResponse`].
+///
+/// Branches on `payload.format`:
+/// - `"multi"`: pass through `objects[]`, `templates{}`, `errors[]`.
+/// - absent / any other value with `objects` array present: treat as
+///   multi (covers 404-all-errored bodies and forward-compat).
+/// - else: lift the entire payload as `objects[0]` (the legacy
+///   single-id shape, where the body itself is the object). If the
+///   payload contains a `template` field, hoist it into `templates`
+///   keyed by `template_id` so the unified shape is consistent.
+///
+/// Tolerates both `{result, response: {…}}` (the documented envelope)
+/// and a flat `{…}` body.
+pub fn parse_bulk_metadata_details_response(
+    body: &Value,
+) -> Result<BulkMetadataDetailsResponse, CliError> {
+    let payload = body.get("response").unwrap_or(body);
+    if !payload.is_object() {
+        return Err(CliError::Parse(
+            "bulk metadata-details response payload is not a JSON object".to_owned(),
+        ));
+    }
+    let format = payload.get("format").and_then(Value::as_str);
+    let multi_shape = payload.get("objects").is_some_and(Value::is_array);
+
+    let treat_as_multi = match format {
+        Some("multi") => true,
+        Some("single") => false,
+        None => multi_shape,
+        Some(other) => {
+            return Err(CliError::Parse(format!(
+                "bulk metadata-details response has unknown format {other:?}"
+            )));
+        }
+    };
+
+    if treat_as_multi {
+        let objects = payload
+            .get("objects")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let templates = payload
+            .get("templates")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let errors = payload
+            .get("errors")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().map(MetadataFetchError::from_value).collect())
+            .unwrap_or_default();
+        return Ok(BulkMetadataDetailsResponse {
+            objects,
+            templates,
+            errors,
+        });
+    }
+
+    // Single-format: legacy single-id endpoint shape, where the
+    // payload itself is the metadata object. Hoist its `template`
+    // (if any) into a `templates` map keyed by `template_id` so
+    // downstream code can render single and multi responses with
+    // the same logic.
+    let mut object = payload.clone();
+    let mut templates: serde_json::Map<String, Value> = serde_json::Map::new();
+    if let Value::Object(obj) = &mut object {
+        // The single-id legacy shape carried the template definition
+        // inline as a `template` field. Move it out into the
+        // hoisted map and replace it with a reference (just the id)
+        // so the multi-format invariant — `objects[*]` carries the
+        // template *id*, `templates[id]` carries the *definition* —
+        // holds for both shapes.
+        let template_id = obj
+            .get("template_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(tpl) = obj.remove("template")
+            && let Some(tid) = template_id
+            && !tpl.is_null()
+        {
+            templates.insert(tid, tpl);
+        }
+    }
+    let objects = if object.is_null() {
+        Vec::new()
+    } else {
+        vec![object]
+    };
+    Ok(BulkMetadataDetailsResponse {
+        objects,
+        templates,
+        errors: Vec::new(),
+    })
+}
+
+/// Get metadata details for a single storage node (legacy single-id
+/// shape).
+///
+/// `GET /workspace/{workspace_id}/storage/{node_id}/metadata/details/`
+///
+/// Returns the raw envelope-unwrapped object. Use
+/// [`get_bulk_node_metadata_details`] for 2+ ids.
+pub async fn get_node_metadata_details(
+    client: &ApiClient,
+    workspace_id: &str,
+    node_id: &str,
+) -> Result<Value, CliError> {
+    let path = format!(
+        "/workspace/{}/storage/{}/metadata/details/",
+        urlencoding::encode(workspace_id),
+        urlencoding::encode(node_id),
+    );
+    client.get(&path).await
+}
+
 /// List files eligible for metadata extraction in a workspace.
 ///
 /// `GET /workspace/{workspace_id}/metadata/eligible/`
@@ -554,11 +844,175 @@ fn validate_fields(fields: &str) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CATEGORY_MAX_CHARS, DESCRIPTION_MAX_CHARS, NAME_MAX_CHARS, SUGGEST_NODE_IDS_MAX,
-        USER_CONTEXT_MAX_CHARS, validate_category, validate_description, validate_extract_fields,
+        BULK_METADATA_DETAILS_MAX_IDS, BulkMetadataDetailsResponse, CATEGORY_MAX_CHARS,
+        DESCRIPTION_MAX_CHARS, NAME_MAX_CHARS, SUGGEST_NODE_IDS_MAX, USER_CONTEXT_MAX_CHARS,
+        build_bulk_metadata_details_path, parse_bulk_metadata_details_response,
+        sanitize_terminal_string, validate_category, validate_description, validate_extract_fields,
         validate_fields, validate_name, validate_node_ids, validate_sort_dir, validate_sort_params,
         validate_user_context,
     };
+    use crate::error::CliError;
+    use serde_json::json;
+
+    fn parsed_metadata(body: &serde_json::Value) -> BulkMetadataDetailsResponse {
+        parse_bulk_metadata_details_response(body).expect("test body should parse")
+    }
+
+    #[test]
+    fn metadata_parse_multi_format_envelope_wrapped() {
+        let body = json!({
+            "result": "yes",
+            "response": {
+                "format": "multi",
+                "objects": [
+                    {"node_id": "abc", "template_id": "tpl1", "custom_metadata": {}}
+                ],
+                "templates": {
+                    "tpl1": {"name": "Photos", "fields": []}
+                },
+                "errors": [
+                    {"node_id": "missing", "code": 191_049, "message": "not found"}
+                ]
+            }
+        });
+        let r = parsed_metadata(&body);
+        assert_eq!(r.objects.len(), 1);
+        assert_eq!(r.templates.len(), 1);
+        assert!(r.templates.contains_key("tpl1"));
+        assert_eq!(r.errors.len(), 1);
+        assert_eq!(r.errors[0].node_id, "missing");
+        assert_eq!(r.errors[0].code, 191_049);
+    }
+
+    #[test]
+    fn metadata_parse_multi_format_404_all_errored() {
+        let body = json!({
+            "result": "no",
+            "response": {
+                "format": "multi",
+                "objects": [],
+                "templates": {},
+                "errors": [
+                    {"node_id": "x", "code": 147_196, "message": "invalid id"},
+                    {"node_id": "Y", "code": 191_049, "message": "not found"}
+                ]
+            }
+        });
+        let r = parsed_metadata(&body);
+        assert!(r.objects.is_empty());
+        assert!(r.templates.is_empty());
+        assert_eq!(r.errors.len(), 2);
+        assert_eq!(r.errors[1].node_id, "Y");
+    }
+
+    #[test]
+    fn metadata_parse_single_format_lifts_object_and_hoists_template() {
+        let body = json!({
+            "result": "yes",
+            "response": {
+                "node_id": "abc",
+                "template_id": "tpl1",
+                "template": {"name": "Photos", "fields": []},
+                "custom_metadata": {"k": "v"}
+            }
+        });
+        let r = parsed_metadata(&body);
+        assert_eq!(r.objects.len(), 1);
+        assert!(r.templates.contains_key("tpl1"));
+        // Object retains template_id but template definition is hoisted out.
+        assert_eq!(r.objects[0]["template_id"], "tpl1");
+        assert!(r.objects[0].get("template").is_none());
+    }
+
+    #[test]
+    fn metadata_parse_missing_format_with_objects_treats_as_multi() {
+        let body = json!({
+            "result": "no",
+            "response": {
+                "objects": [],
+                "errors": [{"node_id": "x", "code": 191_049, "message": "missing"}]
+            }
+        });
+        let r = parsed_metadata(&body);
+        assert!(r.objects.is_empty());
+        assert_eq!(r.errors.len(), 1);
+    }
+
+    #[test]
+    fn metadata_parse_unknown_format_returns_parse_error() {
+        let body = json!({
+            "result": "yes",
+            "response": {"format": "v2", "objects": []}
+        });
+        let err =
+            parse_bulk_metadata_details_response(&body).expect_err("unknown format must error");
+        assert!(matches!(err, CliError::Parse(_)));
+    }
+
+    #[test]
+    fn metadata_parse_non_object_payload_returns_parse_error() {
+        let body = json!([1, 2, 3]);
+        let err =
+            parse_bulk_metadata_details_response(&body).expect_err("non-object payload must error");
+        assert!(matches!(err, CliError::Parse(_)));
+    }
+
+    #[test]
+    fn metadata_sanitize_strips_control_and_bidi_codepoints() {
+        let raw = "hello\x07\u{202E}drowssap\u{200D}.txt\u{FEFF}";
+        let cleaned = sanitize_terminal_string(raw);
+        assert_eq!(cleaned, "hellodrowssap.txt");
+        assert_eq!(sanitize_terminal_string("a\x1bb"), "ab");
+        assert_eq!(sanitize_terminal_string("a\tb\nc\rd"), "a\tb\nc\rd");
+    }
+
+    #[test]
+    fn metadata_build_path_joins_commas_literal() {
+        let path = build_bulk_metadata_details_path(
+            "ws-1",
+            &["abc".to_owned(), "DeF".to_owned(), "ghi-jkl".to_owned()],
+        )
+        .expect("happy path");
+        assert_eq!(
+            path,
+            "/workspace/ws-1/storage/abc,DeF,ghi-jkl/metadata/details/"
+        );
+    }
+
+    #[test]
+    fn metadata_build_path_duplicates_single_id_to_force_bulk_shape() {
+        let path = build_bulk_metadata_details_path("ws", &["abc".to_owned()]).expect("happy path");
+        assert_eq!(path, "/workspace/ws/storage/abc,abc/metadata/details/");
+    }
+
+    #[test]
+    fn metadata_build_path_rejects_empty_input() {
+        let err =
+            build_bulk_metadata_details_path("ws", &[]).expect_err("empty input must be rejected");
+        assert!(matches!(err, CliError::Parse(_)));
+    }
+
+    #[test]
+    fn metadata_build_path_rejects_oversize_input() {
+        let ids: Vec<String> = (0..=BULK_METADATA_DETAILS_MAX_IDS)
+            .map(|i| format!("id{i}"))
+            .collect();
+        let err = build_bulk_metadata_details_path("ws", &ids)
+            .expect_err("oversize input must be rejected");
+        assert!(matches!(err, CliError::Parse(_)));
+    }
+
+    #[test]
+    fn metadata_build_path_encodes_individual_ids() {
+        let path = build_bulk_metadata_details_path("ws", &["a,b".to_owned(), "c d".to_owned()])
+            .expect("happy path");
+        assert_eq!(path, "/workspace/ws/storage/a%2Cb,c%20d/metadata/details/");
+    }
+
+    #[test]
+    fn metadata_bulk_max_ids_matches_server_cap() {
+        assert_eq!(BULK_METADATA_DETAILS_MAX_IDS, 25);
+    }
 
     #[test]
     fn description_rejects_empty_or_whitespace() {

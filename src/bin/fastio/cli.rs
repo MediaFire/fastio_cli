@@ -3047,6 +3047,24 @@ pub enum MetadataCommands {
         #[arg(long)]
         template_id: String,
     },
+    /// Get metadata details for one or more files.
+    ///
+    /// A single node ID (after dedup) returns the existing single-node
+    /// response shape (the metadata object as the body). Two or more
+    /// unique IDs auto-route to the bulk
+    /// `/storage/{ids}/metadata/details/` endpoint and return
+    /// `{count_*, objects: [...], templates: {...}, errors: [...]}`
+    /// (per-id errors are normal). Calls with more than 25 IDs are
+    /// chunked client-side. The CLI accepts at most 1000 IDs per
+    /// invocation to bound wall-time and rate-limit footprint.
+    Details {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// One or more storage node IDs (positional).
+        #[arg(required = true, num_args = 1..)]
+        node_ids: Vec<String>,
+    },
     /// Enqueue an async metadata extraction for a single file. Usually
     /// returns a `job_id`; poll `workspace jobs-status` until status is
     /// "completed", then read values from the metadata details endpoint.

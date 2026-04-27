@@ -1997,6 +1997,13 @@ fn map_metadata_command(cmd: cli::MetadataCommands) -> MetadataCommand {
             workspace,
             template_id,
         },
+        cli::MetadataCommands::Details {
+            workspace,
+            node_ids,
+        } => MetadataCommand::Details {
+            workspace,
+            node_ids,
+        },
         cli::MetadataCommands::Extract {
             workspace,
             node_id,

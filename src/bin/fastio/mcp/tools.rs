@@ -420,7 +420,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("fields", "JSON-encoded field definitions (metadata)", false),
             (
                 "node_ids",
-                "JSON-encoded array of 1-25 node IDs (metadata-template-suggest-fields)",
+                "JSON-encoded array (or comma-separated list) of 1-25 node IDs (metadata-template-suggest-fields, metadata-details)",
                 false,
             ),
             (
@@ -3374,14 +3374,90 @@ async fn handle_workspace(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            let nid = match required_str(args, "node_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
+            // Accept either `node_ids` (JSON-encoded array of strings
+            // OR a comma-separated list, up to 25 unique ids per the
+            // bulk endpoint cap) or `node_id` (legacy single-id form).
+            // When more than one id is provided, route to the bulk
+            // endpoint and return the multi-format `{objects,
+            // templates, errors}` response. Otherwise behave exactly
+            // as the legacy tool.
+            let raw_ids = optional_str(args, "node_ids")
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let raw_single = optional_str(args, "node_id")
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let parsed: Vec<String> = match (raw_ids, raw_single) {
+                (Some(s), _) => {
+                    if s.starts_with('[') {
+                        match serde_json::from_str::<Vec<String>>(s) {
+                            Ok(v) => v
+                                .into_iter()
+                                .map(|p| p.trim().to_owned())
+                                .filter(|p| !p.is_empty())
+                                .collect(),
+                            Err(e) => {
+                                return Ok(CallToolResult::error(vec![Content::text(format!(
+                                    "node_ids must be a JSON array of strings or a comma-separated list: {e}"
+                                ))]));
+                            }
+                        }
+                    } else {
+                        s.split(',')
+                            .map(|p| p.trim().to_owned())
+                            .filter(|p| !p.is_empty())
+                            .collect()
+                    }
+                }
+                (None, Some(s)) => vec![s.to_owned()],
+                (None, None) => {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "Missing required parameter: node_id (or node_ids)",
+                    )]));
+                }
             };
-            let sub = format!("storage/{}/metadata/details/", urlencoding::encode(nid));
-            match api::workspace::metadata_api(&client, ws_id, &sub, "GET", None, None).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
+            if parsed.is_empty() {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "node_ids must contain at least one non-empty id",
+                )]));
+            }
+            // Dedupe case-insensitively to match server normalization.
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut unique: Vec<String> = Vec::with_capacity(parsed.len());
+            for id in parsed {
+                if seen.insert(id.to_ascii_lowercase()) {
+                    unique.push(id);
+                }
+            }
+            if unique.len() == 1 {
+                match api::metadata::get_node_metadata_details(&client, ws_id, &unique[0]).await {
+                    Ok(v) => Ok(success_json(&v)),
+                    Err(e) => Ok(cli_err_to_result(&e)),
+                }
+            } else {
+                match api::metadata::get_bulk_node_metadata_details(&client, ws_id, &unique).await {
+                    Ok(resp) => {
+                        let payload = serde_json::json!({
+                            "format": "multi",
+                            "count_total": unique.len(),
+                            "count_succeeded": resp.objects.len(),
+                            "count_errored": resp.errors.len(),
+                            "objects": resp.objects,
+                            "templates": Value::Object(resp.templates),
+                            "errors": resp
+                                .errors
+                                .iter()
+                                .map(|e| serde_json::json!({
+                                    "node_id": e.node_id,
+                                    "code": e.code,
+                                    "message": e.message,
+                                }))
+                                .collect::<Vec<_>>(),
+                        });
+                        Ok(success_json(&payload))
+                    }
+                    Err(e) => Ok(cli_err_to_result(&e)),
+                }
             }
         }
         "metadata-extract" => {
