@@ -123,9 +123,32 @@ pub enum MetadataCommand {
         /// JSON-encoded fields array (suggest-fields output is compatible).
         fields: String,
     },
+    /// Lexical keyword search over workspace metadata field values.
+    Search {
+        /// Workspace ID.
+        workspace: String,
+        /// Search keyword(s).
+        query: String,
+        /// Optional template scope.
+        template_id: Option<String>,
+        /// Page size (1-100).
+        limit: Option<u32>,
+        /// Skip-N offset.
+        offset: Option<u32>,
+    },
+    /// Enqueue an async TSV export of the caller's saved view.
+    ExportView {
+        /// Workspace ID.
+        workspace: String,
+        /// Template ID.
+        template_id: String,
+        /// Destination folder (defaults to workspace root).
+        parent_node_id: Option<String>,
+    },
 }
 
 /// Execute a metadata subcommand.
+#[allow(clippy::too_many_lines)]
 pub async fn execute(command: &MetadataCommand, ctx: &CommandContext<'_>) -> Result<()> {
     match command {
         MetadataCommand::Eligible {
@@ -207,6 +230,28 @@ pub async fn execute(command: &MetadataCommand, ctx: &CommandContext<'_>) -> Res
             category,
             fields,
         } => create_template(ctx, workspace, name, description, category, fields).await,
+        MetadataCommand::Search {
+            workspace,
+            query,
+            template_id,
+            limit,
+            offset,
+        } => {
+            search(
+                ctx,
+                workspace,
+                query,
+                template_id.as_deref(),
+                *limit,
+                *offset,
+            )
+            .await
+        }
+        MetadataCommand::ExportView {
+            workspace,
+            template_id,
+            parent_node_id,
+        } => export_view(ctx, workspace, template_id, parent_node_id.as_deref()).await,
     }
 }
 
@@ -566,6 +611,39 @@ async fn suggest_fields(
         api::metadata::suggest_fields(&client, workspace, node_ids, description, user_context)
             .await
             .context("failed to request suggested fields")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Lexical keyword search over workspace metadata field values.
+async fn search(
+    ctx: &CommandContext<'_>,
+    workspace: &str,
+    query: &str,
+    template_id: Option<&str>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value =
+        api::metadata::search_metadata(&client, workspace, query, template_id, limit, offset)
+            .await
+            .context("failed to search metadata")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Enqueue an async TSV export of the caller's saved view for a template.
+async fn export_view(
+    ctx: &CommandContext<'_>,
+    workspace: &str,
+    template_id: &str,
+    parent_node_id: Option<&str>,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::metadata::export_view(&client, workspace, template_id, parent_node_id)
+        .await
+        .context("failed to enqueue metadata view export")?;
     ctx.output.render(&value)?;
     Ok(())
 }

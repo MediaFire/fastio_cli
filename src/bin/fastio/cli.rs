@@ -3138,6 +3138,49 @@ pub enum MetadataCommands {
         #[arg(long)]
         fields: String,
     },
+    /// Lexical keyword search over workspace metadata field values.
+    ///
+    /// Multi-token queries require ALL tokens to appear (case-insensitive).
+    /// Substring matching applies for queries up to 64 chars; longer
+    /// queries are matched word-by-word. Indexing is asynchronous (1–2 s)
+    /// — do not search-immediately-after-write as a correctness check.
+    Search {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Search keyword(s) (max 1024 chars; whitespace-trimmed).
+        query: String,
+        /// Restrict to nodes with at least one value contributed by this
+        /// template (custom fields are excluded when set).
+        #[arg(long)]
+        template_id: Option<String>,
+        /// Page size (1-100, default 100 server-side; combined with
+        /// offset, must not exceed 10000).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Skip-N offset (offset + limit may not exceed 10000).
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Enqueue an async TSV export of the caller's saved view for a template.
+    ///
+    /// The TSV is written into the destination folder by a background
+    /// worker; poll the destination folder for the resulting filename.
+    /// Same-view + same-destination calls while a prior job is in
+    /// flight return `status: "duplicate"` instead of stacking.
+    #[command(name = "export-view")]
+    ExportView {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Template ID the saved view belongs to.
+        #[arg(long)]
+        template_id: String,
+        /// Destination folder node ID (defaults to workspace root). Max
+        /// 64 chars.
+        #[arg(long)]
+        parent_node_id: Option<String>,
+    },
 }
 
 // ─── Instructions ─────────────────────────────────────────────────────────────

@@ -1084,7 +1084,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "metadata",
-        description: "Metadata extraction: list eligible files, manage template-file mappings, AI-based matching, batch extraction, and async single-file extraction (returns job_id; poll via workspace jobs-status).",
+        description: "Metadata extraction: list eligible files, manage template-file mappings, AI-based matching, batch extraction, async single-file extraction (returns job_id; poll via workspace jobs-status), lexical keyword search over metadata values, and async TSV export of the caller's saved view.",
         actions: &[
             "eligible",
             "add-nodes",
@@ -1093,6 +1093,8 @@ const TOOL_DEFS: &[ToolDef] = &[
             "auto-match",
             "extract-all",
             "extract",
+            "search",
+            "export-view",
         ],
         params: &[
             ("workspace_id", "Workspace ID", false),
@@ -1118,6 +1120,12 @@ const TOOL_DEFS: &[ToolDef] = &[
             (
                 "fields",
                 "JSON-encoded array of field names for partial extraction (extract)",
+                false,
+            ),
+            ("query", "Search keyword(s), max 1024 chars (search)", false),
+            (
+                "parent_node_id",
+                "Destination folder for export TSV (export-view; defaults to workspace root, max 64 chars)",
                 false,
             ),
         ],
@@ -7815,6 +7823,48 @@ async fn handle_metadata(
                 fields,
             )
             .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "search" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let query = match required_str(args, "query") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let template_id = optional_str(args, "template_id").filter(|s| !s.trim().is_empty());
+            match api::metadata::search_metadata(
+                &client,
+                workspace_id,
+                query,
+                template_id,
+                optional_u32(args, "limit"),
+                optional_u32(args, "offset"),
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "export-view" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let template_id = match required_str(args, "template_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let parent_node_id =
+                optional_str(args, "parent_node_id").filter(|s| !s.trim().is_empty());
+            match api::metadata::export_view(&client, workspace_id, template_id, parent_node_id)
+                .await
             {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),

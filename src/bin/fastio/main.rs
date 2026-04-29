@@ -2052,6 +2052,28 @@ fn map_metadata_command(cmd: cli::MetadataCommands) -> MetadataCommand {
             category,
             fields,
         },
+        cli::MetadataCommands::Search {
+            workspace,
+            query,
+            template_id,
+            limit,
+            offset,
+        } => MetadataCommand::Search {
+            workspace,
+            query,
+            template_id,
+            limit,
+            offset,
+        },
+        cli::MetadataCommands::ExportView {
+            workspace,
+            template_id,
+            parent_node_id,
+        } => MetadataCommand::ExportView {
+            workspace,
+            template_id,
+            parent_node_id,
+        },
     }
 }
 

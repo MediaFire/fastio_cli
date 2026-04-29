@@ -649,6 +649,114 @@ const NAME_MAX_CHARS: usize = 255;
 /// Maximum character count for a template category slug.
 const CATEGORY_MAX_CHARS: usize = 50;
 
+/// Server-enforced cap on the metadata-search `q` parameter (chars).
+pub const METADATA_SEARCH_QUERY_MAX_CHARS: usize = 1024;
+/// Server-enforced upper bound on `limit` for metadata-search.
+pub const METADATA_SEARCH_LIMIT_MAX: u32 = 100;
+/// Server-enforced cap on the deep-page window: `offset + limit` may
+/// not exceed this value.
+pub const METADATA_SEARCH_DEEP_PAGE_MAX: u32 = 10_000;
+/// Server-enforced cap on the export `parent_node_id` value (chars).
+pub const EXPORT_VIEW_PARENT_NODE_ID_MAX_CHARS: usize = 64;
+
+/// Search workspace files by metadata field values (template + custom).
+///
+/// `GET /workspace/{workspace_id}/metadata/search/?q=…`
+///
+/// Lexical keyword search over extracted metadata values — the
+/// metadata-only counterpart to `/storage/search/` (which targets
+/// filenames). Returns BM25-scored hits with the full hydrated node
+/// payload and offset-paged metadata. Trashed nodes are filtered out
+/// at hydration; tenancy is enforced server-side via the workspace
+/// path segment.
+///
+/// Validation mirrors the server contract:
+/// - `q` is whitespace-trimmed and rejected if empty or longer than
+///   [`METADATA_SEARCH_QUERY_MAX_CHARS`] characters.
+/// - `limit`, when supplied, must be in `1..=METADATA_SEARCH_LIMIT_MAX`.
+/// - `offset + limit` may not exceed [`METADATA_SEARCH_DEEP_PAGE_MAX`].
+///
+/// Indexing is asynchronous (1–2 s), so callers should not search
+/// immediately after a metadata write as a correctness check. A
+/// non-empty result with `pagination.total = 0` is a real "no
+/// matches" signal, distinct from a 4xx error.
+pub async fn search_metadata(
+    client: &ApiClient,
+    workspace_id: &str,
+    query: &str,
+    template_id: Option<&str>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Value, CliError> {
+    let trimmed = query.trim();
+    validate_search_query(trimmed)?;
+    let template_id = template_id.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(l) = limit {
+        validate_search_limit(l)?;
+    }
+    validate_search_window(limit, offset)?;
+    let mut params = HashMap::new();
+    params.insert("q".to_owned(), trimmed.to_owned());
+    if let Some(tid) = template_id {
+        params.insert("template_id".to_owned(), tid.to_owned());
+    }
+    if let Some(l) = limit {
+        params.insert("limit".to_owned(), l.to_string());
+    }
+    if let Some(o) = offset {
+        params.insert("offset".to_owned(), o.to_string());
+    }
+    let path = format!(
+        "/workspace/{}/metadata/search/",
+        urlencoding::encode(workspace_id),
+    );
+    client.get_with_params(&path, &params).await
+}
+
+/// Enqueue an asynchronous TSV export of the caller's saved metadata
+/// view for a template.
+///
+/// `POST /workspace/{workspace_id}/metadata/view/{template_id}/export/`
+///
+/// The endpoint reads `$_POST` server-side so the body must be form
+/// encoded, not JSON. The TSV is written into the destination folder
+/// (`parent_node_id`, defaults to workspace root) by a background
+/// worker — the response only confirms the enqueue:
+/// - `status: "queued"` carries a `job_id` and the resolved filename.
+/// - `status: "duplicate"` indicates an in-flight job for the same
+///   `(workspace, user, template, destination)` tuple and carries no
+///   `job_id`. The in-flight job is canonical; the caller should not
+///   retry, just wait for the file to appear in the destination
+///   folder via `GET /workspace/{ws}/storage/{parent}/list/`.
+///
+/// `parent_node_id` is optional — pass `None` (or an empty string) to
+/// write to the workspace root. The server caps the value at
+/// [`EXPORT_VIEW_PARENT_NODE_ID_MAX_CHARS`] characters; this client
+/// rejects oversize values up front. The caller must already have a
+/// saved view for `(workspace, user, template)`; the server returns
+/// 404 otherwise.
+pub async fn export_view(
+    client: &ApiClient,
+    workspace_id: &str,
+    template_id: &str,
+    parent_node_id: Option<&str>,
+) -> Result<Value, CliError> {
+    let parent_node_id = parent_node_id.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(p) = parent_node_id {
+        validate_parent_node_id(p)?;
+    }
+    let path = format!(
+        "/workspace/{}/metadata/view/{}/export/",
+        urlencoding::encode(workspace_id),
+        urlencoding::encode(template_id),
+    );
+    let mut form = HashMap::new();
+    if let Some(p) = parent_node_id {
+        form.insert("parent_node_id".to_owned(), p.to_owned());
+    }
+    client.post(&path, &form).await
+}
+
 fn validate_name(name: &str) -> Result<(), CliError> {
     if name.trim().is_empty() {
         return Err(CliError::Parse("name must not be empty".to_owned()));
@@ -797,6 +905,70 @@ fn validate_sort_dir(dir: &str) -> Result<(), CliError> {
     }
 }
 
+/// Validate the metadata-search `q` parameter.
+///
+/// Defensively re-checks for whitespace-only input even though
+/// [`search_metadata`] already trims, so this validator is safe to
+/// reuse from any future caller. Short-circuits on raw byte length
+/// before walking codepoints, so an adversarial multi-megabyte input
+/// is rejected without a full UTF-8 scan.
+fn validate_search_query(q: &str) -> Result<(), CliError> {
+    if q.trim().is_empty() {
+        return Err(CliError::Parse("search query must not be empty".to_owned()));
+    }
+    // UTF-8 char count cannot exceed byte length, and each char is at
+    // most 4 bytes, so byte length > MAX*4 guarantees over-cap. This
+    // bounds work to a constant regardless of input size.
+    if q.len() > METADATA_SEARCH_QUERY_MAX_CHARS * 4 {
+        return Err(CliError::Parse(format!(
+            "search query must be at most {METADATA_SEARCH_QUERY_MAX_CHARS} chars",
+        )));
+    }
+    let len = q.chars().count();
+    if len > METADATA_SEARCH_QUERY_MAX_CHARS {
+        return Err(CliError::Parse(format!(
+            "search query must be at most {METADATA_SEARCH_QUERY_MAX_CHARS} chars (got {len})",
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the metadata-search `limit` parameter.
+fn validate_search_limit(limit: u32) -> Result<(), CliError> {
+    if limit == 0 || limit > METADATA_SEARCH_LIMIT_MAX {
+        return Err(CliError::Parse(format!(
+            "limit must be between 1 and {METADATA_SEARCH_LIMIT_MAX} (got {limit})",
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the deep-paging window. The server enforces
+/// `offset + limit <= METADATA_SEARCH_DEEP_PAGE_MAX`; defaults are
+/// `limit = 100`, `offset = 0`.
+fn validate_search_window(limit: Option<u32>, offset: Option<u32>) -> Result<(), CliError> {
+    let l = limit.unwrap_or(100);
+    let o = offset.unwrap_or(0);
+    let sum = u64::from(o) + u64::from(l);
+    if sum > u64::from(METADATA_SEARCH_DEEP_PAGE_MAX) {
+        return Err(CliError::Parse(format!(
+            "offset + limit must not exceed {METADATA_SEARCH_DEEP_PAGE_MAX} (got {sum})",
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the export `parent_node_id` form field.
+fn validate_parent_node_id(parent: &str) -> Result<(), CliError> {
+    let len = parent.chars().count();
+    if len > EXPORT_VIEW_PARENT_NODE_ID_MAX_CHARS {
+        return Err(CliError::Parse(format!(
+            "parent_node_id must be at most {EXPORT_VIEW_PARENT_NODE_ID_MAX_CHARS} chars (got {len})",
+        )));
+    }
+    Ok(())
+}
+
 fn validate_fields(fields: &str) -> Result<(), CliError> {
     let parsed: Vec<Value> = serde_json::from_str(fields)
         .map_err(|e| CliError::Parse(format!("fields must be a JSON array: {e}")))?;
@@ -845,11 +1017,13 @@ fn validate_fields(fields: &str) -> Result<(), CliError> {
 mod tests {
     use super::{
         BULK_METADATA_DETAILS_MAX_IDS, BulkMetadataDetailsResponse, CATEGORY_MAX_CHARS,
-        DESCRIPTION_MAX_CHARS, NAME_MAX_CHARS, SUGGEST_NODE_IDS_MAX, USER_CONTEXT_MAX_CHARS,
-        build_bulk_metadata_details_path, parse_bulk_metadata_details_response,
-        sanitize_terminal_string, validate_category, validate_description, validate_extract_fields,
-        validate_fields, validate_name, validate_node_ids, validate_sort_dir, validate_sort_params,
-        validate_user_context,
+        DESCRIPTION_MAX_CHARS, EXPORT_VIEW_PARENT_NODE_ID_MAX_CHARS, METADATA_SEARCH_DEEP_PAGE_MAX,
+        METADATA_SEARCH_LIMIT_MAX, METADATA_SEARCH_QUERY_MAX_CHARS, NAME_MAX_CHARS,
+        SUGGEST_NODE_IDS_MAX, USER_CONTEXT_MAX_CHARS, build_bulk_metadata_details_path,
+        parse_bulk_metadata_details_response, sanitize_terminal_string, validate_category,
+        validate_description, validate_extract_fields, validate_fields, validate_name,
+        validate_node_ids, validate_parent_node_id, validate_search_limit, validate_search_query,
+        validate_search_window, validate_sort_dir, validate_sort_params, validate_user_context,
     };
     use crate::error::CliError;
     use serde_json::json;
@@ -1266,5 +1440,82 @@ mod tests {
     fn extract_fields_accepts_valid() {
         assert!(validate_extract_fields(r#"["field1"]"#).is_ok());
         assert!(validate_extract_fields(r#"["field1","field2","field3"]"#).is_ok());
+    }
+
+    #[test]
+    fn search_query_rejects_empty() {
+        assert!(validate_search_query("").is_err());
+    }
+
+    #[test]
+    fn search_query_rejects_whitespace_only() {
+        // Defense-in-depth: caller trims, but validator must also reject
+        // whitespace-only input on its own.
+        assert!(validate_search_query("   ").is_err());
+        assert!(validate_search_query("\t\n").is_err());
+    }
+
+    #[test]
+    fn search_query_short_circuits_oversize_bytes() {
+        // 5 KB of ASCII is well past the 1024-char cap and should be
+        // rejected without walking the codepoints.
+        let s: String = "x".repeat(METADATA_SEARCH_QUERY_MAX_CHARS * 4 + 1);
+        assert!(validate_search_query(&s).is_err());
+    }
+
+    #[test]
+    fn search_query_rejects_too_long() {
+        let s: String = "x".repeat(METADATA_SEARCH_QUERY_MAX_CHARS + 1);
+        assert!(validate_search_query(&s).is_err());
+    }
+
+    #[test]
+    fn search_query_accepts_boundary_values() {
+        assert!(validate_search_query("a").is_ok());
+        let s: String = "x".repeat(METADATA_SEARCH_QUERY_MAX_CHARS);
+        assert!(validate_search_query(&s).is_ok());
+    }
+
+    #[test]
+    fn search_limit_rejects_zero_and_over_cap() {
+        assert!(validate_search_limit(0).is_err());
+        assert!(validate_search_limit(METADATA_SEARCH_LIMIT_MAX + 1).is_err());
+    }
+
+    #[test]
+    fn search_limit_accepts_boundary_values() {
+        assert!(validate_search_limit(1).is_ok());
+        assert!(validate_search_limit(METADATA_SEARCH_LIMIT_MAX).is_ok());
+    }
+
+    #[test]
+    fn search_window_rejects_overflow_window() {
+        // 9_999 + 100 (default limit) = 10_099, past the 10_000 cap.
+        assert!(validate_search_window(None, Some(9_999)).is_err());
+        // Explicit limit + offset over cap.
+        assert!(
+            validate_search_window(Some(100), Some(METADATA_SEARCH_DEEP_PAGE_MAX - 99)).is_err()
+        );
+    }
+
+    #[test]
+    fn search_window_accepts_boundary_values() {
+        // Default limit 100, offset 9_900 = 10_000 (boundary, allowed).
+        assert!(validate_search_window(None, Some(9_900)).is_ok());
+        // Smallest possible page at boundary.
+        assert!(validate_search_window(Some(1), Some(METADATA_SEARCH_DEEP_PAGE_MAX - 1)).is_ok());
+    }
+
+    #[test]
+    fn parent_node_id_rejects_too_long() {
+        let s: String = "x".repeat(EXPORT_VIEW_PARENT_NODE_ID_MAX_CHARS + 1);
+        assert!(validate_parent_node_id(&s).is_err());
+    }
+
+    #[test]
+    fn parent_node_id_accepts_boundary_values() {
+        assert!(validate_parent_node_id("x").is_ok());
+        let s: String = "x".repeat(EXPORT_VIEW_PARENT_NODE_ID_MAX_CHARS);
+        assert!(validate_parent_node_id(&s).is_ok());
     }
 }
