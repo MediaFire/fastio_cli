@@ -13,8 +13,8 @@ use std::fmt;
     long_about = None,
 )]
 pub struct Cli {
-    /// Output format (json, table, csv). Auto-detects if omitted.
-    #[arg(long, global = true, value_parser = ["json", "table", "csv"])]
+    /// Output format (json, table, csv, markdown). Auto-detects if omitted.
+    #[arg(long, global = true, value_parser = ["json", "table", "csv", "markdown", "md"])]
     pub format: Option<String>,
 
     /// Comma-separated list of fields to include in output.

@@ -120,15 +120,42 @@ All commands support `--format` to control output:
 # Table format (default for terminals)
 fastio org list
 
-# JSON format (default when piped)
+# Markdown format (default when piped; optimized for LLM consumers)
+fastio org list | cat
+
+# JSON format (for scripts that parse structured output)
 fastio org list --format json
 
 # CSV format
 fastio org list --format csv
 
+# Explicit markdown (GitHub-flavored, byte-equivalent to the server's ?output=markdown)
+fastio org list --format markdown
+# `--format md` is accepted as an alias
+
 # Filter specific fields
 fastio org list --fields name,id,description
 ```
+
+Markdown replaced JSON as the non-TTY default on 2026-04-15. The
+rendered output is **byte-equivalent** to what the Fast.io API produces
+for `?output=markdown`: a `**Result:** success|failure` preamble,
+object-valued errors promoted to a leading `# Error` section, and each
+remaining top-level key as an H1 section in insertion order. Arrays of
+associative records render as GFM pipe tables (union of keys in
+insertion order); scalar lists render as bulleted lists.
+
+Note on escaping: bullet values and heading text are **not** escaped —
+the renderer takes a light-touch approach matching the server contract,
+because the output is meant to be read or rendered, not embedded into
+other markdown. **Downstream consumers that render the output to HTML
+MUST sanitize.** The renderer does strip Unicode bidi, zero-width, and
+C0/C1 control characters as a Trojan-Source defense; table cells escape
+`|`, `\`, `` ` ``, and newlines; HTML-like cell content is wrapped in
+inline-code fences.
+
+Pipelines that need machine-parseable output can opt back in with
+`--format json`.
 
 ## Commands
 
@@ -197,6 +224,12 @@ fastio mcp
 
 This exposes all CLI functionality as MCP tools over stdio, compatible with Claude Desktop, VS Code, and other MCP-compatible clients.
 
+Tool responses are rendered as GitHub-flavored Markdown by default,
+byte-equivalent to the Fast.io API's `?output=markdown` output.
+Markdown is substantially more token-efficient for LLMs than
+pretty-printed JSON, so the MCP server uses it for every read and
+status response.
+
 ```json
 {
   "mcpServers": {
@@ -257,7 +290,7 @@ fastio configure list
 
 | Flag | Description |
 |------|-------------|
-| `--format json\|table\|csv` | Output format |
+| `--format json\|table\|csv\|markdown` | Output format (markdown is the default when piped) |
 | `--fields name,id,...` | Filter output fields |
 | `--no-color` | Disable colored output |
 | `--quiet` / `-q` | Suppress all output |
