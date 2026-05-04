@@ -48,6 +48,10 @@ pub enum MetadataCommand {
         limit: Option<u32>,
         /// Offset for pagination.
         offset: Option<u32>,
+        /// Optional template field name to sort by.
+        sort_field: Option<String>,
+        /// Sort direction (`asc` or `desc`).
+        sort_dir: Option<String>,
     },
     /// AI-based file matching for a template.
     AutoMatch {
@@ -63,7 +67,7 @@ pub enum MetadataCommand {
         /// Template ID.
         template_id: String,
     },
-    /// Extract metadata from a single file.
+    /// Enqueue an async metadata extraction for a single file.
     Extract {
         /// Workspace ID.
         workspace: String,
@@ -71,6 +75,41 @@ pub enum MetadataCommand {
         node_id: String,
         /// Template ID to extract against.
         template_id: String,
+        /// JSON-encoded array of field names for partial extraction.
+        fields: Option<String>,
+    },
+    /// Preview files that match a proposed template name + description.
+    PreviewMatch {
+        /// Workspace ID.
+        workspace: String,
+        /// Proposed template name (1-255 chars).
+        name: String,
+        /// Natural-language template description.
+        description: String,
+    },
+    /// Request AI-suggested column definitions for a proposed template.
+    SuggestFields {
+        /// Workspace ID.
+        workspace: String,
+        /// JSON-encoded array of 1-25 sample node IDs.
+        node_ids: String,
+        /// Template description.
+        description: String,
+        /// Optional short user hint (max 64 chars, letters/numbers/spaces).
+        user_context: Option<String>,
+    },
+    /// Create a metadata template (a.k.a. view).
+    CreateTemplate {
+        /// Workspace ID.
+        workspace: String,
+        /// Template name.
+        name: String,
+        /// Template description.
+        description: String,
+        /// Template category.
+        category: String,
+        /// JSON-encoded fields array (suggest-fields output is compatible).
+        fields: String,
     },
 }
 
@@ -97,7 +136,20 @@ pub async fn execute(command: &MetadataCommand, ctx: &CommandContext<'_>) -> Res
             template_id,
             limit,
             offset,
-        } => list_nodes(ctx, workspace, template_id, *limit, *offset).await,
+            sort_field,
+            sort_dir,
+        } => {
+            list_nodes(
+                ctx,
+                workspace,
+                template_id,
+                *limit,
+                *offset,
+                sort_field.as_deref(),
+                sort_dir.as_deref(),
+            )
+            .await
+        }
         MetadataCommand::AutoMatch {
             workspace,
             template_id,
@@ -110,7 +162,35 @@ pub async fn execute(command: &MetadataCommand, ctx: &CommandContext<'_>) -> Res
             workspace,
             node_id,
             template_id,
-        } => extract(ctx, workspace, node_id, template_id).await,
+            fields,
+        } => extract(ctx, workspace, node_id, template_id, fields.as_deref()).await,
+        MetadataCommand::PreviewMatch {
+            workspace,
+            name,
+            description,
+        } => preview_match(ctx, workspace, name, description).await,
+        MetadataCommand::SuggestFields {
+            workspace,
+            node_ids,
+            description,
+            user_context,
+        } => {
+            suggest_fields(
+                ctx,
+                workspace,
+                node_ids,
+                description,
+                user_context.as_deref(),
+            )
+            .await
+        }
+        MetadataCommand::CreateTemplate {
+            workspace,
+            name,
+            description,
+            category,
+            fields,
+        } => create_template(ctx, workspace, name, description, category, fields).await,
     }
 }
 
@@ -167,11 +247,21 @@ async fn list_nodes(
     template_id: &str,
     limit: Option<u32>,
     offset: Option<u32>,
+    sort_field: Option<&str>,
+    sort_dir: Option<&str>,
 ) -> Result<()> {
     let client = ctx.build_client()?;
-    let value = api::metadata::list_template_nodes(&client, workspace, template_id, limit, offset)
-        .await
-        .context("failed to list template nodes")?;
+    let value = api::metadata::list_template_nodes(
+        &client,
+        workspace,
+        template_id,
+        limit,
+        offset,
+        sort_field,
+        sort_dir,
+    )
+    .await
+    .context("failed to list template nodes")?;
     ctx.output.render(&value)?;
     Ok(())
 }
@@ -196,17 +286,69 @@ async fn extract_all(ctx: &CommandContext<'_>, workspace: &str, template_id: &st
     Ok(())
 }
 
-/// Extract metadata from a single file.
+/// Enqueue an async metadata extraction for a single file.
 async fn extract(
     ctx: &CommandContext<'_>,
     workspace: &str,
     node_id: &str,
     template_id: &str,
+    fields: Option<&str>,
 ) -> Result<()> {
     let client = ctx.build_client()?;
-    let value = api::metadata::extract_node_metadata(&client, workspace, node_id, template_id)
+    let value =
+        api::metadata::extract_node_metadata(&client, workspace, node_id, template_id, fields)
+            .await
+            .context("failed to enqueue metadata extraction")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Preview files that match a proposed template name + description.
+async fn preview_match(
+    ctx: &CommandContext<'_>,
+    workspace: &str,
+    name: &str,
+    description: &str,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::metadata::preview_match(&client, workspace, name, description)
         .await
-        .context("failed to extract metadata")?;
+        .context("failed to preview matching files")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Request AI-suggested column definitions for a proposed template.
+async fn suggest_fields(
+    ctx: &CommandContext<'_>,
+    workspace: &str,
+    node_ids: &str,
+    description: &str,
+    user_context: Option<&str>,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value =
+        api::metadata::suggest_fields(&client, workspace, node_ids, description, user_context)
+            .await
+            .context("failed to request suggested fields")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Create a metadata template (a.k.a. view) with the given column definitions.
+async fn create_template(
+    ctx: &CommandContext<'_>,
+    workspace: &str,
+    name: &str,
+    description: &str,
+    category: &str,
+    fields: &str,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value =
+        api::metadata::create_template(&client, workspace, name, description, category, fields)
+            .await
+            .context("failed to create metadata template")?;
     ctx.output.render(&value)?;
     Ok(())
 }

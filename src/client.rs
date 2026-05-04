@@ -37,6 +37,36 @@ const POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 /// Maximum number of idle connections per host in the pool.
 const POOL_MAX_IDLE_PER_HOST: usize = 10;
 
+/// Detail level for the server-side `?output=markdown` modifier.
+///
+/// Passed to [`ApiClient::get_markdown`] to control how verbose the
+/// server's markdown rendering is. The server accepts exactly these three
+/// tokens, combined with `markdown` as `?output=<detail>,markdown`; using
+/// an enum instead of a free-form string enforces the contract at the
+/// type level so callers cannot accidentally send an unrecognized token.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MarkdownDetail {
+    /// Minimal output: identifiers and headline fields only.
+    Terse,
+    /// Default output: the fields most clients need.
+    Standard,
+    /// Full output: all available fields, including administrative metadata.
+    Full,
+}
+
+impl MarkdownDetail {
+    /// Server query token for this detail level.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Terse => "terse",
+            Self::Standard => "standard",
+            Self::Full => "full",
+        }
+    }
+}
+
 /// HTTP client that wraps `reqwest` with Fast.io-specific conventions.
 pub struct ApiClient {
     /// The underlying HTTP client.
@@ -95,6 +125,64 @@ impl ApiClient {
     /// Build the full URL for a relative path.
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
+    }
+
+    /// Perform a GET request that asks the server for a markdown-rendered
+    /// response via the `?output=markdown` modifier, and returns the raw
+    /// markdown body as a string.
+    ///
+    /// The server contract (documented at
+    /// `https://api.fast.io/current/llms/full/`) guarantees that every
+    /// endpoint which returns a JSON envelope also supports this modifier,
+    /// emitting `Content-Type: text/markdown; charset=UTF-8`. Error envelopes
+    /// render as markdown too when markdown was requested; on non-2xx HTTP
+    /// statuses, the body is surfaced as `CliError::Api.message` (capped at
+    /// `ERROR_MESSAGE_MAX_BYTES`).
+    ///
+    /// `detail` selects the server's markdown verbosity and is combined
+    /// with `markdown` as `?output=<detail>,markdown`. Using
+    /// [`MarkdownDetail`] instead of a free-form string guarantees the
+    /// server only ever sees the three documented tokens.
+    /// Any `output` key present in `params` is dropped to prevent the
+    /// server from receiving duplicate `output=` query parameters.
+    ///
+    /// Currently no handler calls this method; it is infrastructure that
+    /// lets a future tool or command opt into server-authoritative markdown
+    /// instead of the client-side renderer.
+    #[allow(dead_code)]
+    pub async fn get_markdown(
+        &self,
+        path: &str,
+        params: Option<&HashMap<String, String>>,
+        detail: Option<MarkdownDetail>,
+    ) -> Result<String, CliError> {
+        let output_value = match detail {
+            Some(d) => format!("{},markdown", d.as_str()),
+            None => "markdown".to_owned(),
+        };
+        tracing::trace!(method = "GET", path, output = %output_value, "api request (markdown)");
+        // Drop any caller-supplied `output` key (case-insensitive) so the
+        // server never sees two `output=` query parameters.
+        let filtered_params: Option<Vec<(&str, &str)>> = params.map(|p| {
+            p.iter()
+                .filter(|(k, _)| !k.eq_ignore_ascii_case("output"))
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect()
+        });
+        self.send_raw_text_with_retry(|| {
+            let mut req = self
+                .inner
+                .get(self.url(path))
+                .query(&[("output", output_value.as_str())]);
+            if let Some(ref p) = filtered_params {
+                req = req.query(p);
+            }
+            if let Some(auth) = self.auth_header() {
+                req = req.header(AUTHORIZATION, auth);
+            }
+            req
+        })
+        .await
     }
 
     /// Build the `Authorization: Bearer <token>` header value.
@@ -397,6 +485,116 @@ impl ApiClient {
             .unwrap_or_else(|| CliError::Parse("request failed: all retries exhausted".to_owned())))
     }
 
+    /// Send a request with retry that returns the raw response body as text
+    /// (no JSON parse, no envelope unwrap).
+    ///
+    /// Used by the markdown fetch path: the server emits
+    /// `Content-Type: text/markdown; charset=UTF-8` which cannot be parsed as
+    /// JSON. Non-success HTTP statuses are surfaced as `CliError::Api` with
+    /// the markdown body included as the error message, matching the
+    /// behavior of `handle_response_raw` for JSON error responses. (The
+    /// server renders error envelopes as markdown when `?output=markdown`
+    /// is set, so the message is still human-readable.)
+    async fn send_raw_text_with_retry<F>(&self, build_request: F) -> Result<String, CliError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let mut last_error: Option<CliError> = None;
+
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let backoff = INITIAL_BACKOFF * 2u32.saturating_pow(attempt - 1);
+                tracing::warn!(
+                    attempt,
+                    backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+                    "retrying request after transient failure"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+
+            let req = build_request();
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+
+                    if status.as_u16() == 429 {
+                        let retry_secs = Self::parse_rate_limit_expiry(&resp);
+                        Self::emit_rate_limit_error(retry_secs);
+                        return Err(CliError::RateLimit {
+                            retry_after_secs: retry_secs,
+                        });
+                    }
+
+                    if matches!(status.as_u16(), 502..=504) && attempt < MAX_RETRIES {
+                        tracing::warn!(
+                            status = status.as_u16(),
+                            "received transient server error, will retry"
+                        );
+                        if let Err(e) = resp.error_for_status_ref() {
+                            last_error = Some(CliError::Http(e));
+                        }
+                        continue;
+                    }
+
+                    Self::check_rate_limit(&resp);
+
+                    let http_status = status.as_u16();
+                    let body = resp.text().await.map_err(|e| {
+                        CliError::Parse(format!("failed to read response body: {e}"))
+                    })?;
+
+                    if !status.is_success() {
+                        let message = if body.trim().is_empty() {
+                            format!("API request failed with HTTP {http_status}")
+                        } else {
+                            Self::truncate_for_error_message(&body)
+                        };
+                        return Err(CliError::Api(ApiError {
+                            code: 0,
+                            error_code: None,
+                            message,
+                            http_status,
+                        }));
+                    }
+
+                    return Ok(body);
+                }
+                Err(e) if Self::is_retryable_error(&e) && attempt < MAX_RETRIES => {
+                    tracing::warn!(error = %e, "transient network error, will retry");
+                    last_error = Some(CliError::Http(e));
+                }
+                Err(e) => return Err(CliError::Http(e)),
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| CliError::Parse("request failed: all retries exhausted".to_owned())))
+    }
+
+    /// Maximum length of an error-response body included in `ApiError.message`.
+    ///
+    /// Non-JSON error paths (markdown, HTML gateway pages) can produce very
+    /// large bodies. Without a cap the body flows verbatim to stderr and log
+    /// sinks via `Display`, which is hostile to both terminals and log
+    /// pipelines. 8 KB keeps multi-paragraph markdown errors readable.
+    const ERROR_MESSAGE_MAX_BYTES: usize = 8 * 1024;
+
+    /// Return the input when short; otherwise return an 8 KB prefix with a
+    /// trailing `… [truncated, N more bytes]` marker (U+2026 HORIZONTAL
+    /// ELLIPSIS, not three ASCII dots). Slicing is UTF-8-safe: the cut
+    /// point is walked back to a char boundary.
+    fn truncate_for_error_message(body: &str) -> String {
+        if body.len() <= Self::ERROR_MESSAGE_MAX_BYTES {
+            return body.to_owned();
+        }
+        let mut cut = Self::ERROR_MESSAGE_MAX_BYTES;
+        while cut > 0 && !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let remaining = body.len() - cut;
+        format!("{}\n… [truncated, {remaining} more bytes]", &body[..cut])
+    }
+
     /// Determine whether a `reqwest::Error` is transient and worth retrying.
     fn is_retryable_error(err: &reqwest::Error) -> bool {
         err.is_timeout() || err.is_connect() || err.is_request()
@@ -438,13 +636,21 @@ impl ApiClient {
             return Err(Self::extract_error(&body, status.as_u16()).into());
         }
 
-        // Unwrap: prefer "response" sub-object, fall back to top level sans "result".
+        // Unwrap behavior:
+        //   - If the body has a `response` sub-object, return that. Callers
+        //     that deserialize into concrete structs expect the payload
+        //     already unwrapped.
+        //   - Otherwise, preserve the full envelope (including `result`)
+        //     so downstream renderers — in particular the markdown
+        //     renderer, which needs `result` to produce the
+        //     `**Result:** success|failure` preamble — receive the server
+        //     envelope verbatim. `current_api_version` is dropped because
+        //     it's server-bookkeeping, not payload.
         let payload = if let Some(response_obj) = body.get("response") {
             response_obj.clone()
         } else {
             let mut map = body;
             if let Some(obj) = map.as_object_mut() {
-                obj.remove("result");
                 obj.remove("current_api_version");
             }
             map
@@ -578,5 +784,37 @@ impl ApiClient {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_body_returned_verbatim() {
+        let body = "short error";
+        assert_eq!(ApiClient::truncate_for_error_message(body), body);
+    }
+
+    #[test]
+    fn long_body_truncated_with_marker() {
+        let body = "a".repeat(ApiClient::ERROR_MESSAGE_MAX_BYTES + 1000);
+        let out = ApiClient::truncate_for_error_message(&body);
+        assert!(out.len() < body.len());
+        assert!(out.contains("[truncated, 1000 more bytes]"), "got: {out}");
+    }
+
+    #[test]
+    fn truncation_walks_back_to_char_boundary() {
+        // Build a body whose cut point (8192) would split a multi-byte char.
+        // "あ" is 3 bytes (E3 81 82); place one spanning position 8191-8193.
+        let mut body = "a".repeat(ApiClient::ERROR_MESSAGE_MAX_BYTES - 1);
+        body.push('あ');
+        body.push_str("bbb");
+        let out = ApiClient::truncate_for_error_message(&body);
+        // Output must be valid UTF-8 and contain the truncation marker.
+        assert!(out.is_char_boundary(out.len()));
+        assert!(out.contains("[truncated,"), "got: {out}");
     }
 }

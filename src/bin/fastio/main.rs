@@ -614,6 +614,9 @@ fn map_workspace_command(cmd: cli::WorkspaceCommands) -> WorkspaceCommand {
         cli::WorkspaceCommands::DisableWorkflow { workspace_id } => {
             WorkspaceCommand::DisableWorkflow { workspace_id }
         }
+        cli::WorkspaceCommands::JobsStatus { workspace_id } => {
+            WorkspaceCommand::JobsStatus { workspace_id }
+        }
         cli::WorkspaceCommands::Search {
             workspace_id,
             query,
@@ -1925,6 +1928,7 @@ fn map_lock_command(cmd: &cli::LockCommands) -> LockCommand {
 }
 
 /// Convert clap-parsed metadata commands to the internal enum.
+#[allow(clippy::too_many_lines)]
 fn map_metadata_command(cmd: cli::MetadataCommands) -> MetadataCommand {
     match cmd {
         cli::MetadataCommands::Eligible {
@@ -1959,11 +1963,15 @@ fn map_metadata_command(cmd: cli::MetadataCommands) -> MetadataCommand {
             template_id,
             limit,
             offset,
+            sort_field,
+            sort_dir,
         } => MetadataCommand::ListNodes {
             workspace,
             template_id,
             limit,
             offset,
+            sort_field,
+            sort_dir,
         },
         cli::MetadataCommands::AutoMatch {
             workspace,
@@ -1983,10 +1991,45 @@ fn map_metadata_command(cmd: cli::MetadataCommands) -> MetadataCommand {
             workspace,
             node_id,
             template_id,
+            fields,
         } => MetadataCommand::Extract {
             workspace,
             node_id,
             template_id,
+            fields,
+        },
+        cli::MetadataCommands::PreviewMatch {
+            workspace,
+            name,
+            description,
+        } => MetadataCommand::PreviewMatch {
+            workspace,
+            name,
+            description,
+        },
+        cli::MetadataCommands::SuggestFields {
+            workspace,
+            node_ids,
+            description,
+            user_context,
+        } => MetadataCommand::SuggestFields {
+            workspace,
+            node_ids,
+            description,
+            user_context,
+        },
+        cli::MetadataCommands::CreateTemplate {
+            workspace,
+            name,
+            description,
+            category,
+            fields,
+        } => MetadataCommand::CreateTemplate {
+            workspace,
+            name,
+            description,
+            category,
+            fields,
         },
     }
 }

@@ -418,6 +418,43 @@ pub async fn disable_import(client: &ApiClient, workspace_id: &str) -> Result<Va
     client.post_json(&path, &serde_json::json!({})).await
 }
 
+/// List active background jobs for a workspace.
+///
+/// Returns the workspace's job status snapshot under a top-level `jobs`
+/// object with these children (each is either an object/`null` for
+/// singleton sweeps or an array for per-resource jobs):
+///
+/// - `jobs.intelligence` — object or `null`. Workspace-wide AI-indexing
+///   sweep status.
+/// - `jobs.summarize` — object or `null`. AI-summary generation sweep.
+/// - `jobs.upsert_file` — object or `null`. File upsert / bulk-write sweep.
+/// - `jobs.metadata_extract` — array of active and recently-completed
+///   metadata extraction jobs.
+/// - `jobs.template_match` — array of active and recently-completed
+///   `auto-match` jobs.
+///
+/// Each entry in `metadata_extract` carries a `kind` discriminator:
+/// `"single"` for per-node jobs (match on `node_id` / `template_id`) and
+/// `"batch"` for template-wide `extract-all` runs (match on `template_id`).
+/// Single-job `status` values are one of `"queued"`, `"in_progress"`,
+/// `"completed"`, `"errored"`; on `"errored"`, surface `error_message`.
+///
+/// Callers must poll this endpoint after enqueueing an asynchronous
+/// extraction via [`crate::api::metadata::extract_node_metadata`] or
+/// `POST /metadata/templates/{template_id}/extract-all/` — the extraction
+/// response does not carry values; read them from `/metadata/details/`
+/// after `status == "completed"`. Stale entries (completed or errored
+/// more than one hour ago) are hidden by the server.
+///
+/// `GET /workspace/{workspace_id}/jobs/status/`
+pub async fn jobs_status(client: &ApiClient, workspace_id: &str) -> Result<Value, CliError> {
+    let path = format!(
+        "/workspace/{}/jobs/status/",
+        urlencoding::encode(workspace_id),
+    );
+    client.get(&path).await
+}
+
 /// Generic metadata API call helper.
 ///
 /// Provides a passthrough for various metadata endpoints.

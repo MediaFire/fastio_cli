@@ -109,7 +109,10 @@ impl ServerHandler for FastioMcpServer {
             instructions: Some(
                 "Fast.io MCP server -- manages files, workspaces, shares, uploads, \
                  downloads, AI chat, and workflow primitives via the Fast.io REST API. \
-                 Run `fastio auth login` in a terminal first to authenticate."
+                 Tool results are rendered as GitHub-flavored Markdown (shape-compatible \
+                 with the server-side `?output=markdown` contract) for compact, \
+                 high-signal LLM consumption. Run `fastio auth login` in a terminal \
+                 first to authenticate."
                     .to_owned(),
             ),
         }

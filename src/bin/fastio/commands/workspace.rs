@@ -69,6 +69,11 @@ pub enum WorkspaceCommand {
         /// Workspace ID.
         workspace_id: String,
     },
+    /// List active background jobs (poll after async metadata extract).
+    JobsStatus {
+        /// Workspace ID.
+        workspace_id: String,
+    },
     /// Search workspace content.
     Search {
         /// Workspace ID.
@@ -138,6 +143,7 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
         WorkspaceCommand::DisableWorkflow { workspace_id } => {
             disable_workflow(ctx, workspace_id).await
         }
+        WorkspaceCommand::JobsStatus { workspace_id } => jobs_status(ctx, workspace_id).await,
         WorkspaceCommand::Search {
             workspace_id,
             query,
@@ -267,6 +273,16 @@ async fn disable_workflow(ctx: &CommandContext<'_>, workspace_id: &str) -> Resul
     let value = api::workspace::disable_workflow(&client, workspace_id)
         .await
         .context("failed to disable workflow features")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// List active background jobs (poll target after async metadata extract).
+async fn jobs_status(ctx: &CommandContext<'_>, workspace_id: &str) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::workspace::jobs_status(&client, workspace_id)
+        .await
+        .context("failed to fetch workspace jobs status")?;
     ctx.output.render(&value)?;
     Ok(())
 }

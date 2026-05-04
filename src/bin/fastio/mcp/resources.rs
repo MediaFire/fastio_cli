@@ -43,7 +43,7 @@ pub async fn read_resource(state: &McpState, uri: &str) -> Result<ReadResourceRe
             };
             Ok(ReadResourceResult {
                 contents: vec![ResourceContents::text(
-                    serde_json::to_string_pretty(&status).unwrap_or_default(),
+                    fastio_cli::output::markdown::to_markdown(&status),
                     uri.to_owned(),
                 )],
             })

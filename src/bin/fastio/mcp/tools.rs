@@ -1,8 +1,16 @@
-/// MCP tool definitions and action-based routing for the Fast.io CLI.
-///
-/// Each tool corresponds to an API domain (auth, org, workspace, etc.)
-/// and uses an `action` parameter to select the specific operation.
-/// All tool handlers delegate to the existing `src/api/` functions.
+// `CallToolResult` is the standard MCP error payload and is shared by
+// every handler in this module; propagating it by-value in `Result::Err`
+// is the ergonomic API that rmcp expects. Boxing it would cascade
+// through ~200 handlers for no runtime benefit. Suppress the
+// `result_large_err` lint at the module level.
+#![allow(clippy::result_large_err)]
+
+//! MCP tool definitions and action-based routing for the Fast.io CLI.
+//!
+//! Each tool corresponds to an API domain (auth, org, workspace, etc.)
+//! and uses an `action` parameter to select the specific operation.
+//! All tool handlers delegate to the existing `src/api/` functions.
+
 use std::sync::Arc;
 
 use rmcp::ErrorData as McpError;
@@ -19,8 +27,14 @@ use super::McpState;
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Build a successful MCP tool result from a JSON value.
+///
+/// Returns markdown-formatted content by default, byte-equivalent to the
+/// server-side `?output=markdown` contract. Markdown is roughly 3–5×
+/// more token-efficient for LLM consumers than pretty-printed JSON
+/// across typical Fast.io list/details payloads, so MCP tool responses
+/// use it by default.
 fn success_json(value: &Value) -> CallToolResult {
-    let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    let text = fastio_cli::output::markdown::to_markdown(value);
     CallToolResult::success(vec![Content::text(text)])
 }
 
@@ -364,6 +378,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             "delete",
             "enable-workflow",
             "disable-workflow",
+            "jobs-status",
             "search",
             "limits",
             "archive",
@@ -383,6 +398,8 @@ const TOOL_DEFS: &[ToolDef] = &[
             "disable-import",
             "metadata-template-categories",
             "metadata-template-create",
+            "metadata-template-preview-match",
+            "metadata-template-suggest-fields",
             "metadata-template-delete",
             "metadata-template-list",
             "metadata-template-details",
@@ -415,6 +432,16 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("template_id", "Metadata template ID", false),
             ("category", "Metadata template category", false),
             ("fields", "JSON-encoded field definitions (metadata)", false),
+            (
+                "node_ids",
+                "JSON-encoded array of 1-25 node IDs (metadata-template-suggest-fields)",
+                false,
+            ),
+            (
+                "user_context",
+                "Short hint, max 64 chars, letters/numbers/spaces only (metadata-template-suggest-fields)",
+                false,
+            ),
             (
                 "enabled",
                 "Enabled state (true/false, metadata-template-settings)",
@@ -1071,7 +1098,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "metadata",
-        description: "Metadata extraction: list eligible files, manage template-file mappings, AI-based matching, batch and single-file extraction.",
+        description: "Metadata extraction: list eligible files, manage template-file mappings, AI-based matching, batch extraction, and async single-file extraction (returns job_id; poll via workspace jobs-status).",
         actions: &[
             "eligible",
             "add-nodes",
@@ -1092,6 +1119,21 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             ("limit", "Pagination limit", false),
             ("offset", "Pagination offset", false),
+            (
+                "sort_field",
+                "Template field name to sort by (list-nodes)",
+                false,
+            ),
+            (
+                "sort_dir",
+                "Sort direction: \"asc\" or \"desc\" (list-nodes)",
+                false,
+            ),
+            (
+                "fields",
+                "JSON-encoded array of field names for partial extraction (extract)",
+                false,
+            ),
         ],
     },
     ToolDef {
@@ -3094,6 +3136,16 @@ async fn handle_workspace(
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
+        "jobs-status" => {
+            let ws_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::workspace::jobs_status(&client, ws_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
         "enable-import" => {
             let ws_id = match required_str(args, "workspace_id") {
                 Ok(v) => v,
@@ -3150,18 +3202,44 @@ async fn handle_workspace(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            let body =
-                json!({ "name": name, "description": desc, "category": cat, "fields": fields });
-            match api::workspace::metadata_api(
-                &client,
-                ws_id,
-                "metadata/templates/",
-                "POST",
-                Some(&body),
-                None,
-            )
-            .await
-            {
+            match api::metadata::create_template(&client, ws_id, name, desc, cat, fields).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "metadata-template-preview-match" => {
+            let ws_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let name = match required_str(args, "name") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let desc = match required_str(args, "description") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::metadata::preview_match(&client, ws_id, name, desc).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "metadata-template-suggest-fields" => {
+            let ws_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let node_ids = match required_str(args, "node_ids") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let desc = match required_str(args, "description") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let user_ctx = optional_str(args, "user_context");
+            match api::metadata::suggest_fields(&client, ws_id, node_ids, desc, user_ctx).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -3333,11 +3411,8 @@ async fn handle_workspace(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            let sub = format!("storage/{}/metadata/extract/", urlencoding::encode(nid));
-            let body = json!({ "template_id": tid });
-            match api::workspace::metadata_api(&client, ws_id, &sub, "POST", Some(&body), None)
-                .await
-            {
+            let fields = optional_str(args, "fields").filter(|s| !s.trim().is_empty());
+            match api::metadata::extract_node_metadata(&client, ws_id, nid, tid, fields).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -7585,6 +7660,8 @@ async fn handle_metadata(
                 template_id,
                 optional_u32(args, "limit"),
                 optional_u32(args, "offset"),
+                optional_str(args, "sort_field"),
+                optional_str(args, "sort_dir"),
             )
             .await
             {
@@ -7633,8 +7710,15 @@ async fn handle_metadata(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            match api::metadata::extract_node_metadata(&client, workspace_id, node_id, template_id)
-                .await
+            let fields = optional_str(args, "fields").filter(|s| !s.trim().is_empty());
+            match api::metadata::extract_node_metadata(
+                &client,
+                workspace_id,
+                node_id,
+                template_id,
+                fields,
+            )
+            .await
             {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),

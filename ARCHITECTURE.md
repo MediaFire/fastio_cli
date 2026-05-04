@@ -182,7 +182,11 @@ Each module handles one command group, orchestrating API calls and output render
 - 22 action-routed tools with 286 total actions
 - Each tool has an `action` parameter for routing (mirrors the remote MCP server pattern)
 - All handlers call existing `src/api/` functions — zero duplicated API logic
-- Returns MCP text content blocks with JSON-formatted data
+- Returns MCP text content blocks with markdown-formatted data,
+  byte-equivalent to the server-side `?output=markdown` contract
+  (implementation in `output/markdown.rs`).
+  Callers that need JSON can invoke `fastio <command> --format json` from
+  the CLI side instead of the MCP path
 
 #### `resources.rs`
 - `session://status` — current auth state (authenticated, email, token expiry, scopes)
@@ -193,12 +197,41 @@ Each module handles one command group, orchestrating API calls and output render
 ### `output/`
 
 #### `mod.rs`
-- `OutputFormat` enum: Json, Table, Csv
+- `OutputFormat` enum: Json, Table, Csv, Markdown
 - `OutputConfig`: format, fields filter, no_color, quiet
-- Auto-detection: table for TTY, JSON for piped output
+- Auto-detection: table for TTY, markdown for piped output (was JSON before
+  2026-04-15; markdown is roughly 3–5× more token-efficient for LLM consumers)
 
 #### `json.rs`
 - Pretty-printed JSON via `serde_json`
+
+#### `markdown.rs`
+- GitHub-flavored Markdown renderer byte-equivalent to the server-side
+  `?output=markdown` contract (see
+  `https://api.fast.io/current/llms/full/` for the public spec).
+- Emits the `**Result:** success|failure` preamble from a scalar
+  `result` field, promotes an object-valued `error` to a leading
+  `# Error` section, and emits each remaining top-level key as an H1
+  section in insertion order.
+- Arrays of associative records render as GFM pipe tables with
+  insertion-order column union (requires the
+  `serde_json/preserve_order` feature); scalar lists render as
+  bulleted lists; mixed lists render as bulleted lists with maps
+  inlined as `**k:** v; **k:** v`.
+- Value/body text is NOT escaped — the renderer takes a light-touch
+  approach matching the server contract. HTML-sanitization is the
+  responsibility of downstream consumers that render to HTML. Table
+  cells escape only `|`, `\`, `` ` ``, and newlines; HTML-like /
+  multiline cell content is wrapped in inline-code fences.
+- Runtime safety rails orthogonal to the server contract: 4 MiB
+  output cap, 64-frame recursion cap, 256-column table cap, and
+  stripping of C0/C1 controls plus Unicode bidi / zero-width / BOM
+  code points (Trojan-Source / homoglyph defense).
+- The markdown path in `OutputConfig::render` does NOT go through
+  `flatten_response` (unlike table/CSV) — the renderer needs the
+  full envelope including `result` to produce the preamble.
+- Consumers include the MCP tool-response path (markdown is the MCP
+  default) and the top-level `--format markdown` CLI flag.
 
 #### `table.rs`
 - Table rendering via `comfy-table` with dynamic columns and color support
