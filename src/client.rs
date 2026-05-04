@@ -400,117 +400,17 @@ impl ApiClient {
         .await
     }
 
-    /// Send a request with automatic retry and exponential backoff for transient errors.
+    /// Send a request with automatic retry and exponential backoff,
+    /// returning the unprocessed [`reqwest::Response`] for body-shape-specific
+    /// handlers to parse.
     ///
-    /// Retries on connection errors, timeouts, and HTTP 502/503/504 responses.
-    /// Does not retry on client errors (4xx) or successful responses.
-    async fn send_with_retry<T, F>(&self, build_request: F) -> Result<T, CliError>
-    where
-        T: DeserializeOwned,
-        F: Fn() -> reqwest::RequestBuilder,
-    {
-        let mut last_error: Option<CliError> = None;
-
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
-                let backoff = INITIAL_BACKOFF * 2u32.saturating_pow(attempt - 1);
-                tracing::warn!(
-                    attempt,
-                    backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
-                    "retrying request after transient failure"
-                );
-                tokio::time::sleep(backoff).await;
-            }
-
-            let req = build_request();
-            match req.send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-
-                    // Retry on server gateway errors.
-                    if matches!(status.as_u16(), 502..=504) && attempt < MAX_RETRIES {
-                        tracing::warn!(
-                            status = status.as_u16(),
-                            "received transient server error, will retry"
-                        );
-                        // error_for_status() always returns Err for 5xx codes.
-                        if let Err(e) = resp.error_for_status() {
-                            last_error = Some(CliError::Http(e));
-                        }
-                        continue;
-                    }
-
-                    return self.handle_response(resp).await;
-                }
-                Err(e) if Self::is_retryable_error(&e) && attempt < MAX_RETRIES => {
-                    tracing::warn!(error = %e, "transient network error, will retry");
-                    last_error = Some(CliError::Http(e));
-                }
-                Err(e) => return Err(CliError::Http(e)),
-            }
-        }
-
-        // All retries exhausted - return the last error.
-        // `last_error` is always `Some` here because the loop body sets it
-        // on every retryable failure, but we handle `None` defensively.
-        Err(last_error
-            .unwrap_or_else(|| CliError::Parse("request failed: all retries exhausted".to_owned())))
-    }
-
-    /// Send a request with retry, returning the raw JSON response without
-    /// envelope unwrapping.
-    async fn send_with_retry_raw<T, F>(&self, build_request: F) -> Result<T, CliError>
-    where
-        T: DeserializeOwned,
-        F: Fn() -> reqwest::RequestBuilder,
-    {
-        let mut last_error: Option<CliError> = None;
-
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
-                let backoff = INITIAL_BACKOFF * 2u32.saturating_pow(attempt - 1);
-                tracing::warn!(
-                    attempt,
-                    backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
-                    "retrying request after transient failure"
-                );
-                tokio::time::sleep(backoff).await;
-            }
-
-            let req = build_request();
-            match req.send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-
-                    if matches!(status.as_u16(), 502..=504) && attempt < MAX_RETRIES {
-                        tracing::warn!(
-                            status = status.as_u16(),
-                            "received transient server error, will retry"
-                        );
-                        if let Err(e) = resp.error_for_status() {
-                            last_error = Some(CliError::Http(e));
-                        }
-                        continue;
-                    }
-
-                    return self.handle_response_raw(resp).await;
-                }
-                Err(e) if Self::is_retryable_error(&e) && attempt < MAX_RETRIES => {
-                    tracing::warn!(error = %e, "transient network error, will retry");
-                    last_error = Some(CliError::Http(e));
-                }
-                Err(e) => return Err(CliError::Http(e)),
-            }
-        }
-
-        Err(last_error
-            .unwrap_or_else(|| CliError::Parse("request failed: all retries exhausted".to_owned())))
-    }
-
-    /// Send a request with retry, returning `(http_status, body)` for both
-    /// HTTP 200 and HTTP 404 responses without envelope unwrapping. Used
-    /// by `get_partial_envelope`; see that method for the contract.
-    async fn send_with_retry_partial<F>(&self, build_request: F) -> Result<(u16, Value), CliError>
+    /// Retries on connection errors, timeouts, and HTTP 502/503/504. A 429
+    /// response is converted to [`CliError::RateLimit`] without retrying.
+    /// Rate-limit headers are checked on every successful return.
+    async fn send_request_with_retry<F>(
+        &self,
+        build_request: F,
+    ) -> Result<reqwest::Response, CliError>
     where
         F: Fn() -> reqwest::RequestBuilder,
     {
@@ -531,6 +431,7 @@ impl ApiClient {
             match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();
+                    tracing::trace!(status = status.as_u16(), "api response");
 
                     if matches!(status.as_u16(), 502..=504) && attempt < MAX_RETRIES {
                         tracing::warn!(
@@ -552,52 +453,7 @@ impl ApiClient {
                     }
 
                     Self::check_rate_limit(&resp);
-
-                    // Non-200/404 responses may legitimately have a
-                    // non-JSON body (proxy HTML error pages, empty
-                    // 401s); fall back to an empty Value so
-                    // `extract_error` can still return its default
-                    // message rather than collapsing to a parse error.
-                    let body: Value = if matches!(status.as_u16(), 200 | 404) {
-                        resp.json().await.map_err(|e| {
-                            CliError::Parse(format!(
-                                "failed to parse {} response body: {e}",
-                                status.as_u16()
-                            ))
-                        })?
-                    } else {
-                        resp.json().await.unwrap_or_default()
-                    };
-                    tracing::trace!(body = %body, "api response body (partial envelope)");
-
-                    if matches!(status.as_u16(), 200 | 404) {
-                        // The bulk-details contract uses the HTTP status
-                        // and `result: "no"` together: a 404 with
-                        // `result: "no"` is the all-errored success
-                        // case, but a 200 with `result: "no"` (or
-                        // either status with a top-level `error` and
-                        // no bulk shape) is an authoritative envelope
-                        // failure that must NOT be parsed as a bulk
-                        // body. Detect via "no `nodes`/`errors` arrays
-                        // and no non-null `node` object". A literal
-                        // `node: null` does NOT count as bulk shape —
-                        // treating it as such would let `result: "no"`
-                        // + null-node masquerade as a successful
-                        // empty result (round-2 review N3).
-                        let payload = body.get("response").unwrap_or(&body);
-                        let has_bulk_shape = payload.get("nodes").is_some_and(Value::is_array)
-                            || payload.get("errors").is_some_and(Value::is_array)
-                            || payload.get("node").is_some_and(|n| !n.is_null());
-                        let result_no = matches!(
-                            body.get("result"),
-                            Some(Value::String(s)) if s == "no"
-                        );
-                        if result_no && !has_bulk_shape {
-                            return Err(Self::extract_error(&body, status.as_u16()).into());
-                        }
-                        return Ok((status.as_u16(), body));
-                    }
-                    return Err(Self::extract_error(&body, status.as_u16()).into());
+                    return Ok(resp);
                 }
                 Err(e) if Self::is_retryable_error(&e) && attempt < MAX_RETRIES => {
                     tracing::warn!(error = %e, "transient network error, will retry");
@@ -607,11 +463,45 @@ impl ApiClient {
             }
         }
 
+        // `last_error` is always `Some` here because the loop body sets it
+        // on every retryable failure, but we handle `None` defensively.
         Err(last_error
             .unwrap_or_else(|| CliError::Parse("request failed: all retries exhausted".to_owned())))
     }
 
-    /// Send a request with retry that returns the raw response body as text
+    /// Send a request with retry; deserialize the unwrapped envelope payload.
+    async fn send_with_retry<T, F>(&self, build_request: F) -> Result<T, CliError>
+    where
+        T: DeserializeOwned,
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let resp = self.send_request_with_retry(build_request).await?;
+        self.handle_response(resp).await
+    }
+
+    /// Send a request with retry; deserialize the full JSON body without
+    /// envelope unwrapping.
+    async fn send_with_retry_raw<T, F>(&self, build_request: F) -> Result<T, CliError>
+    where
+        T: DeserializeOwned,
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let resp = self.send_request_with_retry(build_request).await?;
+        self.handle_response_raw(resp).await
+    }
+
+    /// Send a request with retry; return `(http_status, body)` for both
+    /// HTTP 200 and HTTP 404 responses without envelope unwrapping. Used
+    /// by `get_partial_envelope`; see that method for the contract.
+    async fn send_with_retry_partial<F>(&self, build_request: F) -> Result<(u16, Value), CliError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let resp = self.send_request_with_retry(build_request).await?;
+        Self::handle_response_partial(resp).await
+    }
+
+    /// Send a request with retry; return the raw response body as text
     /// (no JSON parse, no envelope unwrap).
     ///
     /// Used by the markdown fetch path: the server emits
@@ -625,76 +515,8 @@ impl ApiClient {
     where
         F: Fn() -> reqwest::RequestBuilder,
     {
-        let mut last_error: Option<CliError> = None;
-
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
-                let backoff = INITIAL_BACKOFF * 2u32.saturating_pow(attempt - 1);
-                tracing::warn!(
-                    attempt,
-                    backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
-                    "retrying request after transient failure"
-                );
-                tokio::time::sleep(backoff).await;
-            }
-
-            let req = build_request();
-            match req.send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-
-                    if status.as_u16() == 429 {
-                        let retry_secs = Self::parse_rate_limit_expiry(&resp);
-                        Self::emit_rate_limit_error(retry_secs);
-                        return Err(CliError::RateLimit {
-                            retry_after_secs: retry_secs,
-                        });
-                    }
-
-                    if matches!(status.as_u16(), 502..=504) && attempt < MAX_RETRIES {
-                        tracing::warn!(
-                            status = status.as_u16(),
-                            "received transient server error, will retry"
-                        );
-                        if let Err(e) = resp.error_for_status_ref() {
-                            last_error = Some(CliError::Http(e));
-                        }
-                        continue;
-                    }
-
-                    Self::check_rate_limit(&resp);
-
-                    let http_status = status.as_u16();
-                    let body = resp.text().await.map_err(|e| {
-                        CliError::Parse(format!("failed to read response body: {e}"))
-                    })?;
-
-                    if !status.is_success() {
-                        let message = if body.trim().is_empty() {
-                            format!("API request failed with HTTP {http_status}")
-                        } else {
-                            Self::truncate_for_error_message(&body)
-                        };
-                        return Err(CliError::Api(ApiError {
-                            code: 0,
-                            error_code: None,
-                            message,
-                            http_status,
-                        }));
-                    }
-
-                    return Ok(body);
-                }
-                Err(e) if Self::is_retryable_error(&e) && attempt < MAX_RETRIES => {
-                    tracing::warn!(error = %e, "transient network error, will retry");
-                    last_error = Some(CliError::Http(e));
-                }
-                Err(e) => return Err(CliError::Http(e)),
-            }
-        }
-
-        Err(last_error
-            .unwrap_or_else(|| CliError::Parse("request failed: all retries exhausted".to_owned())))
+        let resp = self.send_request_with_retry(build_request).await?;
+        Self::handle_response_text(resp).await
     }
 
     /// Maximum length of an error-response body included in `ApiError.message`.
@@ -726,25 +548,13 @@ impl ApiClient {
         err.is_timeout() || err.is_connect() || err.is_request()
     }
 
-    /// Process an API response: check rate limits, unwrap envelope.
+    /// Process an API response: parse JSON, check the envelope, return the
+    /// unwrapped payload.
     async fn handle_response<T: DeserializeOwned>(
         &self,
         resp: reqwest::Response,
     ) -> Result<T, CliError> {
         let status = resp.status();
-        tracing::trace!(status = status.as_u16(), "api response");
-
-        // Check for HTTP 429 before attempting to parse body.
-        if status.as_u16() == 429 {
-            let retry_secs = Self::parse_rate_limit_expiry(&resp);
-            Self::emit_rate_limit_error(retry_secs);
-            return Err(CliError::RateLimit {
-                retry_after_secs: retry_secs,
-            });
-        }
-
-        Self::check_rate_limit(&resp);
-
         let body: Value = resp
             .json()
             .await
@@ -786,26 +596,13 @@ impl ApiClient {
             .map_err(|e| CliError::Parse(format!("failed to deserialize response: {e}")))
     }
 
-    /// Process an API response without envelope unwrapping.
-    ///
-    /// Checks for rate limits and HTTP errors, then deserializes the full
-    /// JSON body directly into `T`.
+    /// Process an API response without envelope unwrapping: deserialize the
+    /// full JSON body directly into `T`.
     async fn handle_response_raw<T: DeserializeOwned>(
         &self,
         resp: reqwest::Response,
     ) -> Result<T, CliError> {
         let status = resp.status();
-        tracing::trace!(status = status.as_u16(), "api response (raw)");
-
-        if status.as_u16() == 429 {
-            let retry_secs = Self::parse_rate_limit_expiry(&resp);
-            Self::emit_rate_limit_error(retry_secs);
-            return Err(CliError::RateLimit {
-                retry_after_secs: retry_secs,
-            });
-        }
-
-        Self::check_rate_limit(&resp);
 
         if !status.is_success() {
             let body: Value = resp.json().await.unwrap_or_default();
@@ -821,6 +618,86 @@ impl ApiClient {
 
         serde_json::from_str(&body_text)
             .map_err(|e| CliError::Parse(format!("failed to deserialize response: {e}")))
+    }
+
+    /// Process an API response for the bulk-details partial-envelope contract.
+    ///
+    /// Returns `(http_status, body)` for both HTTP 200 and HTTP 404 so the
+    /// caller can distinguish full success from the all-errored case (which
+    /// the server signals as 404 + `result: "no"`). Other statuses produce
+    /// a structured error.
+    async fn handle_response_partial(resp: reqwest::Response) -> Result<(u16, Value), CliError> {
+        let status = resp.status();
+
+        // Non-200/404 responses may legitimately have a non-JSON body
+        // (proxy HTML error pages, empty 401s); fall back to an empty
+        // Value so `extract_error` can still return its default message
+        // rather than collapsing to a parse error.
+        let body: Value = if matches!(status.as_u16(), 200 | 404) {
+            resp.json().await.map_err(|e| {
+                CliError::Parse(format!(
+                    "failed to parse {} response body: {e}",
+                    status.as_u16()
+                ))
+            })?
+        } else {
+            resp.json().await.unwrap_or_default()
+        };
+        tracing::trace!(body = %body, "api response body (partial envelope)");
+
+        if matches!(status.as_u16(), 200 | 404) {
+            // The bulk-details contract uses the HTTP status and
+            // `result: "no"` together: a 404 with `result: "no"` is the
+            // all-errored success case, but a 200 with `result: "no"`
+            // (or either status with a top-level `error` and no bulk
+            // shape) is an authoritative envelope failure that must NOT
+            // be parsed as a bulk body. Detect via "no `nodes`/`errors`
+            // arrays and no non-null `node` object". A literal
+            // `node: null` does NOT count as bulk shape — treating it
+            // as such would let `result: "no"` + null-node masquerade
+            // as a successful empty result (round-2 review N3).
+            let payload = body.get("response").unwrap_or(&body);
+            let has_bulk_shape = payload.get("nodes").is_some_and(Value::is_array)
+                || payload.get("errors").is_some_and(Value::is_array)
+                || payload.get("node").is_some_and(|n| !n.is_null());
+            let result_no = matches!(
+                body.get("result"),
+                Some(Value::String(s)) if s == "no"
+            );
+            if result_no && !has_bulk_shape {
+                return Err(Self::extract_error(&body, status.as_u16()).into());
+            }
+            return Ok((status.as_u16(), body));
+        }
+        Err(Self::extract_error(&body, status.as_u16()).into())
+    }
+
+    /// Process an API response that returns text rather than JSON (e.g. the
+    /// markdown fetch path). Non-success statuses are surfaced as
+    /// `CliError::Api` with the body included as the error message.
+    async fn handle_response_text(resp: reqwest::Response) -> Result<String, CliError> {
+        let status = resp.status();
+        let http_status = status.as_u16();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| CliError::Parse(format!("failed to read response body: {e}")))?;
+
+        if !status.is_success() {
+            let message = if body.trim().is_empty() {
+                format!("API request failed with HTTP {http_status}")
+            } else {
+                Self::truncate_for_error_message(&body)
+            };
+            return Err(CliError::Api(ApiError {
+                code: 0,
+                error_code: None,
+                message,
+                http_status,
+            }));
+        }
+
+        Ok(body)
     }
 
     /// Extract a structured API error from the response body.
