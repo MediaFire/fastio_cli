@@ -68,6 +68,8 @@ pub mod event;
 pub mod files;
 /// External storage import commands.
 pub mod import;
+/// AI instructions commands (user / org / workspace / share).
+pub mod instructions;
 /// Workspace invitation commands.
 pub mod invitation;
 /// File locking commands.

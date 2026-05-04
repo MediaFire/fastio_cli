@@ -434,7 +434,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("fields", "JSON-encoded field definitions (metadata)", false),
             (
                 "node_ids",
-                "JSON-encoded array of 1-25 node IDs (metadata-template-suggest-fields)",
+                "JSON-encoded array (or comma-separated list) of 1-25 node IDs (metadata-template-suggest-fields, metadata-details)",
                 false,
             ),
             (
@@ -1098,7 +1098,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "metadata",
-        description: "Metadata extraction: list eligible files, manage template-file mappings, AI-based matching, batch extraction, and async single-file extraction (returns job_id; poll via workspace jobs-status).",
+        description: "Metadata extraction: list eligible files, manage template-file mappings, AI-based matching, batch extraction, async single-file extraction (returns job_id; poll via workspace jobs-status), lexical keyword search over metadata values, and async TSV export of the caller's saved view.",
         actions: &[
             "eligible",
             "add-nodes",
@@ -1107,6 +1107,8 @@ const TOOL_DEFS: &[ToolDef] = &[
             "auto-match",
             "extract-all",
             "extract",
+            "search",
+            "export-view",
         ],
         params: &[
             ("workspace_id", "Workspace ID", false),
@@ -1132,6 +1134,53 @@ const TOOL_DEFS: &[ToolDef] = &[
             (
                 "fields",
                 "JSON-encoded array of field names for partial extraction (extract)",
+                false,
+            ),
+            ("query", "Search keyword(s), max 1024 chars (search)", false),
+            (
+                "parent_node_id",
+                "Destination folder for export TSV (export-view; defaults to workspace root, max 64 chars)",
+                false,
+            ),
+        ],
+    },
+    ToolDef {
+        name: "instructions",
+        description: "AI instructions (markdown blob, max 65,536 raw bytes) per profile. Scopes: user (self only), org/workspace/share (profile-wide admin slot + per-user override at /me/). User has no /me/ variant. clear-* maps to DELETE; setting empty content is equivalent.",
+        actions: &[
+            "get-user",
+            "set-user",
+            "clear-user",
+            "get-org",
+            "set-org",
+            "clear-org",
+            "get-org-user",
+            "set-org-user",
+            "clear-org-user",
+            "get-workspace",
+            "set-workspace",
+            "clear-workspace",
+            "get-workspace-user",
+            "set-workspace-user",
+            "clear-workspace-user",
+            "get-share",
+            "set-share",
+            "clear-share",
+            "get-share-user",
+            "set-share-user",
+            "clear-share-user",
+        ],
+        params: &[
+            ("org_id", "Org ID (org / org-user actions)", false),
+            (
+                "workspace_id",
+                "Workspace ID (workspace / workspace-user actions)",
+                false,
+            ),
+            ("share_id", "Share ID (share / share-user actions)", false),
+            (
+                "content",
+                "Markdown content for set-* actions (max 65,536 raw bytes)",
                 false,
             ),
         ],
@@ -1209,6 +1258,7 @@ impl ToolRouter {
             "import" => handle_import(&self.state, action, &args).await,
             "lock" => handle_lock(&self.state, action, &args).await,
             "metadata" => handle_metadata(&self.state, action, &args).await,
+            "instructions" => handle_instructions(&self.state, action, &args).await,
             "system" => handle_system(&self.state, action, &args).await,
             _ => Ok(error_text(&format!("Unknown tool: {name}"))),
         }
@@ -3388,14 +3438,90 @@ async fn handle_workspace(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            let nid = match required_str(args, "node_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
+            // Accept either `node_ids` (JSON-encoded array of strings
+            // OR a comma-separated list, up to 25 unique ids per the
+            // bulk endpoint cap) or `node_id` (legacy single-id form).
+            // When more than one id is provided, route to the bulk
+            // endpoint and return the multi-format `{objects,
+            // templates, errors}` response. Otherwise behave exactly
+            // as the legacy tool.
+            let raw_ids = optional_str(args, "node_ids")
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let raw_single = optional_str(args, "node_id")
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let parsed: Vec<String> = match (raw_ids, raw_single) {
+                (Some(s), _) => {
+                    if s.starts_with('[') {
+                        match serde_json::from_str::<Vec<String>>(s) {
+                            Ok(v) => v
+                                .into_iter()
+                                .map(|p| p.trim().to_owned())
+                                .filter(|p| !p.is_empty())
+                                .collect(),
+                            Err(e) => {
+                                return Ok(CallToolResult::error(vec![Content::text(format!(
+                                    "node_ids must be a JSON array of strings or a comma-separated list: {e}"
+                                ))]));
+                            }
+                        }
+                    } else {
+                        s.split(',')
+                            .map(|p| p.trim().to_owned())
+                            .filter(|p| !p.is_empty())
+                            .collect()
+                    }
+                }
+                (None, Some(s)) => vec![s.to_owned()],
+                (None, None) => {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "Missing required parameter: node_id (or node_ids)",
+                    )]));
+                }
             };
-            let sub = format!("storage/{}/metadata/details/", urlencoding::encode(nid));
-            match api::workspace::metadata_api(&client, ws_id, &sub, "GET", None, None).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
+            if parsed.is_empty() {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "node_ids must contain at least one non-empty id",
+                )]));
+            }
+            // Dedupe case-insensitively to match server normalization.
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut unique: Vec<String> = Vec::with_capacity(parsed.len());
+            for id in parsed {
+                if seen.insert(id.to_ascii_lowercase()) {
+                    unique.push(id);
+                }
+            }
+            if unique.len() == 1 {
+                match api::metadata::get_node_metadata_details(&client, ws_id, &unique[0]).await {
+                    Ok(v) => Ok(success_json(&v)),
+                    Err(e) => Ok(cli_err_to_result(&e)),
+                }
+            } else {
+                match api::metadata::get_bulk_node_metadata_details(&client, ws_id, &unique).await {
+                    Ok(resp) => {
+                        let payload = serde_json::json!({
+                            "format": "multi",
+                            "count_total": unique.len(),
+                            "count_succeeded": resp.objects.len(),
+                            "count_errored": resp.errors.len(),
+                            "objects": resp.objects,
+                            "templates": Value::Object(resp.templates),
+                            "errors": resp
+                                .errors
+                                .iter()
+                                .map(|e| serde_json::json!({
+                                    "node_id": e.node_id,
+                                    "code": e.code,
+                                    "message": e.message,
+                                }))
+                                .collect::<Vec<_>>(),
+                        });
+                        Ok(success_json(&payload))
+                    }
+                    Err(e) => Ok(cli_err_to_result(&e)),
+                }
             }
         }
         "metadata-extract" => {
@@ -7724,7 +7850,298 @@ async fn handle_metadata(
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
+        "search" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let query = match required_str(args, "query") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let template_id = optional_str(args, "template_id").filter(|s| !s.trim().is_empty());
+            match api::metadata::search_metadata(
+                &client,
+                workspace_id,
+                query,
+                template_id,
+                optional_u32(args, "limit"),
+                optional_u32(args, "offset"),
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "export-view" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let template_id = match required_str(args, "template_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let parent_node_id =
+                optional_str(args, "parent_node_id").filter(|s| !s.trim().is_empty());
+            match api::metadata::export_view(&client, workspace_id, template_id, parent_node_id)
+                .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
         _ => Ok(error_text(&format!("Unknown metadata action: {action}"))),
+    }
+}
+
+/// AI instructions tool handler.
+#[allow(clippy::too_many_lines)]
+async fn handle_instructions(
+    state: &McpState,
+    action: &str,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    if let Err(e) = require_auth(state).await {
+        return Ok(e);
+    }
+    let client = state.client().read().await;
+    match action {
+        "get-user" => match api::instructions::get_user_instructions(&client).await {
+            Ok(v) => Ok(success_json(&v)),
+            Err(e) => Ok(cli_err_to_result(&e)),
+        },
+        "set-user" => {
+            let content = match required_str(args, "content") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::set_user_instructions(&client, content).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "clear-user" => match api::instructions::delete_user_instructions(&client).await {
+            Ok(v) => Ok(success_json(&v)),
+            Err(e) => Ok(cli_err_to_result(&e)),
+        },
+
+        "get-org" => {
+            let org_id = match required_str(args, "org_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::get_org_instructions(&client, org_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "set-org" => {
+            let org_id = match required_str(args, "org_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let content = match required_str(args, "content") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::set_org_instructions(&client, org_id, content).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "clear-org" => {
+            let org_id = match required_str(args, "org_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::delete_org_instructions(&client, org_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "get-org-user" => {
+            let org_id = match required_str(args, "org_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::get_org_user_instructions(&client, org_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "set-org-user" => {
+            let org_id = match required_str(args, "org_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let content = match required_str(args, "content") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::set_org_user_instructions(&client, org_id, content).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "clear-org-user" => {
+            let org_id = match required_str(args, "org_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::delete_org_user_instructions(&client, org_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+
+        "get-workspace" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::get_workspace_instructions(&client, workspace_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "set-workspace" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let content = match required_str(args, "content") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::set_workspace_instructions(&client, workspace_id, content)
+                .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "clear-workspace" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::delete_workspace_instructions(&client, workspace_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "get-workspace-user" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::get_workspace_user_instructions(&client, workspace_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "set-workspace-user" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let content = match required_str(args, "content") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::set_workspace_user_instructions(&client, workspace_id, content)
+                .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "clear-workspace-user" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::delete_workspace_user_instructions(&client, workspace_id).await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+
+        "get-share" => {
+            let share_id = match required_str(args, "share_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::get_share_instructions(&client, share_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "set-share" => {
+            let share_id = match required_str(args, "share_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let content = match required_str(args, "content") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::set_share_instructions(&client, share_id, content).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "clear-share" => {
+            let share_id = match required_str(args, "share_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::delete_share_instructions(&client, share_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "get-share-user" => {
+            let share_id = match required_str(args, "share_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::get_share_user_instructions(&client, share_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "set-share-user" => {
+            let share_id = match required_str(args, "share_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let content = match required_str(args, "content") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::set_share_user_instructions(&client, share_id, content).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "clear-share-user" => {
+            let share_id = match required_str(args, "share_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::instructions::delete_share_user_instructions(&client, share_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+
+        _ => Ok(error_text(&format!(
+            "Unknown instructions action: {action}"
+        ))),
     }
 }
 

@@ -20,6 +20,7 @@ use commands::download::DownloadCommand;
 use commands::event::EventCommand;
 use commands::files::{FileLockCommand, FilesCommand};
 use commands::import::ImportCommand;
+use commands::instructions::InstructionsCommand;
 use commands::invitation::InvitationCommand;
 use commands::lock::LockCommand;
 use commands::member::MemberCommand;
@@ -151,6 +152,9 @@ async fn dispatch(
         Commands::Import(c) => commands::import::execute(&map_import_command(&c), ctx).await,
         Commands::Lock(c) => commands::lock::execute(&map_lock_command(&c), ctx).await,
         Commands::Metadata(c) => commands::metadata::execute(&map_metadata_command(c), ctx).await,
+        Commands::Instructions(c) => {
+            commands::instructions::execute(&map_instructions_command(c), ctx).await
+        }
         Commands::System(c) => commands::system::execute(&map_system_command(&c), ctx).await,
         Commands::Completions { shell } => {
             generate_completions(shell);
@@ -730,9 +734,13 @@ fn map_files_command(cmd: cli::FilesCommands) -> FilesCommand {
             page_size,
             cursor,
         },
-        cli::FilesCommands::Info { workspace, node_id } => {
-            FilesCommand::Info { workspace, node_id }
-        }
+        cli::FilesCommands::Info {
+            workspace,
+            node_ids,
+        } => FilesCommand::Info {
+            workspace,
+            node_ids,
+        },
         cli::FilesCommands::CreateFolder {
             workspace,
             name,
@@ -878,12 +886,18 @@ fn map_upload_command(cmd: cli::UploadCommands) -> UploadCommand {
     match cmd {
         cli::UploadCommands::File {
             workspace,
-            file_path,
+            file_paths,
             folder,
+            preserve_tree,
+            allow_partial,
+            creator,
         } => UploadCommand::File {
             workspace,
-            file_path,
+            file_paths,
             folder,
+            preserve_tree,
+            allow_partial,
+            creator,
         },
         cli::UploadCommands::Text {
             workspace,
@@ -1987,6 +2001,13 @@ fn map_metadata_command(cmd: cli::MetadataCommands) -> MetadataCommand {
             workspace,
             template_id,
         },
+        cli::MetadataCommands::Details {
+            workspace,
+            node_ids,
+        } => MetadataCommand::Details {
+            workspace,
+            node_ids,
+        },
         cli::MetadataCommands::Extract {
             workspace,
             node_id,
@@ -2031,6 +2052,99 @@ fn map_metadata_command(cmd: cli::MetadataCommands) -> MetadataCommand {
             category,
             fields,
         },
+        cli::MetadataCommands::Search {
+            workspace,
+            query,
+            template_id,
+            limit,
+            offset,
+        } => MetadataCommand::Search {
+            workspace,
+            query,
+            template_id,
+            limit,
+            offset,
+        },
+        cli::MetadataCommands::ExportView {
+            workspace,
+            template_id,
+            parent_node_id,
+        } => MetadataCommand::ExportView {
+            workspace,
+            template_id,
+            parent_node_id,
+        },
+    }
+}
+
+/// Convert clap-parsed instructions commands to the internal enum.
+#[allow(clippy::too_many_lines)]
+fn map_instructions_command(cmd: cli::InstructionsCommands) -> InstructionsCommand {
+    match cmd {
+        cli::InstructionsCommands::GetUser => InstructionsCommand::GetUser,
+        cli::InstructionsCommands::SetUser { content } => InstructionsCommand::SetUser { content },
+        cli::InstructionsCommands::ClearUser => InstructionsCommand::ClearUser,
+
+        cli::InstructionsCommands::GetOrg { org_id } => InstructionsCommand::GetOrg { org_id },
+        cli::InstructionsCommands::SetOrg { org_id, content } => {
+            InstructionsCommand::SetOrg { org_id, content }
+        }
+        cli::InstructionsCommands::ClearOrg { org_id } => InstructionsCommand::ClearOrg { org_id },
+        cli::InstructionsCommands::GetOrgUser { org_id } => {
+            InstructionsCommand::GetOrgUser { org_id }
+        }
+        cli::InstructionsCommands::SetOrgUser { org_id, content } => {
+            InstructionsCommand::SetOrgUser { org_id, content }
+        }
+        cli::InstructionsCommands::ClearOrgUser { org_id } => {
+            InstructionsCommand::ClearOrgUser { org_id }
+        }
+
+        cli::InstructionsCommands::GetWorkspace { workspace_id } => {
+            InstructionsCommand::GetWorkspace { workspace_id }
+        }
+        cli::InstructionsCommands::SetWorkspace {
+            workspace_id,
+            content,
+        } => InstructionsCommand::SetWorkspace {
+            workspace_id,
+            content,
+        },
+        cli::InstructionsCommands::ClearWorkspace { workspace_id } => {
+            InstructionsCommand::ClearWorkspace { workspace_id }
+        }
+        cli::InstructionsCommands::GetWorkspaceUser { workspace_id } => {
+            InstructionsCommand::GetWorkspaceUser { workspace_id }
+        }
+        cli::InstructionsCommands::SetWorkspaceUser {
+            workspace_id,
+            content,
+        } => InstructionsCommand::SetWorkspaceUser {
+            workspace_id,
+            content,
+        },
+        cli::InstructionsCommands::ClearWorkspaceUser { workspace_id } => {
+            InstructionsCommand::ClearWorkspaceUser { workspace_id }
+        }
+
+        cli::InstructionsCommands::GetShare { share_id } => {
+            InstructionsCommand::GetShare { share_id }
+        }
+        cli::InstructionsCommands::SetShare { share_id, content } => {
+            InstructionsCommand::SetShare { share_id, content }
+        }
+        cli::InstructionsCommands::ClearShare { share_id } => {
+            InstructionsCommand::ClearShare { share_id }
+        }
+        cli::InstructionsCommands::GetShareUser { share_id } => {
+            InstructionsCommand::GetShareUser { share_id }
+        }
+        cli::InstructionsCommands::SetShareUser { share_id, content } => {
+            InstructionsCommand::SetShareUser { share_id, content }
+        }
+        cli::InstructionsCommands::ClearShareUser { share_id } => {
+            InstructionsCommand::ClearShareUser { share_id }
+        }
     }
 }
 

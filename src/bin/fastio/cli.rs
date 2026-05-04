@@ -128,6 +128,10 @@ pub enum Commands {
     #[command(subcommand)]
     Metadata(MetadataCommands),
 
+    /// AI instructions for user / org / workspace / share profiles.
+    #[command(subcommand)]
+    Instructions(InstructionsCommands),
+
     /// System health and status checks (no auth required).
     #[command(subcommand)]
     System(SystemCommands),
@@ -1145,13 +1149,25 @@ pub enum FilesCommands {
         #[arg(long)]
         cursor: Option<String>,
     },
-    /// Get details for a file or folder.
+    /// Get details for one or more files or folders.
+    ///
+    /// A single node ID (after dedup) returns the existing single-node
+    /// response shape (`{node: {...}}`). Two or more unique IDs
+    /// auto-route to the bulk `/storage/{ids}/details/` endpoint and
+    /// return `{count_*, nodes: [...], errors: [...]}` (per-id errors
+    /// are normal). Calls with more than 25 IDs are chunked
+    /// client-side. The CLI accepts at most 1000 IDs per invocation
+    /// to bound wall-time and rate-limit footprint — going over
+    /// produces a clear error message (the runtime cap is enforced
+    /// in `info()` rather than at clap-parse time so the message
+    /// can include the actual count).
     Info {
         /// Workspace ID.
         #[arg(long)]
         workspace: String,
-        /// Storage node ID.
-        node_id: String,
+        /// One or more storage node IDs (positional).
+        #[arg(required = true, num_args = 1..)]
+        node_ids: Vec<String>,
     },
     /// Create a new folder.
     #[command(name = "create-folder")]
@@ -1366,16 +1382,36 @@ pub enum FileLockCommands {
 #[derive(Subcommand, Debug)]
 #[non_exhaustive]
 pub enum UploadCommands {
-    /// Upload a local file with progress bar.
+    /// Upload one or more local files.
+    ///
+    /// A single path uses the single-file pipeline (single-call for ≤ 4 MB,
+    /// chunked otherwise). Two or more paths auto-route through the batch
+    /// endpoint (`/upload/batch/`): small files are packed into sequential
+    /// batches of ≤ 200 files / ≤ 100 MB, oversize files (> 4 MB) fall back
+    /// to the chunked pipeline per file.
     File {
         /// Workspace ID.
         #[arg(long)]
         workspace: String,
-        /// Path to the local file.
-        file_path: String,
+        /// One or more local files to upload.
+        #[arg(num_args = 1.., required_unless_present = "preserve_tree")]
+        file_paths: Vec<String>,
         /// Destination folder node ID (defaults to root).
         #[arg(long)]
         folder: Option<String>,
+        /// Upload an entire directory tree, preserving sub-folder structure
+        /// via per-file `relative_path`. Mutually exclusive with positional
+        /// file paths.
+        #[arg(long, value_name = "DIR", conflicts_with = "file_paths")]
+        preserve_tree: Option<String>,
+        /// Exit 0 even if some files in a batch errored. Without this flag,
+        /// any per-file error causes a nonzero exit with a summary.
+        #[arg(long)]
+        allow_partial: bool,
+        /// Optional echo-back correlation tag (1-150 chars, alphanumeric and
+        /// hyphens only). Passed through to the server on batch uploads.
+        #[arg(long)]
+        creator: Option<String>,
     },
     /// Upload text content as a file.
     Text {
@@ -3015,6 +3051,24 @@ pub enum MetadataCommands {
         #[arg(long)]
         template_id: String,
     },
+    /// Get metadata details for one or more files.
+    ///
+    /// A single node ID (after dedup) returns the existing single-node
+    /// response shape (the metadata object as the body). Two or more
+    /// unique IDs auto-route to the bulk
+    /// `/storage/{ids}/metadata/details/` endpoint and return
+    /// `{count_*, objects: [...], templates: {...}, errors: [...]}`
+    /// (per-id errors are normal). Calls with more than 25 IDs are
+    /// chunked client-side. The CLI accepts at most 1000 IDs per
+    /// invocation to bound wall-time and rate-limit footprint.
+    Details {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// One or more storage node IDs (positional).
+        #[arg(required = true, num_args = 1..)]
+        node_ids: Vec<String>,
+    },
     /// Enqueue an async metadata extraction for a single file. Usually
     /// returns a `job_id`; poll `workspace jobs-status` until status is
     /// "completed", then read values from the metadata details endpoint.
@@ -3083,6 +3137,226 @@ pub enum MetadataCommands {
         /// JSON-encoded array of column definitions (compatible with suggest-fields output).
         #[arg(long)]
         fields: String,
+    },
+    /// Lexical keyword search over workspace metadata field values.
+    ///
+    /// Multi-token queries require ALL tokens to appear (case-insensitive).
+    /// Substring matching applies for queries up to 64 chars; longer
+    /// queries are matched word-by-word. Indexing is asynchronous (1–2 s)
+    /// — do not search-immediately-after-write as a correctness check.
+    Search {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Search keyword(s) (max 1024 chars; whitespace-trimmed).
+        query: String,
+        /// Restrict to nodes with at least one value contributed by this
+        /// template (custom fields are excluded when set).
+        #[arg(long)]
+        template_id: Option<String>,
+        /// Page size (1-100, default 100 server-side; combined with
+        /// offset, must not exceed 10000).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Skip-N offset (offset + limit may not exceed 10000).
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Enqueue an async TSV export of the caller's saved view for a template.
+    ///
+    /// The TSV is written into the destination folder by a background
+    /// worker; poll the destination folder for the resulting filename.
+    /// Same-view + same-destination calls while a prior job is in
+    /// flight return `status: "duplicate"` instead of stacking.
+    #[command(name = "export-view")]
+    ExportView {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Template ID the saved view belongs to.
+        #[arg(long)]
+        template_id: String,
+        /// Destination folder node ID (defaults to workspace root). Max
+        /// 64 chars.
+        #[arg(long)]
+        parent_node_id: Option<String>,
+    },
+}
+
+// ─── Instructions ─────────────────────────────────────────────────────────────
+
+/// AI instructions subcommands.
+///
+/// `content` is a markdown blob up to 65,536 raw bytes (multibyte chars
+/// count for more than one). Setting an empty string is equivalent to
+/// `clear`. Profile-wide writes (`set-org`, `set-workspace`, `set-share`)
+/// require admin/owner privilege; the `*-user` variants write the
+/// caller's own per-user override.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum InstructionsCommands {
+    /// Get the calling user's self-scoped AI instructions.
+    #[command(name = "get-user")]
+    GetUser,
+    /// Set the calling user's self-scoped AI instructions.
+    #[command(name = "set-user")]
+    SetUser {
+        /// Markdown content (up to 65,536 raw bytes).
+        #[arg(long, allow_hyphen_values = true)]
+        content: String,
+    },
+    /// Clear the calling user's self-scoped AI instructions.
+    #[command(name = "clear-user")]
+    ClearUser,
+
+    /// Get the org-wide AI instructions.
+    #[command(name = "get-org")]
+    GetOrg {
+        /// Org ID.
+        #[arg(long)]
+        org_id: String,
+    },
+    /// Set the org-wide AI instructions (owner / admin only).
+    #[command(name = "set-org")]
+    SetOrg {
+        /// Org ID.
+        #[arg(long)]
+        org_id: String,
+        /// Markdown content (up to 65,536 raw bytes).
+        #[arg(long, allow_hyphen_values = true)]
+        content: String,
+    },
+    /// Clear the org-wide AI instructions (owner / admin only).
+    #[command(name = "clear-org")]
+    ClearOrg {
+        /// Org ID.
+        #[arg(long)]
+        org_id: String,
+    },
+    /// Get the calling user's per-user override of an org's instructions.
+    #[command(name = "get-org-user")]
+    GetOrgUser {
+        /// Org ID.
+        #[arg(long)]
+        org_id: String,
+    },
+    /// Set the calling user's per-user override of an org's instructions.
+    #[command(name = "set-org-user")]
+    SetOrgUser {
+        /// Org ID.
+        #[arg(long)]
+        org_id: String,
+        /// Markdown content (up to 65,536 raw bytes).
+        #[arg(long, allow_hyphen_values = true)]
+        content: String,
+    },
+    /// Clear the calling user's per-user override of an org's instructions.
+    #[command(name = "clear-org-user")]
+    ClearOrgUser {
+        /// Org ID.
+        #[arg(long)]
+        org_id: String,
+    },
+
+    /// Get the workspace-wide AI instructions.
+    #[command(name = "get-workspace")]
+    GetWorkspace {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace_id: String,
+    },
+    /// Set the workspace-wide AI instructions (owner / admin only).
+    #[command(name = "set-workspace")]
+    SetWorkspace {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace_id: String,
+        /// Markdown content (up to 65,536 raw bytes).
+        #[arg(long, allow_hyphen_values = true)]
+        content: String,
+    },
+    /// Clear the workspace-wide AI instructions (owner / admin only).
+    #[command(name = "clear-workspace")]
+    ClearWorkspace {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace_id: String,
+    },
+    /// Get the calling user's per-user override of a workspace's instructions.
+    #[command(name = "get-workspace-user")]
+    GetWorkspaceUser {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace_id: String,
+    },
+    /// Set the calling user's per-user override of a workspace's instructions.
+    /// Blocked for guests.
+    #[command(name = "set-workspace-user")]
+    SetWorkspaceUser {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace_id: String,
+        /// Markdown content (up to 65,536 raw bytes).
+        #[arg(long, allow_hyphen_values = true)]
+        content: String,
+    },
+    /// Clear the calling user's per-user override of a workspace's instructions.
+    #[command(name = "clear-workspace-user")]
+    ClearWorkspaceUser {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace_id: String,
+    },
+
+    /// Get the share-wide AI instructions.
+    #[command(name = "get-share")]
+    GetShare {
+        /// Share ID.
+        #[arg(long)]
+        share_id: String,
+    },
+    /// Set the share-wide AI instructions (owner / admin only).
+    #[command(name = "set-share")]
+    SetShare {
+        /// Share ID.
+        #[arg(long)]
+        share_id: String,
+        /// Markdown content (up to 65,536 raw bytes).
+        #[arg(long, allow_hyphen_values = true)]
+        content: String,
+    },
+    /// Clear the share-wide AI instructions (owner / admin only).
+    #[command(name = "clear-share")]
+    ClearShare {
+        /// Share ID.
+        #[arg(long)]
+        share_id: String,
+    },
+    /// Get the calling user's per-user override of a share's instructions.
+    /// Registered share members only — anonymous/link guests blocked.
+    #[command(name = "get-share-user")]
+    GetShareUser {
+        /// Share ID.
+        #[arg(long)]
+        share_id: String,
+    },
+    /// Set the calling user's per-user override of a share's instructions.
+    /// Registered share members only.
+    #[command(name = "set-share-user")]
+    SetShareUser {
+        /// Share ID.
+        #[arg(long)]
+        share_id: String,
+        /// Markdown content (up to 65,536 raw bytes).
+        #[arg(long, allow_hyphen_values = true)]
+        content: String,
+    },
+    /// Clear the calling user's per-user override of a share's instructions.
+    #[command(name = "clear-share-user")]
+    ClearShareUser {
+        /// Share ID.
+        #[arg(long)]
+        share_id: String,
     },
 }
 
