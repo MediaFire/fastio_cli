@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/MediaFire/fastio_cli"
+    "url": "git+https://github.com/MediaFire/fastio_cli.git"
   },
   "homepage": "https://fast.io",
   "keywords": [
