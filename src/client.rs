@@ -330,6 +330,34 @@ impl ApiClient {
         .await
     }
 
+    /// Perform a JSON POST and return the raw JSON body **without** the
+    /// `result`/`response` envelope unwrap.
+    ///
+    /// Prefer [`Self::post_json`] for endpoints that follow the standard
+    /// `{"result": "yes", "response": …}` envelope. Use this for endpoints
+    /// whose success body does not (e.g. AI chat cancel, which returns
+    /// `{"success": true, …}` on 2xx). Non-2xx responses are surfaced as
+    /// `CliError::Api` via [`Self::extract_error`], which recognizes both
+    /// the nested standard envelope and a flat
+    /// `{"error_message": …, "error_id": …}` shape. Callers are
+    /// responsible for inspecting the returned 2xx body for any
+    /// application-level error fields.
+    pub async fn post_json_raw<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<T, CliError> {
+        tracing::trace!(method = "POST", path, body = %body, "api request (json, raw)");
+        self.send_with_retry_raw(|| {
+            let mut req = self.inner.post(self.url(path)).json(body);
+            if let Some(auth) = self.auth_header() {
+                req = req.header(AUTHORIZATION, auth);
+            }
+            req
+        })
+        .await
+    }
+
     /// Perform a GET request and return the parsed JSON body for both
     /// HTTP 200 and HTTP 404 responses, without unwrapping the
     /// `result`/`response` envelope.
@@ -701,6 +729,18 @@ impl ApiClient {
     }
 
     /// Extract a structured API error from the response body.
+    ///
+    /// Recognizes two envelope shapes:
+    ///
+    /// - **Nested** (the standard Fast.io envelope):
+    ///   `{"result": "no", "error": {"code": …, "text"|"message": …,
+    ///   "error_code": …}}`. Mined first.
+    /// - **Flat** (used by the AI chat cancel endpoint and any future
+    ///   non-conforming endpoints): `{"result": false, "error_message": …,
+    ///   "error_id": …}`. Tried as a fallback when no nested `error` object
+    ///   is present, so live HTTP 4xx/5xx responses surface the server's
+    ///   actual message instead of the generic
+    ///   `"API request failed with HTTP {status}"` placeholder.
     fn extract_error(body: &Value, http_status: u16) -> ApiError {
         if let Some(err) = body.get("error") {
             let code = err.get("code").and_then(Value::as_u64).unwrap_or(0);
@@ -718,6 +758,40 @@ impl ApiClient {
                 code: u32::try_from(code).unwrap_or(0),
                 error_code,
                 message,
+                http_status,
+            };
+        }
+
+        if let Some(message) = body
+            .get("error_message")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            // `error_id` is documented numeric on at least the cancel
+            // endpoint; accept either a number or a numeric string for
+            // forward-compatibility. Server IDs may exceed u32; emit a
+            // trace warning when narrowing collapses a non-zero ID to 0
+            // so support can correlate to the raw body if needed.
+            let raw_id = body.get("error_id").and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+            });
+            let code = raw_id
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or_else(|| {
+                    if let Some(n) = raw_id {
+                        tracing::warn!(
+                            error_id = n,
+                            http_status,
+                            "API error_id exceeds u32; truncating ApiError.code to 0"
+                        );
+                    }
+                    0
+                });
+            return ApiError {
+                code,
+                error_code: None,
+                message: message.to_owned(),
                 http_status,
             };
         }
@@ -819,5 +893,80 @@ mod tests {
         // Output must be valid UTF-8 and contain the truncation marker.
         assert!(out.is_char_boundary(out.len()));
         assert!(out.contains("[truncated,"), "got: {out}");
+    }
+
+    #[test]
+    fn extract_error_uses_nested_envelope_when_present() {
+        let body = serde_json::json!({
+            "result": "no",
+            "error": {"code": 1605, "text": "bad hash", "error_code": "APP_BAD_HASH"},
+        });
+        let err = ApiClient::extract_error(&body, 403);
+        assert_eq!(err.code, 1605);
+        assert_eq!(err.message, "bad hash");
+        assert_eq!(err.error_code.as_deref(), Some("APP_BAD_HASH"));
+        assert_eq!(err.http_status, 403);
+    }
+
+    #[test]
+    fn extract_error_falls_back_to_flat_envelope() {
+        // Cancel-endpoint error shape: flat `error_message` / `error_id`,
+        // no nested `error` object. Must surface the server's actual
+        // message rather than the generic placeholder.
+        let body = serde_json::json!({
+            "result": false,
+            "error_message": "Chat not found",
+            "error_id": 12_345,
+        });
+        let err = ApiClient::extract_error(&body, 406);
+        assert_eq!(err.message, "Chat not found");
+        assert_eq!(err.code, 12_345);
+        assert_eq!(err.http_status, 406);
+        assert!(err.error_code.is_none());
+    }
+
+    #[test]
+    fn extract_error_flat_envelope_accepts_string_id() {
+        let body = serde_json::json!({
+            "error_message": "permission denied",
+            "error_id": "67890",
+        });
+        let err = ApiClient::extract_error(&body, 406);
+        assert_eq!(err.code, 67_890);
+        assert_eq!(err.message, "permission denied");
+    }
+
+    #[test]
+    fn extract_error_flat_envelope_truncates_oversize_id_to_zero() {
+        // 19-digit Fast.io entity IDs overflow u32; ApiError.code is u32
+        // throughout the codebase. Verify the narrowing collapses to 0
+        // without panicking and the message still surfaces.
+        let body = serde_json::json!({
+            "error_message": "rejected",
+            "error_id": "4687730903718774523",
+        });
+        let err = ApiClient::extract_error(&body, 406);
+        assert_eq!(err.code, 0);
+        assert_eq!(err.message, "rejected");
+    }
+
+    #[test]
+    fn extract_error_falls_through_to_generic_message_when_no_known_shape() {
+        let body = serde_json::json!({"some_other_field": "value"});
+        let err = ApiClient::extract_error(&body, 502);
+        assert_eq!(err.code, 0);
+        assert_eq!(err.message, "API request failed with HTTP 502");
+        assert_eq!(err.http_status, 502);
+    }
+
+    #[test]
+    fn extract_error_empty_flat_message_falls_through_to_generic() {
+        // An empty `error_message` would render as a blank line to the
+        // user; treat it as no usable message and surface the generic
+        // placeholder instead.
+        let body = serde_json::json!({"error_message": "", "error_id": 99});
+        let err = ApiClient::extract_error(&body, 406);
+        assert_eq!(err.message, "API request failed with HTTP 406");
+        assert_eq!(err.code, 0);
     }
 }

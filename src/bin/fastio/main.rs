@@ -1397,6 +1397,18 @@ fn map_ai_command(cmd: cli::AiCommands) -> AiCommand {
             workspace,
             node_ids,
         },
+        cli::AiCommands::Cancel {
+            workspace,
+            share,
+            chat_id,
+        } => {
+            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
+            AiCommand::Cancel {
+                profile_type,
+                profile_id,
+                chat_id,
+            }
+        }
     }
 }
 
@@ -1507,7 +1519,7 @@ fn map_task_list_command(cmd: cli::TaskListCommands) -> TaskListCommand {
             limit,
             offset,
         } => {
-            let (profile_type, profile_id) = resolve_todo_profile(workspace, share);
+            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
             TaskListCommand::List {
                 profile_type,
                 profile_id,
@@ -1657,7 +1669,7 @@ fn map_todo_command(cmd: cli::TodoCommands) -> TodoCommand {
             title,
             assignee_id,
         } => {
-            let (profile_type, profile_id) = resolve_todo_profile(workspace, share);
+            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
             TodoCommand::Create {
                 profile_type,
                 profile_id,
@@ -1684,7 +1696,7 @@ fn map_todo_command(cmd: cli::TodoCommands) -> TodoCommand {
             todo_ids,
             done,
         } => {
-            let (profile_type, profile_id) = resolve_todo_profile(workspace, share);
+            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
             let ids: Vec<String> = todo_ids.split(',').map(|s| s.trim().to_owned()).collect();
             TodoCommand::BulkToggle {
                 profile_type,
@@ -1701,7 +1713,10 @@ fn map_todo_command(cmd: cli::TodoCommands) -> TodoCommand {
 /// Clap ensures at least one of `workspace` or `share` is present via
 /// `required_unless_present`. If both are `None` (should not happen), returns
 /// an empty workspace profile ID which will fail server-side.
-fn resolve_todo_profile(workspace: Option<String>, share: Option<String>) -> (String, String) {
+fn resolve_workspace_or_share_profile(
+    workspace: Option<String>,
+    share: Option<String>,
+) -> (String, String) {
     if let Some(sid) = share {
         ("share".to_owned(), sid)
     } else if let Some(wid) = workspace {

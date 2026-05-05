@@ -63,6 +63,15 @@ pub enum AiCommand {
         /// File node IDs to include in the summary (at least one required).
         node_ids: Vec<String>,
     },
+    /// Cancel an in-progress chat message.
+    Cancel {
+        /// Profile type: `workspace` or `share`.
+        profile_type: String,
+        /// Profile ID (workspace ID or share ID).
+        profile_id: String,
+        /// Chat ID.
+        chat_id: String,
+    },
 }
 
 /// Execute an AI subcommand.
@@ -103,6 +112,11 @@ pub async fn execute(command: &AiCommand, ctx: &CommandContext<'_>) -> Result<()
             workspace,
             node_ids,
         } => summary(ctx, workspace, node_ids).await,
+        AiCommand::Cancel {
+            profile_type,
+            profile_id,
+            chat_id,
+        } => cancel(ctx, profile_type, profile_id, chat_id).await,
     }
 }
 
@@ -310,6 +324,27 @@ async fn summary(ctx: &CommandContext<'_>, workspace: &str, node_ids: &[String])
     let value = api::ai::summarize(&client, workspace, node_ids)
         .await
         .context("failed to generate AI summary")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Cancel an in-progress chat message.
+///
+/// `profile_type` and `profile_id` are pre-resolved by `map_ai_command` from
+/// the clap-enforced `--workspace` xor `--share` flags, so the handler does
+/// not re-validate that invariant. ID trimming and `profile_type`
+/// whitelisting happen inside `cancel_message` so the MCP path benefits
+/// from the same guards.
+async fn cancel(
+    ctx: &CommandContext<'_>,
+    profile_type: &str,
+    profile_id: &str,
+    chat_id: &str,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::ai::cancel_message(&client, profile_type, profile_id, chat_id)
+        .await
+        .context("failed to cancel AI chat message")?;
     ctx.output.render(&value)?;
     Ok(())
 }

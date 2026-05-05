@@ -2151,6 +2151,18 @@ pub enum AiCommands {
         /// File node IDs to include in the summary (at least one required).
         node_ids: Vec<String>,
     },
+    /// Cancel an in-progress chat message (idempotent; safe when nothing is pending).
+    Cancel {
+        /// Workspace ID.
+        #[arg(long, required_unless_present = "share")]
+        workspace: Option<String>,
+        /// Share ID (alternative to workspace).
+        #[arg(long, conflicts_with = "workspace")]
+        share: Option<String>,
+        /// Chat ID.
+        #[arg(long)]
+        chat_id: String,
+    },
 }
 
 // ─── Task ───────────────────────────────────────────────────────────────────

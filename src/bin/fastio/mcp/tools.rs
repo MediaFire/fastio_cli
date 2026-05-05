@@ -681,7 +681,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "ai",
-        description: "AI: chat create/list/details/update/delete/publish, message send/list/details/read, search, share-generate, transactions, autotitle.",
+        description: "AI: chat create/list/details/update/delete/publish/cancel, message send/list/details/read, search, share-generate, transactions, autotitle.",
         actions: &[
             "chat-create",
             "chat-list",
@@ -689,6 +689,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             "chat-update",
             "chat-delete",
             "chat-publish",
+            "chat-cancel",
             "message-send",
             "message-list",
             "message-details",
@@ -5116,6 +5117,7 @@ async fn handle_ai(
         "chat-update" => handle_ai_chat_update(state, args).await,
         "chat-delete" => handle_ai_chat_delete(state, args).await,
         "chat-publish" => handle_ai_chat_publish(state, args).await,
+        "chat-cancel" => handle_ai_chat_cancel(state, args).await,
         "message-send" => handle_ai_message_send(state, args).await,
         "message-list" => handle_ai_message_list(state, args).await,
         "message-details" | "message-read" => handle_ai_message_details(state, args).await,
@@ -5290,6 +5292,26 @@ async fn handle_ai_chat_publish(
     };
     let sub = format!("chat/{}/publish/", urlencoding::encode(chat_id));
     match api::ai::ai_api(&client, ctx_type, ctx_id, &sub, "POST", None, None).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+async fn handle_ai_chat_cancel(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let ctx_type = optional_str(args, "context_type").unwrap_or("workspace");
+    let ctx_id = match required_str(args, "context_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let chat_id = match required_str(args, "chat_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::ai::cancel_message(&client, ctx_type, ctx_id, chat_id).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
