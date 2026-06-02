@@ -61,6 +61,22 @@ impl McpState {
         self.client.write().await.set_token(token);
         *self.authenticated.write().await = true;
     }
+
+    /// Construct an unauthenticated state for unit tests.
+    ///
+    /// Used by tool-router tests to exercise dispatch (e.g. the hidden `ai`
+    /// alias routing to the ripley handler) without a live session — calls
+    /// short-circuit at `require_auth`, which is enough to prove the alias
+    /// reached the correct handler rather than the unknown-tool arm.
+    #[cfg(test)]
+    pub fn new_unauthenticated_for_test(api_base: &str) -> Self {
+        let client = ApiClient::new(api_base, None).expect("test client should construct");
+        McpState {
+            client: RwLock::new(client),
+            api_base: api_base.to_owned(),
+            authenticated: RwLock::new(false),
+        }
+    }
 }
 
 /// The MCP server handler that routes tool calls, resources, and prompts.

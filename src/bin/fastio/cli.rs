@@ -112,9 +112,11 @@ pub enum Commands {
     /// Share management (data rooms).
     #[command(subcommand)]
     Share(ShareCommands),
-    /// AI chat and search.
-    #[command(subcommand)]
-    Ai(AiCommands),
+    /// Offload multi-step work to Ripley — Fast.io's AI agent. Ask questions
+    /// about your content, generate AI shares, and search semantically. (The
+    /// former `ai` group; `ai` still works as a hidden alias.)
+    #[command(subcommand, alias = "ai")]
+    Ripley(RipleyCommands),
     /// File comments.
     #[command(subcommand)]
     Comment(CommentCommands),
@@ -2116,10 +2118,10 @@ pub enum AssetCommands {
 
 // ─── AI ─────────────────────────────────────────────────────────────────────
 
-/// AI subcommands.
+/// Ripley (AI agent) subcommands.
 #[derive(Subcommand, Debug)]
 #[non_exhaustive]
-pub enum AiCommands {
+pub enum RipleyCommands {
     /// Send a chat message and get the AI response.
     Chat {
         /// Workspace ID.
@@ -2130,14 +2132,29 @@ pub enum AiCommands {
         /// Existing chat ID (creates new if omitted).
         #[arg(long)]
         chat_id: Option<String>,
-        /// Scope query to specific file/folder node IDs (comma-separated).
-        #[arg(long, value_delimiter = ',')]
+        /// Scope the chat to specific file versions: comma-separated
+        /// `nodeId:versionId` pairs (max 100). Both parts are required.
+        #[arg(long)]
+        files_scope: Option<String>,
+        /// Scope the chat to folders: comma-separated `nodeId:depth` pairs
+        /// (max 100, depth 1-10).
+        #[arg(long)]
+        folders_scope: Option<String>,
+        /// Attach specific file versions to the chat: comma-separated
+        /// `nodeId:versionId` pairs.
+        #[arg(long)]
+        files_attach: Option<String>,
+        /// [deprecated] Scope to file node IDs (comma-separated); prefer
+        /// `--files-scope nodeId:versionId`. Bare node IDs (no version) are
+        /// rejected because the API requires a non-empty version per pair.
+        #[arg(long, value_delimiter = ',', hide = true)]
         node_ids: Option<Vec<String>>,
-        /// Folder ID to scope the AI query to.
-        #[arg(long)]
+        /// [deprecated] Folder ID to scope to; mapped to `folders_scope=<id>:10`.
+        /// Prefer `--folders-scope nodeId:depth`.
+        #[arg(long, hide = true)]
         folder_id: Option<String>,
-        /// Enable enhanced intelligence for this query.
-        #[arg(long)]
+        /// [deprecated] No longer maps to a chat parameter; accepted but ignored.
+        #[arg(long, hide = true)]
         intelligence: Option<bool>,
     },
     /// Semantic search over indexed workspace files.
@@ -3485,6 +3502,142 @@ impl fmt::Debug for AuthCommands {
                 .finish(),
             #[allow(unreachable_patterns)]
             _ => write!(f, "AuthCommands(<unknown variant>)"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod ripley_alias_tests {
+    use super::{Cli, Commands, RipleyCommands};
+    use clap::{CommandFactory, Parser};
+
+    /// Clap's own internal invariant checker — catches duplicate/ambiguous
+    /// aliases, bad arg combos, etc. at test time.
+    #[test]
+    fn cli_command_debug_assert() {
+        Cli::command().debug_assert();
+    }
+
+    /// The canonical `ripley` group parses to the `Ripley` variant.
+    #[test]
+    fn ripley_chat_parses_to_ripley_variant() {
+        let cli = Cli::try_parse_from(["fastio", "ripley", "chat", "--workspace", "ws1", "hi"])
+            .expect("ripley chat should parse");
+        match cli.command {
+            Commands::Ripley(RipleyCommands::Chat {
+                workspace, message, ..
+            }) => {
+                assert_eq!(workspace, "ws1");
+                assert_eq!(message, "hi");
+            }
+            other => panic!("expected Ripley(Chat), got {other:?}"),
+        }
+    }
+
+    /// The hidden `ai` alias still parses to the same `Ripley` variant
+    /// (back-compat is load-bearing per the resolved premise decision).
+    #[test]
+    fn ai_alias_parses_to_ripley_variant() {
+        let cli = Cli::try_parse_from(["fastio", "ai", "chat", "--workspace", "ws2", "hello"])
+            .expect("ai alias should parse");
+        match cli.command {
+            Commands::Ripley(RipleyCommands::Chat {
+                workspace, message, ..
+            }) => {
+                assert_eq!(workspace, "ws2");
+                assert_eq!(message, "hello");
+            }
+            other => panic!("expected Ripley(Chat) via `ai` alias, got {other:?}"),
+        }
+    }
+
+    /// `ripley` is visible in `--help`; the `ai` alias is hidden (clap
+    /// `alias` is hidden by default — that is the desired behavior).
+    #[test]
+    fn ripley_visible_ai_hidden_in_help() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_long_help().to_string();
+        assert!(help.contains("ripley"), "`ripley` should appear in help");
+        // The hidden `ai` alias must NOT be advertised as its own listed
+        // subcommand line. The token `ai` can appear inside prose
+        // (descriptions), so assert it is not a standalone left-column entry.
+        let listed_as_subcommand = help
+            .lines()
+            .any(|l| l.trim_start().starts_with("ai ") || l.trim_start() == "ai");
+        assert!(
+            !listed_as_subcommand,
+            "hidden `ai` alias must not be listed as a subcommand in help"
+        );
+    }
+
+    /// Legacy `--node-ids`/`--folder-id`/`--intelligence` flags are still
+    /// accepted (hidden) on `ripley chat` so old invocations don't break.
+    #[test]
+    fn legacy_chat_flags_still_accepted() {
+        let cli = Cli::try_parse_from([
+            "fastio",
+            "ripley",
+            "chat",
+            "--workspace",
+            "ws",
+            "--node-ids",
+            "a,b",
+            "--folder-id",
+            "f1",
+            "--intelligence",
+            "true",
+            "q",
+        ])
+        .expect("legacy flags should still parse");
+        match cli.command {
+            Commands::Ripley(RipleyCommands::Chat {
+                node_ids,
+                folder_id,
+                intelligence,
+                ..
+            }) => {
+                assert_eq!(
+                    node_ids.as_deref(),
+                    Some(&["a".to_owned(), "b".to_owned()][..])
+                );
+                assert_eq!(folder_id.as_deref(), Some("f1"));
+                assert_eq!(intelligence, Some(true));
+            }
+            other => panic!("expected Ripley(Chat), got {other:?}"),
+        }
+    }
+
+    /// The new visible `--files-scope` / `--folders-scope` / `--files-attach`
+    /// flags parse and reach the `Chat` variant.
+    #[test]
+    fn new_scope_flags_parse_to_ripley_variant() {
+        let cli = Cli::try_parse_from([
+            "fastio",
+            "ripley",
+            "chat",
+            "--workspace",
+            "ws",
+            "--files-scope",
+            "n1:v1,n2:v2",
+            "--folders-scope",
+            "f1:5",
+            "--files-attach",
+            "a1:v1",
+            "q",
+        ])
+        .expect("new scope flags should parse");
+        match cli.command {
+            Commands::Ripley(RipleyCommands::Chat {
+                files_scope,
+                folders_scope,
+                files_attach,
+                ..
+            }) => {
+                assert_eq!(files_scope.as_deref(), Some("n1:v1,n2:v2"));
+                assert_eq!(folders_scope.as_deref(), Some("f1:5"));
+                assert_eq!(files_attach.as_deref(), Some("a1:v1"));
+            }
+            other => panic!("expected Ripley(Chat), got {other:?}"),
         }
     }
 }

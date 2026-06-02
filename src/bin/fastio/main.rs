@@ -144,7 +144,7 @@ async fn dispatch(
         Commands::Event(c) => commands::event::execute(&map_event_command(c), ctx).await,
         Commands::Preview(c) => commands::preview::execute(&map_preview_command(c), ctx).await,
         Commands::Asset(c) => commands::asset::execute(&map_asset_command(c), ctx).await,
-        Commands::Ai(c) => commands::ai::execute(&map_ai_command(c), ctx).await,
+        Commands::Ripley(c) => commands::ai::execute(&map_ripley_command(c), ctx).await,
         Commands::Task(c) => commands::task::execute(&map_task_command(c), ctx).await,
         Commands::Worklog(c) => commands::worklog::execute(&map_worklog_command(c), ctx).await,
         Commands::Approval(c) => commands::approval::execute(&map_approval_command(c), ctx).await,
@@ -169,7 +169,10 @@ async fn dispatch(
             Ok(())
         }
         Commands::Mcp { .. } => {
-            unreachable!("MCP mode is handled before this match")
+            // MCP mode is dispatched earlier (before this match) and never
+            // reaches here; return a graceful error rather than panicking so
+            // no `unreachable!` remains in the production dispatch path.
+            anyhow::bail!("mcp command should be handled before this point")
         }
     }
 }
@@ -1351,13 +1354,16 @@ fn map_asset_command(cmd: cli::AssetCommands) -> AssetCommand {
     }
 }
 
-/// Convert clap-parsed AI commands to the internal enum.
-fn map_ai_command(cmd: cli::AiCommands) -> AiCommand {
+/// Convert clap-parsed Ripley (AI agent) commands to the internal enum.
+fn map_ripley_command(cmd: cli::RipleyCommands) -> AiCommand {
     match cmd {
-        cli::AiCommands::Chat {
+        cli::RipleyCommands::Chat {
             workspace,
             message,
             chat_id,
+            files_scope,
+            folders_scope,
+            files_attach,
             node_ids,
             folder_id,
             intelligence,
@@ -1365,11 +1371,14 @@ fn map_ai_command(cmd: cli::AiCommands) -> AiCommand {
             workspace,
             message,
             chat_id,
+            files_scope,
+            folders_scope,
+            files_attach,
             node_ids,
             folder_id,
             intelligence,
         },
-        cli::AiCommands::Search {
+        cli::RipleyCommands::Search {
             workspace,
             query,
             limit,
@@ -1380,7 +1389,7 @@ fn map_ai_command(cmd: cli::AiCommands) -> AiCommand {
             limit,
             offset,
         },
-        cli::AiCommands::History {
+        cli::RipleyCommands::History {
             workspace,
             chat_id,
             limit,
@@ -1391,14 +1400,14 @@ fn map_ai_command(cmd: cli::AiCommands) -> AiCommand {
             limit,
             offset,
         },
-        cli::AiCommands::Summary {
+        cli::RipleyCommands::Summary {
             workspace,
             node_ids,
         } => AiCommand::Summary {
             workspace,
             node_ids,
         },
-        cli::AiCommands::Cancel {
+        cli::RipleyCommands::Cancel {
             workspace,
             share,
             chat_id,

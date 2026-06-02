@@ -11,73 +11,136 @@ use serde_json::Value;
 use crate::client::ApiClient;
 use crate::error::{ApiError, CliError};
 
+/// Optional scope/attachment parameters shared by chat create and follow-up
+/// message sends.
+///
+/// All fields are pre-formatted strings matching the `/ai/agent/` form
+/// contract (see `~/vividengine/llms/ai.txt:271-273,579-581`):
+/// - `files_scope` / `folders_scope` — comma-separated `nodeId:versionId`
+///   (files) or `nodeId:depth` (folders) pairs.
+/// - `files_attach` — comma-separated file `nodeId:versionId` pairs.
+///
+/// The shared builder forwards whatever is set verbatim; per-context
+/// validation (e.g. share chats rejecting `privacy`) lives at the caller.
+#[derive(Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct ChatScope {
+    /// Comma-separated `nodeId:versionId` file scope pairs (max 100).
+    pub files_scope: Option<String>,
+    /// Comma-separated `nodeId:depth` folder scope pairs (max 100).
+    pub folders_scope: Option<String>,
+    /// Comma-separated file `nodeId:versionId` attachment pairs (max 20).
+    pub files_attach: Option<String>,
+}
+
+/// Optional create-time chat parameters beyond the required `type`/`question`.
+///
+/// Mirrors the `/ai/agent/` create contract
+/// (`~/vividengine/llms/ai.txt:263-273`). `privacy`/`kind` are
+/// workspace-only — share chats reject them; the caller is responsible for
+/// not populating them in a share context.
+#[derive(Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct ChatCreateOptions {
+    /// `private` or `public` (workspace-only; share chats are always private).
+    pub privacy: Option<String>,
+    /// Chat display name (auto-generated from the question if omitted).
+    pub name: Option<String>,
+    /// `concise` or `detailed` (defaults to `detailed` server-side).
+    pub personality: Option<String>,
+    /// `user` or `agent` (workspace-only; immutable after creation).
+    pub kind: Option<String>,
+    /// File/folder scope and attachment parameters.
+    pub scope: ChatScope,
+}
+
 /// Create a new AI chat session.
 ///
-/// `POST /workspace/{workspace_id}/ai/chat/`
+/// `POST /workspace/{workspace_id}/ai/agent/` (or the share variant via the
+/// `ai_api*` path builders). The body is **form-encoded** per the
+/// `/ai/agent/` contract (`~/vividengine/llms/ai.txt:251-283`); the legacy
+/// JSON `nodes`/`folder_id`/`intelligence` fields are gone — use
+/// `files_scope`/`folders_scope`/`files_attach` instead.
 pub async fn create_chat(
     client: &ApiClient,
     workspace_id: &str,
     question: &str,
     chat_type: &str,
-    node_ids: Option<&[String]>,
-    folder_id: Option<&str>,
-    intelligence: Option<bool>,
+    options: &ChatCreateOptions,
 ) -> Result<Value, CliError> {
-    let mut body = serde_json::json!({
-        "type": chat_type,
-        "question": question,
-        "personality": "detailed",
-    });
-    if let Some(nodes) = node_ids
-        && let Some(obj) = body.as_object_mut()
-    {
-        obj.insert("nodes".to_owned(), serde_json::json!(nodes.join(",")));
+    let mut form = HashMap::new();
+    form.insert("type".to_owned(), chat_type.to_owned());
+    form.insert("question".to_owned(), question.to_owned());
+    if let Some(p) = &options.privacy {
+        form.insert("privacy".to_owned(), p.clone());
     }
-    if let Some(fid) = folder_id
-        && let Some(obj) = body.as_object_mut()
-    {
-        obj.insert("folder_id".to_owned(), serde_json::json!(fid));
+    if let Some(n) = &options.name {
+        form.insert("name".to_owned(), n.clone());
     }
-    if let Some(intel) = intelligence
-        && let Some(obj) = body.as_object_mut()
-    {
-        obj.insert("intelligence".to_owned(), serde_json::json!(intel));
+    if let Some(p) = &options.personality {
+        form.insert("personality".to_owned(), p.clone());
     }
-    let path = format!("/workspace/{}/ai/chat/", urlencoding::encode(workspace_id),);
-    client.post_json(&path, &body).await
+    if let Some(k) = &options.kind {
+        form.insert("kind".to_owned(), k.clone());
+    }
+    apply_scope(&mut form, &options.scope);
+    let path = format!("/workspace/{}/ai/agent/", urlencoding::encode(workspace_id),);
+    client.post(&path, &form).await
+}
+
+/// Insert any populated scope/attach fields into a form body.
+fn apply_scope(form: &mut HashMap<String, String>, scope: &ChatScope) {
+    if let Some(v) = &scope.files_scope {
+        form.insert("files_scope".to_owned(), v.clone());
+    }
+    if let Some(v) = &scope.folders_scope {
+        form.insert("folders_scope".to_owned(), v.clone());
+    }
+    if let Some(v) = &scope.files_attach {
+        form.insert("files_attach".to_owned(), v.clone());
+    }
 }
 
 /// Send a message to an existing AI chat.
 ///
-/// `POST /workspace/{workspace_id}/ai/chat/{chat_id}/message/`
+/// `POST /workspace/{workspace_id}/ai/agent/{chat_id}/message/`. The body is
+/// **form-encoded** per the `/ai/agent/` contract
+/// (`~/vividengine/llms/ai.txt:563-591`). The chat type is inherited from
+/// the chat, so `type` is not resent.
 pub async fn send_message(
     client: &ApiClient,
     workspace_id: &str,
     chat_id: &str,
     question: &str,
+    personality: Option<&str>,
+    scope: &ChatScope,
 ) -> Result<Value, CliError> {
-    let body = serde_json::json!({
-        "question": question,
-    });
+    let mut form = HashMap::new();
+    form.insert("question".to_owned(), question.to_owned());
+    if let Some(p) = personality {
+        form.insert("personality".to_owned(), p.to_owned());
+    }
+    apply_scope(&mut form, scope);
     let path = format!(
-        "/workspace/{}/ai/chat/{}/message/",
+        "/workspace/{}/ai/agent/{}/message/",
         urlencoding::encode(workspace_id),
         urlencoding::encode(chat_id),
     );
-    client.post_json(&path, &body).await
+    client.post(&path, &form).await
 }
 
 /// Build the path for the AI chat cancel endpoint.
 ///
-/// `/{context_type}/{context_id}/ai/chat/{chat_id}/cancel`
+/// `/{context_type}/{context_id}/ai/agent/{chat_id}/cancel/`
 ///
-/// `context_type` must be either `workspace` or `share`. Per the API
-/// contract the path has no trailing slash. Both segment values are
-/// URL-encoded; higher-level validation (whitelist on `context_type`,
-/// non-empty IDs) is the caller's responsibility — see `cancel_message`.
+/// `context_type` must be either `workspace` or `share`. Per the
+/// `/ai/agent/` contract (`~/vividengine/llms/ai.txt:617`) the path carries
+/// a **trailing slash**. Both segment values are URL-encoded; higher-level
+/// validation (whitelist on `context_type`, non-empty IDs) is the caller's
+/// responsibility — see `cancel_message`.
 fn build_cancel_path(context_type: &str, context_id: &str, chat_id: &str) -> String {
     format!(
-        "/{}/{}/ai/chat/{}/cancel",
+        "/{}/{}/ai/agent/{}/cancel/",
         urlencoding::encode(context_type),
         urlencoding::encode(context_id),
         urlencoding::encode(chat_id),
@@ -141,8 +204,8 @@ fn parse_cancel_response(body: Value) -> Result<Value, CliError> {
 
 /// Cancel an in-progress AI chat message.
 ///
-/// `POST /workspace/{workspace_id}/ai/chat/{chat_id}/cancel`
-/// `POST /share/{share_id}/ai/chat/{chat_id}/cancel`
+/// `POST /workspace/{workspace_id}/ai/agent/{chat_id}/cancel/`
+/// `POST /share/{share_id}/ai/agent/{chat_id}/cancel/`
 ///
 /// `context_type` must be either `"workspace"` or `"share"`; any other
 /// value is rejected before a request is issued so a typo cannot mis-route
@@ -172,19 +235,21 @@ pub async fn cancel_message(
         return Err(CliError::Parse("chat_id must not be empty".to_owned()));
     }
     let path = build_cancel_path(context_type, context_id, chat_id);
-    // The cancel endpoint's HTTP-200 success bodies don't carry a
-    // `result` field, so the standard envelope-unwrap (`post_json` →
-    // `handle_response`) would reject them as errors. Use the raw
-    // helper, which returns the body verbatim on 2xx and routes
-    // non-2xx through `extract_error` (which now also recognizes the
-    // cancel endpoint's flat `error_message` / `error_id` shape).
-    let body: Value = client.post_json_raw(&path, &serde_json::json!({})).await?;
+    // The cancel endpoint's body is documented as **Empty** (ai.txt:625), so
+    // send a body-less POST rather than a JSON `{}` — `post_empty_raw` sets
+    // no `Content-Type` and no payload. Its HTTP-200 success bodies don't
+    // carry a `result` field, so the standard envelope-unwrap (`post_json` →
+    // `handle_response`) would reject them as errors. The raw helper returns
+    // the body verbatim on 2xx and routes non-2xx through `extract_error`
+    // (which also recognizes the cancel endpoint's flat
+    // `error_message` / `error_id` shape).
+    let body: Value = client.post_empty_raw(&path).await?;
     parse_cancel_response(body)
 }
 
 /// Get message details (used for polling).
 ///
-/// `GET /workspace/{workspace_id}/ai/chat/{chat_id}/message/{message_id}/details/`
+/// `GET /workspace/{workspace_id}/ai/agent/{chat_id}/message/{message_id}/details/`
 pub async fn get_message_details(
     client: &ApiClient,
     workspace_id: &str,
@@ -192,7 +257,7 @@ pub async fn get_message_details(
     message_id: &str,
 ) -> Result<Value, CliError> {
     let path = format!(
-        "/workspace/{}/ai/chat/{}/message/{}/details/",
+        "/workspace/{}/ai/agent/{}/message/{}/details/",
         urlencoding::encode(workspace_id),
         urlencoding::encode(chat_id),
         urlencoding::encode(message_id),
@@ -202,7 +267,7 @@ pub async fn get_message_details(
 
 /// List messages in a chat.
 ///
-/// `GET /workspace/{workspace_id}/ai/chat/{chat_id}/messages/list/`
+/// `GET /workspace/{workspace_id}/ai/agent/{chat_id}/messages/list/`
 pub async fn list_messages(
     client: &ApiClient,
     workspace_id: &str,
@@ -218,7 +283,7 @@ pub async fn list_messages(
         params.insert("offset".to_owned(), o.to_string());
     }
     let path = format!(
-        "/workspace/{}/ai/chat/{}/messages/list/",
+        "/workspace/{}/ai/agent/{}/messages/list/",
         urlencoding::encode(workspace_id),
         urlencoding::encode(chat_id),
     );
@@ -231,7 +296,7 @@ pub async fn list_messages(
 
 /// List all chats in a workspace.
 ///
-/// `GET /workspace/{workspace_id}/ai/chat/list/`
+/// `GET /workspace/{workspace_id}/ai/agent/list/`
 pub async fn list_chats(
     client: &ApiClient,
     workspace_id: &str,
@@ -246,7 +311,7 @@ pub async fn list_chats(
         params.insert("offset".to_owned(), o.to_string());
     }
     let path = format!(
-        "/workspace/{}/ai/chat/list/",
+        "/workspace/{}/ai/agent/list/",
         urlencoding::encode(workspace_id),
     );
     if params.is_empty() {
@@ -258,7 +323,14 @@ pub async fn list_chats(
 
 /// Semantic search over indexed workspace files.
 ///
-/// `GET /workspace/{workspace_id}/ai/search/?question=<query>`
+/// `GET /workspace/{workspace_id}/ai/search/?query_text=<query>`
+///
+/// The endpoint's required query parameter is `query_text`
+/// (`~/vividengine/llms/ai.txt:1647`), not `question`.
+///
+/// NOTE: this stays on the **deprecated** `/ai/search/` endpoint for now —
+/// it is NOT migrated to `/ai/agent/search/` (no such endpoint). Phase 3
+/// re-points it to `/storage/search/`.
 pub async fn search(
     client: &ApiClient,
     workspace_id: &str,
@@ -267,7 +339,7 @@ pub async fn search(
     offset: Option<u32>,
 ) -> Result<Value, CliError> {
     let mut params = HashMap::new();
-    params.insert("question".to_owned(), query.to_owned());
+    params.insert("query_text".to_owned(), query.to_owned());
     if let Some(l) = limit {
         params.insert("limit".to_owned(), l.to_string());
     }
@@ -285,22 +357,50 @@ pub async fn search(
 ///
 /// `POST /workspace/{workspace_id}/ai/share/`
 ///
-/// Requires at least one node ID. The API generates an AI-powered summary
-/// of the specified files that can be shared via a public link.
+/// Requires 1-25 file opaque IDs. The endpoint reads **form-encoded** input
+/// and the `files` field must be a **JSON-encoded array string** of node
+/// opaque IDs, e.g. `files=["id1","id2"]` (NOT a comma-separated `nodes`
+/// CSV — see `~/vividengine/llms/ai.txt:890-904`). The API generates
+/// AI-powered markdown with temporary download URLs that can be pasted into
+/// an external chatbot.
 pub async fn summarize(
     client: &ApiClient,
     workspace_id: &str,
-    node_ids: &[String],
+    file_ids: &[String],
 ) -> Result<Value, CliError> {
-    let nodes_csv = node_ids.join(",");
-    let body = serde_json::json!({ "nodes": nodes_csv });
     let path = format!("/workspace/{}/ai/share/", urlencoding::encode(workspace_id),);
-    client.post_json(&path, &body).await
+    client.post(&path, &build_share_form(file_ids)).await
+}
+
+/// Build the form body for the `ai/share/` (share-generate) endpoint:
+/// a single `files` field whose value is a JSON-array string of node IDs.
+///
+/// Shared by the CLI `summarize` builder and the MCP `share-generate`
+/// handler so both contexts (workspace + share) emit identical, correct
+/// bodies. `serde_json::to_string` of a `Vec<String>` never fails, so the
+/// empty/fallback arm exists only to satisfy the type.
+///
+/// This builder does NOT enforce the API's 1-25 `files` bound
+/// (`~/vividengine/llms/ai.txt:894`) — callers are responsible for the
+/// client-side length check before calling this; both the CLI `summary`
+/// handler and the MCP `share-generate` handler reject `> 25` (and empty)
+/// before the network round-trip.
+#[must_use]
+pub fn build_share_form(file_ids: &[String]) -> HashMap<String, String> {
+    let mut form = HashMap::new();
+    let json = serde_json::to_string(file_ids).unwrap_or_else(|_| "[]".to_owned());
+    form.insert("files".to_owned(), json);
+    form
 }
 
 /// Generic AI API call that supports both workspace and share context.
 ///
-/// Routes to `/{context_type}/{context_id}/ai/{sub_path}`.
+/// Routes to `/{context_type}/{context_id}/ai/{sub_path}`. POST bodies sent
+/// through this helper are **JSON**; the `/ai/agent/` create/send and
+/// `ai/share/` endpoints require form encoding, so those callers must use
+/// [`ai_api_form`] instead. This helper remains for the GET/DELETE actions
+/// (list/details/messages/delete) and the genuinely-JSON-free POSTs
+/// (publish/autotitle) where the server tolerates an empty/JSON body.
 #[allow(clippy::implicit_hasher)]
 pub async fn ai_api(
     client: &ApiClient,
@@ -336,25 +436,50 @@ pub async fn ai_api(
     }
 }
 
+/// Form-encoded POST variant of [`ai_api`] for the workspace/share-context
+/// `/ai/agent/` create + follow-up message endpoints and the `ai/share/`
+/// share-generate endpoint, all of which read
+/// `application/x-www-form-urlencoded` bodies (`~/vividengine/llms/ai.txt`).
+#[allow(clippy::implicit_hasher)]
+pub async fn ai_api_form(
+    client: &ApiClient,
+    context_type: &str,
+    context_id: &str,
+    sub_path: &str,
+    form: &HashMap<String, String>,
+) -> Result<Value, CliError> {
+    let path = format!(
+        "/{}/{}/ai/{}",
+        urlencoding::encode(context_type),
+        urlencoding::encode(context_id),
+        sub_path,
+    );
+    client.post(&path, form).await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_cancel_path, parse_cancel_response};
+    use super::{
+        ChatCreateOptions, ChatScope, build_cancel_path, build_share_form, parse_cancel_response,
+    };
     use crate::error::CliError;
     use serde_json::json;
 
     #[test]
-    fn cancel_path_workspace_scope_has_no_trailing_slash() {
+    fn cancel_path_workspace_scope_uses_agent_with_trailing_slash() {
+        // Migrated path: /ai/chat/ -> /ai/agent/, AND a trailing slash on
+        // cancel per ai.txt:617.
         let p = build_cancel_path("workspace", "4687730903718774523", "AIC_abc123");
         assert_eq!(
             p,
-            "/workspace/4687730903718774523/ai/chat/AIC_abc123/cancel"
+            "/workspace/4687730903718774523/ai/agent/AIC_abc123/cancel/"
         );
     }
 
     #[test]
-    fn cancel_path_share_scope_has_no_trailing_slash() {
+    fn cancel_path_share_scope_uses_agent_with_trailing_slash() {
         let p = build_cancel_path("share", "S_xyz", "AIC_abc123");
-        assert_eq!(p, "/share/S_xyz/ai/chat/AIC_abc123/cancel");
+        assert_eq!(p, "/share/S_xyz/ai/agent/AIC_abc123/cancel/");
     }
 
     #[test]
@@ -363,7 +488,7 @@ mod tests {
         // value so a stray reserved character can't break the path or smuggle
         // extra segments past the router.
         let p = build_cancel_path("workspace", "ws id", "chat/with slash");
-        assert_eq!(p, "/workspace/ws%20id/ai/chat/chat%2Fwith%20slash/cancel");
+        assert_eq!(p, "/workspace/ws%20id/ai/agent/chat%2Fwith%20slash/cancel/");
     }
 
     #[test]
@@ -371,7 +496,75 @@ mod tests {
         // RLO (U+202E) and newline must encode rather than land in the path
         // verbatim — Trojan-Source / smuggling defense.
         let p = build_cancel_path("workspace", "ws", "chat\u{202E}\nrest");
-        assert_eq!(p, "/workspace/ws/ai/chat/chat%E2%80%AE%0Arest/cancel");
+        assert_eq!(p, "/workspace/ws/ai/agent/chat%E2%80%AE%0Arest/cancel/");
+    }
+
+    #[test]
+    fn create_chat_form_carries_only_documented_fields() {
+        // The form body must NOT emit the retired `nodes`/`folder_id`/
+        // `intelligence` fields — those are the cause of the live outage.
+        let mut form = std::collections::HashMap::new();
+        form.insert("type".to_owned(), "chat_with_files".to_owned());
+        form.insert("question".to_owned(), "hi".to_owned());
+        let opts = ChatCreateOptions {
+            privacy: Some("private".to_owned()),
+            name: Some("My chat".to_owned()),
+            personality: Some("detailed".to_owned()),
+            kind: Some("user".to_owned()),
+            scope: ChatScope {
+                files_scope: Some("n1:".to_owned()),
+                folders_scope: Some("f1:10".to_owned()),
+                files_attach: None,
+            },
+        };
+        super::apply_scope(&mut form, &opts.scope);
+        if let Some(p) = &opts.privacy {
+            form.insert("privacy".to_owned(), p.clone());
+        }
+        if let Some(n) = &opts.name {
+            form.insert("name".to_owned(), n.clone());
+        }
+        if let Some(p) = &opts.personality {
+            form.insert("personality".to_owned(), p.clone());
+        }
+        if let Some(k) = &opts.kind {
+            form.insert("kind".to_owned(), k.clone());
+        }
+        // Documented field set present.
+        for key in [
+            "type",
+            "question",
+            "privacy",
+            "name",
+            "personality",
+            "kind",
+            "files_scope",
+            "folders_scope",
+        ] {
+            assert!(form.contains_key(key), "missing {key}");
+        }
+        // Retired fields absent.
+        for key in ["nodes", "folder_id", "intelligence"] {
+            assert!(!form.contains_key(key), "should not emit {key}");
+        }
+    }
+
+    #[test]
+    fn share_form_sends_files_json_array_not_nodes_csv() {
+        let ids = vec!["aBc".to_owned(), "dEf".to_owned()];
+        let form = build_share_form(&ids);
+        assert_eq!(
+            form.get("files").map(String::as_str),
+            Some(r#"["aBc","dEf"]"#)
+        );
+        // Must NOT use the retired `nodes` CSV field.
+        assert!(!form.contains_key("nodes"));
+    }
+
+    #[test]
+    fn share_form_single_file_is_valid_json_array() {
+        let form = build_share_form(&["only".to_owned()]);
+        assert_eq!(form.get("files").map(String::as_str), Some(r#"["only"]"#));
     }
 
     #[test]

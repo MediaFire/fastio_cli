@@ -70,7 +70,7 @@ Use the `files` tool with `action: \"list\"` and provide your workspace_id.
 
 ## Available Tool Domains
 - auth, user, org, workspace, files, upload, download, share
-- ai, member, comment, event, invitation, preview, asset
+- ripley, member, comment, event, invitation, preview, asset
 - task, worklog, approval, todo
 
 Each tool uses an `action` parameter to select the operation.";

@@ -497,6 +497,33 @@ impl ApiClient {
         .await
     }
 
+    /// Perform an authenticated POST with **no request body at all** and
+    /// return the raw JSON body **without** the `result`/`response` envelope
+    /// unwrap.
+    ///
+    /// Unlike [`Self::post_json_raw`], this sends neither a JSON body nor a
+    /// `Content-Type` header — the wire request carries an empty body. It is
+    /// for endpoints whose contract is literally "Body: Empty" (e.g. the AI
+    /// chat cancel endpoint, ai.txt:625), where sending `{}` with
+    /// `Content-Type: application/json` would diverge from the documented
+    /// contract. Like `post_json_raw`, the 2xx body is returned verbatim and
+    /// non-2xx responses are surfaced as `CliError::Api` via
+    /// [`Self::extract_error`] (which recognizes both the nested standard
+    /// envelope and a flat `{"error_message": …, "error_id": …}` shape).
+    /// Callers are responsible for inspecting the returned 2xx body for any
+    /// application-level error fields.
+    pub async fn post_empty_raw<T: DeserializeOwned>(&self, path: &str) -> Result<T, CliError> {
+        tracing::trace!(method = "POST", path, "api request (empty body, raw)");
+        self.send_with_retry_raw(|| {
+            let mut req = self.inner.post(self.url(path));
+            if let Some(auth) = self.auth_header() {
+                req = req.header(AUTHORIZATION, auth);
+            }
+            req
+        })
+        .await
+    }
+
     /// Perform a JSON PATCH and unwrap the API envelope.
     ///
     /// Mirrors [`Self::post_json`] with the method swapped to `PATCH`; routes
@@ -2334,5 +2361,96 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         assert_eq!(ct, "application/x-www-form-urlencoded");
+    }
+
+    // ----- post_empty_raw: authed POST with NO body / NO content-type -----
+
+    /// Build the request `post_empty_raw` issues and assert it carries no
+    /// body and no `Content-Type` (the AI chat cancel contract is "Body:
+    /// Empty", ai.txt:625), while still attaching the bearer token.
+    #[test]
+    fn post_empty_raw_builds_bodyless_authed_post() {
+        let client = parity_client();
+        let mut req = client.inner.post(client.url("/x/ai/agent/c/cancel/"));
+        if let Some(auth) = client.auth_header() {
+            req = req.header(AUTHORIZATION, auth);
+        }
+        let built = req.build().expect("builds");
+        assert_eq!(built.method(), reqwest::Method::POST);
+        assert_eq!(
+            built.url().as_str(),
+            "https://api.example/current/x/ai/agent/c/cancel/"
+        );
+        // No JSON (or any) body, and therefore no Content-Type header.
+        let sent = built.body().and_then(reqwest::Body::as_bytes);
+        assert!(
+            sent.is_none() || sent == Some(&b""[..]),
+            "cancel request must carry no body, got {sent:?}"
+        );
+        assert!(
+            built.headers().get(CONTENT_TYPE).is_none(),
+            "cancel request must not set a Content-Type"
+        );
+        // The bearer token is still attached.
+        assert!(
+            built.headers().get(AUTHORIZATION).is_some(),
+            "cancel request must be authenticated"
+        );
+    }
+
+    /// End-to-end: `post_empty_raw` reaches a real socket, the server sees a
+    /// POST with a zero-length body and no `Content-Type`, and the 2xx body
+    /// is returned verbatim (no envelope unwrap).
+    #[tokio::test]
+    async fn post_empty_raw_sends_no_body_over_the_wire() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = br#"{"success":true,"no_pending_message":true}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+                let _ = tx.send(request);
+            }
+        });
+        let client = ApiClient::new(&format!("http://{addr}"), Some("tok".to_owned()))
+            .expect("client builds");
+        let body: Value = client
+            .post_empty_raw("/ai/agent/c/cancel/")
+            .await
+            .expect("empty-body POST succeeds");
+        // 2xx body returned verbatim (no envelope unwrap).
+        assert_eq!(body["no_pending_message"], Value::Bool(true));
+
+        let request = rx.await.expect("server captured request");
+        assert!(
+            request.starts_with("POST /ai/agent/c/cancel/"),
+            "expected POST to cancel path, got: {request}"
+        );
+        let lower = request.to_ascii_lowercase();
+        assert!(
+            !lower.contains("content-type:"),
+            "empty-body POST must not send a Content-Type: {request}"
+        );
+        // No request body: a zero Content-Length (or none) and no trailing
+        // payload after the header terminator.
+        let after_headers = request.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(
+            after_headers.is_empty(),
+            "empty-body POST must send no payload, got body: {after_headers:?}"
+        );
     }
 }

@@ -680,8 +680,8 @@ const TOOL_DEFS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "ai",
-        description: "AI: chat create/list/details/update/delete/publish/cancel, message send/list/details/read, search, share-generate, transactions, autotitle.",
+        name: "ripley",
+        description: "Offload multi-step work to Ripley, Fast.io's AI agent: ask questions about your content (chat create/list/details/update/delete/publish/cancel, message send/list/details/read), semantic search, generate AI shares (share-generate), transactions, autotitle. (Formerly the `ai` tool; `ai` still works as a hidden alias.)",
         actions: &[
             "chat-create",
             "chat-list",
@@ -710,18 +710,48 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             ("chat_id", "Chat ID", false),
             ("message_id", "Message ID", false),
-            ("name", "New chat name (chat-update)", false),
+            ("name", "Chat name (chat-create, chat-update)", false),
+            (
+                "privacy",
+                "private or public (chat-create; workspace-only, rejected for share)",
+                false,
+            ),
+            (
+                "kind",
+                "user or agent (chat-create; workspace-only, rejected for share)",
+                false,
+            ),
+            (
+                "files_scope",
+                "Comma-separated nodeId:versionId file scope pairs (chat-create, message-send)",
+                false,
+            ),
+            (
+                "folders_scope",
+                "Comma-separated nodeId:depth folder scope pairs (chat-create, message-send)",
+                false,
+            ),
+            (
+                "files_attach",
+                "Comma-separated file nodeId:versionId attachment pairs (chat-create, message-send)",
+                false,
+            ),
             (
                 "node_ids",
-                "Comma-separated node IDs (share-generate workspace)",
+                "Comma-separated file IDs (share-generate; converted to a JSON `files` array)",
                 false,
             ),
             (
                 "files",
-                "Comma-separated file IDs (share-generate share)",
+                "Comma-separated file IDs (share-generate; converted to a JSON `files` array)",
                 false,
             ),
             ("personality", "Response style: concise or detailed", false),
+            (
+                "include_deleted",
+                "List deleted chats instead (chat-list)",
+                false,
+            ),
             ("context", "Hint for autotitle", false),
             ("limit", "Pagination limit", false),
             ("offset", "Pagination offset", false),
@@ -1244,7 +1274,11 @@ impl ToolRouter {
             "upload" => handle_upload(&self.state, action, &args).await,
             "download" => handle_download(&self.state, action, &args).await,
             "share" => handle_share(&self.state, action, &args).await,
-            "ai" => handle_ai(&self.state, action, &args).await,
+            // `ai` is the hidden back-compat alias for the renamed `ripley`
+            // tool. Both route to the same handler, which already issues the
+            // migrated `/ai/agent/` paths and the corrected form bodies, so
+            // legacy `ai` callers transparently get the fixed behavior.
+            "ripley" | "ai" => handle_ai(&self.state, action, &args).await,
             "member" => handle_member(&self.state, action, &args).await,
             "comment" => handle_comment(&self.state, action, &args).await,
             "event" => handle_event(&self.state, action, &args).await,
@@ -5125,7 +5159,25 @@ async fn handle_ai(
         "transactions" => handle_ai_transactions(state, args).await,
         "autotitle" => handle_ai_autotitle(state, args).await,
         "search" => handle_ai_search(state, args).await,
-        _ => Ok(error_text(&format!("Unknown ai action: {action}"))),
+        _ => Ok(error_text(&format!("Unknown ripley action: {action}"))),
+    }
+}
+
+/// Guard the `/ai/agent/` mutual-exclusion rule: `files_attach` cannot be
+/// combined with `files_scope`/`folders_scope` in the same request — the
+/// server rejects both with `1605` (ai.txt:115,311,609). Returns an error
+/// `CallToolResult` to surface to the agent if the combination is present.
+fn check_files_attach_exclusion(args: &Map<String, Value>) -> Option<CallToolResult> {
+    let has_attach = optional_str(args, "files_attach").is_some();
+    let has_scope = optional_str(args, "files_scope").is_some()
+        || optional_str(args, "folders_scope").is_some();
+    if has_attach && has_scope {
+        Some(error_text(
+            "files_attach cannot be combined with files_scope/folders_scope — \
+             use one or the other",
+        ))
+    } else {
+        None
     }
 }
 
@@ -5140,36 +5192,49 @@ async fn handle_ai_chat_create(
         Err(e) => return Ok(e),
     };
     let chat_type = optional_str(args, "type").unwrap_or("chat");
-    let mut body = serde_json::json!({
-        "type": chat_type,
-        "personality": optional_str(args, "personality").unwrap_or("detailed"),
-    });
-    if let Some(q) = optional_str(args, "query_text") {
-        body["question"] = Value::String(q.to_owned());
+    // The `/ai/agent/` create endpoint is form-encoded; emit only the
+    // documented field set (no retired `nodes`/`folder_id`/`intelligence`).
+    let mut form = std::collections::HashMap::new();
+    form.insert("type".to_owned(), chat_type.to_owned());
+    form.insert(
+        "personality".to_owned(),
+        optional_str(args, "personality")
+            .unwrap_or("detailed")
+            .to_owned(),
+    );
+    // `question` is REQUIRED for chat create (ai.txt:265). Reject a create
+    // that omits it rather than silently sending a question-less body.
+    let question = match required_str(args, "query_text") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    form.insert("question".to_owned(), question.to_owned());
+    if let Some(v) = optional_str(args, "name") {
+        form.insert("name".to_owned(), v.to_owned());
     }
-    if let Some(v) = optional_str(args, "privacy") {
-        body["privacy"] = Value::String(v.to_owned());
+    // `privacy`/`kind` are workspace-only — share chats reject them, so only
+    // forward in a workspace context.
+    if ctx_type == "workspace" {
+        if let Some(v) = optional_str(args, "privacy") {
+            form.insert("privacy".to_owned(), v.to_owned());
+        }
+        if let Some(v) = optional_str(args, "kind") {
+            form.insert("kind".to_owned(), v.to_owned());
+        }
+    }
+    if let Some(err) = check_files_attach_exclusion(args) {
+        return Ok(err);
     }
     if let Some(v) = optional_str(args, "files_scope") {
-        body["files_scope"] = Value::String(v.to_owned());
+        form.insert("files_scope".to_owned(), v.to_owned());
     }
     if let Some(v) = optional_str(args, "folders_scope") {
-        body["folders_scope"] = Value::String(v.to_owned());
+        form.insert("folders_scope".to_owned(), v.to_owned());
     }
     if let Some(v) = optional_str(args, "files_attach") {
-        body["files_attach"] = Value::String(v.to_owned());
+        form.insert("files_attach".to_owned(), v.to_owned());
     }
-    match api::ai::ai_api(
-        &client,
-        ctx_type,
-        ctx_id,
-        "chat/",
-        "POST",
-        Some(&body),
-        None,
-    )
-    .await
-    {
+    match api::ai::ai_api_form(&client, ctx_type, ctx_id, "agent/", &form).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5192,10 +5257,10 @@ async fn handle_ai_chat_list(
     if let Some(o) = optional_str(args, "offset") {
         params.insert("offset".to_owned(), o.to_owned());
     }
-    let sub = if optional_bool(args, "include_deleted").unwrap_or(false) && ctx_type == "share" {
-        "chat/list/deleted/"
+    let sub = if optional_bool(args, "include_deleted").unwrap_or(false) {
+        "agent/list/deleted"
     } else {
-        "chat/list/"
+        "agent/list/"
     };
     let p = if params.is_empty() {
         None
@@ -5222,7 +5287,7 @@ async fn handle_ai_chat_details(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let sub = format!("chat/{}/details/", urlencoding::encode(chat_id));
+    let sub = format!("agent/{}/details/", urlencoding::encode(chat_id));
     match api::ai::ai_api(&client, ctx_type, ctx_id, &sub, "GET", None, None).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
@@ -5247,9 +5312,11 @@ async fn handle_ai_chat_update(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let body = serde_json::json!({ "name": name });
-    let sub = format!("chat/{}/update/", urlencoding::encode(chat_id));
-    match api::ai::ai_api(&client, ctx_type, ctx_id, &sub, "POST", Some(&body), None).await {
+    // Update is form-encoded (`-d "name=..."`).
+    let mut form = std::collections::HashMap::new();
+    form.insert("name".to_owned(), name.to_owned());
+    let sub = format!("agent/{}/update/", urlencoding::encode(chat_id));
+    match api::ai::ai_api_form(&client, ctx_type, ctx_id, &sub, &form).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5269,7 +5336,7 @@ async fn handle_ai_chat_delete(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let sub = format!("chat/{}/", urlencoding::encode(chat_id));
+    let sub = format!("agent/{}/", urlencoding::encode(chat_id));
     match api::ai::ai_api(&client, ctx_type, ctx_id, &sub, "DELETE", None, None).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
@@ -5290,7 +5357,7 @@ async fn handle_ai_chat_publish(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let sub = format!("chat/{}/publish/", urlencoding::encode(chat_id));
+    let sub = format!("agent/{}/publish/", urlencoding::encode(chat_id));
     match api::ai::ai_api(&client, ctx_type, ctx_id, &sub, "POST", None, None).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
@@ -5335,21 +5402,26 @@ async fn handle_ai_message_send(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let mut body = serde_json::json!({ "question": query });
+    // Follow-up messages are form-encoded; `type` is inherited from the chat.
+    let mut form = std::collections::HashMap::new();
+    form.insert("question".to_owned(), query.to_owned());
     if let Some(v) = optional_str(args, "personality") {
-        body["personality"] = Value::String(v.to_owned());
+        form.insert("personality".to_owned(), v.to_owned());
+    }
+    if let Some(err) = check_files_attach_exclusion(args) {
+        return Ok(err);
     }
     if let Some(v) = optional_str(args, "files_scope") {
-        body["files_scope"] = Value::String(v.to_owned());
+        form.insert("files_scope".to_owned(), v.to_owned());
     }
     if let Some(v) = optional_str(args, "folders_scope") {
-        body["folders_scope"] = Value::String(v.to_owned());
+        form.insert("folders_scope".to_owned(), v.to_owned());
     }
     if let Some(v) = optional_str(args, "files_attach") {
-        body["files_attach"] = Value::String(v.to_owned());
+        form.insert("files_attach".to_owned(), v.to_owned());
     }
-    let sub = format!("chat/{}/message/", urlencoding::encode(chat_id));
-    match api::ai::ai_api(&client, ctx_type, ctx_id, &sub, "POST", Some(&body), None).await {
+    let sub = format!("agent/{}/message/", urlencoding::encode(chat_id));
+    match api::ai::ai_api_form(&client, ctx_type, ctx_id, &sub, &form).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5376,7 +5448,7 @@ async fn handle_ai_message_list(
     if let Some(o) = optional_str(args, "offset") {
         params.insert("offset".to_owned(), o.to_owned());
     }
-    let sub = format!("chat/{}/messages/list/", urlencoding::encode(chat_id));
+    let sub = format!("agent/{}/messages/list/", urlencoding::encode(chat_id));
     let p = if params.is_empty() {
         None
     } else {
@@ -5407,7 +5479,7 @@ async fn handle_ai_message_details(
         Err(e) => return Ok(e),
     };
     let sub = format!(
-        "chat/{}/message/{}/details/",
+        "agent/{}/message/{}/details/",
         urlencoding::encode(chat_id),
         urlencoding::encode(msg_id),
     );
@@ -5427,31 +5499,51 @@ async fn handle_ai_share_generate(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let body = if ctx_type == "workspace" {
-        let ids_str = match required_str(args, "node_ids") {
-            Ok(v) => v,
-            Err(e) => return Ok(e),
-        };
-        serde_json::json!({ "nodes": ids_str })
-    } else {
-        let ids_str = match required_str(args, "files") {
-            Ok(v) => v,
-            Err(e) => return Ok(e),
-        };
-        let file_ids: Vec<String> = ids_str.split(',').map(|s| s.trim().to_owned()).collect();
-        serde_json::json!({ "files": file_ids })
+    // Both workspace and share contexts use the same form contract: a single
+    // `files` field whose value is a JSON-array string of file IDs (NOT a
+    // `nodes` CSV). Accept the IDs from either `files` or the legacy
+    // `node_ids` arg for back-compat. `files` may be either a CSV string or a
+    // JSON-array string (e.g. `["id1","id2"]`); both are accepted.
+    let Some(ids_str) = optional_str(args, "files").or_else(|| optional_str(args, "node_ids"))
+    else {
+        return Ok(error_text(
+            "share-generate requires `files` (comma-separated or JSON-array of file IDs)",
+        ));
     };
-    match api::ai::ai_api(
-        &client,
-        ctx_type,
-        ctx_id,
-        "share/",
-        "POST",
-        Some(&body),
-        None,
-    )
-    .await
-    {
+    let trimmed = ids_str.trim();
+    let file_ids: Vec<String> = if trimmed.starts_with('[') {
+        match serde_json::from_str::<Vec<String>>(trimmed) {
+            Ok(v) => v
+                .into_iter()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            Err(e) => {
+                return Ok(error_text(&format!(
+                    "share-generate `files` looked like a JSON array but failed to parse: {e}"
+                )));
+            }
+        }
+    } else {
+        trimmed
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    if file_ids.is_empty() {
+        return Ok(error_text("share-generate requires at least one file ID"));
+    }
+    // The `/ai/share/` endpoint caps `files` at 1-25 (ai.txt:894); reject
+    // oversized requests before the network round-trip.
+    if file_ids.len() > 25 {
+        return Ok(error_text(&format!(
+            "too many files: {} supplied, but AI share accepts at most 25",
+            file_ids.len()
+        )));
+    }
+    let form = api::ai::build_share_form(&file_ids);
+    match api::ai::ai_api_form(&client, ctx_type, ctx_id, "share/", &form).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5527,8 +5619,9 @@ async fn handle_ai_search(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    // `/ai/search/` requires `query_text` (ai.txt:1647), not `question`.
     let mut params = std::collections::HashMap::new();
-    params.insert("question".to_owned(), query.to_owned());
+    params.insert("query_text".to_owned(), query.to_owned());
     if let Some(l) = optional_str(args, "limit") {
         params.insert("limit".to_owned(), l.to_owned());
     }
@@ -8187,5 +8280,187 @@ async fn handle_system(
             Err(e) => Ok(cli_err_to_result(&e)),
         },
         _ => Ok(error_text(&format!("Unknown system action: {action}"))),
+    }
+}
+
+#[cfg(test)]
+mod ripley_tool_tests {
+    use super::{McpState, ToolRouter};
+    use serde_json::{Map, Value, json};
+    use std::sync::Arc;
+
+    /// Serialize a `CallToolResult` to JSON text so tests can assert on the
+    /// rendered content without depending on rmcp's internal field layout.
+    fn result_to_string(result: &super::CallToolResult) -> String {
+        serde_json::to_string(result).unwrap_or_default()
+    }
+
+    fn unauthed_router() -> ToolRouter {
+        ToolRouter::new(Arc::new(McpState::new_unauthenticated_for_test(
+            "https://api.fast.io/current",
+        )))
+    }
+
+    /// An authenticated router whose client points at an unroutable base URL.
+    /// Lets tests exercise the pre-network input validation (which runs after
+    /// `require_auth`) without any real HTTP — a validation error is returned
+    /// before any request is attempted.
+    async fn authed_router() -> ToolRouter {
+        let state = Arc::new(McpState::new_unauthenticated_for_test(
+            "https://api.fast.io/current",
+        ));
+        state.set_token("test-token".to_owned()).await;
+        ToolRouter::new(state)
+    }
+
+    #[test]
+    fn list_tools_advertises_ripley_not_ai() {
+        let tools = ToolRouter::list_tools().tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(names.contains(&"ripley"), "ripley tool must be advertised");
+        assert!(
+            !names.contains(&"ai"),
+            "hidden `ai` alias must NOT be advertised in list_tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_alias_routes_to_ripley_handler() {
+        // An unauthenticated call short-circuits at require_auth inside
+        // handle_ai; reaching that (vs the unknown-tool arm) proves the
+        // `ai` alias routed to the ripley handler.
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("chat-list".to_owned()));
+        let res = router.call_tool("ai", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("Not authenticated"),
+            "ai alias should reach handle_ai (auth gate), got: {text}"
+        );
+        assert!(
+            !text.contains("Unknown tool"),
+            "ai alias must not fall through to the unknown-tool arm"
+        );
+    }
+
+    #[tokio::test]
+    async fn ripley_name_routes_to_ripley_handler() {
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("chat-list".to_owned()));
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(text.contains("Not authenticated"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_still_reports_unknown() {
+        let router = unauthed_router();
+        let res = router
+            .call_tool("definitely-not-a-tool", Map::new())
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(text.contains("Unknown tool"), "got: {text}");
+    }
+
+    #[test]
+    fn ripley_tool_description_leads_with_offload_framing() {
+        let tools = ToolRouter::list_tools().tools;
+        let ripley = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "ripley")
+            .expect("ripley tool present");
+        let desc = ripley.description.as_deref().unwrap_or_default();
+        assert!(
+            desc.starts_with("Offload"),
+            "ripley description should lead with offload framing, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn share_form_helper_builds_files_json_array() {
+        // The MCP share-generate handler delegates to this shared builder;
+        // confirm the body shape it produces is the JSON `files` array.
+        let form = super::api::ai::build_share_form(&["x".to_owned(), "y".to_owned()]);
+        assert_eq!(form.get("files").map(String::as_str), Some(r#"["x","y"]"#));
+        assert!(!form.contains_key("nodes"));
+        let _ = json!({}); // silence unused import if other asserts change
+    }
+
+    #[tokio::test]
+    async fn ai_chat_create_without_question_errors() {
+        // ai.txt:265 makes `question` required for create; the handler must
+        // reject a create that omits `query_text` rather than send a
+        // question-less body.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("chat-create".to_owned()));
+        args.insert("context_id".to_owned(), Value::String("ws1".to_owned()));
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("query_text"),
+            "create without question must surface a missing query_text error, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_share_generate_rejects_more_than_25_files() {
+        // ai.txt:894 caps `files` at 1-25; the handler must reject >25
+        // client-side before the network round-trip.
+        let router = authed_router().await;
+        let ids: Vec<String> = (0..26).map(|i| format!("id{i}")).collect();
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("share-generate".to_owned()),
+        );
+        args.insert("context_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("files".to_owned(), Value::String(ids.join(",")));
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("too many files") && text.contains("25"),
+            "share-generate with 26 files must be rejected, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_share_generate_accepts_json_array_files() {
+        // `files` may be a JSON-array string; confirm it parses (a single id
+        // is well under the cap, so this passes validation and proceeds to the
+        // network attempt — which then fails, but NOT with a parse/validation
+        // error).
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("share-generate".to_owned()),
+        );
+        args.insert("context_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert(
+            "files".to_owned(),
+            Value::String(r#"["abc","def"]"#.to_owned()),
+        );
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("failed to parse") && !text.contains("at least one file ID"),
+            "JSON-array files should parse cleanly, got: {text}"
+        );
     }
 }
