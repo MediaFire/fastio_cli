@@ -65,6 +65,26 @@ pub enum TodoCommand {
         /// Completion state to set.
         done: bool,
     },
+    /// Filtered todo list (personal/group view).
+    Filter {
+        /// Profile type ("workspace" or "share").
+        profile_type: String,
+        /// Profile ID (workspace or share ID).
+        profile_id: String,
+        /// Filter: assigned, created, done, pending.
+        filter: String,
+        /// Max results.
+        limit: Option<u32>,
+        /// Offset for pagination.
+        offset: Option<u32>,
+    },
+    /// Todo count summary for a workspace or share.
+    Summary {
+        /// Profile type ("workspace" or "share").
+        profile_type: String,
+        /// Profile ID (workspace or share ID).
+        profile_id: String,
+    },
 }
 
 /// Execute a todo subcommand.
@@ -105,7 +125,52 @@ pub async fn execute(command: &TodoCommand, ctx: &CommandContext<'_>) -> Result<
             todo_ids,
             done,
         } => bulk_toggle(ctx, profile_type, profile_id, todo_ids, *done).await,
+        TodoCommand::Filter {
+            profile_type,
+            profile_id,
+            filter,
+            limit,
+            offset,
+        } => filter_todos(ctx, profile_type, profile_id, filter, *limit, *offset).await,
+        TodoCommand::Summary {
+            profile_type,
+            profile_id,
+        } => summary(ctx, profile_type, profile_id).await,
     }
+}
+
+/// Filtered todo list.
+async fn filter_todos(
+    ctx: &CommandContext<'_>,
+    profile_type: &str,
+    profile_id: &str,
+    filter: &str,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let query = api::workflow::FilterQuery {
+        limit,
+        offset,
+        status: None,
+        entry_type: None,
+    };
+    let value =
+        api::workflow::list_todos_filtered(&client, profile_type, profile_id, filter, &query)
+            .await
+            .context("failed to list filtered todos")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Todo count summary.
+async fn summary(ctx: &CommandContext<'_>, profile_type: &str, profile_id: &str) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::workflow::todos_summary(&client, profile_type, profile_id)
+        .await
+        .context("failed to get todo summary")?;
+    ctx.output.render(&value)?;
+    Ok(())
 }
 
 /// List todos in a workspace or share.

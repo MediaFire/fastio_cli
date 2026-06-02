@@ -129,17 +129,33 @@ pub enum Commands {
     /// Organization and workspace assets.
     #[command(subcommand)]
     Asset(AssetCommands),
-    /// Task management.
-    #[command(subcommand)]
+    /// [legacy] Task management. Superseded by the new `fastio workflow`
+    /// orchestration (coming in this release).
+    #[command(
+        subcommand,
+        long_about = "[legacy] Task management.\n\nThis is a legacy primitive that will be replaced by the new `fastio workflow` orchestration group (landing later in this release). It remains fully functional for now; prefer `fastio workflow` for new work once it ships."
+    )]
     Task(TaskCommands),
-    /// Worklog management.
-    #[command(subcommand)]
+    /// [legacy] Worklog management. Superseded by the new `fastio workflow`
+    /// orchestration (coming in this release).
+    #[command(
+        subcommand,
+        long_about = "[legacy] Worklog management.\n\nThis is a legacy primitive that will be replaced by the new `fastio workflow` orchestration group (landing later in this release). It remains fully functional for now; prefer `fastio workflow` for new work once it ships."
+    )]
     Worklog(WorklogCommands),
-    /// Approval workflows.
-    #[command(subcommand)]
+    /// [legacy] Approval workflows. Superseded by the new `fastio workflow`
+    /// orchestration (coming in this release).
+    #[command(
+        subcommand,
+        long_about = "[legacy] Approval workflows.\n\nThis is a legacy primitive that will be replaced by the new `fastio workflow` orchestration group (landing later in this release). It remains fully functional for now; prefer `fastio workflow` for new work once it ships."
+    )]
     Approval(ApprovalCommands),
-    /// Todo items.
-    #[command(subcommand)]
+    /// [legacy] Todo items. Superseded by the new `fastio workflow`
+    /// orchestration (coming in this release).
+    #[command(
+        subcommand,
+        long_about = "[legacy] Todo items.\n\nThis is a legacy primitive that will be replaced by the new `fastio workflow` orchestration group (landing later in this release). It remains fully functional for now; prefer `fastio workflow` for new work once it ships."
+    )]
     Todo(TodoCommands),
 
     /// Connected apps and integrations.
@@ -1101,6 +1117,11 @@ pub enum WorkspaceCommands {
         /// New folder name.
         #[arg(long)]
         folder_name: Option<String>,
+        /// Toggle AI indexing (intelligence). Enabling requires the
+        /// `content_ai` and `ai_agent` plan features; disabling flushes
+        /// embeddings and re-enabling re-indexes (costs AI credits).
+        #[arg(long)]
+        intelligence: Option<bool>,
     },
     /// Delete a workspace. Permanent and irreversible.
     Delete {
@@ -1110,13 +1131,17 @@ pub enum WorkspaceCommands {
         #[arg(long)]
         confirm: String,
     },
-    /// Enable workflow features on a workspace.
+    /// Enable the legacy workflow feature (tasks/worklogs/approvals/todos) on a
+    /// workspace. Does not affect AI indexing — use `workspace update
+    /// --intelligence` for that.
     #[command(name = "enable-workflow")]
     EnableWorkflow {
         /// Workspace ID.
         workspace_id: String,
     },
-    /// Disable workflow features on a workspace.
+    /// Disable the legacy workflow feature on a workspace. Existing
+    /// tasks/worklogs/approvals/todos are preserved but inaccessible until
+    /// re-enabled.
     #[command(name = "disable-workflow")]
     DisableWorkflow {
         /// Workspace ID.
@@ -2696,6 +2721,36 @@ pub enum TaskCommands {
         #[arg(long)]
         list_ids: String,
     },
+    /// Filtered task list (personal view on a workspace, group view on a share).
+    Filter {
+        /// Profile type: workspace or share.
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
+        profile_type: String,
+        /// Workspace or share ID (alias: --workspace).
+        #[arg(long, alias = "workspace")]
+        profile_id: String,
+        /// Filter: assigned, created, status.
+        #[arg(value_parser = ["assigned", "created", "status"])]
+        filter: String,
+        /// Status (required for `status` filter; optional for assigned/created).
+        #[arg(long, value_parser = ["pending", "in_progress", "complete", "blocked"])]
+        status: Option<String>,
+        /// Maximum number of results.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Task count summary for a workspace or share.
+    Summary {
+        /// Profile type: workspace or share.
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
+        profile_type: String,
+        /// Workspace or share ID (alias: --workspace).
+        #[arg(long, alias = "workspace")]
+        profile_id: String,
+    },
     /// Manage task lists.
     #[command(subcommand)]
     Lists(TaskListCommands),
@@ -2763,8 +2818,8 @@ pub enum WorklogCommands {
         /// Workspace ID.
         #[arg(long)]
         workspace: String,
-        /// Entity type (profile, task, `task_list`). Defaults to "profile".
-        #[arg(long, value_parser = ["profile", "task", "task_list"])]
+        /// Entity type (profile, task, `task_list`, node). Defaults to "profile".
+        #[arg(long, value_parser = ["profile", "task", "task_list", "node"])]
         entity_type: Option<String>,
         /// Entity ID (defaults to workspace ID).
         #[arg(long)]
@@ -2783,8 +2838,8 @@ pub enum WorklogCommands {
         workspace: String,
         /// Message content.
         message: String,
-        /// Entity type (profile, task, `task_list`). Defaults to "profile".
-        #[arg(long, value_parser = ["profile", "task", "task_list"])]
+        /// Entity type (profile, task, `task_list`, node). Defaults to "profile".
+        #[arg(long, value_parser = ["profile", "task", "task_list", "node"])]
         entity_type: Option<String>,
         /// Entity ID (defaults to workspace ID).
         #[arg(long)]
@@ -2797,8 +2852,8 @@ pub enum WorklogCommands {
         workspace: String,
         /// Message content.
         message: String,
-        /// Entity type (profile, task, `task_list`). Defaults to "profile".
-        #[arg(long, value_parser = ["profile", "task", "task_list"])]
+        /// Entity type (profile, task, `task_list`, node). Defaults to "profile".
+        #[arg(long, value_parser = ["profile", "task", "task_list", "node"])]
         entity_type: Option<String>,
         /// Entity ID (defaults to workspace ID).
         #[arg(long)]
@@ -2812,8 +2867,8 @@ pub enum WorklogCommands {
     /// List unacknowledged interjections for an entity.
     #[command(name = "list-interjections")]
     ListInterjections {
-        /// Entity type (profile, task, `task_list`).
-        #[arg(long, value_parser = ["profile", "task", "task_list"])]
+        /// Entity type (profile, task, `task_list`, node).
+        #[arg(long, value_parser = ["profile", "task", "task_list", "node"])]
         entity_type: String,
         /// Entity ID.
         #[arg(long)]
@@ -2829,6 +2884,52 @@ pub enum WorklogCommands {
     Acknowledge {
         /// Worklog entry ID to acknowledge.
         entry_id: String,
+    },
+    /// List all worklog entries in a workspace or share.
+    #[command(name = "list-all")]
+    ListAll {
+        /// Profile type: workspace or share.
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
+        profile_type: String,
+        /// Workspace or share ID (alias: --workspace).
+        #[arg(long, alias = "workspace")]
+        profile_id: String,
+        /// Maximum number of results.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Filtered worklog list (personal view on a workspace, group view on a share).
+    Filter {
+        /// Profile type: workspace or share.
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
+        profile_type: String,
+        /// Workspace or share ID (alias: --workspace).
+        #[arg(long, alias = "workspace")]
+        profile_id: String,
+        /// Filter: authored, interjections.
+        #[arg(value_parser = ["authored", "interjections"])]
+        filter: String,
+        /// Entry type (authored filter only).
+        #[arg(long, value_parser = ["info", "decision", "error", "status_change", "request", "interjection"])]
+        entry_type: Option<String>,
+        /// Maximum number of results.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Worklog entry summary for a workspace or share.
+    Summary {
+        /// Profile type: workspace or share.
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
+        profile_type: String,
+        /// Workspace or share ID (alias: --workspace).
+        #[arg(long, alias = "workspace")]
+        profile_id: String,
     },
 }
 
@@ -2855,11 +2956,14 @@ pub enum ApprovalCommands {
     },
     /// Request an approval.
     Request {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace: String,
-        /// Entity type: task, node, or `worklog_entry`.
-        #[arg(long, value_parser = ["task", "node", "worklog_entry"])]
+        /// Profile type the approval is scoped to: workspace or share.
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
+        profile_type: String,
+        /// Workspace or share profile ID (alias: --workspace).
+        #[arg(long, alias = "workspace")]
+        profile_id: String,
+        /// Entity type: task, node, `worklog_entry`, or share.
+        #[arg(long, value_parser = ["task", "node", "worklog_entry", "share"])]
         entity_type: String,
         /// Entity ID.
         entity_id: String,
@@ -2869,9 +2973,37 @@ pub enum ApprovalCommands {
         /// Designated approver profile ID.
         #[arg(long)]
         approver_id: Option<String>,
+        /// Informational deadline (YYYY-MM-DD HH:MM:SS).
+        #[arg(long)]
+        deadline: Option<String>,
+        /// Associated artifact node ID.
+        #[arg(long)]
+        node_id: Option<String>,
+        /// Metadata properties as a JSON object string.
+        #[arg(long)]
+        properties: Option<String>,
+    },
+    /// Get approval details.
+    Info {
+        /// Profile type the approval is scoped to: workspace or share.
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
+        profile_type: String,
+        /// Workspace or share profile ID (alias: --workspace). Omit to use the
+        /// legacy unscoped route.
+        #[arg(long, alias = "workspace")]
+        profile_id: Option<String>,
+        /// Approval ID.
+        approval_id: String,
     },
     /// Approve an approval request.
     Approve {
+        /// Profile type the approval is scoped to: workspace or share.
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
+        profile_type: String,
+        /// Workspace or share profile ID (alias: --workspace). Omit to use the
+        /// legacy unscoped route.
+        #[arg(long, alias = "workspace")]
+        profile_id: Option<String>,
         /// Approval ID.
         approval_id: String,
         /// Optional comment.
@@ -2880,11 +3012,102 @@ pub enum ApprovalCommands {
     },
     /// Reject an approval request.
     Reject {
+        /// Profile type the approval is scoped to: workspace or share.
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
+        profile_type: String,
+        /// Workspace or share profile ID (alias: --workspace). Omit to use the
+        /// legacy unscoped route.
+        #[arg(long, alias = "workspace")]
+        profile_id: Option<String>,
         /// Approval ID.
         approval_id: String,
         /// Optional comment.
         #[arg(long)]
         comment: Option<String>,
+    },
+    /// Update a pending approval (at least one field required).
+    Update {
+        /// Profile type the approval is scoped to: workspace or share.
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
+        profile_type: String,
+        /// Workspace or share profile ID (alias: --workspace). Omit to use the
+        /// legacy unscoped route.
+        #[arg(long, alias = "workspace")]
+        profile_id: Option<String>,
+        /// Approval ID.
+        approval_id: String,
+        /// Updated description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Updated designated approver profile ID.
+        #[arg(long)]
+        approver_id: Option<String>,
+        /// Updated deadline (YYYY-MM-DD HH:MM:SS).
+        #[arg(long)]
+        deadline: Option<String>,
+        /// Updated associated node ID.
+        #[arg(long)]
+        node_id: Option<String>,
+        /// Updated metadata properties as a JSON object string.
+        #[arg(long)]
+        properties: Option<String>,
+    },
+    /// Delete an approval (pending or resolved).
+    Delete {
+        /// Profile type the approval is scoped to: workspace or share.
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
+        profile_type: String,
+        /// Workspace or share profile ID (alias: --workspace). Omit to use the
+        /// legacy unscoped route.
+        #[arg(long, alias = "workspace")]
+        profile_id: Option<String>,
+        /// Approval ID.
+        approval_id: String,
+    },
+    /// Filtered approval list (personal view on a workspace, group view on a share).
+    Filter {
+        /// Profile type: workspace or share.
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
+        profile_type: String,
+        /// Workspace or share profile ID (alias: --workspace).
+        #[arg(long, alias = "workspace")]
+        profile_id: String,
+        /// Filter: pending, created, assigned, resolved.
+        #[arg(value_parser = ["pending", "created", "assigned", "resolved"])]
+        filter: String,
+        /// Status filter (created/assigned only): pending, approved, rejected.
+        #[arg(long, value_parser = ["pending", "approved", "rejected"])]
+        status: Option<String>,
+        /// Maximum number of results.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Approval count summary for a workspace or share.
+    Summary {
+        /// Profile type: workspace or share.
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
+        profile_type: String,
+        /// Workspace or share profile ID (alias: --workspace).
+        #[arg(long, alias = "workspace")]
+        profile_id: String,
+    },
+    /// List the authenticated user's approvals across all profiles.
+    Mine {
+        /// Filter: pending, created, resolved.
+        #[arg(value_parser = ["pending", "created", "resolved"])]
+        filter: String,
+        /// Status filter (created only): pending, approved, rejected.
+        #[arg(long, value_parser = ["pending", "approved", "rejected"])]
+        status: Option<String>,
+        /// Maximum number of results.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
     },
 }
 
@@ -2962,6 +3185,33 @@ pub enum TodoCommands {
         /// Set completion state (true = done, false = not done).
         #[arg(long, default_value = "true")]
         done: bool,
+    },
+    /// Filtered todo list (personal view on a workspace, group view on a share).
+    Filter {
+        /// Profile type: workspace or share.
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
+        profile_type: String,
+        /// Workspace or share ID (alias: --workspace).
+        #[arg(long, alias = "workspace")]
+        profile_id: String,
+        /// Filter: assigned, created, done, pending.
+        #[arg(value_parser = ["assigned", "created", "done", "pending"])]
+        filter: String,
+        /// Maximum number of results.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Todo count summary for a workspace or share.
+    Summary {
+        /// Profile type: workspace or share.
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
+        profile_type: String,
+        /// Workspace or share ID (alias: --workspace).
+        #[arg(long, alias = "workspace")]
+        profile_id: String,
     },
 }
 
@@ -3896,7 +4146,10 @@ impl fmt::Debug for AuthCommands {
 
 #[cfg(test)]
 mod ripley_alias_tests {
-    use super::{Cli, Commands, RipleyCommands, SearchCommands};
+    use super::{
+        ApprovalCommands, Cli, Commands, RipleyCommands, SearchCommands, TaskCommands,
+        TodoCommands, WorklogCommands,
+    };
     use clap::{CommandFactory, Parser};
 
     /// Clap's own internal invariant checker — catches duplicate/ambiguous
@@ -4376,5 +4629,223 @@ mod ripley_alias_tests {
             help.contains("memory"),
             "`memory` should be visible in ripley help"
         );
+    }
+
+    #[test]
+    fn legacy_workflow_groups_marked_in_top_level_help() {
+        // Each legacy primitive group's about line must carry `[legacy]`.
+        let mut cmd = Cli::command();
+        let mut buf = Vec::new();
+        cmd.write_long_help(&mut buf).expect("render help");
+        let help = String::from_utf8(buf).expect("utf8 help");
+        for group in ["task", "worklog", "approval", "todo"] {
+            // Find the subcommand and inspect its about text directly (robust to
+            // help-layout wrapping).
+            let sub = Cli::command()
+                .get_subcommands()
+                .find(|c| c.get_name() == group)
+                .map(|c| {
+                    c.get_about()
+                        .map(std::string::ToString::to_string)
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            assert!(
+                sub.contains("[legacy]"),
+                "{group} about must contain [legacy], got: {sub}"
+            );
+        }
+        // Sanity: the rendered help is non-empty.
+        assert!(!help.is_empty());
+    }
+
+    #[test]
+    fn approval_request_parses_scope_and_optional_fields() {
+        let cli = Cli::try_parse_from([
+            "fastio",
+            "approval",
+            "request",
+            "--profile-type",
+            "share",
+            "--profile-id",
+            "sh1",
+            "--entity-type",
+            "task",
+            "abc",
+            "--description",
+            "review please",
+            "--approver-id",
+            "appr1",
+            "--deadline",
+            "2025-06-15 23:59:59",
+        ])
+        .expect("approval request should parse");
+        match cli.command {
+            Commands::Approval(ApprovalCommands::Request {
+                profile_type,
+                profile_id,
+                entity_type,
+                entity_id,
+                description,
+                approver_id,
+                deadline,
+                ..
+            }) => {
+                assert_eq!(profile_type, "share");
+                assert_eq!(profile_id, "sh1");
+                assert_eq!(entity_type, "task");
+                assert_eq!(entity_id, "abc");
+                assert_eq!(description, "review please");
+                assert_eq!(approver_id.as_deref(), Some("appr1"));
+                assert_eq!(deadline.as_deref(), Some("2025-06-15 23:59:59"));
+            }
+            other => panic!("expected approval request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approval_approve_defaults_profile_type_to_workspace() {
+        let cli = Cli::try_parse_from([
+            "fastio",
+            "approval",
+            "approve",
+            "--profile-id",
+            "ws1",
+            "appr1",
+        ])
+        .expect("approval approve should parse");
+        match cli.command {
+            Commands::Approval(ApprovalCommands::Approve {
+                profile_type,
+                profile_id,
+                approval_id,
+                ..
+            }) => {
+                assert_eq!(profile_type, "workspace");
+                assert_eq!(profile_id.as_deref(), Some("ws1"));
+                assert_eq!(approval_id, "appr1");
+            }
+            other => panic!("expected approval approve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approval_approve_works_without_scope() {
+        // Backward compat: the historical `approval approve <id>` syntax must
+        // parse without any scope flag (profile_id is then None → legacy route).
+        let cli = Cli::try_parse_from(["fastio", "approval", "approve", "appr1"])
+            .expect("approval approve should parse without a scope");
+        match cli.command {
+            Commands::Approval(ApprovalCommands::Approve {
+                profile_id,
+                approval_id,
+                ..
+            }) => {
+                assert!(profile_id.is_none());
+                assert_eq!(approval_id, "appr1");
+            }
+            other => panic!("expected approval approve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approval_mine_parses_filter() {
+        let cli = Cli::try_parse_from(["fastio", "approval", "mine", "pending"])
+            .expect("approval mine should parse");
+        match cli.command {
+            Commands::Approval(ApprovalCommands::Mine { filter, .. }) => {
+                assert_eq!(filter, "pending");
+            }
+            other => panic!("expected approval mine, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_filter_and_summary_parse() {
+        let cli =
+            Cli::try_parse_from(["fastio", "task", "filter", "--workspace", "ws1", "assigned"])
+                .expect("task filter should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Task(TaskCommands::Filter { .. })
+        ));
+        let cli = Cli::try_parse_from(["fastio", "task", "summary", "--workspace", "ws1"])
+            .expect("task summary should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Task(TaskCommands::Summary { .. })
+        ));
+    }
+
+    #[test]
+    fn worklog_list_accepts_node_entity_type() {
+        // workflow.txt lists `node` as a valid worklog entity type; the CLI
+        // value_parser must accept it (previously rejected).
+        let cli = Cli::try_parse_from([
+            "fastio",
+            "worklog",
+            "list",
+            "--workspace",
+            "ws1",
+            "--entity-type",
+            "node",
+            "--entity-id",
+            "n1",
+        ])
+        .expect("worklog list --entity-type node should parse");
+        match cli.command {
+            Commands::Worklog(WorklogCommands::List { entity_type, .. }) => {
+                assert_eq!(entity_type.as_deref(), Some("node"));
+            }
+            other => panic!("expected worklog list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worklog_filter_listall_summary_parse() {
+        for (args, ok) in [
+            (
+                vec!["fastio", "worklog", "list-all", "--workspace", "ws1"],
+                true,
+            ),
+            (
+                vec![
+                    "fastio",
+                    "worklog",
+                    "filter",
+                    "--workspace",
+                    "ws1",
+                    "authored",
+                ],
+                true,
+            ),
+            (
+                vec!["fastio", "worklog", "summary", "--workspace", "ws1"],
+                true,
+            ),
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args.clone()).is_ok(),
+                ok,
+                "parsing {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn todo_filter_and_summary_parse() {
+        let cli =
+            Cli::try_parse_from(["fastio", "todo", "filter", "--workspace", "ws1", "pending"])
+                .expect("todo filter should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Todo(TodoCommands::Filter { .. })
+        ));
+        let cli = Cli::try_parse_from(["fastio", "todo", "summary", "--workspace", "ws1"])
+            .expect("todo summary should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Todo(TodoCommands::Summary { .. })
+        ));
     }
 }

@@ -135,6 +135,28 @@ pub enum TaskCommand {
         /// Comma-separated list IDs in desired order.
         list_ids: String,
     },
+    /// Filtered task list (personal/group view).
+    Filter {
+        /// Profile type: workspace or share.
+        profile_type: String,
+        /// Workspace or share ID.
+        profile_id: String,
+        /// Filter: assigned, created, status.
+        filter: String,
+        /// Status filter.
+        status: Option<String>,
+        /// Max results.
+        limit: Option<u32>,
+        /// Offset for pagination.
+        offset: Option<u32>,
+    },
+    /// Task count summary for a workspace or share.
+    Summary {
+        /// Profile type: workspace or share.
+        profile_type: String,
+        /// Workspace or share ID.
+        profile_id: String,
+    },
     /// Manage task lists.
     Lists(TaskListCommand),
 }
@@ -182,6 +204,7 @@ pub enum TaskListCommand {
 }
 
 /// Execute a task subcommand.
+#[allow(clippy::too_many_lines)]
 pub async fn execute(command: &TaskCommand, ctx: &CommandContext<'_>) -> Result<()> {
     match command {
         TaskCommand::List {
@@ -257,8 +280,73 @@ pub async fn execute(command: &TaskCommand, ctx: &CommandContext<'_>) -> Result<
             profile_id,
             list_ids,
         } => reorder_lists(ctx, profile_type, profile_id, list_ids).await,
+        TaskCommand::Filter {
+            profile_type,
+            profile_id,
+            filter,
+            status,
+            limit,
+            offset,
+        } => {
+            filter_tasks(
+                ctx,
+                profile_type,
+                profile_id,
+                filter,
+                status.as_deref(),
+                *limit,
+                *offset,
+            )
+            .await
+        }
+        TaskCommand::Summary {
+            profile_type,
+            profile_id,
+        } => tasks_summary(ctx, profile_type, profile_id).await,
         TaskCommand::Lists(cmd) => lists(cmd, ctx).await,
     }
+}
+
+/// Filtered task list.
+async fn filter_tasks(
+    ctx: &CommandContext<'_>,
+    profile_type: &str,
+    profile_id: &str,
+    filter: &str,
+    status: Option<&str>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<()> {
+    if filter == "status" && status.is_none() {
+        anyhow::bail!("the `status` filter requires --status");
+    }
+    let client = ctx.build_client()?;
+    let query = api::workflow::FilterQuery {
+        limit,
+        offset,
+        status,
+        entry_type: None,
+    };
+    let value =
+        api::workflow::list_tasks_filtered(&client, profile_type, profile_id, filter, &query)
+            .await
+            .context("failed to list filtered tasks")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Task count summary.
+async fn tasks_summary(
+    ctx: &CommandContext<'_>,
+    profile_type: &str,
+    profile_id: &str,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::workflow::tasks_summary(&client, profile_type, profile_id)
+        .await
+        .context("failed to get task summary")?;
+    ctx.output.render(&value)?;
+    Ok(())
 }
 
 /// List tasks.

@@ -51,6 +51,8 @@ pub enum WorkspaceCommand {
         description: Option<String>,
         /// New folder name.
         folder_name: Option<String>,
+        /// Toggle AI indexing (intelligence).
+        intelligence: Option<bool>,
     },
     /// Delete a workspace.
     Delete {
@@ -123,6 +125,7 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
             name,
             description,
             folder_name,
+            intelligence,
         } => {
             update(
                 ctx,
@@ -130,6 +133,7 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
                 name.as_deref(),
                 description.as_deref(),
                 folder_name.as_deref(),
+                *intelligence,
             )
             .await
         }
@@ -209,20 +213,17 @@ async fn info(ctx: &CommandContext<'_>, workspace_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Update workspace settings.
-async fn update(
-    ctx: &CommandContext<'_>,
-    workspace_id: &str,
+/// Build the form-field map for a workspace update from the provided options.
+///
+/// `intelligence` is serialized as the string `"true"`/`"false"` because the
+/// `/workspace/{id}/update/` endpoint takes the AI-indexing toggle as a string
+/// form field (workspaces.txt).
+fn build_workspace_update_fields(
     name: Option<&str>,
     description: Option<&str>,
     folder_name: Option<&str>,
-) -> Result<()> {
-    if name.is_none() && description.is_none() && folder_name.is_none() {
-        anyhow::bail!(
-            "at least one update field is required (--name, --description, --folder-name)"
-        );
-    }
-
+    intelligence: Option<bool>,
+) -> HashMap<String, String> {
     let mut fields = HashMap::new();
     if let Some(v) = name {
         fields.insert("name".to_owned(), v.to_owned());
@@ -233,6 +234,28 @@ async fn update(
     if let Some(v) = folder_name {
         fields.insert("folder_name".to_owned(), v.to_owned());
     }
+    if let Some(v) = intelligence {
+        fields.insert("intelligence".to_owned(), v.to_string());
+    }
+    fields
+}
+
+/// Update workspace settings.
+async fn update(
+    ctx: &CommandContext<'_>,
+    workspace_id: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+    folder_name: Option<&str>,
+    intelligence: Option<bool>,
+) -> Result<()> {
+    if name.is_none() && description.is_none() && folder_name.is_none() && intelligence.is_none() {
+        anyhow::bail!(
+            "at least one update field is required (--name, --description, --folder-name, --intelligence)"
+        );
+    }
+
+    let fields = build_workspace_update_fields(name, description, folder_name, intelligence);
 
     let client = ctx.build_client()?;
     let value = api::workspace::update_workspace(&client, workspace_id, &fields)
@@ -318,4 +341,36 @@ async fn limits(ctx: &CommandContext<'_>, workspace_id: &str) -> Result<()> {
         .context("failed to get workspace limits")?;
     ctx.output.render(&value)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_workspace_update_fields;
+
+    #[test]
+    fn update_fields_carry_intelligence_true() {
+        // `workspace update --intelligence true` must reach the form body as
+        // the string "true" (workspaces.txt: intelligence is a string toggle).
+        let fields = build_workspace_update_fields(None, None, None, Some(true));
+        assert_eq!(fields.get("intelligence").map(String::as_str), Some("true"));
+        assert_eq!(fields.len(), 1);
+    }
+
+    #[test]
+    fn update_fields_carry_intelligence_false() {
+        let fields = build_workspace_update_fields(None, None, None, Some(false));
+        assert_eq!(
+            fields.get("intelligence").map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn update_fields_omit_intelligence_when_unset() {
+        // When --intelligence is not passed the toggle must NOT be sent, so an
+        // unrelated rename never accidentally flips AI indexing.
+        let fields = build_workspace_update_fields(Some("New Name"), None, None, None);
+        assert!(!fields.contains_key("intelligence"));
+        assert_eq!(fields.get("name").map(String::as_str), Some("New Name"));
+    }
 }

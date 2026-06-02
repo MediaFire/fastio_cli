@@ -7,7 +7,7 @@ use super::CommandContext;
 use fastio_cli::api;
 
 /// Allowed entity types for worklog operations.
-const VALID_ENTITY_TYPES: &[&str] = &["profile", "task", "task_list"];
+const VALID_ENTITY_TYPES: &[&str] = &["profile", "task", "task_list", "node"];
 
 /// Validate that an entity type is one of the known values.
 fn validate_entity_type(entity_type: &str) -> Result<()> {
@@ -17,6 +17,18 @@ fn validate_entity_type(entity_type: &str) -> Result<()> {
             entity_type,
             VALID_ENTITY_TYPES.join(", ")
         );
+    }
+    Ok(())
+}
+
+/// Validate the `--entry-type` filter against the worklog filter in use.
+///
+/// Per the contract (workflow.txt) only the `authored` filter honors
+/// `?entry_type=`; other filters (e.g. `interjections`) ignore it server-side,
+/// so passing it elsewhere is rejected rather than silently dropped.
+fn validate_entry_type_filter(filter: &str, entry_type: Option<&str>) -> Result<()> {
+    if entry_type.is_some() && filter != "authored" {
+        anyhow::bail!("--entry-type is only valid with the `authored` filter");
     }
     Ok(())
 }
@@ -81,6 +93,39 @@ pub enum WorklogCommand {
         /// Worklog entry ID to acknowledge.
         entry_id: String,
     },
+    /// List all worklog entries in a workspace or share.
+    ListAll {
+        /// Profile type: workspace or share.
+        profile_type: String,
+        /// Workspace or share ID.
+        profile_id: String,
+        /// Max results.
+        limit: Option<u32>,
+        /// Offset for pagination.
+        offset: Option<u32>,
+    },
+    /// Filtered worklog list (personal/group view).
+    Filter {
+        /// Profile type: workspace or share.
+        profile_type: String,
+        /// Workspace or share ID.
+        profile_id: String,
+        /// Filter: authored, interjections.
+        filter: String,
+        /// Entry type filter (authored only).
+        entry_type: Option<String>,
+        /// Max results.
+        limit: Option<u32>,
+        /// Offset for pagination.
+        offset: Option<u32>,
+    },
+    /// Worklog entry summary for a workspace or share.
+    Summary {
+        /// Profile type: workspace or share.
+        profile_type: String,
+        /// Workspace or share ID.
+        profile_id: String,
+    },
 }
 
 /// Execute a worklog subcommand.
@@ -125,7 +170,95 @@ pub async fn execute(command: &WorklogCommand, ctx: &CommandContext<'_>) -> Resu
             offset,
         } => list_interjections(ctx, entity_type, entity_id, *limit, *offset).await,
         WorklogCommand::Acknowledge { entry_id } => acknowledge(ctx, entry_id).await,
+        WorklogCommand::ListAll {
+            profile_type,
+            profile_id,
+            limit,
+            offset,
+        } => list_all(ctx, profile_type, profile_id, *limit, *offset).await,
+        WorklogCommand::Filter {
+            profile_type,
+            profile_id,
+            filter,
+            entry_type,
+            limit,
+            offset,
+        } => {
+            filter_worklogs(
+                ctx,
+                profile_type,
+                profile_id,
+                filter,
+                entry_type.as_deref(),
+                *limit,
+                *offset,
+            )
+            .await
+        }
+        WorklogCommand::Summary {
+            profile_type,
+            profile_id,
+        } => summary(ctx, profile_type, profile_id).await,
     }
+}
+
+/// List all worklog entries in a workspace or share.
+async fn list_all(
+    ctx: &CommandContext<'_>,
+    profile_type: &str,
+    profile_id: &str,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let query = api::workflow::FilterQuery {
+        limit,
+        offset,
+        status: None,
+        entry_type: None,
+    };
+    let value = api::workflow::list_worklogs_ctx(&client, profile_type, profile_id, &query)
+        .await
+        .context("failed to list worklog entries")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Filtered worklog list.
+async fn filter_worklogs(
+    ctx: &CommandContext<'_>,
+    profile_type: &str,
+    profile_id: &str,
+    filter: &str,
+    entry_type: Option<&str>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<()> {
+    validate_entry_type_filter(filter, entry_type)?;
+
+    let client = ctx.build_client()?;
+    let query = api::workflow::FilterQuery {
+        limit,
+        offset,
+        status: None,
+        entry_type,
+    };
+    let value =
+        api::workflow::list_worklogs_filtered(&client, profile_type, profile_id, filter, &query)
+            .await
+            .context("failed to list filtered worklog entries")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Worklog entry summary.
+async fn summary(ctx: &CommandContext<'_>, profile_type: &str, profile_id: &str) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::workflow::worklogs_summary(&client, profile_type, profile_id)
+        .await
+        .context("failed to get worklog summary")?;
+    ctx.output.render(&value)?;
+    Ok(())
 }
 
 /// List worklog entries.
@@ -225,4 +358,33 @@ async fn acknowledge(ctx: &CommandContext<'_>, entry_id: &str) -> Result<()> {
         .context("failed to acknowledge worklog interjection")?;
     ctx.output.render(&value)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_entity_type, validate_entry_type_filter};
+
+    #[test]
+    fn entity_type_accepts_node() {
+        // workflow.txt lists `node` as a valid worklog entity type.
+        assert!(validate_entity_type("node").is_ok());
+        assert!(validate_entity_type("profile").is_ok());
+        assert!(validate_entity_type("task").is_ok());
+        assert!(validate_entity_type("task_list").is_ok());
+    }
+
+    #[test]
+    fn entity_type_rejects_unknown() {
+        assert!(validate_entity_type("workspace").is_err());
+    }
+
+    #[test]
+    fn entry_type_filter_allowed_only_with_authored() {
+        // `authored` honors `?entry_type=`; the guard permits it there.
+        assert!(validate_entry_type_filter("authored", Some("info")).is_ok());
+        // No entry_type → always fine regardless of filter.
+        assert!(validate_entry_type_filter("interjections", None).is_ok());
+        // entry_type with a non-authored filter is rejected (not silently dropped).
+        assert!(validate_entry_type_filter("interjections", Some("info")).is_err());
+    }
 }

@@ -146,10 +146,22 @@ async fn dispatch(
         Commands::Preview(c) => commands::preview::execute(&map_preview_command(c), ctx).await,
         Commands::Asset(c) => commands::asset::execute(&map_asset_command(c), ctx).await,
         Commands::Ripley(c) => commands::ai::execute(&map_ripley_command(c), ctx).await,
-        Commands::Task(c) => commands::task::execute(&map_task_command(c), ctx).await,
-        Commands::Worklog(c) => commands::worklog::execute(&map_worklog_command(c), ctx).await,
-        Commands::Approval(c) => commands::approval::execute(&map_approval_command(c), ctx).await,
-        Commands::Todo(c) => commands::todo::execute(&map_todo_command(c), ctx).await,
+        Commands::Task(c) => {
+            fastio_cli::deprecation::warn_legacy("task", "`fastio workflow`", ctx.output.quiet);
+            commands::task::execute(&map_task_command(c), ctx).await
+        }
+        Commands::Worklog(c) => {
+            fastio_cli::deprecation::warn_legacy("worklog", "`fastio workflow`", ctx.output.quiet);
+            commands::worklog::execute(&map_worklog_command(c), ctx).await
+        }
+        Commands::Approval(c) => {
+            fastio_cli::deprecation::warn_legacy("approval", "`fastio workflow`", ctx.output.quiet);
+            commands::approval::execute(&map_approval_command(c), ctx).await
+        }
+        Commands::Todo(c) => {
+            fastio_cli::deprecation::warn_legacy("todo", "`fastio workflow`", ctx.output.quiet);
+            commands::todo::execute(&map_todo_command(c), ctx).await
+        }
         Commands::Apps(c) => commands::apps::execute(&map_apps_command(&c), ctx).await,
         Commands::Import(c) => commands::import::execute(&map_import_command(&c), ctx).await,
         Commands::Lock(c) => commands::lock::execute(&map_lock_command(&c), ctx).await,
@@ -624,11 +636,13 @@ fn map_workspace_command(cmd: cli::WorkspaceCommands) -> WorkspaceCommand {
             name,
             description,
             folder_name,
+            intelligence,
         } => WorkspaceCommand::Update {
             workspace_id,
             name,
             description,
             folder_name,
+            intelligence,
         },
         cli::WorkspaceCommands::Delete {
             workspace_id,
@@ -1620,6 +1634,7 @@ fn map_ripley_command(cmd: cli::RipleyCommands) -> AiCommand {
 }
 
 /// Convert clap-parsed task commands to the internal enum.
+#[allow(clippy::too_many_lines)]
 fn map_task_command(cmd: cli::TaskCommands) -> TaskCommand {
     match cmd {
         cli::TaskCommands::List {
@@ -1712,6 +1727,28 @@ fn map_task_command(cmd: cli::TaskCommands) -> TaskCommand {
             profile_type,
             profile_id,
             list_ids,
+        },
+        cli::TaskCommands::Filter {
+            profile_type,
+            profile_id,
+            filter,
+            status,
+            limit,
+            offset,
+        } => TaskCommand::Filter {
+            profile_type,
+            profile_id,
+            filter,
+            status,
+            limit,
+            offset,
+        },
+        cli::TaskCommands::Summary {
+            profile_type,
+            profile_id,
+        } => TaskCommand::Summary {
+            profile_type,
+            profile_id,
         },
         cli::TaskCommands::Lists(lists_cmd) => TaskCommand::Lists(map_task_list_command(lists_cmd)),
     }
@@ -1809,11 +1846,61 @@ fn map_worklog_command(cmd: cli::WorklogCommands) -> WorklogCommand {
             offset,
         },
         cli::WorklogCommands::Acknowledge { entry_id } => WorklogCommand::Acknowledge { entry_id },
+        cli::WorklogCommands::ListAll {
+            profile_type,
+            profile_id,
+            limit,
+            offset,
+        } => WorklogCommand::ListAll {
+            profile_type,
+            profile_id,
+            limit,
+            offset,
+        },
+        cli::WorklogCommands::Filter {
+            profile_type,
+            profile_id,
+            filter,
+            entry_type,
+            limit,
+            offset,
+        } => WorklogCommand::Filter {
+            profile_type,
+            profile_id,
+            filter,
+            entry_type,
+            limit,
+            offset,
+        },
+        cli::WorklogCommands::Summary {
+            profile_type,
+            profile_id,
+        } => WorklogCommand::Summary {
+            profile_type,
+            profile_id,
+        },
     }
 }
 
+/// Build an optional approval scope from a profile type and an optional
+/// profile ID. When the ID is absent (`--profile-id`/`--workspace` omitted),
+/// returns `None` so the command falls back to the legacy unscoped route,
+/// preserving the historical `approval approve <id>` syntax. The `profile_type`
+/// default is irrelevant when no ID is supplied.
+fn optional_approval_scope(
+    profile_type: String,
+    profile_id: Option<String>,
+) -> Option<commands::approval::ApprovalScope> {
+    profile_id.map(|profile_id| commands::approval::ApprovalScope {
+        profile_type,
+        profile_id,
+    })
+}
+
 /// Convert clap-parsed approval commands to the internal enum.
+#[allow(clippy::too_many_lines)]
 fn map_approval_command(cmd: cli::ApprovalCommands) -> ApprovalCommand {
+    use commands::approval::ApprovalScope;
     match cmd {
         cli::ApprovalCommands::List {
             workspace,
@@ -1827,31 +1914,118 @@ fn map_approval_command(cmd: cli::ApprovalCommands) -> ApprovalCommand {
             offset,
         },
         cli::ApprovalCommands::Request {
-            workspace,
+            profile_type,
+            profile_id,
             entity_type,
             entity_id,
             description,
             approver_id,
+            deadline,
+            node_id,
+            properties,
         } => ApprovalCommand::Request {
-            workspace,
+            scope: ApprovalScope {
+                profile_type,
+                profile_id,
+            },
             entity_type,
             entity_id,
             description,
             approver_id,
+            deadline,
+            node_id,
+            properties,
+        },
+        cli::ApprovalCommands::Info {
+            profile_type,
+            profile_id,
+            approval_id,
+        } => ApprovalCommand::Info {
+            scope: optional_approval_scope(profile_type, profile_id),
+            approval_id,
         },
         cli::ApprovalCommands::Approve {
+            profile_type,
+            profile_id,
             approval_id,
             comment,
         } => ApprovalCommand::Approve {
+            scope: optional_approval_scope(profile_type, profile_id),
             approval_id,
             comment,
         },
         cli::ApprovalCommands::Reject {
+            profile_type,
+            profile_id,
             approval_id,
             comment,
         } => ApprovalCommand::Reject {
+            scope: optional_approval_scope(profile_type, profile_id),
             approval_id,
             comment,
+        },
+        cli::ApprovalCommands::Update {
+            profile_type,
+            profile_id,
+            approval_id,
+            description,
+            approver_id,
+            deadline,
+            node_id,
+            properties,
+        } => ApprovalCommand::Update {
+            scope: optional_approval_scope(profile_type, profile_id),
+            approval_id,
+            description,
+            approver_id,
+            deadline,
+            node_id,
+            properties,
+        },
+        cli::ApprovalCommands::Delete {
+            profile_type,
+            profile_id,
+            approval_id,
+        } => ApprovalCommand::Delete {
+            scope: optional_approval_scope(profile_type, profile_id),
+            approval_id,
+        },
+        cli::ApprovalCommands::Filter {
+            profile_type,
+            profile_id,
+            filter,
+            status,
+            limit,
+            offset,
+        } => ApprovalCommand::Filter {
+            scope: ApprovalScope {
+                profile_type,
+                profile_id,
+            },
+            filter,
+            status,
+            limit,
+            offset,
+        },
+        cli::ApprovalCommands::Summary {
+            profile_type,
+            profile_id,
+        } => ApprovalCommand::Summary {
+            scope: ApprovalScope {
+                profile_type,
+                profile_id,
+            },
+        },
+        cli::ApprovalCommands::Mine {
+            filter,
+            status,
+            limit,
+            offset,
+        } => ApprovalCommand::Mine {
+            filter,
+            status,
+            limit,
+            offset,
         },
     }
 }
@@ -1912,6 +2086,26 @@ fn map_todo_command(cmd: cli::TodoCommands) -> TodoCommand {
                 done,
             }
         }
+        cli::TodoCommands::Filter {
+            profile_type,
+            profile_id,
+            filter,
+            limit,
+            offset,
+        } => TodoCommand::Filter {
+            profile_type,
+            profile_id,
+            filter,
+            limit,
+            offset,
+        },
+        cli::TodoCommands::Summary {
+            profile_type,
+            profile_id,
+        } => TodoCommand::Summary {
+            profile_type,
+            profile_id,
+        },
     }
 }
 

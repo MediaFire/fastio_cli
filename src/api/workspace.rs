@@ -154,14 +154,24 @@ pub async fn list_workspace_members(
     }
 }
 
+/// Build the workspace workflow toggle path (`enable` or `disable`).
+fn workflow_toggle_path(workspace_id: &str, action: &str) -> String {
+    format!(
+        "/workspace/{}/workflow/{action}/",
+        urlencoding::encode(workspace_id)
+    )
+}
+
 /// Enable workflow features on a workspace.
 ///
-/// `POST /workspace/{workspace_id}/update/` with `intelligence=true`.
+/// `POST /workspace/{workspace_id}/workflow/enable/`
+///
+/// Gates the legacy task/worklog/approval/todo primitives on the workspace.
+/// This does **not** touch AI indexing (`intelligence`) — see
+/// [`update_workspace`] / `workspace update --intelligence` for that.
 pub async fn enable_workflow(client: &ApiClient, workspace_id: &str) -> Result<Value, CliError> {
-    let mut form = HashMap::new();
-    form.insert("intelligence".to_owned(), "true".to_owned());
-    let path = format!("/workspace/{}/update/", urlencoding::encode(workspace_id),);
-    client.post(&path, &form).await
+    let path = workflow_toggle_path(workspace_id, "enable");
+    client.post_json(&path, &serde_json::json!({})).await
 }
 
 /// Archive a workspace.
@@ -439,10 +449,7 @@ pub async fn quickshares_list(
 ///
 /// `POST /workspace/{workspace_id}/workflow/disable/`
 pub async fn disable_workflow(client: &ApiClient, workspace_id: &str) -> Result<Value, CliError> {
-    let path = format!(
-        "/workspace/{}/workflow/disable/",
-        urlencoding::encode(workspace_id)
-    );
+    let path = workflow_toggle_path(workspace_id, "disable");
     client.post_json(&path, &serde_json::json!({})).await
 }
 
@@ -610,7 +617,31 @@ pub async fn metadata_api(
 
 #[cfg(test)]
 mod tests {
-    use super::{MetadataRequestKind, build_update_note_form, note_path, plan_metadata_request};
+    use super::{
+        MetadataRequestKind, build_update_note_form, note_path, plan_metadata_request,
+        workflow_toggle_path,
+    };
+
+    #[test]
+    fn enable_workflow_targets_workflow_enable_not_update() {
+        // Regression: enable_workflow must hit /workflow/enable/, NOT
+        // /update/ with intelligence=true (which toggles AI indexing).
+        let p = workflow_toggle_path("1234567890123456789", "enable");
+        assert_eq!(p, "/workspace/1234567890123456789/workflow/enable/");
+        assert!(!p.contains("/update/"), "must not target /update/: {p}");
+    }
+
+    #[test]
+    fn disable_workflow_targets_workflow_disable() {
+        let p = workflow_toggle_path("1234567890123456789", "disable");
+        assert_eq!(p, "/workspace/1234567890123456789/workflow/disable/");
+    }
+
+    #[test]
+    fn workflow_toggle_path_url_encodes_workspace_id() {
+        let p = workflow_toggle_path("ws id", "enable");
+        assert!(p.contains("ws%20id"), "{p}");
+    }
 
     #[test]
     fn metadata_get_with_params_forwards_query() {

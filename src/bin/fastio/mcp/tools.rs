@@ -1093,7 +1093,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "task",
-        description: "Tasks: manage task lists and tasks. list-lists, create-list, list-details, update-list, delete-list, list-tasks, create-task, task-details, update-task, delete-task, change-status, assign-task, bulk-status, move-task, reorder-tasks, reorder-lists.",
+        description: "[legacy] Tasks: manage task lists and tasks. Legacy workflow primitive, will be replaced by the new `workflow` orchestration tool (landing later this release). list-lists, create-list, list-details, update-list, delete-list, list-tasks, create-task, task-details, update-task, delete-task, change-status, assign-task, bulk-status, move-task, reorder-tasks, reorder-lists, filter, summary.",
         actions: &[
             "list-lists",
             "create-list",
@@ -1111,6 +1111,8 @@ const TOOL_DEFS: &[ToolDef] = &[
             "move-task",
             "reorder-tasks",
             "reorder-lists",
+            "filter",
+            "summary",
         ],
         params: &[
             ("profile_type", "Profile type: workspace or share", false),
@@ -1148,13 +1150,18 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "Node ID to link (create-task, update-task)",
                 false,
             ),
+            (
+                "filter",
+                "Filter: assigned, created, status (filter action)",
+                false,
+            ),
             ("limit", "Pagination limit", false),
             ("offset", "Pagination offset", false),
         ],
     },
     ToolDef {
         name: "worklog",
-        description: "Worklogs: list, append, interject, details, acknowledge, unacknowledged.",
+        description: "[legacy] Worklogs: list, append, interject, details, acknowledge, unacknowledged, list-all, filter, summary. Legacy workflow primitive, will be replaced by the new `workflow` orchestration tool (landing later this release).",
         actions: &[
             "list",
             "append",
@@ -1162,40 +1169,108 @@ const TOOL_DEFS: &[ToolDef] = &[
             "details",
             "acknowledge",
             "unacknowledged",
+            "list-all",
+            "filter",
+            "summary",
         ],
         params: &[
             (
                 "entity_type",
-                "Entity type: task, task_list, or profile",
+                "Entity type: profile (default), task, task_list, or node",
                 false,
             ),
             ("entity_id", "Entity ID", false),
             ("entry_id", "Worklog entry ID (details, acknowledge)", false),
             ("message", "Worklog content", false),
+            (
+                "profile_type",
+                "Profile type: workspace or share (list-all, filter, summary)",
+                false,
+            ),
+            (
+                "profile_id",
+                "Profile ID (list-all, filter, summary)",
+                false,
+            ),
+            (
+                "filter",
+                "Filter: authored, interjections (filter action)",
+                false,
+            ),
+            ("entry_type", "Entry type filter (authored filter)", false),
             ("limit", "Pagination limit", false),
             ("offset", "Pagination offset", false),
         ],
     },
     ToolDef {
         name: "approval",
-        description: "Approvals: list, request, approve, reject approval workflows.",
-        actions: &["list", "request", "approve", "reject"],
+        description: "[legacy] Approvals: list, request, details, approve, reject, update, delete, filter, summary, user-approvals. Legacy workflow primitive, will be replaced by the new `workflow` orchestration tool (landing later this release).",
+        actions: &[
+            "list",
+            "request",
+            "details",
+            "approve",
+            "reject",
+            "update",
+            "delete",
+            "filter",
+            "summary",
+            "user-approvals",
+        ],
         params: &[
             ("workspace_id", "Workspace ID (list)", false),
-            ("approval_id", "Approval ID (approve, reject)", false),
-            ("entity_type", "Entity type (request)", false),
+            (
+                "profile_type",
+                "Profile type: workspace or share (request, details, approve, reject, update, delete, filter, summary)",
+                false,
+            ),
+            (
+                "profile_id",
+                "Profile ID. Required for request/filter/summary; for details/approve/reject/update/delete, omit to use the legacy unscoped route",
+                false,
+            ),
+            (
+                "approval_id",
+                "Approval ID (details, approve, reject, update, delete)",
+                false,
+            ),
+            (
+                "entity_type",
+                "Entity type: task, node, worklog_entry, share (request)",
+                false,
+            ),
             ("entity_id", "Entity ID (request)", false),
-            ("description", "Description (request)", false),
-            ("approver_id", "Approver user ID (request)", false),
+            ("description", "Description (request, update)", false),
+            ("approver_id", "Approver user ID (request, update)", false),
+            (
+                "deadline",
+                "Deadline YYYY-MM-DD HH:MM:SS (request, update)",
+                false,
+            ),
+            ("node_id", "Artifact node ID (request, update)", false),
+            (
+                "properties",
+                "Metadata properties as a JSON object (request, update)",
+                false,
+            ),
             ("comment", "Comment (approve, reject)", false),
-            ("status", "Status filter (list)", false),
+            (
+                "filter",
+                "Filter (filter: pending/created/assigned/resolved; user-approvals: pending/created/resolved)",
+                false,
+            ),
+            (
+                "status",
+                "Status filter (list, filter, user-approvals)",
+                false,
+            ),
             ("limit", "Pagination limit", false),
             ("offset", "Pagination offset", false),
         ],
     },
     ToolDef {
         name: "todo",
-        description: "Todos: list, create, details, update, delete, toggle, bulk-toggle.",
+        description: "[legacy] Todos: list, create, details, update, delete, toggle, bulk-toggle, filter, summary. Legacy workflow primitive, will be replaced by the new `workflow` orchestration tool (landing later this release).",
         actions: &[
             "list",
             "create",
@@ -1204,6 +1279,8 @@ const TOOL_DEFS: &[ToolDef] = &[
             "toggle",
             "delete",
             "bulk-toggle",
+            "filter",
+            "summary",
         ],
         params: &[
             ("profile_type", "Profile type: workspace or share", false),
@@ -1217,6 +1294,11 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("assignee_id", "Assignee user ID", false),
             ("done", "Completion state (true/false)", false),
             ("todo_ids", "Comma-separated todo IDs (bulk-toggle)", false),
+            (
+                "filter",
+                "Filter: assigned, created, done, pending (filter action)",
+                false,
+            ),
             ("limit", "Pagination limit", false),
             ("offset", "Pagination offset", false),
         ],
@@ -3112,6 +3194,30 @@ const METADATA_VIEW_SUBPATH: &str = "metadata/view/";
 /// Sub-path for listing the caller's workspace-level saved views.
 const METADATA_VIEWS_SUBPATH: &str = "metadata/views/";
 
+/// Build the form-field map for an MCP `workspace` update from the tool args.
+///
+/// Forwards the advertised `intelligence` toggle as the string `"true"`/
+/// `"false"` (the `/workspace/{id}/update/` endpoint takes it as a string form
+/// field — workspaces.txt) so AI indexing can be toggled through MCP.
+fn build_workspace_update_fields(
+    args: &Map<String, Value>,
+) -> std::collections::HashMap<String, String> {
+    let mut fields = std::collections::HashMap::new();
+    if let Some(v) = optional_str(args, "name") {
+        fields.insert("name".to_owned(), v.to_owned());
+    }
+    if let Some(v) = optional_str(args, "description") {
+        fields.insert("description".to_owned(), v.to_owned());
+    }
+    if let Some(v) = optional_str(args, "folder_name") {
+        fields.insert("folder_name".to_owned(), v.to_owned());
+    }
+    if let Some(v) = optional_bool(args, "intelligence") {
+        fields.insert("intelligence".to_owned(), v.to_string());
+    }
+    fields
+}
+
 /// Workspace tool handler.
 #[allow(clippy::too_many_lines)]
 async fn handle_workspace(
@@ -3176,16 +3282,7 @@ async fn handle_workspace(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            let mut fields = std::collections::HashMap::new();
-            if let Some(v) = optional_str(args, "name") {
-                fields.insert("name".to_owned(), v.to_owned());
-            }
-            if let Some(v) = optional_str(args, "description") {
-                fields.insert("description".to_owned(), v.to_owned());
-            }
-            if let Some(v) = optional_str(args, "folder_name") {
-                fields.insert("folder_name".to_owned(), v.to_owned());
-            }
+            let fields = build_workspace_update_fields(args);
             match api::workspace::update_workspace(&client, ws_id, &fields).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
@@ -7218,7 +7315,55 @@ async fn handle_task(
         "move-task" => handle_task_move_task(state, args).await,
         "reorder-tasks" => handle_task_reorder_tasks(state, args).await,
         "reorder-lists" => handle_task_reorder_lists(state, args).await,
+        "filter" => handle_task_filter(state, args).await,
+        "summary" => handle_task_summary(state, args).await,
         _ => Ok(error_text(&format!("Unknown task action: {action}"))),
+    }
+}
+
+/// `task` filter action: filtered task list for a workspace or share.
+async fn handle_task_filter(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
+    let profile_id = match required_str(args, "profile_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let filter = match required_str(args, "filter") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let query = api::workflow::FilterQuery {
+        limit: optional_u32(args, "limit"),
+        offset: optional_u32(args, "offset"),
+        status: optional_str(args, "status"),
+        entry_type: None,
+    };
+    match api::workflow::list_tasks_filtered(&client, profile_type, profile_id, filter, &query)
+        .await
+    {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// `task` summary action: task count summary for a workspace or share.
+async fn handle_task_summary(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
+    let profile_id = match required_str(args, "profile_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::workflow::tasks_summary(&client, profile_type, profile_id).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
     }
 }
 
@@ -7589,7 +7734,16 @@ async fn handle_task_reorder_lists(
     }
 }
 
+/// Resolve the worklog `entity_type`, defaulting to `profile` (NOT
+/// `workspace`, which is not a valid worklog entity type). The accepted set is
+/// `profile`, `task`, `task_list`, and `node`; the value passes through to the
+/// API unchanged so `node` is honored.
+fn worklog_entity_type(args: &Map<String, Value>) -> &str {
+    optional_str(args, "entity_type").unwrap_or("profile")
+}
+
 /// Worklog tool handler.
+#[allow(clippy::too_many_lines)]
 async fn handle_worklog(
     state: &McpState,
     action: &str,
@@ -7599,7 +7753,9 @@ async fn handle_worklog(
         return Ok(e);
     }
     let client = state.client().read().await;
-    let entity_type = optional_str(args, "entity_type").unwrap_or("workspace");
+    // Per the worklog contract the entity-scoped endpoints accept
+    // `profile` (default), `task`, `task_list`, and `node`.
+    let entity_type = worklog_entity_type(args);
     match action {
         "list" => {
             let entity_id = match required_str(args, "entity_id") {
@@ -7685,11 +7841,70 @@ async fn handle_worklog(
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
+        "list-all" => {
+            let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
+            let profile_id = match required_str(args, "profile_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let query = api::workflow::FilterQuery {
+                limit: optional_u32(args, "limit"),
+                offset: optional_u32(args, "offset"),
+                status: None,
+                entry_type: None,
+            };
+            match api::workflow::list_worklogs_ctx(&client, profile_type, profile_id, &query).await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "filter" => {
+            let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
+            let profile_id = match required_str(args, "profile_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let filter = match required_str(args, "filter") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let query = api::workflow::FilterQuery {
+                limit: optional_u32(args, "limit"),
+                offset: optional_u32(args, "offset"),
+                status: None,
+                entry_type: optional_str(args, "entry_type"),
+            };
+            match api::workflow::list_worklogs_filtered(
+                &client,
+                profile_type,
+                profile_id,
+                filter,
+                &query,
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "summary" => {
+            let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
+            let profile_id = match required_str(args, "profile_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::workflow::worklogs_summary(&client, profile_type, profile_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
         _ => Ok(error_text(&format!("Unknown worklog action: {action}"))),
     }
 }
 
 /// Approval tool handler.
+#[allow(clippy::too_many_lines)]
 async fn handle_approval(
     state: &McpState,
     action: &str,
@@ -7731,33 +7946,55 @@ async fn handle_approval(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            let ws_id = match required_str(args, "workspace_id") {
+            // Accept `profile_id` (scoped) and fall back to the legacy
+            // `workspace_id` arg name; default the type to workspace.
+            let profile_id = match approval_profile_id(args) {
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            match api::workflow::create_approval(
-                &client,
+            let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
+            let properties = match approval_properties(args) {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let params = api::workflow::CreateApprovalParams {
+                profile_type,
+                profile_id,
                 entity_type,
                 entity_id,
                 description,
-                ws_id,
-                optional_str(args, "approver_id"),
-            )
-            .await
-            {
+                approver_id: optional_str(args, "approver_id"),
+                deadline: optional_str(args, "deadline"),
+                node_id: optional_str(args, "node_id"),
+                properties: properties.as_ref(),
+            };
+            match api::workflow::create_approval(&client, &params).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
-        "approve" => {
+        "details" => {
+            let scope = approval_scope_opt(args);
+            let approval_id = match required_str(args, "approval_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::workflow::get_approval(&client, scope, approval_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "approve" | "reject" => {
+            let scope = approval_scope_opt(args);
             let approval_id = match required_str(args, "approval_id") {
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
             match api::workflow::resolve_approval(
                 &client,
+                scope,
                 approval_id,
-                "approve",
+                action,
                 optional_str(args, "comment"),
             )
             .await
@@ -7766,24 +8003,147 @@ async fn handle_approval(
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
-        "reject" => {
+        "update" => {
+            let scope = approval_scope_opt(args);
             let approval_id = match required_str(args, "approval_id") {
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            match api::workflow::resolve_approval(
-                &client,
+            let properties = match approval_properties(args) {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let params = api::workflow::UpdateApprovalParams {
+                scope,
                 approval_id,
-                "reject",
-                optional_str(args, "comment"),
+                description: optional_str(args, "description"),
+                approver_id: optional_str(args, "approver_id"),
+                deadline: optional_str(args, "deadline"),
+                node_id: optional_str(args, "node_id"),
+                properties: properties.as_ref(),
+            };
+            if params.description.is_none()
+                && params.approver_id.is_none()
+                && params.deadline.is_none()
+                && params.node_id.is_none()
+                && params.properties.is_none()
+            {
+                return Ok(error_text(
+                    "approval update requires at least one of: description, approver_id, \
+                     deadline, node_id, properties",
+                ));
+            }
+            match api::workflow::update_approval(&client, &params).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "delete" => {
+            let scope = approval_scope_opt(args);
+            let approval_id = match required_str(args, "approval_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::workflow::delete_approval(&client, scope, approval_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "filter" => {
+            let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
+            let profile_id = match approval_profile_id(args) {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let filter = match required_str(args, "filter") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let query = api::workflow::FilterQuery {
+                limit: optional_u32(args, "limit"),
+                offset: optional_u32(args, "offset"),
+                status: optional_str(args, "status"),
+                entry_type: None,
+            };
+            match api::workflow::list_approvals_filtered(
+                &client,
+                profile_type,
+                profile_id,
+                filter,
+                &query,
             )
             .await
             {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "summary" => {
+            let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
+            let profile_id = match approval_profile_id(args) {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::workflow::approvals_summary(&client, profile_type, profile_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "user-approvals" => {
+            let filter = match required_str(args, "filter") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let query = api::workflow::FilterQuery {
+                limit: optional_u32(args, "limit"),
+                offset: optional_u32(args, "offset"),
+                status: optional_str(args, "status"),
+                entry_type: None,
+            };
+            match api::workflow::user_approvals(&client, filter, &query).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
         _ => Ok(error_text(&format!("Unknown approval action: {action}"))),
+    }
+}
+
+/// Resolve the scoped approval profile ID, accepting `profile_id` (preferred)
+/// or the legacy `workspace_id` arg name.
+fn approval_profile_id(args: &Map<String, Value>) -> Result<&str, CallToolResult> {
+    optional_str(args, "profile_id")
+        .or_else(|| optional_str(args, "workspace_id"))
+        .ok_or_else(|| error_text("Missing required parameter: profile_id"))
+}
+
+/// Resolve an optional approval scope for per-approval action routes
+/// (details/approve/reject/update/delete). Returns `Some((profile_type,
+/// profile_id))` when a profile ID is supplied (preferred `profile_id`, legacy
+/// `workspace_id`), or `None` to use the legacy unscoped route.
+fn approval_scope_opt(args: &Map<String, Value>) -> Option<(&str, &str)> {
+    let profile_id =
+        optional_str(args, "profile_id").or_else(|| optional_str(args, "workspace_id"))?;
+    let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
+    Some((profile_type, profile_id))
+}
+
+/// Parse an optional `properties` MCP arg into a JSON object value. Accepts
+/// either a JSON object passed directly or a JSON-object string; returns an
+/// error result if it is neither a JSON object nor a string encoding one.
+fn approval_properties(args: &Map<String, Value>) -> Result<Option<Value>, CallToolResult> {
+    match args.get("properties") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(map)) => Ok(Some(Value::Object(map.clone()))),
+        Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw) {
+            Ok(v) if v.is_object() => Ok(Some(v)),
+            _ => Err(error_text(
+                "properties must be a JSON object (e.g. {\"key\":\"value\"})",
+            )),
+        },
+        Some(_) => Err(error_text(
+            "properties must be a JSON object (e.g. {\"key\":\"value\"})",
+        )),
     }
 }
 
@@ -7804,6 +8164,8 @@ async fn handle_todo(
         "toggle" => handle_todo_toggle(state, args).await,
         "delete" => handle_todo_delete(state, args).await,
         "bulk-toggle" => handle_todo_bulk_toggle(state, args).await,
+        "filter" => handle_todo_filter(state, args).await,
+        "summary" => handle_todo_summary(state, args).await,
         _ => Ok(error_text(&format!("Unknown todo action: {action}"))),
     }
 }
@@ -7939,6 +8301,52 @@ async fn handle_todo_bulk_toggle(
     let done = optional_bool(args, "done").unwrap_or(true);
     let ids: Vec<String> = ids_str.split(',').map(|s| s.trim().to_owned()).collect();
     match api::workflow::bulk_toggle_todos(&client, pt, pid, &ids, done).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// `todo` filter action: filtered todo list for a workspace or share.
+async fn handle_todo_filter(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
+    let profile_id = match required_str(args, "profile_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let filter = match required_str(args, "filter") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let query = api::workflow::FilterQuery {
+        limit: optional_u32(args, "limit"),
+        offset: optional_u32(args, "offset"),
+        status: None,
+        entry_type: None,
+    };
+    match api::workflow::list_todos_filtered(&client, profile_type, profile_id, filter, &query)
+        .await
+    {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// `todo` summary action: todo count summary for a workspace or share.
+async fn handle_todo_summary(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
+    let profile_id = match required_str(args, "profile_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::workflow::todos_summary(&client, profile_type, profile_id).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -10210,5 +10618,161 @@ mod ripley_tool_tests {
             text.contains("fields is present but empty"),
             "present-but-empty fields must be rejected, got: {text}"
         );
+    }
+
+    #[test]
+    fn legacy_workflow_tools_are_flagged() {
+        // The four legacy workflow primitive tools must advertise `[legacy]`.
+        let tools = ToolRouter::list_tools().tools;
+        for name in ["task", "worklog", "approval", "todo"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("{name} tool present"));
+            let desc = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                desc.contains("[legacy]"),
+                "{name} tool description must contain [legacy], got: {desc}"
+            );
+        }
+    }
+
+    #[test]
+    fn worklog_entity_type_defaults_to_profile() {
+        // Regression: the MCP worklog default was `workspace` (invalid); it
+        // must default to `profile`.
+        let empty = Map::new();
+        assert_eq!(super::worklog_entity_type(&empty), "profile");
+    }
+
+    #[test]
+    fn worklog_entity_type_accepts_node() {
+        // `node` is a documented worklog entity type and must pass through.
+        let mut args = Map::new();
+        args.insert("entity_type".to_owned(), Value::String("node".to_owned()));
+        assert_eq!(super::worklog_entity_type(&args), "node");
+    }
+
+    #[test]
+    fn approval_profile_id_prefers_profile_id_then_workspace_id() {
+        let mut with_profile = Map::new();
+        with_profile.insert("profile_id".to_owned(), Value::String("p1".to_owned()));
+        assert_eq!(super::approval_profile_id(&with_profile).ok(), Some("p1"));
+
+        // Legacy fallback to workspace_id.
+        let mut with_ws = Map::new();
+        with_ws.insert("workspace_id".to_owned(), Value::String("w1".to_owned()));
+        assert_eq!(super::approval_profile_id(&with_ws).ok(), Some("w1"));
+
+        // Neither → error.
+        assert!(super::approval_profile_id(&Map::new()).is_err());
+    }
+
+    #[tokio::test]
+    async fn approval_update_requires_a_field() {
+        // The MCP approval `update` action must reject when no mutable field is
+        // supplied (mirrors the CLI guard) before any network call.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("update".to_owned()));
+        args.insert("profile_id".to_owned(), Value::String("w1".to_owned()));
+        args.insert("approval_id".to_owned(), Value::String("a1".to_owned()));
+        let res = router
+            .call_tool("approval", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("at least one of"),
+            "empty approval update must be rejected, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_details_without_profile_id_uses_legacy_unscoped_route() {
+        // FIX 2: per-approval action routes (details/approve/reject/update/
+        // delete) no longer hard-require a scope. With no profile_id the legacy
+        // unscoped route is used, so the call must NOT short-circuit with a
+        // missing-profile_id error — it proceeds past validation (and only the
+        // unroutable test network fails it). Backward compat for the historical
+        // `approval details <id>` syntax.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("details".to_owned()));
+        args.insert("approval_id".to_owned(), Value::String("a1".to_owned()));
+        let res = router
+            .call_tool("approval", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("Missing required parameter: profile_id"),
+            "details without scope must not demand profile_id, got: {text}"
+        );
+    }
+
+    #[test]
+    fn approval_scope_opt_some_when_profile_id_present() {
+        let mut args = Map::new();
+        args.insert("profile_id".to_owned(), Value::String("p1".to_owned()));
+        args.insert("profile_type".to_owned(), Value::String("share".to_owned()));
+        assert_eq!(super::approval_scope_opt(&args), Some(("share", "p1")));
+
+        // Default profile_type is workspace; legacy workspace_id is accepted.
+        let mut legacy = Map::new();
+        legacy.insert("workspace_id".to_owned(), Value::String("w1".to_owned()));
+        assert_eq!(
+            super::approval_scope_opt(&legacy),
+            Some(("workspace", "w1"))
+        );
+    }
+
+    #[test]
+    fn approval_scope_opt_none_when_no_profile() {
+        // No profile_id and no workspace_id → legacy unscoped route.
+        assert_eq!(super::approval_scope_opt(&Map::new()), None);
+    }
+
+    #[test]
+    fn approval_properties_parses_object_and_string_and_rejects_scalar() {
+        // Object passed directly.
+        let mut obj = Map::new();
+        obj.insert("properties".to_owned(), json!({"k": "v"}));
+        let parsed = super::approval_properties(&obj).expect("object ok");
+        assert_eq!(parsed.expect("some")["k"], "v");
+
+        // JSON-object string is parsed.
+        let mut s = Map::new();
+        s.insert(
+            "properties".to_owned(),
+            Value::String(r#"{"k":1}"#.to_owned()),
+        );
+        let parsed = super::approval_properties(&s).expect("string ok");
+        assert_eq!(parsed.expect("some")["k"], 1);
+
+        // A non-object scalar is rejected.
+        let mut bad = Map::new();
+        bad.insert("properties".to_owned(), json!(42));
+        assert!(super::approval_properties(&bad).is_err());
+
+        // Absent → None.
+        assert!(
+            super::approval_properties(&Map::new())
+                .expect("absent ok")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workspace_update_fields_forward_intelligence() {
+        // FIX 1: the MCP workspace-update handler must forward the advertised
+        // `intelligence` toggle into the form body as a string.
+        let mut args = Map::new();
+        args.insert("intelligence".to_owned(), Value::Bool(true));
+        let fields = super::build_workspace_update_fields(&args);
+        assert_eq!(fields.get("intelligence").map(String::as_str), Some("true"));
+
+        // Omitted → not sent.
+        assert!(!super::build_workspace_update_fields(&Map::new()).contains_key("intelligence"));
     }
 }
