@@ -2257,16 +2257,26 @@ fn map_metadata_command(cmd: cli::MetadataCommands) -> MetadataCommand {
         cli::MetadataCommands::AutoMatch {
             workspace,
             template_id,
+            batch_size,
+            confirm_ai_spend,
         } => MetadataCommand::AutoMatch {
             workspace,
             template_id,
+            batch_size,
+            confirm_ai_spend,
         },
         cli::MetadataCommands::ExtractAll {
             workspace,
             template_id,
+            fields,
+            force,
+            confirm_ai_spend,
         } => MetadataCommand::ExtractAll {
             workspace,
             template_id,
+            fields,
+            force,
+            confirm_ai_spend,
         },
         cli::MetadataCommands::Details {
             workspace,
@@ -2280,31 +2290,41 @@ fn map_metadata_command(cmd: cli::MetadataCommands) -> MetadataCommand {
             node_id,
             template_id,
             fields,
+            wait,
+            poll_interval,
+            confirm_ai_spend,
         } => MetadataCommand::Extract {
             workspace,
             node_id,
             template_id,
             fields,
+            wait,
+            poll_interval,
+            confirm_ai_spend,
         },
         cli::MetadataCommands::PreviewMatch {
             workspace,
             name,
             description,
+            confirm_ai_spend,
         } => MetadataCommand::PreviewMatch {
             workspace,
             name,
             description,
+            confirm_ai_spend,
         },
         cli::MetadataCommands::SuggestFields {
             workspace,
             node_ids,
             description,
             user_context,
+            confirm_ai_spend,
         } => MetadataCommand::SuggestFields {
             workspace,
             node_ids,
             description,
             user_context,
+            confirm_ai_spend,
         },
         cli::MetadataCommands::CreateTemplate {
             workspace,

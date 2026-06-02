@@ -2,11 +2,14 @@
 ///
 /// Handles listing eligible files, managing template-file mappings,
 /// AI-based matching, and metadata extraction.
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use super::CommandContext;
 use fastio_cli::api;
+use fastio_cli::api::metadata::ExtractJobState;
 
 /// Metadata subcommand variants.
 #[derive(Debug, Clone)]
@@ -54,19 +57,29 @@ pub enum MetadataCommand {
         /// Sort direction (`asc` or `desc`).
         sort_dir: Option<String>,
     },
-    /// AI-based file matching for a template.
+    /// AI-based file matching for a template. Spends AI credits.
     AutoMatch {
         /// Workspace ID.
         workspace: String,
         /// Template ID.
         template_id: String,
+        /// Optional server-clamped batch-size override.
+        batch_size: Option<u32>,
+        /// AI-spend acknowledgement flag (skips the interactive prompt).
+        confirm_ai_spend: bool,
     },
-    /// Batch extract metadata for all files in a template.
+    /// Batch extract metadata for all files in a template. Spends AI credits.
     ExtractAll {
         /// Workspace ID.
         workspace: String,
         /// Template ID.
         template_id: String,
+        /// JSON-encoded array of field names for partial extraction.
+        fields: Option<String>,
+        /// Re-extract nodes that already have values for this template.
+        force: bool,
+        /// AI-spend acknowledgement flag (skips the interactive prompt).
+        confirm_ai_spend: bool,
     },
     /// Get metadata details for one or more files.
     ///
@@ -79,18 +92,28 @@ pub enum MetadataCommand {
         /// One or more storage node IDs.
         node_ids: Vec<String>,
     },
-    /// Enqueue an async metadata extraction for a single file.
+    /// Enqueue an async metadata extraction for a single file. Spends AI
+    /// credits; optionally polls the job to a terminal state.
     Extract {
         /// Workspace ID.
         workspace: String,
         /// Node ID of the file.
         node_id: String,
-        /// Template ID to extract against.
-        template_id: String,
+        /// Template ID to extract against (optional; server defaults to the
+        /// first template mapped to the file).
+        template_id: Option<String>,
         /// JSON-encoded array of field names for partial extraction.
         fields: Option<String>,
+        /// Poll the workspace jobs-status endpoint until the job is
+        /// terminal, then report the outcome.
+        wait: bool,
+        /// Seconds between job-status polls when `wait` is set.
+        poll_interval: Option<u64>,
+        /// AI-spend acknowledgement flag (skips the interactive prompt).
+        confirm_ai_spend: bool,
     },
     /// Preview files that match a proposed template name + description.
+    /// Spends AI credits.
     PreviewMatch {
         /// Workspace ID.
         workspace: String,
@@ -98,8 +121,11 @@ pub enum MetadataCommand {
         name: String,
         /// Natural-language template description.
         description: String,
+        /// AI-spend acknowledgement flag (skips the interactive prompt).
+        confirm_ai_spend: bool,
     },
     /// Request AI-suggested column definitions for a proposed template.
+    /// Spends AI credits.
     SuggestFields {
         /// Workspace ID.
         workspace: String,
@@ -109,6 +135,8 @@ pub enum MetadataCommand {
         description: String,
         /// Optional short user hint (max 64 chars, letters/numbers/spaces).
         user_context: Option<String>,
+        /// AI-spend acknowledgement flag (skips the interactive prompt).
+        confirm_ai_spend: bool,
     },
     /// Create a metadata template (a.k.a. view).
     CreateTemplate {
@@ -188,11 +216,26 @@ pub async fn execute(command: &MetadataCommand, ctx: &CommandContext<'_>) -> Res
         MetadataCommand::AutoMatch {
             workspace,
             template_id,
-        } => auto_match(ctx, workspace, template_id).await,
+            batch_size,
+            confirm_ai_spend,
+        } => auto_match(ctx, workspace, template_id, *batch_size, *confirm_ai_spend).await,
         MetadataCommand::ExtractAll {
             workspace,
             template_id,
-        } => extract_all(ctx, workspace, template_id).await,
+            fields,
+            force,
+            confirm_ai_spend,
+        } => {
+            extract_all(
+                ctx,
+                workspace,
+                template_id,
+                fields.as_deref(),
+                *force,
+                *confirm_ai_spend,
+            )
+            .await
+        }
         MetadataCommand::Details {
             workspace,
             node_ids,
@@ -202,17 +245,34 @@ pub async fn execute(command: &MetadataCommand, ctx: &CommandContext<'_>) -> Res
             node_id,
             template_id,
             fields,
-        } => extract(ctx, workspace, node_id, template_id, fields.as_deref()).await,
+            wait,
+            poll_interval,
+            confirm_ai_spend,
+        } => {
+            extract(
+                ctx,
+                workspace,
+                node_id,
+                template_id.as_deref(),
+                fields.as_deref(),
+                *wait,
+                *poll_interval,
+                *confirm_ai_spend,
+            )
+            .await
+        }
         MetadataCommand::PreviewMatch {
             workspace,
             name,
             description,
-        } => preview_match(ctx, workspace, name, description).await,
+            confirm_ai_spend,
+        } => preview_match(ctx, workspace, name, description, *confirm_ai_spend).await,
         MetadataCommand::SuggestFields {
             workspace,
             node_ids,
             description,
             user_context,
+            confirm_ai_spend,
         } => {
             suggest_fields(
                 ctx,
@@ -220,6 +280,7 @@ pub async fn execute(command: &MetadataCommand, ctx: &CommandContext<'_>) -> Res
                 node_ids,
                 description,
                 user_context.as_deref(),
+                *confirm_ai_spend,
             )
             .await
         }
@@ -261,6 +322,74 @@ const MAX_ID_LEN: usize = 128;
 /// Runtime cap on positional node IDs per `fastio metadata details`
 /// invocation. Bounds wall-time and rate-limit footprint.
 const DETAILS_MAX_NODE_IDS: usize = 1000;
+
+/// Default seconds between job-status polls when `extract --wait` is set.
+const DEFAULT_POLL_INTERVAL_SECS: u64 = 3;
+/// Lower bound on the poll interval (avoids hammering the API).
+const MIN_POLL_INTERVAL_SECS: u64 = 1;
+/// Upper bound on the poll interval.
+const MAX_POLL_INTERVAL_SECS: u64 = 60;
+/// Hard ceiling on the `extract --wait` poll loop. Sized well under the
+/// ~1-hour JWT lifetime so a stuck job surfaces a clear timeout (with a
+/// re-auth hint on a 401) rather than hanging indefinitely.
+const EXTRACT_WAIT_MAX_SECS: u64 = 600;
+
+/// Gate an AI-credit-spending action behind explicit acknowledgement.
+///
+/// Returns `Ok(())` when the caller may proceed:
+/// - `confirm_ai_spend == true` (the `--confirm-ai-spend` flag was passed), or
+/// - stdin AND stderr are both a TTY and the user answers `y`/`yes` to the
+///   interactive prompt.
+///
+/// Otherwise returns an error. Non-interactive callers (pipes, MCP, CI)
+/// that omit the flag are blocked deterministically — they never hang on a
+/// prompt that has no reader.
+fn confirm_ai_spend(action: &str, cost_note: &str, confirm_ai_spend: bool) -> Result<()> {
+    use std::io::{self, BufRead, IsTerminal, Write};
+
+    if confirm_ai_spend {
+        return Ok(());
+    }
+
+    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+    if !interactive {
+        anyhow::bail!(
+            "'{action}' spends AI credits ({cost_note}). Re-run with --confirm-ai-spend to proceed."
+        );
+    }
+
+    eprint!("'{action}' spends AI credits ({cost_note}). Proceed? [y/N] ");
+    io::stderr().flush().ok();
+    let mut answer = String::new();
+    io::stdin()
+        .lock()
+        .read_line(&mut answer)
+        .context("failed to read confirmation from stdin")?;
+    let answer = answer.trim().to_ascii_lowercase();
+    if answer == "y" || answer == "yes" {
+        Ok(())
+    } else {
+        anyhow::bail!("aborted: AI-spend not confirmed for '{action}'");
+    }
+}
+
+/// Clamp a user-supplied poll interval into the supported range.
+fn clamp_poll_interval(secs: Option<u64>) -> u64 {
+    secs.unwrap_or(DEFAULT_POLL_INTERVAL_SECS)
+        .clamp(MIN_POLL_INTERVAL_SECS, MAX_POLL_INTERVAL_SECS)
+}
+
+/// Extract the `job_id` from a single-file extract `202` response body,
+/// if present. A full-row call whose effective scope is empty responds
+/// successfully without a `job_id`, so this returns `None` in that case.
+fn extract_job_id(resp: &Value) -> Option<String> {
+    let payload = resp.get("response").unwrap_or(resp);
+    payload
+        .get("job_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
 
 /// Validate that an identifier is non-empty, within length, and uses
 /// only the opaque-ID alphabet `[A-Za-z0-9_-]`.
@@ -546,50 +675,199 @@ async fn list_nodes(
     Ok(())
 }
 
-/// AI-based file matching for a template.
-async fn auto_match(ctx: &CommandContext<'_>, workspace: &str, template_id: &str) -> Result<()> {
+/// AI-based file matching for a template. Spends AI credits.
+async fn auto_match(
+    ctx: &CommandContext<'_>,
+    workspace: &str,
+    template_id: &str,
+    batch_size: Option<u32>,
+    spend_ack: bool,
+) -> Result<()> {
+    confirm_ai_spend(
+        "metadata auto-match",
+        "one AI classification per eligible file scanned",
+        spend_ack,
+    )?;
     let client = ctx.build_client()?;
-    let value = api::metadata::auto_match_template(&client, workspace, template_id)
+    let value = api::metadata::auto_match_template(&client, workspace, template_id, batch_size)
         .await
         .context("failed to auto-match files to template")?;
     ctx.output.render(&value)?;
     Ok(())
 }
 
-/// Batch extract metadata for all files in a template.
-async fn extract_all(ctx: &CommandContext<'_>, workspace: &str, template_id: &str) -> Result<()> {
+/// Batch extract metadata for all files in a template. Spends AI credits.
+async fn extract_all(
+    ctx: &CommandContext<'_>,
+    workspace: &str,
+    template_id: &str,
+    fields: Option<&str>,
+    force: bool,
+    spend_ack: bool,
+) -> Result<()> {
+    confirm_ai_spend(
+        "metadata extract-all",
+        "one AI extraction per mapped file (up to 1,000 files)",
+        spend_ack,
+    )?;
     let client = ctx.build_client()?;
-    let value = api::metadata::extract_all(&client, workspace, template_id)
+    let value = api::metadata::extract_all(&client, workspace, template_id, fields, force)
         .await
         .context("failed to batch extract metadata")?;
     ctx.output.render(&value)?;
     Ok(())
 }
 
-/// Enqueue an async metadata extraction for a single file.
+/// Enqueue an async metadata extraction for a single file. Spends AI
+/// credits; optionally polls the job to a terminal state.
+#[allow(clippy::too_many_arguments)]
 async fn extract(
     ctx: &CommandContext<'_>,
     workspace: &str,
     node_id: &str,
-    template_id: &str,
+    template_id: Option<&str>,
     fields: Option<&str>,
+    wait: bool,
+    poll_interval: Option<u64>,
+    spend_ack: bool,
 ) -> Result<()> {
+    confirm_ai_spend(
+        "metadata extract",
+        "one AI extraction for this file",
+        spend_ack,
+    )?;
     let client = ctx.build_client()?;
     let value =
         api::metadata::extract_node_metadata(&client, workspace, node_id, template_id, fields)
             .await
             .context("failed to enqueue metadata extraction")?;
     ctx.output.render(&value)?;
-    Ok(())
+
+    if !wait {
+        return Ok(());
+    }
+
+    let Some(job_id) = extract_job_id(&value) else {
+        if !ctx.output.quiet {
+            eprintln!(
+                "no job was enqueued (empty effective extraction scope); nothing to wait for."
+            );
+        }
+        return Ok(());
+    };
+
+    let interval = clamp_poll_interval(poll_interval);
+    wait_for_extract_job(ctx, &client, workspace, node_id, &job_id, interval).await
+}
+
+/// Poll the workspace jobs-status endpoint until the single-file extraction
+/// job reaches a terminal state, then report the outcome.
+///
+/// Strategy mirrors `ripley ask --wait`: a bounded loop
+/// ([`EXTRACT_WAIT_MAX_SECS`]) so it cannot hang past the ~1-hour JWT
+/// lifetime, with a 401 short-circuiting to a clear re-auth hint rather
+/// than spinning. Transient (non-401) errors are tolerated and retried on
+/// the next tick. A job that is absent from jobs-status (`NotFound`) is NOT
+/// treated as success: terminal entries only age out after ~1h, well beyond
+/// this bounded window, so within the window a missing entry means the job is
+/// not yet visible (or just enqueued) — the loop keeps polling until it
+/// observes an EXPLICIT terminal state (`completed`/`errored`) or hits the
+/// deadline (which surfaces an indeterminate timeout, never a false success).
+async fn wait_for_extract_job(
+    ctx: &CommandContext<'_>,
+    client: &fastio_cli::client::ApiClient,
+    workspace: &str,
+    node_id: &str,
+    job_id: &str,
+    interval_secs: u64,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(EXTRACT_WAIT_MAX_SECS);
+
+    if !ctx.output.quiet {
+        eprintln!("waiting for extraction job {job_id} (polling every {interval_secs}s)...");
+    }
+
+    loop {
+        match api::workspace::jobs_status(client, workspace).await {
+            Ok(status) => {
+                match api::metadata::classify_single_extract_job(&status, node_id, Some(job_id)) {
+                    ExtractJobState::Completed => {
+                        if !ctx.output.quiet {
+                            eprintln!(
+                                "extraction completed; read values via \
+                                 'fastio metadata details --workspace {workspace} {node_id}'."
+                            );
+                        }
+                        return Ok(());
+                    }
+                    ExtractJobState::Errored(msg) => {
+                        let detail = msg.unwrap_or_else(|| "no error message provided".to_owned());
+                        anyhow::bail!("extraction job {job_id} failed: {detail}");
+                    }
+                    // `NotFound` is NOT treated as success. The server only
+                    // ages out terminal entries after ~1h, far beyond this
+                    // bounded `EXTRACT_WAIT_MAX_SECS` window, so within the
+                    // window a missing entry means the job is not yet visible
+                    // (or just enqueued) — keep polling until we observe an
+                    // EXPLICIT terminal state (`completed`/`errored`) or hit
+                    // the deadline. Reporting success on `NotFound` here would
+                    // risk a false success. `Pending` and the
+                    // `#[non_exhaustive]` catch-all also keep us polling.
+                    _ => {}
+                }
+            }
+            Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 401 => {
+                anyhow::bail!(
+                    "authentication expired while waiting for extraction job {job_id}. The job \
+                     may still complete server-side; re-authenticate (fastio auth login) and read \
+                     values via 'fastio metadata details --workspace {workspace} {node_id}'."
+                );
+            }
+            // Transient errors are tolerated; retry on the next tick.
+            Err(_) => {}
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out after ~{EXTRACT_WAIT_MAX_SECS}s waiting for extraction job {job_id}. \
+                 The job may still complete server-side; poll \
+                 'fastio workspace jobs-status --workspace-id {workspace}' or read values via \
+                 'fastio metadata details --workspace {workspace} {node_id}'."
+            );
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let sleep = remaining.min(Duration::from_secs(interval_secs));
+        tokio::time::sleep(sleep).await;
+
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out after ~{EXTRACT_WAIT_MAX_SECS}s waiting for extraction job {job_id}. \
+                 The job may still complete server-side; poll \
+                 'fastio workspace jobs-status --workspace-id {workspace}' or read values via \
+                 'fastio metadata details --workspace {workspace} {node_id}'."
+            );
+        }
+    }
 }
 
 /// Preview files that match a proposed template name + description.
+///
+/// Spends AI credits (ai.txt:2272 — "Requires available AI credits"), so the
+/// same `--confirm-ai-spend` gate as the other AI-spending metadata commands
+/// applies for consistent credit-spend protection.
 async fn preview_match(
     ctx: &CommandContext<'_>,
     workspace: &str,
     name: &str,
     description: &str,
+    spend_ack: bool,
 ) -> Result<()> {
+    confirm_ai_spend(
+        "metadata preview-match",
+        "AI classification over a sample of eligible files",
+        spend_ack,
+    )?;
     let client = ctx.build_client()?;
     let value = api::metadata::preview_match(&client, workspace, name, description)
         .await
@@ -598,14 +876,21 @@ async fn preview_match(
     Ok(())
 }
 
-/// Request AI-suggested column definitions for a proposed template.
+/// Request AI-suggested column definitions for a proposed template. Spends
+/// AI credits.
 async fn suggest_fields(
     ctx: &CommandContext<'_>,
     workspace: &str,
     node_ids: &str,
     description: &str,
     user_context: Option<&str>,
+    spend_ack: bool,
 ) -> Result<()> {
+    confirm_ai_spend(
+        "metadata suggest-fields",
+        "one AI call over the sampled files",
+        spend_ack,
+    )?;
     let client = ctx.build_client()?;
     let value =
         api::metadata::suggest_fields(&client, workspace, node_ids, description, user_context)
@@ -668,7 +953,10 @@ async fn create_template(
 
 #[cfg(test)]
 mod tests {
-    use super::aggregate_metadata_chunks;
+    use super::{
+        DEFAULT_POLL_INTERVAL_SECS, MAX_POLL_INTERVAL_SECS, MIN_POLL_INTERVAL_SECS,
+        aggregate_metadata_chunks, clamp_poll_interval, confirm_ai_spend, extract_job_id,
+    };
     use fastio_cli::api::metadata::{
         BulkMetadataDetailsResponse, parse_bulk_metadata_details_response,
     };
@@ -676,6 +964,82 @@ mod tests {
 
     fn make_chunk(body: &serde_json::Value) -> BulkMetadataDetailsResponse {
         parse_bulk_metadata_details_response(body).expect("test body should parse")
+    }
+
+    #[test]
+    fn confirm_ai_spend_passes_with_flag() {
+        // The acknowledgement flag bypasses any prompt.
+        assert!(confirm_ai_spend("metadata extract", "one extraction", true).is_ok());
+    }
+
+    #[test]
+    fn confirm_ai_spend_blocks_non_interactive_without_flag() {
+        // Under `cargo test`, stdin/stderr are not a TTY, so the prompt
+        // path is skipped and the spend is blocked deterministically.
+        let err = confirm_ai_spend("metadata auto-match", "per-file classification", false)
+            .expect_err("spend must be blocked without the flag in a non-TTY context");
+        let msg = err.to_string();
+        assert!(msg.contains("--confirm-ai-spend"), "message was: {msg}");
+        assert!(msg.contains("metadata auto-match"), "message was: {msg}");
+    }
+
+    #[test]
+    fn preview_match_is_gated_on_ai_spend() {
+        // FIX 5: preview-match spends AI credits (ai.txt:2272), so it routes
+        // through the same `confirm_ai_spend` gate. With the flag it passes;
+        // without it (non-TTY) it is blocked with the standard message.
+        assert!(
+            confirm_ai_spend(
+                "metadata preview-match",
+                "AI classification over a sample of eligible files",
+                true,
+            )
+            .is_ok()
+        );
+        let err = confirm_ai_spend(
+            "metadata preview-match",
+            "AI classification over a sample of eligible files",
+            false,
+        )
+        .expect_err("preview-match spend must be blocked without the flag in a non-TTY context");
+        let msg = err.to_string();
+        assert!(msg.contains("--confirm-ai-spend"), "message was: {msg}");
+        assert!(msg.contains("metadata preview-match"), "message was: {msg}");
+    }
+
+    #[test]
+    fn clamp_poll_interval_uses_default_when_absent() {
+        assert_eq!(clamp_poll_interval(None), DEFAULT_POLL_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn clamp_poll_interval_clamps_bounds() {
+        assert_eq!(clamp_poll_interval(Some(0)), MIN_POLL_INTERVAL_SECS);
+        assert_eq!(clamp_poll_interval(Some(99_999)), MAX_POLL_INTERVAL_SECS);
+        assert_eq!(clamp_poll_interval(Some(5)), 5);
+    }
+
+    #[test]
+    fn extract_job_id_reads_enveloped_and_flat_bodies() {
+        // Enveloped 202 body.
+        let enveloped = json!({
+            "result": "yes",
+            "response": { "job_id": "aj_123", "status": "queued" }
+        });
+        assert_eq!(extract_job_id(&enveloped).as_deref(), Some("aj_123"));
+        // Flat body.
+        let flat = json!({ "job_id": "aj_456", "status": "queued" });
+        assert_eq!(extract_job_id(&flat).as_deref(), Some("aj_456"));
+    }
+
+    #[test]
+    fn extract_job_id_none_for_empty_scope_response() {
+        // A full-row call with an empty effective scope returns no job_id.
+        let no_job = json!({ "result": "yes", "response": { "status": "queued" } });
+        assert_eq!(extract_job_id(&no_job), None);
+        // Empty-string job_id is treated as absent.
+        let empty = json!({ "response": { "job_id": "" } });
+        assert_eq!(extract_job_id(&empty), None);
     }
 
     #[test]

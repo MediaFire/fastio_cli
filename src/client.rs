@@ -1808,6 +1808,31 @@ mod tests {
     }
 
     #[test]
+    fn build_get_injects_output_on_metadata_paths() {
+        // The metadata family accepts the documented terse/standard/full
+        // tokens (ai.txt "Compact Responses"), so `--detail` must thread
+        // through to its envelope GETs — list/detail/eligible/details.
+        let client = ApiClient::with_detail(
+            "https://api.example/current",
+            Some("tok".to_owned()),
+            Some(OutputDetail::Terse),
+        )
+        .expect("client builds");
+        for path in [
+            "/workspace/ws/metadata/eligible/",
+            "/workspace/ws/metadata/templates/tid/nodes/",
+            "/workspace/ws/storage/abc,def/metadata/details/",
+        ] {
+            let req = client.build_get(path).build().expect("request builds");
+            let query = req.url().query().unwrap_or_default();
+            assert!(
+                query.contains("output=terse"),
+                "metadata path {path} must be --detail-injectable, got query: {query}"
+            );
+        }
+    }
+
+    #[test]
     fn inject_output_query_skips_on_denylisted_path() {
         let client = ApiClient::with_detail(
             "https://api.example/current",

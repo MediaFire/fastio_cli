@@ -505,9 +505,67 @@ pub async fn jobs_status(client: &ApiClient, workspace_id: &str) -> Result<Value
     client.get(&path).await
 }
 
+/// How a [`metadata_api`] call is dispatched onto the HTTP client, decided
+/// purely from `(method, has_form, has_body, has_params)`.
+///
+/// Extracted as a pure enum so the contract-driven encoding decision (form vs
+/// JSON on POST; query-param forwarding on DELETE) can be unit-tested without
+/// a live HTTP client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetadataRequestKind {
+    /// `GET` with no query parameters.
+    Get,
+    /// `GET` forwarding `params` as a query string.
+    GetWithParams,
+    /// `POST` with a form-encoded (`application/x-www-form-urlencoded`) body.
+    PostForm,
+    /// `POST` with a JSON body (`body`, or an empty object when absent).
+    PostJson,
+    /// `DELETE` with no query parameters (deliberate delete-all for the
+    /// node-metadata endpoint).
+    Delete,
+    /// `DELETE` forwarding `params` as a query string (e.g. `keys`,
+    /// `template_id`).
+    DeleteWithParams,
+}
+
+/// Decide how a metadata request is dispatched.
+///
+/// Encoding rules (driven by the metadata contract in `ai.txt` /
+/// `storage.txt`):
+///
+/// - **`POST`** is **form-encoded** when a `form` is supplied — every metadata
+///   mutation endpoint (`templates/.../settings/`, `templates/.../update/`,
+///   `storage/{n}/metadata/update/{tid}/`, `metadata/view/`) requires
+///   `application/x-www-form-urlencoded` and returns `406` for a JSON body.
+///   When no `form` is supplied it falls back to a JSON body for the rare POST
+///   endpoint whose contract is genuinely JSON.
+/// - **`DELETE`** forwards `params` as a query string so callers can send the
+///   documented query parameters (e.g. `keys`, `template_id`). Dropping them
+///   previously turned a targeted metadata delete into a delete-all.
+/// - Any unrecognized method falls back to a bare `GET`.
+pub(crate) fn plan_metadata_request(
+    method: &str,
+    has_form: bool,
+    has_body: bool,
+    has_params: bool,
+) -> MetadataRequestKind {
+    match method {
+        "GET" if has_params => MetadataRequestKind::GetWithParams,
+        "POST" if has_form => MetadataRequestKind::PostForm,
+        "POST" if has_body => MetadataRequestKind::PostJson,
+        "POST" => MetadataRequestKind::PostJson,
+        "DELETE" if has_params => MetadataRequestKind::DeleteWithParams,
+        "DELETE" => MetadataRequestKind::Delete,
+        _ => MetadataRequestKind::Get,
+    }
+}
+
 /// Generic metadata API call helper.
 ///
-/// Provides a passthrough for various metadata endpoints.
+/// Provides a passthrough for various metadata endpoints. The wire shape
+/// (form vs JSON on POST; query-param forwarding on DELETE) is decided by
+/// [`plan_metadata_request`]; see that function for the contract citations.
 #[allow(clippy::implicit_hasher)]
 pub async fn metadata_api(
     client: &ApiClient,
@@ -515,6 +573,7 @@ pub async fn metadata_api(
     sub_path: &str,
     method: &str,
     body: Option<&Value>,
+    form: Option<&HashMap<String, String>>,
     params: Option<&HashMap<String, String>>,
 ) -> Result<Value, CliError> {
     let path = format!(
@@ -522,29 +581,99 @@ pub async fn metadata_api(
         urlencoding::encode(workspace_id),
         sub_path,
     );
-    match method {
-        "GET" => {
-            if let Some(p) = params {
-                client.get_with_params(&path, p).await
-            } else {
-                client.get(&path).await
-            }
+    // `plan_metadata_request` decides the wire shape; the `Some` payloads it
+    // implies are pattern-matched here so no `unwrap`/temporary is needed.
+    let empty = HashMap::new();
+    match plan_metadata_request(method, form.is_some(), body.is_some(), params.is_some()) {
+        MetadataRequestKind::Get => client.get(&path).await,
+        MetadataRequestKind::GetWithParams => {
+            client
+                .get_with_params(&path, params.unwrap_or(&empty))
+                .await
         }
-        "POST" => {
+        MetadataRequestKind::PostForm => client.post(&path, form.unwrap_or(&empty)).await,
+        MetadataRequestKind::PostJson => {
             if let Some(b) = body {
                 client.post_json(&path, b).await
             } else {
                 client.post_json(&path, &serde_json::json!({})).await
             }
         }
-        "DELETE" => client.delete(&path).await,
-        _ => client.get(&path).await,
+        MetadataRequestKind::Delete => client.delete(&path).await,
+        MetadataRequestKind::DeleteWithParams => {
+            client
+                .delete_with_params(&path, params.unwrap_or(&empty))
+                .await
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_update_note_form, note_path};
+    use super::{MetadataRequestKind, build_update_note_form, note_path, plan_metadata_request};
+
+    #[test]
+    fn metadata_get_with_params_forwards_query() {
+        // metadata-list / templates-in-use pass query params on GET.
+        assert_eq!(
+            plan_metadata_request("GET", false, false, true),
+            MetadataRequestKind::GetWithParams
+        );
+        assert_eq!(
+            plan_metadata_request("GET", false, false, false),
+            MetadataRequestKind::Get
+        );
+    }
+
+    #[test]
+    fn metadata_post_mutations_are_form_encoded() {
+        // FIX 3: settings / template-update / key_values-update / view-save
+        // all build a `form`, which must dispatch as form-encoded (NOT JSON —
+        // a JSON body returns 406 for the form-only mutation endpoints).
+        assert_eq!(
+            plan_metadata_request("POST", true, false, false),
+            MetadataRequestKind::PostForm
+        );
+        // A form always wins over a stray JSON body.
+        assert_eq!(
+            plan_metadata_request("POST", true, true, false),
+            MetadataRequestKind::PostForm
+        );
+        // No form supplied → JSON fallback (template-select sends no body;
+        // any genuinely-JSON POST endpoint keeps JSON).
+        assert_eq!(
+            plan_metadata_request("POST", false, true, false),
+            MetadataRequestKind::PostJson
+        );
+        assert_eq!(
+            plan_metadata_request("POST", false, false, false),
+            MetadataRequestKind::PostJson
+        );
+    }
+
+    #[test]
+    fn metadata_delete_forwards_keys_query() {
+        // FIX 1: when `keys` is supplied it rides as a query parameter on the
+        // DELETE so a targeted delete stays targeted.
+        assert_eq!(
+            plan_metadata_request("DELETE", false, false, true),
+            MetadataRequestKind::DeleteWithParams
+        );
+        // Omitting `keys` is a DELIBERATE delete-all (ai.txt:2600-2612): the
+        // DELETE carries no query parameters and the server removes all keys.
+        assert_eq!(
+            plan_metadata_request("DELETE", false, false, false),
+            MetadataRequestKind::Delete
+        );
+    }
+
+    #[test]
+    fn metadata_unknown_method_falls_back_to_get() {
+        assert_eq!(
+            plan_metadata_request("PATCH", true, true, true),
+            MetadataRequestKind::Get
+        );
+    }
 
     #[test]
     fn note_paths_use_correct_endpoints() {

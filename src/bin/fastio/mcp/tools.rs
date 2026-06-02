@@ -83,6 +83,14 @@ fn optional_bool(args: &Map<String, Value>, key: &str) -> Option<bool> {
     })
 }
 
+/// Extract an optional u64 parameter (number or string-encoded).
+fn optional_u64(args: &Map<String, Value>, key: &str) -> Option<u64> {
+    args.get(key).and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    })
+}
+
 /// Require authentication before proceeding. Returns an error result if not authed.
 async fn require_auth(state: &McpState) -> Result<(), CallToolResult> {
     if state.is_authenticated().await {
@@ -98,6 +106,111 @@ async fn require_auth(state: &McpState) -> Result<(), CallToolResult> {
 /// Convert a `CliError` into an MCP tool error result.
 fn cli_err_to_result(err: &fastio_cli::error::CliError) -> CallToolResult {
     error_text(&err.to_string())
+}
+
+/// Gate an AI-credit-spending action behind an explicit `confirm_ai_spend`
+/// acknowledgement.
+///
+/// The interactive CLI gates credit spend behind the `--confirm-ai-spend`
+/// flag. The MCP surface is non-interactive, so the same protection is
+/// expressed as a required-to-proceed `confirm_ai_spend` boolean parameter:
+/// unless the caller passes `confirm_ai_spend == true`, the action is rejected
+/// BEFORE any API call (and thus before any credits are spent). Returns
+/// `Some(error_result)` to short-circuit the handler when confirmation is
+/// missing, or `None` when the caller has explicitly opted in.
+fn require_ai_spend_confirmation(args: &Map<String, Value>) -> Option<CallToolResult> {
+    if ai_spend_confirmed(args) {
+        None
+    } else {
+        Some(error_text(AI_SPEND_REJECTION))
+    }
+}
+
+/// Error message returned when an AI-credit-spending MCP action is invoked
+/// without an explicit `confirm_ai_spend=true`.
+const AI_SPEND_REJECTION: &str =
+    "this action spends AI credits; pass confirm_ai_spend=true to proceed";
+
+/// Pure predicate: has the caller explicitly opted into AI credit spend via
+/// `confirm_ai_spend=true`? Accepts a native bool or the string `"true"`.
+fn ai_spend_confirmed(args: &Map<String, Value>) -> bool {
+    optional_bool(args, "confirm_ai_spend") == Some(true)
+}
+
+/// Error message returned when `keys` is present on `metadata-delete` but
+/// empty/malformed (blank, whitespace, `[]`, an empty array, or a value that
+/// is not a JSON array of key names) — which must NOT degrade into a
+/// destructive delete-all.
+const EMPTY_KEYS_REJECTION: &str = "keys is present but empty; omit keys entirely to delete all, \
+     or supply a non-empty JSON array of key names";
+
+/// Error message returned when `fields` is present on an extract action but
+/// blank/whitespace (which must NOT silently widen scope to the full schema).
+const EMPTY_FIELDS_REJECTION: &str = "fields is present but empty; omit fields entirely to extract \
+     the full schema, or supply a non-empty JSON array of field names";
+
+/// Resolve the optional `fields` extraction-scope parameter, rejecting a
+/// PRESENT-but-empty value.
+///
+/// Per the contract (ai.txt:2404 for extract-all, ai.txt:2631 for single-file
+/// extract) an OMITTED `fields` means "extract the full schema" — the wide,
+/// most expensive path. An absent `fields` is therefore allowed and resolves
+/// to `Ok(None)`. But a PRESENT-but-blank/whitespace `fields` must NOT
+/// silently widen the operation into a full extraction: a caller who supplied
+/// the field (even malformed) is asking to NARROW scope, so a blank value is
+/// rejected rather than spending credits on the full schema.
+fn resolve_extract_fields(args: &Map<String, Value>) -> Result<Option<&str>, &'static str> {
+    match args.get("fields") {
+        None => Ok(None),
+        Some(v) => {
+            let raw = v.as_str().unwrap_or_default();
+            if raw.trim().is_empty() {
+                Err(EMPTY_FIELDS_REJECTION)
+            } else {
+                Ok(Some(raw))
+            }
+        }
+    }
+}
+
+/// Resolve the optional `keys` parameter for `metadata-delete`, distinguishing
+/// ABSENT from PRESENT-but-empty/malformed.
+///
+/// Per the contract (ai.txt:2600-2612) `keys` is a JSON-encoded array of key
+/// names to delete, and an OMITTED `keys` deliberately deletes ALL metadata
+/// keys for the node. An absent `keys` therefore resolves to `Ok(None)`
+/// (delete-all, allowed).
+///
+/// A PRESENT `keys`, however, signals intent to delete a SPECIFIC subset, so it
+/// must NOT silently degrade into a destructive delete-all. Because the server
+/// may treat an empty array `[]` like omission (delete-all), an empty array is
+/// just as dangerous as a blank value. This function rejects (with
+/// `EMPTY_KEYS_REJECTION`) any present-but-empty/malformed value:
+/// blank/whitespace, the literal `[]` / `[ ]`, a JSON array with zero elements,
+/// or any value that does not parse as a JSON array of strings. Only a present,
+/// non-empty JSON array of key names resolves to `Ok(Some(raw))`.
+fn resolve_delete_keys(args: &Map<String, Value>) -> Result<Option<&str>, &'static str> {
+    match args.get("keys") {
+        None => Ok(None),
+        Some(v) => {
+            let raw = v.as_str().unwrap_or_default();
+            if raw.trim().is_empty() {
+                return Err(EMPTY_KEYS_REJECTION);
+            }
+            // `keys` is documented as a JSON-encoded array of key names. Parse
+            // it and require a non-empty array whose elements are all strings.
+            // An empty array `[]` is ambiguous/destructive (the server may
+            // treat it like omission → delete-all), so it is rejected here.
+            match serde_json::from_str::<Value>(raw) {
+                Ok(Value::Array(items))
+                    if !items.is_empty() && items.iter().all(Value::is_string) =>
+                {
+                    Ok(Some(raw))
+                }
+                _ => Err(EMPTY_KEYS_REJECTION),
+            }
+        }
+    }
 }
 
 // ─── Tool Definitions ───────────────────────────────────────────────────────
@@ -369,7 +482,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "workspace",
-        description: "Workspaces: list, create, view, update, delete, archive/unarchive, members, shares, notes, quickshares, metadata, import/export, workflow.",
+        description: "Workspaces: list, create, view, update, delete, archive/unarchive, members, shares, notes, quickshares, metadata, import/export, workflow. SIDE EFFECTS — these metadata actions SPEND AI CREDITS: 'metadata-template-preview-match', 'metadata-template-suggest-fields', 'metadata-extract', 'metadata-extract-and-wait'. 'metadata-extract-and-wait' enqueues a single-file extraction and polls workspace jobs-status to a terminal state before returning.",
         actions: &[
             "list",
             "create",
@@ -408,11 +521,13 @@ const TOOL_DEFS: &[ToolDef] = &[
             "metadata-delete",
             "metadata-details",
             "metadata-extract",
+            "metadata-extract-and-wait",
             "metadata-list",
             "metadata-template-select",
             "metadata-templates-in-use",
             "metadata-update",
             "metadata-view-save",
+            "metadata-view-get",
             "metadata-view-delete",
             "metadata-views-list",
         ],
@@ -443,7 +558,11 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "Specific note version to read (read-note)",
                 false,
             ),
-            ("template_id", "Metadata template ID", false),
+            (
+                "template_id",
+                "Metadata template ID (also the key for workspace-level saved views: view-save/view-get/view-delete)",
+                false,
+            ),
             ("category", "Metadata template category", false),
             ("fields", "JSON-encoded field definitions (metadata)", false),
             (
@@ -489,13 +608,23 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("order_by", "Field to order by (metadata-list)", false),
             ("order_desc", "Descending order (true/false)", false),
             (
-                "view_id",
-                "Metadata view ID (view-save, view-delete)",
+                "config",
+                "JSON-encoded saved-view config string: {version:1, columns:[{field,visible?,width?}], sort:{field,dir}, filters:[{field,operator,value_type,value}]} (metadata-view-save)",
                 false,
             ),
             (
                 "filter",
                 "Filter: enabled/disabled (metadata-template-list)",
+                false,
+            ),
+            (
+                "poll_interval",
+                "Seconds between job-status polls, 1-60, default 3 (metadata-extract-and-wait)",
+                false,
+            ),
+            (
+                "confirm_ai_spend",
+                "REQUIRED to proceed (true/false) for the AI-credit-spending actions metadata-template-preview-match, metadata-template-suggest-fields, metadata-extract, metadata-extract-and-wait. These actions are rejected unless confirm_ai_spend=true. Ignored by read-only metadata actions.",
                 false,
             ),
             ("limit", "Pagination limit", false),
@@ -1190,7 +1319,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "metadata",
-        description: "Metadata extraction: list eligible files, manage template-file mappings, AI-based matching, batch extraction, async single-file extraction (returns job_id; poll via workspace jobs-status), lexical keyword search over metadata values, and async TSV export of the caller's saved view.",
+        description: "Metadata extraction: list eligible files, manage template-file mappings, AI-based matching, batch extraction, async single-file extraction (returns job_id; poll via workspace jobs-status), lexical keyword search over metadata values, and async TSV export of the caller's saved view. SIDE EFFECTS — these actions SPEND AI CREDITS: 'suggest-fields', 'auto-match', 'extract-all', 'extract', 'extract-and-wait'. The 'extract-and-wait' action enqueues a single-file extraction and polls workspace jobs-status to a terminal state before returning (the offload-friendly compound).",
         actions: &[
             "eligible",
             "add-nodes",
@@ -1199,13 +1328,18 @@ const TOOL_DEFS: &[ToolDef] = &[
             "auto-match",
             "extract-all",
             "extract",
+            "extract-and-wait",
             "search",
             "export-view",
         ],
         params: &[
             ("workspace_id", "Workspace ID", false),
-            ("template_id", "Metadata template ID", false),
-            ("node_id", "File node ID (extract)", false),
+            (
+                "template_id",
+                "Metadata template ID (optional on extract/extract-and-wait; required on auto-match/extract-all/list-nodes/add-nodes/remove-nodes/export-view)",
+                false,
+            ),
+            ("node_id", "File node ID (extract, extract-and-wait)", false),
             (
                 "node_ids",
                 "JSON-encoded array of node IDs (add-nodes, remove-nodes)",
@@ -1225,7 +1359,27 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             (
                 "fields",
-                "JSON-encoded array of field names for partial extraction (extract)",
+                "JSON-encoded array of field names for partial extraction (extract, extract-and-wait, extract-all)",
+                false,
+            ),
+            (
+                "force",
+                "Re-extract every mapped node even if it already has values (true/false, extract-all)",
+                false,
+            ),
+            (
+                "batch_size",
+                "Optional server-clamped batch-size override (auto-match)",
+                false,
+            ),
+            (
+                "poll_interval",
+                "Seconds between job-status polls, 1-60, default 3 (extract-and-wait)",
+                false,
+            ),
+            (
+                "confirm_ai_spend",
+                "REQUIRED to proceed (true/false) for the AI-credit-spending actions auto-match, extract-all, extract, extract-and-wait. These actions are rejected unless confirm_ai_spend=true. Ignored by read-only actions.",
                 false,
             ),
             ("query", "Search keyword(s), max 1024 chars (search)", false),
@@ -2950,6 +3104,14 @@ async fn handle_org_create_workspace(
     }
 }
 
+/// Sub-path for a single workspace-level saved view (`view-save` /
+/// `view-get` / `view-delete`). Saved views are WORKSPACE-level and keyed by
+/// `template_id`, NOT node-scoped — `metadata_api` prepends
+/// `/workspace/{id}/`. Contract: storage.txt saved-view section, ai.txt:2735.
+const METADATA_VIEW_SUBPATH: &str = "metadata/view/";
+/// Sub-path for listing the caller's workspace-level saved views.
+const METADATA_VIEWS_SUBPATH: &str = "metadata/views/";
+
 /// Workspace tool handler.
 #[allow(clippy::too_many_lines)]
 async fn handle_workspace(
@@ -3326,6 +3488,7 @@ async fn handle_workspace(
                 "GET",
                 None,
                 None,
+                None,
             )
             .await
             {
@@ -3360,6 +3523,9 @@ async fn handle_workspace(
             }
         }
         "metadata-template-preview-match" => {
+            if let Some(e) = require_ai_spend_confirmation(args) {
+                return Ok(e);
+            }
             let ws_id = match required_str(args, "workspace_id") {
                 Ok(v) => v,
                 Err(e) => return Ok(e),
@@ -3378,6 +3544,9 @@ async fn handle_workspace(
             }
         }
         "metadata-template-suggest-fields" => {
+            if let Some(e) = require_ai_spend_confirmation(args) {
+                return Ok(e);
+            }
             let ws_id = match required_str(args, "workspace_id") {
                 Ok(v) => v,
                 Err(e) => return Ok(e),
@@ -3406,7 +3575,9 @@ async fn handle_workspace(
                 Err(e) => return Ok(e),
             };
             let sub = format!("metadata/templates/{}/", urlencoding::encode(tid));
-            match api::workspace::metadata_api(&client, ws_id, &sub, "DELETE", None, None).await {
+            match api::workspace::metadata_api(&client, ws_id, &sub, "DELETE", None, None, None)
+                .await
+            {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -3421,7 +3592,8 @@ async fn handle_workspace(
             } else {
                 "metadata/templates/list/".to_owned()
             };
-            match api::workspace::metadata_api(&client, ws_id, &sub, "GET", None, None).await {
+            match api::workspace::metadata_api(&client, ws_id, &sub, "GET", None, None, None).await
+            {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -3436,7 +3608,8 @@ async fn handle_workspace(
                 Err(e) => return Ok(e),
             };
             let sub = format!("metadata/templates/{}/details/", urlencoding::encode(tid));
-            match api::workspace::metadata_api(&client, ws_id, &sub, "GET", None, None).await {
+            match api::workspace::metadata_api(&client, ws_id, &sub, "GET", None, None, None).await
+            {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -3450,12 +3623,15 @@ async fn handle_workspace(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            let mut body = serde_json::Map::new();
+            // Contract (ai.txt:2076-2094) is form-encoded with stringy
+            // `enabled` ("true"/"false") and `priority` ("1".."5").
+            let mut form: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             if let Some(v) = optional_bool(args, "enabled") {
-                body.insert("enabled".to_owned(), Value::Bool(v));
+                form.insert("enabled".to_owned(), v.to_string());
             }
             if let Some(v) = optional_u8(args, "priority") {
-                body.insert("priority".to_owned(), Value::Number(v.into()));
+                form.insert("priority".to_owned(), v.to_string());
             }
             let sub = format!("metadata/templates/{}/settings/", urlencoding::encode(tid));
             match api::workspace::metadata_api(
@@ -3463,7 +3639,8 @@ async fn handle_workspace(
                 ws_id,
                 &sub,
                 "POST",
-                Some(&Value::Object(body)),
+                None,
+                Some(&form),
                 None,
             )
             .await
@@ -3490,25 +3667,30 @@ async fn handle_workspace(
             } else {
                 format!("metadata/templates/{}/update/", urlencoding::encode(tid))
             };
-            let mut body = serde_json::Map::new();
+            // Contract (ai.txt:2102-2129) is form-encoded; every field is
+            // optional and only provided fields are updated. `fields` is a
+            // JSON-encoded array passed through as a form value.
+            let mut form: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             if let Some(v) = optional_str(args, "name") {
-                body.insert("name".to_owned(), Value::String(v.to_owned()));
+                form.insert("name".to_owned(), v.to_owned());
             }
             if let Some(v) = optional_str(args, "description") {
-                body.insert("description".to_owned(), Value::String(v.to_owned()));
+                form.insert("description".to_owned(), v.to_owned());
             }
             if let Some(v) = optional_str(args, "category") {
-                body.insert("category".to_owned(), Value::String(v.to_owned()));
+                form.insert("category".to_owned(), v.to_owned());
             }
             if let Some(v) = optional_str(args, "fields") {
-                body.insert("fields".to_owned(), Value::String(v.to_owned()));
+                form.insert("fields".to_owned(), v.to_owned());
             }
             match api::workspace::metadata_api(
                 &client,
                 ws_id,
                 &sub,
                 "POST",
-                Some(&Value::Object(body)),
+                None,
+                Some(&form),
                 None,
             )
             .await
@@ -3527,9 +3709,34 @@ async fn handle_workspace(
                 Err(e) => return Ok(e),
             };
             let sub = format!("storage/{}/metadata/", urlencoding::encode(nid));
-            let body = optional_str(args, "keys").map(|k| json!({ "keys": k }));
-            match api::workspace::metadata_api(&client, ws_id, &sub, "DELETE", body.as_ref(), None)
-                .await
+            // Forward the documented `keys` parameter (ai.txt:2600-2612) as a
+            // query string on the DELETE. `keys` is a JSON-encoded array of
+            // key names to remove; when OMITTED the server deliberately
+            // deletes ALL metadata keys for the node. `resolve_delete_keys`
+            // distinguishes an ABSENT `keys` (purposeful delete-all, allowed)
+            // from a PRESENT-but-blank/whitespace value (rejected, so a
+            // malformed input cannot silently degrade into a destructive
+            // delete-all).
+            let params = match resolve_delete_keys(args) {
+                Ok(None) => None,
+                Ok(Some(raw)) => {
+                    let mut m: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    m.insert("keys".to_owned(), raw.to_owned());
+                    Some(m)
+                }
+                Err(msg) => return Ok(error_text(msg)),
+            };
+            match api::workspace::metadata_api(
+                &client,
+                ws_id,
+                &sub,
+                "DELETE",
+                None,
+                None,
+                params.as_ref(),
+            )
+            .await
             {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
@@ -3627,6 +3834,9 @@ async fn handle_workspace(
             }
         }
         "metadata-extract" => {
+            if let Some(e) = require_ai_spend_confirmation(args) {
+                return Ok(e);
+            }
             let ws_id = match required_str(args, "workspace_id") {
                 Ok(v) => v,
                 Err(e) => return Ok(e),
@@ -3635,15 +3845,35 @@ async fn handle_workspace(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            let tid = match required_str(args, "template_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
+            let tid = optional_str(args, "template_id").filter(|s| !s.trim().is_empty());
+            let fields = match resolve_extract_fields(args) {
+                Ok(f) => f,
+                Err(msg) => return Ok(error_text(msg)),
             };
-            let fields = optional_str(args, "fields").filter(|s| !s.trim().is_empty());
             match api::metadata::extract_node_metadata(&client, ws_id, nid, tid, fields).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
+        }
+        "metadata-extract-and-wait" => {
+            if let Some(e) = require_ai_spend_confirmation(args) {
+                return Ok(e);
+            }
+            let ws_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let nid = match required_str(args, "node_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let tid = optional_str(args, "template_id").filter(|s| !s.trim().is_empty());
+            let fields = match resolve_extract_fields(args) {
+                Ok(f) => f,
+                Err(msg) => return Ok(error_text(msg)),
+            };
+            let poll_interval = optional_u64(args, "poll_interval");
+            Ok(metadata_extract_and_wait(&client, ws_id, nid, tid, fields, poll_interval).await)
         }
         "metadata-list" => {
             let ws_id = match required_str(args, "workspace_id") {
@@ -3678,7 +3908,7 @@ async fn handle_workspace(
             } else {
                 Some(&params)
             };
-            match api::workspace::metadata_api(&client, ws_id, &sub, "GET", None, p).await {
+            match api::workspace::metadata_api(&client, ws_id, &sub, "GET", None, None, p).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -3696,7 +3926,8 @@ async fn handle_workspace(
                 "storage/{}/metadata/template_select/",
                 urlencoding::encode(nid)
             );
-            match api::workspace::metadata_api(&client, ws_id, &sub, "POST", None, None).await {
+            match api::workspace::metadata_api(&client, ws_id, &sub, "POST", None, None, None).await
+            {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -3726,7 +3957,7 @@ async fn handle_workspace(
             } else {
                 Some(&params)
             };
-            match api::workspace::metadata_api(&client, ws_id, &sub, "GET", None, p).await {
+            match api::workspace::metadata_api(&client, ws_id, &sub, "GET", None, None, p).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -3753,54 +3984,18 @@ async fn handle_workspace(
                 urlencoding::encode(nid),
                 urlencoding::encode(tid)
             );
-            let body = json!({ "key_values": kv });
-            match api::workspace::metadata_api(&client, ws_id, &sub, "POST", Some(&body), None)
-                .await
-            {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "metadata-view-save" => {
-            let ws_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let nid = match required_str(args, "node_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let sub = if let Some(vid) = optional_str(args, "view_id") {
-                format!(
-                    "storage/{}/metadata/view/{}/",
-                    urlencoding::encode(nid),
-                    urlencoding::encode(vid)
-                )
-            } else {
-                format!("storage/{}/metadata/view/", urlencoding::encode(nid))
-            };
-            let mut body = serde_json::Map::new();
-            if let Some(v) = optional_str(args, "name") {
-                body.insert("name".to_owned(), Value::String(v.to_owned()));
-            }
-            if let Some(v) = optional_str(args, "template_id") {
-                body.insert("template_id".to_owned(), Value::String(v.to_owned()));
-            }
-            if let Some(v) = optional_str(args, "filters") {
-                body.insert("filters".to_owned(), Value::String(v.to_owned()));
-            }
-            if let Some(v) = optional_str(args, "order_by") {
-                body.insert("order_by".to_owned(), Value::String(v.to_owned()));
-            }
-            if let Some(v) = optional_bool(args, "order_desc") {
-                body.insert("order_desc".to_owned(), Value::Bool(v));
-            }
+            // Contract (ai.txt:2073-2118): form-encoded `key_values` (a
+            // JSON-encoded object passed through verbatim as the form value).
+            let mut form: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            form.insert("key_values".to_owned(), kv.to_owned());
             match api::workspace::metadata_api(
                 &client,
                 ws_id,
                 &sub,
                 "POST",
-                Some(&Value::Object(body)),
+                None,
+                Some(&form),
                 None,
             )
             .await
@@ -3809,40 +4004,119 @@ async fn handle_workspace(
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
-        "metadata-view-delete" => {
+        "metadata-view-save" => {
+            // Saved views are WORKSPACE-level and keyed by `template_id`
+            // (NOT node-scoped). Contract: storage.txt saved-view section +
+            // ai.txt:2735-2744. POST /workspace/{id}/metadata/view/ takes a
+            // form-encoded body of `template_id` + `config` (a JSON-encoded
+            // string holding the view config). A JSON body returns 406.
             let ws_id = match required_str(args, "workspace_id") {
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            let nid = match required_str(args, "node_id") {
+            let tid = match required_str(args, "template_id") {
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            let vid = match required_str(args, "view_id") {
+            let config = match required_str(args, "config") {
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            let sub = format!(
-                "storage/{}/metadata/view/{}/",
-                urlencoding::encode(nid),
-                urlencoding::encode(vid)
-            );
-            match api::workspace::metadata_api(&client, ws_id, &sub, "DELETE", None, None).await {
+            let mut form: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            form.insert("template_id".to_owned(), tid.to_owned());
+            form.insert("config".to_owned(), config.to_owned());
+            match api::workspace::metadata_api(
+                &client,
+                ws_id,
+                METADATA_VIEW_SUBPATH,
+                "POST",
+                None,
+                Some(&form),
+                None,
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "metadata-view-get" => {
+            // GET /workspace/{id}/metadata/view/?template_id={tid} — the
+            // caller's saved view for a single template (1609 when absent).
+            let ws_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let tid = match required_str(args, "template_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let mut params: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            params.insert("template_id".to_owned(), tid.to_owned());
+            match api::workspace::metadata_api(
+                &client,
+                ws_id,
+                METADATA_VIEW_SUBPATH,
+                "GET",
+                None,
+                None,
+                Some(&params),
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "metadata-view-delete" => {
+            // DELETE /workspace/{id}/metadata/view/?template_id={tid} — removes
+            // only the caller's own view for that template.
+            let ws_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let tid = match required_str(args, "template_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let mut params: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            params.insert("template_id".to_owned(), tid.to_owned());
+            match api::workspace::metadata_api(
+                &client,
+                ws_id,
+                METADATA_VIEW_SUBPATH,
+                "DELETE",
+                None,
+                None,
+                Some(&params),
+            )
+            .await
+            {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
         "metadata-views-list" => {
+            // GET /workspace/{id}/metadata/views/ — every saved view the
+            // caller owns in this workspace. Workspace-level, no node id.
             let ws_id = match required_str(args, "workspace_id") {
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            let nid = match required_str(args, "node_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let sub = format!("storage/{}/metadata/views/", urlencoding::encode(nid));
-            match api::workspace::metadata_api(&client, ws_id, &sub, "GET", None, None).await {
+            match api::workspace::metadata_api(
+                &client,
+                ws_id,
+                METADATA_VIEWS_SUBPATH,
+                "GET",
+                None,
+                None,
+                None,
+            )
+            .await
+            {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -8336,6 +8610,9 @@ async fn handle_metadata(
             }
         }
         "auto-match" => {
+            if let Some(e) = require_ai_spend_confirmation(args) {
+                return Ok(e);
+            }
             let workspace_id = match required_str(args, "workspace_id") {
                 Ok(v) => v,
                 Err(e) => return Ok(e),
@@ -8344,12 +8621,18 @@ async fn handle_metadata(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            match api::metadata::auto_match_template(&client, workspace_id, template_id).await {
+            let batch_size = optional_u32(args, "batch_size");
+            match api::metadata::auto_match_template(&client, workspace_id, template_id, batch_size)
+                .await
+            {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
         "extract-all" => {
+            if let Some(e) = require_ai_spend_confirmation(args) {
+                return Ok(e);
+            }
             let workspace_id = match required_str(args, "workspace_id") {
                 Ok(v) => v,
                 Err(e) => return Ok(e),
@@ -8358,12 +8641,22 @@ async fn handle_metadata(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            match api::metadata::extract_all(&client, workspace_id, template_id).await {
+            let fields = match resolve_extract_fields(args) {
+                Ok(f) => f,
+                Err(msg) => return Ok(error_text(msg)),
+            };
+            let force = optional_bool(args, "force").unwrap_or(false);
+            match api::metadata::extract_all(&client, workspace_id, template_id, fields, force)
+                .await
+            {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
         "extract" => {
+            if let Some(e) = require_ai_spend_confirmation(args) {
+                return Ok(e);
+            }
             let workspace_id = match required_str(args, "workspace_id") {
                 Ok(v) => v,
                 Err(e) => return Ok(e),
@@ -8372,11 +8665,11 @@ async fn handle_metadata(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            let template_id = match required_str(args, "template_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
+            let template_id = optional_str(args, "template_id").filter(|s| !s.trim().is_empty());
+            let fields = match resolve_extract_fields(args) {
+                Ok(f) => f,
+                Err(msg) => return Ok(error_text(msg)),
             };
-            let fields = optional_str(args, "fields").filter(|s| !s.trim().is_empty());
             match api::metadata::extract_node_metadata(
                 &client,
                 workspace_id,
@@ -8389,6 +8682,34 @@ async fn handle_metadata(
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
+        }
+        "extract-and-wait" => {
+            if let Some(e) = require_ai_spend_confirmation(args) {
+                return Ok(e);
+            }
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let node_id = match required_str(args, "node_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let template_id = optional_str(args, "template_id").filter(|s| !s.trim().is_empty());
+            let fields = match resolve_extract_fields(args) {
+                Ok(f) => f,
+                Err(msg) => return Ok(error_text(msg)),
+            };
+            let poll_interval = optional_u64(args, "poll_interval");
+            Ok(metadata_extract_and_wait(
+                &client,
+                workspace_id,
+                node_id,
+                template_id,
+                fields,
+                poll_interval,
+            )
+            .await)
         }
         "search" => {
             let workspace_id = match required_str(args, "workspace_id") {
@@ -8433,6 +8754,135 @@ async fn handle_metadata(
             }
         }
         _ => Ok(error_text(&format!("Unknown metadata action: {action}"))),
+    }
+}
+
+/// Default seconds between metadata-extract job-status polls (MCP).
+const METADATA_EXTRACT_POLL_DEFAULT_SECS: u64 = 3;
+/// Lower bound on the metadata-extract poll interval (MCP).
+const METADATA_EXTRACT_POLL_MIN_SECS: u64 = 1;
+/// Upper bound on the metadata-extract poll interval (MCP).
+const METADATA_EXTRACT_POLL_MAX_SECS: u64 = 60;
+/// Hard ceiling on the MCP `metadata extract-and-wait` poll loop. Sized
+/// well under the ~1-hour JWT lifetime so a stuck job surfaces a clear
+/// timeout rather than hanging the MCP session.
+const METADATA_EXTRACT_WAIT_MAX_SECS: u64 = 600;
+
+/// Compound: enqueue a single-file metadata extraction, then poll the
+/// workspace jobs-status endpoint until the job reaches a terminal state.
+///
+/// This is the offload-friendly MCP expression of "extract and tell me the
+/// result" — the agent makes one call instead of enqueue-then-poll. Spends
+/// AI credits. The loop is bounded by [`METADATA_EXTRACT_WAIT_MAX_SECS`] so
+/// it cannot hang past the JWT lifetime; a 401 short-circuits to a clear
+/// re-auth error. When the enqueue resolves to an empty effective scope
+/// (no `job_id`), the original `202` body is returned unchanged — there is
+/// nothing to wait for.
+async fn metadata_extract_and_wait(
+    client: &fastio_cli::client::ApiClient,
+    workspace_id: &str,
+    node_id: &str,
+    template_id: Option<&str>,
+    fields: Option<&str>,
+    poll_interval: Option<u64>,
+) -> CallToolResult {
+    use fastio_cli::api::metadata::ExtractJobState;
+
+    let enqueue = match api::metadata::extract_node_metadata(
+        client,
+        workspace_id,
+        node_id,
+        template_id,
+        fields,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return cli_err_to_result(&e),
+    };
+
+    // Pull the job_id out of the (possibly enveloped) 202 body.
+    let payload = enqueue.get("response").unwrap_or(&enqueue);
+    let job_id = payload
+        .get("job_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let Some(job_id) = job_id else {
+        // No job enqueued (empty effective scope) — return the 202 body.
+        return success_json(&enqueue);
+    };
+
+    let interval = poll_interval
+        .unwrap_or(METADATA_EXTRACT_POLL_DEFAULT_SECS)
+        .clamp(
+            METADATA_EXTRACT_POLL_MIN_SECS,
+            METADATA_EXTRACT_POLL_MAX_SECS,
+        );
+
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(METADATA_EXTRACT_WAIT_MAX_SECS);
+
+    loop {
+        match api::workspace::jobs_status(client, workspace_id).await {
+            Ok(status) => {
+                match api::metadata::classify_single_extract_job(&status, node_id, Some(&job_id)) {
+                    ExtractJobState::Completed => {
+                        let result = serde_json::json!({
+                            "result": "yes",
+                            "job_id": job_id,
+                            "node_id": node_id,
+                            "status": "completed",
+                            "message": "Extraction completed. Read values via the metadata-details action.",
+                        });
+                        return success_json(&result);
+                    }
+                    ExtractJobState::Errored(msg) => {
+                        let detail = msg.unwrap_or_else(|| "no error message provided".to_owned());
+                        return error_text(&format!("extraction job {job_id} failed: {detail}"));
+                    }
+                    // `NotFound` is NOT treated as success. Terminal entries
+                    // only age out after ~1h, well beyond this bounded
+                    // `METADATA_EXTRACT_WAIT_MAX_SECS` window, so a missing
+                    // entry within the window means the job is not yet visible
+                    // rather than aged-out-after-completion. Keep polling until
+                    // an EXPLICIT terminal state is observed or the deadline is
+                    // reached (which returns an indeterminate timeout, not
+                    // success). `Pending` and the `#[non_exhaustive]` catch-all
+                    // also keep us polling.
+                    _ => {}
+                }
+            }
+            Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 401 => {
+                return error_text(&format!(
+                    "authentication expired while waiting for extraction job {job_id}. The job \
+                     may still complete server-side; re-authenticate and read values via the \
+                     metadata-details action."
+                ));
+            }
+            // Transient errors are tolerated; retry on the next tick.
+            Err(_) => {}
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return error_text(&format!(
+                "timed out after ~{METADATA_EXTRACT_WAIT_MAX_SECS}s waiting for extraction job \
+                 {job_id}. The job may still complete server-side; poll the workspace \
+                 jobs-status action or read values via metadata-details."
+            ));
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let sleep = remaining.min(std::time::Duration::from_secs(interval));
+        tokio::time::sleep(sleep).await;
+
+        if tokio::time::Instant::now() >= deadline {
+            return error_text(&format!(
+                "timed out after ~{METADATA_EXTRACT_WAIT_MAX_SECS}s waiting for extraction job \
+                 {job_id}. The job may still complete server-side; poll the workspace \
+                 jobs-status action or read values via metadata-details."
+            ));
+        }
     }
 }
 
@@ -8940,6 +9390,168 @@ mod ripley_tool_tests {
         }
     }
 
+    #[test]
+    fn metadata_tool_advertises_extract_and_wait_action() {
+        let tools = ToolRouter::list_tools().tools;
+        let metadata = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "metadata")
+            .expect("metadata tool present");
+        let schema = serde_json::to_string(&metadata.input_schema).unwrap_or_default();
+        for action in ["extract", "extract-and-wait", "auto-match", "extract-all"] {
+            assert!(
+                schema.contains(action),
+                "metadata schema must advertise `{action}`, got: {schema}"
+            );
+        }
+        // New params surfaced.
+        for param in ["batch_size", "force", "poll_interval"] {
+            assert!(
+                schema.contains(param),
+                "metadata schema must advertise param `{param}`, got: {schema}"
+            );
+        }
+        // Credit-spend side-effects flagged in the description.
+        assert!(
+            metadata
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("SPEND AI CREDITS"),
+            "metadata description must flag credit-spending actions"
+        );
+    }
+
+    #[test]
+    fn workspace_tool_advertises_metadata_extract_and_wait_action() {
+        let tools = ToolRouter::list_tools().tools;
+        let workspace = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "workspace")
+            .expect("workspace tool present");
+        let schema = serde_json::to_string(&workspace.input_schema).unwrap_or_default();
+        for action in ["metadata-extract", "metadata-extract-and-wait"] {
+            assert!(
+                schema.contains(action),
+                "workspace schema must advertise `{action}`, got: {schema}"
+            );
+        }
+        assert!(
+            workspace
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("SPEND AI CREDITS"),
+            "workspace description must flag credit-spending metadata actions"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_extract_and_wait_routes_to_handler() {
+        // Unauthenticated → short-circuits at the auth gate inside
+        // handle_metadata, proving `extract-and-wait` routed (vs the
+        // unknown-action arm).
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("extract-and-wait".to_owned()),
+        );
+        let res = router
+            .call_tool("metadata", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(text.contains("Not authenticated"), "got: {text}");
+        assert!(!text.contains("Unknown metadata action"), "got: {text}");
+    }
+
+    #[test]
+    fn saved_view_subpaths_are_workspace_level() {
+        // FIX 2: saved views are WORKSPACE-level and keyed by template_id.
+        // `metadata_api` prepends `/workspace/{id}/`, so the sub-paths must be
+        // `metadata/view/` and `metadata/views/` — NOT the old node-scoped
+        // `storage/{node}/metadata/view/...` shape.
+        assert_eq!(super::METADATA_VIEW_SUBPATH, "metadata/view/");
+        assert_eq!(super::METADATA_VIEWS_SUBPATH, "metadata/views/");
+        assert!(
+            !super::METADATA_VIEW_SUBPATH.contains("storage/"),
+            "saved-view path must not be node-scoped"
+        );
+        assert!(
+            !super::METADATA_VIEWS_SUBPATH.contains("storage/"),
+            "saved-views list path must not be node-scoped"
+        );
+    }
+
+    #[test]
+    fn workspace_tool_advertises_saved_view_actions_and_config_param() {
+        // FIX 2: the workspace tool exposes the workspace-level saved-view
+        // actions (incl. the new `metadata-view-get`) and the `config` param
+        // (form field for view-save); the retired `view_id` param is gone.
+        let tools = ToolRouter::list_tools().tools;
+        let workspace = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "workspace")
+            .expect("workspace tool present");
+        let schema = serde_json::to_string(&workspace.input_schema).unwrap_or_default();
+        for action in [
+            "metadata-view-save",
+            "metadata-view-get",
+            "metadata-view-delete",
+            "metadata-views-list",
+        ] {
+            assert!(
+                schema.contains(action),
+                "workspace schema must advertise `{action}`, got: {schema}"
+            );
+        }
+        assert!(
+            schema.contains("config"),
+            "workspace schema must advertise the saved-view `config` param"
+        );
+        assert!(
+            !schema.contains("view_id"),
+            "retired node-scoped `view_id` param must be gone from the workspace schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_view_get_routes_to_handler() {
+        // Proves `metadata-view-get` is wired (auth gate short-circuit vs the
+        // unknown-action arm).
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("metadata-view-get".to_owned()),
+        );
+        let res = router
+            .call_tool("workspace", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(text.contains("Not authenticated"), "got: {text}");
+        assert!(!text.contains("Unknown workspace action"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn workspace_metadata_extract_and_wait_routes_to_handler() {
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("metadata-extract-and-wait".to_owned()),
+        );
+        let res = router
+            .call_tool("workspace", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(text.contains("Not authenticated"), "got: {text}");
+        assert!(!text.contains("Unknown workspace action"), "got: {text}");
+    }
+
     #[tokio::test]
     async fn memory_get_routes_to_handler() {
         // Unauthenticated → short-circuits at the auth gate inside handle_ai,
@@ -9303,5 +9915,300 @@ mod ripley_tool_tests {
             .expect("call_tool ok");
         let text = result_to_string(&res);
         assert!(text.contains("Unknown ripley action"), "got: {text}");
+    }
+
+    // ── FIX 1: AI-credit-spend confirmation gate (MCP) ──────────────────────
+
+    #[test]
+    fn ai_spend_confirmed_only_on_explicit_true() {
+        let mut absent = Map::new();
+        absent.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        assert!(
+            !super::ai_spend_confirmed(&absent),
+            "absent must not confirm"
+        );
+
+        let mut native_true = Map::new();
+        native_true.insert("confirm_ai_spend".to_owned(), Value::Bool(true));
+        assert!(
+            super::ai_spend_confirmed(&native_true),
+            "native true confirms"
+        );
+
+        let mut native_false = Map::new();
+        native_false.insert("confirm_ai_spend".to_owned(), Value::Bool(false));
+        assert!(
+            !super::ai_spend_confirmed(&native_false),
+            "native false must not confirm"
+        );
+
+        let mut str_true = Map::new();
+        str_true.insert(
+            "confirm_ai_spend".to_owned(),
+            Value::String("true".to_owned()),
+        );
+        assert!(
+            super::ai_spend_confirmed(&str_true),
+            "string \"true\" confirms"
+        );
+
+        let mut str_false = Map::new();
+        str_false.insert(
+            "confirm_ai_spend".to_owned(),
+            Value::String("false".to_owned()),
+        );
+        assert!(
+            !super::ai_spend_confirmed(&str_false),
+            "string \"false\" must not confirm"
+        );
+    }
+
+    /// Drive a credit-spending action through `call_tool` WITHOUT
+    /// `confirm_ai_spend` and assert it is rejected with the spend message,
+    /// and NOT with any missing-parameter error (i.e. the guard fires before
+    /// param validation and before any network call).
+    async fn assert_spend_rejected_without_confirm(tool: &str, action: &str) {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String(action.to_owned()));
+        let res = router.call_tool(tool, args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("spends AI credits") && text.contains("confirm_ai_spend=true"),
+            "`{tool}`/`{action}` must be rejected without confirm_ai_spend, got: {text}"
+        );
+        assert!(
+            !text.contains("Missing required parameter"),
+            "spend guard must fire BEFORE param validation for `{tool}`/`{action}`, got: {text}"
+        );
+    }
+
+    /// Drive a credit-spending action through `call_tool` WITH
+    /// `confirm_ai_spend=true` but missing `workspace_id`, and assert it
+    /// proceeds PAST the spend guard (surfacing the missing-param error
+    /// instead of the spend rejection — so no network call is attempted).
+    async fn assert_spend_proceeds_with_confirm(tool: &str, action: &str) {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String(action.to_owned()));
+        args.insert("confirm_ai_spend".to_owned(), Value::Bool(true));
+        let res = router.call_tool(tool, args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("spends AI credits"),
+            "`{tool}`/`{action}` must pass the spend guard when confirm_ai_spend=true, got: {text}"
+        );
+        assert!(
+            text.contains("Missing required parameter: workspace_id"),
+            "with confirm_ai_spend=true the handler should reach param validation, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_credit_spending_actions_require_confirm_ai_spend() {
+        // Workspace tool surface.
+        for action in [
+            "metadata-template-preview-match",
+            "metadata-template-suggest-fields",
+            "metadata-extract",
+            "metadata-extract-and-wait",
+        ] {
+            assert_spend_rejected_without_confirm("workspace", action).await;
+            assert_spend_proceeds_with_confirm("workspace", action).await;
+        }
+        // Standalone metadata tool surface.
+        for action in ["auto-match", "extract-all", "extract", "extract-and-wait"] {
+            assert_spend_rejected_without_confirm("metadata", action).await;
+            assert_spend_proceeds_with_confirm("metadata", action).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_metadata_actions_do_not_require_confirm_ai_spend() {
+        // A read-only action (metadata-list) must NOT be blocked by the spend
+        // guard: with no confirm_ai_spend it still reaches param validation
+        // rather than the spend rejection.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("metadata-list".to_owned()),
+        );
+        let res = router
+            .call_tool("workspace", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("spends AI credits"),
+            "read-only metadata-list must not be spend-gated, got: {text}"
+        );
+        assert!(
+            text.contains("Missing required parameter"),
+            "metadata-list should reach param validation, got: {text}"
+        );
+    }
+
+    #[test]
+    fn workspace_and_metadata_schemas_advertise_confirm_ai_spend() {
+        let tools = ToolRouter::list_tools().tools;
+        for tool_name in ["workspace", "metadata"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name.as_ref() == tool_name)
+                .expect("tool present");
+            let schema = serde_json::to_string(&tool.input_schema).unwrap_or_default();
+            assert!(
+                schema.contains("confirm_ai_spend"),
+                "`{tool_name}` schema must advertise the confirm_ai_spend param, got: {schema}"
+            );
+        }
+    }
+
+    // ── FIX 2: present-but-empty keys / fields rejection (MCP) ──────────────
+
+    #[test]
+    fn resolve_delete_keys_distinguishes_absent_from_empty() {
+        // ABSENT keys → delete-all (allowed).
+        let mut absent = Map::new();
+        absent.insert("node_id".to_owned(), Value::String("n1".to_owned()));
+        assert_eq!(super::resolve_delete_keys(&absent), Ok(None));
+
+        // PRESENT-but-empty → rejected.
+        let mut blank = Map::new();
+        blank.insert("keys".to_owned(), Value::String(String::new()));
+        assert_eq!(
+            super::resolve_delete_keys(&blank),
+            Err(super::EMPTY_KEYS_REJECTION)
+        );
+
+        // PRESENT-but-whitespace → rejected.
+        let mut ws = Map::new();
+        ws.insert("keys".to_owned(), Value::String("   ".to_owned()));
+        assert_eq!(
+            super::resolve_delete_keys(&ws),
+            Err(super::EMPTY_KEYS_REJECTION)
+        );
+
+        // PRESENT empty JSON array "[]" → rejected (ambiguous delete-all).
+        let mut empty_arr = Map::new();
+        empty_arr.insert("keys".to_owned(), Value::String("[]".to_owned()));
+        assert_eq!(
+            super::resolve_delete_keys(&empty_arr),
+            Err(super::EMPTY_KEYS_REJECTION)
+        );
+
+        // PRESENT empty JSON array with inner whitespace "[ ]" → rejected.
+        let mut empty_arr_ws = Map::new();
+        empty_arr_ws.insert("keys".to_owned(), Value::String("[ ]".to_owned()));
+        assert_eq!(
+            super::resolve_delete_keys(&empty_arr_ws),
+            Err(super::EMPTY_KEYS_REJECTION)
+        );
+
+        // PRESENT non-array JSON (e.g. an object) → rejected.
+        let mut non_array = Map::new();
+        non_array.insert("keys".to_owned(), Value::String(r#"{"a":1}"#.to_owned()));
+        assert_eq!(
+            super::resolve_delete_keys(&non_array),
+            Err(super::EMPTY_KEYS_REJECTION)
+        );
+
+        // PRESENT array with a non-string element → rejected.
+        let mut mixed = Map::new();
+        mixed.insert("keys".to_owned(), Value::String(r#"["a",1]"#.to_owned()));
+        assert_eq!(
+            super::resolve_delete_keys(&mixed),
+            Err(super::EMPTY_KEYS_REJECTION)
+        );
+
+        // PRESENT non-empty JSON array of key names → forwarded verbatim.
+        let mut present = Map::new();
+        present.insert("keys".to_owned(), Value::String(r#"["a","b"]"#.to_owned()));
+        assert_eq!(
+            super::resolve_delete_keys(&present),
+            Ok(Some(r#"["a","b"]"#))
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_delete_rejects_present_but_empty_keys() {
+        // With workspace_id + node_id present but keys="" the handler must
+        // reject (not silently delete-all) BEFORE any network call.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("metadata-delete".to_owned()),
+        );
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("node_id".to_owned(), Value::String("n1".to_owned()));
+        args.insert("keys".to_owned(), Value::String(String::new()));
+        let res = router
+            .call_tool("workspace", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("keys is present but empty"),
+            "present-but-empty keys must be rejected, got: {text}"
+        );
+    }
+
+    #[test]
+    fn resolve_extract_fields_distinguishes_absent_from_empty() {
+        // ABSENT fields → full schema (allowed).
+        let absent = Map::new();
+        assert_eq!(super::resolve_extract_fields(&absent), Ok(None));
+
+        // PRESENT-but-empty → rejected (would otherwise widen to full schema).
+        let mut blank = Map::new();
+        blank.insert("fields".to_owned(), Value::String(String::new()));
+        assert_eq!(
+            super::resolve_extract_fields(&blank),
+            Err(super::EMPTY_FIELDS_REJECTION)
+        );
+
+        // PRESENT-but-whitespace → rejected.
+        let mut ws = Map::new();
+        ws.insert("fields".to_owned(), Value::String("  ".to_owned()));
+        assert_eq!(
+            super::resolve_extract_fields(&ws),
+            Err(super::EMPTY_FIELDS_REJECTION)
+        );
+
+        // PRESENT, non-empty → forwarded verbatim.
+        let mut present = Map::new();
+        present.insert(
+            "fields".to_owned(),
+            Value::String(r#"["amount"]"#.to_owned()),
+        );
+        assert_eq!(
+            super::resolve_extract_fields(&present),
+            Ok(Some(r#"["amount"]"#))
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_all_rejects_present_but_empty_fields() {
+        // confirm_ai_spend=true to pass the spend guard, workspace_id +
+        // template_id present, fields="" → present-but-empty rejection BEFORE
+        // any network call (would otherwise widen to the full schema).
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("extract-all".to_owned()));
+        args.insert("confirm_ai_spend".to_owned(), Value::Bool(true));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("template_id".to_owned(), Value::String("mt_1".to_owned()));
+        args.insert("fields".to_owned(), Value::String(String::new()));
+        let res = router
+            .call_tool("metadata", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("fields is present but empty"),
+            "present-but-empty fields must be rejected, got: {text}"
+        );
     }
 }

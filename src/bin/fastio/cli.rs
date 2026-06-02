@@ -3423,7 +3423,8 @@ pub enum MetadataCommands {
         #[arg(long, value_parser = ["asc", "desc"], requires = "sort_field")]
         sort_dir: Option<String>,
     },
-    /// AI-based file matching for a template.
+    /// AI-based file matching for a template. SPENDS AI CREDITS — requires
+    /// --confirm-ai-spend (or an interactive y/N confirmation on a TTY).
     #[command(name = "auto-match")]
     AutoMatch {
         /// Workspace ID.
@@ -3432,8 +3433,18 @@ pub enum MetadataCommands {
         /// Template ID.
         #[arg(long)]
         template_id: String,
+        /// Optional batch-size override (clamped server-side to the
+        /// supported range). Omit to use the server default.
+        #[arg(long)]
+        batch_size: Option<u32>,
+        /// Acknowledge that this is an AI-credit-spending action. Required
+        /// to proceed non-interactively; on a TTY you are prompted instead.
+        #[arg(long)]
+        confirm_ai_spend: bool,
     },
-    /// Batch extract metadata for all files in a template.
+    /// Batch extract metadata for all files in a template. SPENDS AI CREDITS
+    /// — requires --confirm-ai-spend (or an interactive y/N confirmation on
+    /// a TTY). Up to 1,000 files are processed per job.
     #[command(name = "extract-all")]
     ExtractAll {
         /// Workspace ID.
@@ -3442,6 +3453,18 @@ pub enum MetadataCommands {
         /// Template ID.
         #[arg(long)]
         template_id: String,
+        /// JSON-encoded array of template field names for partial
+        /// extraction (omit to extract every field).
+        #[arg(long)]
+        fields: Option<String>,
+        /// Re-extract every mapped node even if it already has values for
+        /// this template (default skips nodes that already have values).
+        #[arg(long)]
+        force: bool,
+        /// Acknowledge that this is an AI-credit-spending action. Required
+        /// to proceed non-interactively; on a TTY you are prompted instead.
+        #[arg(long)]
+        confirm_ai_spend: bool,
     },
     /// Get metadata details for one or more files.
     ///
@@ -3461,12 +3484,15 @@ pub enum MetadataCommands {
         #[arg(required = true, num_args = 1..)]
         node_ids: Vec<String>,
     },
-    /// Enqueue an async metadata extraction for a single file. Usually
-    /// returns a `job_id`; poll `workspace jobs-status` until status is
-    /// "completed", then read values from the metadata details endpoint.
-    /// A full-row call whose effective scope is empty (every template
-    /// field has `autoextract: false`) responds successfully without
-    /// enqueueing a job — do not assume a `job_id` is always present.
+    /// Enqueue an async metadata extraction for a single file. SPENDS AI
+    /// CREDITS — requires --confirm-ai-spend (or an interactive y/N
+    /// confirmation on a TTY). Usually returns a `job_id`; poll
+    /// `workspace jobs-status` until status is "completed", then read
+    /// values from the metadata details endpoint (or pass --wait to do
+    /// this automatically). A full-row call whose effective scope is empty
+    /// (every template field has `autoextract: false`) responds
+    /// successfully without enqueueing a job — do not assume a `job_id` is
+    /// always present.
     Extract {
         /// Workspace ID.
         #[arg(long)]
@@ -3474,15 +3500,30 @@ pub enum MetadataCommands {
         /// File node ID.
         #[arg(long)]
         node_id: String,
-        /// Template ID to extract against.
+        /// Template ID to extract against (optional; defaults server-side
+        /// to the first template mapped to the file).
         #[arg(long)]
-        template_id: String,
+        template_id: Option<String>,
         /// JSON-encoded array of field names for partial extraction
         /// (omit for full-row extraction).
         #[arg(long)]
         fields: Option<String>,
+        /// Poll the workspace jobs-status endpoint until the extraction
+        /// job reaches a terminal state, then report the outcome.
+        #[arg(long)]
+        wait: bool,
+        /// Seconds between job-status polls when --wait is set (default 3,
+        /// clamped to 1..=60).
+        #[arg(long)]
+        poll_interval: Option<u64>,
+        /// Acknowledge that this is an AI-credit-spending action. Required
+        /// to proceed non-interactively; on a TTY you are prompted instead.
+        #[arg(long)]
+        confirm_ai_spend: bool,
     },
     /// Preview files that would match a proposed template name + description.
+    /// SPENDS AI CREDITS — requires --confirm-ai-spend (or an interactive y/N
+    /// confirmation on a TTY).
     #[command(name = "preview-match")]
     PreviewMatch {
         /// Workspace ID.
@@ -3494,8 +3535,14 @@ pub enum MetadataCommands {
         /// Natural-language description of the view/template.
         #[arg(long)]
         description: String,
+        /// Acknowledge that this is an AI-credit-spending action. Required
+        /// to proceed non-interactively; on a TTY you are prompted instead.
+        #[arg(long)]
+        confirm_ai_spend: bool,
     },
-    /// Suggest custom columns for a proposed template (AI-assisted).
+    /// Suggest custom columns for a proposed template (AI-assisted). SPENDS
+    /// AI CREDITS — requires --confirm-ai-spend (or an interactive y/N
+    /// confirmation on a TTY).
     #[command(name = "suggest-fields")]
     SuggestFields {
         /// Workspace ID.
@@ -3510,6 +3557,10 @@ pub enum MetadataCommands {
         /// Optional short hint ("photo collection", max 64 chars, letters/numbers/spaces).
         #[arg(long)]
         user_context: Option<String>,
+        /// Acknowledge that this is an AI-credit-spending action. Required
+        /// to proceed non-interactively; on a TTY you are prompted instead.
+        #[arg(long)]
+        confirm_ai_spend: bool,
     },
     /// Create a metadata template (a.k.a. "view").
     #[command(name = "create-template")]

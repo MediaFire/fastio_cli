@@ -429,44 +429,83 @@ pub async fn list_template_nodes(
 
 /// AI-based file matching for a metadata template.
 ///
+/// **Spends AI credits.** Enqueues an async job that uses AI to match
+/// eligible files in the workspace to the template based on file content
+/// and the template's field definitions. Returns immediately with a job
+/// descriptor (`{job_id, status}`); poll the workspace jobs-status
+/// endpoint under the `template_match` key for progress. A `status:
+/// "duplicate"` response (no `job_id`) means an in-flight job for the same
+/// template was re-used.
+///
 /// The server silently caps the number of matched files at the workspace's
 /// `plan_node_limit` to avoid burning credits on rows the listing would
 /// hide anyway. The response shape is unchanged; check `template details`
 /// or call `preview-match` first to see how many files would be admitted.
+///
+/// `batch_size` is an optional override clamped server-side to the
+/// supported min/max range; pass `None` to use the default.
 ///
 /// `POST /workspace/{workspace_id}/metadata/templates/{template_id}/auto-match/`
 pub async fn auto_match_template(
     client: &ApiClient,
     workspace_id: &str,
     template_id: &str,
+    batch_size: Option<u32>,
 ) -> Result<Value, CliError> {
     let path = format!(
         "/workspace/{}/metadata/templates/{}/auto-match/",
         urlencoding::encode(workspace_id),
         urlencoding::encode(template_id),
     );
-    let form = HashMap::new();
+    let mut form = HashMap::new();
+    if let Some(bs) = batch_size {
+        form.insert("batch_size".to_owned(), bs.to_string());
+    }
     client.post(&path, &form).await
 }
 
 /// Batch-extract metadata for all files mapped to a template.
+///
+/// **Spends AI credits.** Async — returns a `job_id` for tracking; poll
+/// the workspace jobs-status endpoint under the `metadata_extract` key
+/// (`kind: "batch"`). A maximum of 1,000 files are processed per job.
+///
+/// `fields` is an optional JSON-encoded array of template field names that
+/// restricts the job to a partial extraction; each name must exist in the
+/// template schema. Pass `None` to extract every field. `force`, when
+/// `true`, re-extracts every mapped node even if it already has values for
+/// this template (the "re-extract" flow); the default (`None`/`false`)
+/// skips nodes whose values are already present.
 ///
 /// `POST /workspace/{workspace_id}/metadata/templates/{template_id}/extract-all/`
 pub async fn extract_all(
     client: &ApiClient,
     workspace_id: &str,
     template_id: &str,
+    fields: Option<&str>,
+    force: bool,
 ) -> Result<Value, CliError> {
+    if let Some(f) = fields {
+        validate_extract_fields(f)?;
+    }
     let path = format!(
         "/workspace/{}/metadata/templates/{}/extract-all/",
         urlencoding::encode(workspace_id),
         urlencoding::encode(template_id),
     );
-    let form = HashMap::new();
+    let mut form = HashMap::new();
+    if let Some(f) = fields {
+        form.insert("fields".to_owned(), f.to_owned());
+    }
+    if force {
+        form.insert("force".to_owned(), "true".to_owned());
+    }
     client.post(&path, &form).await
 }
 
 /// Enqueue an asynchronous metadata extraction for a single storage node.
+///
+/// **Spends AI credits.**
 ///
 /// **Async contract (breaking change from the prior synchronous version):**
 /// the server returns `202 Accepted` within ~500ms with a payload of the
@@ -478,6 +517,10 @@ pub async fn extract_all(
 /// `GET /workspace/{ws}/storage/{node}/metadata/details/` once the job
 /// reports `status: "completed"`. On `status: "errored"`, surface
 /// `error_message` to the user.
+///
+/// `template_id` is **optional** per the API contract: pass `None` to let
+/// the server default to the first template mapped to the file. Supply an
+/// explicit id to extract against a specific template.
 ///
 /// `fields` is an optional JSON-encoded array of template field names for
 /// partial extraction. Pass `None` for a full-row extraction: the server
@@ -506,23 +549,99 @@ pub async fn extract_node_metadata(
     client: &ApiClient,
     workspace_id: &str,
     node_id: &str,
-    template_id: &str,
+    template_id: Option<&str>,
     fields: Option<&str>,
 ) -> Result<Value, CliError> {
     if let Some(f) = fields {
         validate_extract_fields(f)?;
     }
+    let template_id = template_id.map(str::trim).filter(|s| !s.is_empty());
     let path = format!(
         "/workspace/{}/storage/{}/metadata/extract/",
         urlencoding::encode(workspace_id),
         urlencoding::encode(node_id),
     );
     let mut form = HashMap::new();
-    form.insert("template_id".to_owned(), template_id.to_owned());
+    if let Some(tid) = template_id {
+        form.insert("template_id".to_owned(), tid.to_owned());
+    }
     if let Some(f) = fields {
         form.insert("fields".to_owned(), f.to_owned());
     }
     client.post(&path, &form).await
+}
+
+/// Terminal-state outcome of a single-file extraction job, extracted from
+/// a workspace jobs-status response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExtractJobState {
+    /// The job reached `completed`.
+    Completed,
+    /// The job reached `errored`; carries the server `error_message` when
+    /// one was present.
+    Errored(Option<String>),
+    /// The job is still queued or in progress (non-terminal).
+    Pending,
+    /// No matching entry was found in the jobs-status response. The server
+    /// hides completed/errored entries older than one hour; callers such as
+    /// [`classify_single_extract_job`]'s bounded poll loops (which wait far
+    /// less than that age-out window) therefore must NOT treat `NotFound` as
+    /// success — within their window a missing entry means the job is not yet
+    /// visible, so they keep polling for an explicit terminal state.
+    NotFound,
+}
+
+/// Find the single-file extraction job for `node_id` (and optionally
+/// `job_id`) in a workspace jobs-status response and classify its state.
+///
+/// Matches entries in `jobs.metadata_extract[]` with `kind == "single"`.
+/// When `job_id` is supplied, it must also match (so concurrent single-file
+/// jobs on the same node for different field scopes are disambiguated);
+/// when `None`, the first `single` entry for the node is used.
+///
+/// Extracted as a pure function so the terminal-state classification can be
+/// unit-tested without an HTTP client.
+#[must_use]
+pub fn classify_single_extract_job(
+    jobs_status: &Value,
+    node_id: &str,
+    job_id: Option<&str>,
+) -> ExtractJobState {
+    let payload = jobs_status.get("response").unwrap_or(jobs_status);
+    let entries = payload
+        .get("jobs")
+        .and_then(|j| j.get("metadata_extract"))
+        .and_then(Value::as_array);
+    let Some(entries) = entries else {
+        return ExtractJobState::NotFound;
+    };
+    for entry in entries {
+        if entry.get("kind").and_then(Value::as_str) != Some("single") {
+            continue;
+        }
+        if entry.get("node_id").and_then(Value::as_str) != Some(node_id) {
+            continue;
+        }
+        if let Some(want) = job_id
+            && entry.get("job_id").and_then(Value::as_str) != Some(want)
+        {
+            continue;
+        }
+        return match entry.get("status").and_then(Value::as_str) {
+            Some("completed") => ExtractJobState::Completed,
+            Some("errored") => {
+                let msg = entry
+                    .get("error_message")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                ExtractJobState::Errored(msg)
+            }
+            _ => ExtractJobState::Pending,
+        };
+    }
+    ExtractJobState::NotFound
 }
 
 /// Preview files that match a proposed metadata template description.
@@ -1017,9 +1136,10 @@ fn validate_fields(fields: &str) -> Result<(), CliError> {
 mod tests {
     use super::{
         BULK_METADATA_DETAILS_MAX_IDS, BulkMetadataDetailsResponse, CATEGORY_MAX_CHARS,
-        DESCRIPTION_MAX_CHARS, EXPORT_VIEW_PARENT_NODE_ID_MAX_CHARS, METADATA_SEARCH_DEEP_PAGE_MAX,
-        METADATA_SEARCH_LIMIT_MAX, METADATA_SEARCH_QUERY_MAX_CHARS, NAME_MAX_CHARS,
-        SUGGEST_NODE_IDS_MAX, USER_CONTEXT_MAX_CHARS, build_bulk_metadata_details_path,
+        DESCRIPTION_MAX_CHARS, EXPORT_VIEW_PARENT_NODE_ID_MAX_CHARS, ExtractJobState,
+        METADATA_SEARCH_DEEP_PAGE_MAX, METADATA_SEARCH_LIMIT_MAX, METADATA_SEARCH_QUERY_MAX_CHARS,
+        NAME_MAX_CHARS, SUGGEST_NODE_IDS_MAX, USER_CONTEXT_MAX_CHARS,
+        build_bulk_metadata_details_path, classify_single_extract_job,
         parse_bulk_metadata_details_response, sanitize_terminal_string, validate_category,
         validate_description, validate_extract_fields, validate_fields, validate_name,
         validate_node_ids, validate_parent_node_id, validate_search_limit, validate_search_query,
@@ -1517,5 +1637,184 @@ mod tests {
         assert!(validate_parent_node_id("x").is_ok());
         let s: String = "x".repeat(EXPORT_VIEW_PARENT_NODE_ID_MAX_CHARS);
         assert!(validate_parent_node_id(&s).is_ok());
+    }
+
+    fn jobs_status_with_extract(entry: &serde_json::Value) -> serde_json::Value {
+        json!({
+            "result": "yes",
+            "response": {
+                "jobs": {
+                    "intelligence": null,
+                    "metadata_extract": [entry]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn classify_extract_job_detects_completed() {
+        let body = jobs_status_with_extract(&json!({
+            "kind": "single",
+            "node_id": "abc",
+            "job_id": "j1",
+            "status": "completed",
+            "progress_percent": 100
+        }));
+        assert_eq!(
+            classify_single_extract_job(&body, "abc", Some("j1")),
+            ExtractJobState::Completed
+        );
+        // job_id None still matches the node's single entry.
+        assert_eq!(
+            classify_single_extract_job(&body, "abc", None),
+            ExtractJobState::Completed
+        );
+    }
+
+    #[test]
+    fn classify_extract_job_detects_errored_with_message() {
+        let body = jobs_status_with_extract(&json!({
+            "kind": "single",
+            "node_id": "abc",
+            "job_id": "j1",
+            "status": "errored",
+            "error_message": "extraction failed: bad mimetype"
+        }));
+        assert_eq!(
+            classify_single_extract_job(&body, "abc", Some("j1")),
+            ExtractJobState::Errored(Some("extraction failed: bad mimetype".to_owned()))
+        );
+    }
+
+    #[test]
+    fn classify_extract_job_errored_without_message_is_none_payload() {
+        let body = jobs_status_with_extract(&json!({
+            "kind": "single",
+            "node_id": "abc",
+            "status": "errored"
+        }));
+        assert_eq!(
+            classify_single_extract_job(&body, "abc", None),
+            ExtractJobState::Errored(None)
+        );
+    }
+
+    #[test]
+    fn classify_extract_job_in_progress_is_pending() {
+        let body = jobs_status_with_extract(&json!({
+            "kind": "single",
+            "node_id": "abc",
+            "job_id": "j1",
+            "status": "in_progress",
+            "progress_percent": 0
+        }));
+        assert_eq!(
+            classify_single_extract_job(&body, "abc", Some("j1")),
+            ExtractJobState::Pending
+        );
+    }
+
+    #[test]
+    fn classify_extract_job_queued_is_pending() {
+        let body = jobs_status_with_extract(&json!({
+            "kind": "single",
+            "node_id": "abc",
+            "status": "queued"
+        }));
+        assert_eq!(
+            classify_single_extract_job(&body, "abc", None),
+            ExtractJobState::Pending
+        );
+    }
+
+    #[test]
+    fn classify_extract_job_missing_entry_is_not_found() {
+        // Empty list.
+        let body = json!({
+            "response": { "jobs": { "metadata_extract": [] } }
+        });
+        assert_eq!(
+            classify_single_extract_job(&body, "abc", None),
+            ExtractJobState::NotFound
+        );
+        // No jobs key at all.
+        let bare = json!({ "response": {} });
+        assert_eq!(
+            classify_single_extract_job(&bare, "abc", None),
+            ExtractJobState::NotFound
+        );
+    }
+
+    #[test]
+    fn classify_extract_job_ignores_batch_and_other_nodes() {
+        let body = json!({
+            "response": {
+                "jobs": {
+                    "metadata_extract": [
+                        {"kind": "batch", "node_id": null, "status": "completed"},
+                        {"kind": "single", "node_id": "other", "status": "completed"},
+                        {"kind": "single", "node_id": "abc", "job_id": "want", "status": "in_progress"}
+                    ]
+                }
+            }
+        });
+        // batch entry and other-node entry are skipped; our node is pending.
+        assert_eq!(
+            classify_single_extract_job(&body, "abc", Some("want")),
+            ExtractJobState::Pending
+        );
+        // job_id mismatch on the single entry → no match → NotFound.
+        assert_eq!(
+            classify_single_extract_job(&body, "abc", Some("nope")),
+            ExtractJobState::NotFound
+        );
+    }
+
+    #[test]
+    fn classify_extract_job_works_on_flat_body() {
+        // Tolerates a body without the `response` envelope wrapper.
+        let body = json!({
+            "jobs": {
+                "metadata_extract": [
+                    {"kind": "single", "node_id": "abc", "status": "completed"}
+                ]
+            }
+        });
+        assert_eq!(
+            classify_single_extract_job(&body, "abc", None),
+            ExtractJobState::Completed
+        );
+    }
+
+    #[test]
+    fn classify_extract_job_running_then_gone_is_never_terminal_success() {
+        // FIX 4: the bounded `--wait` / extract-and-wait poll loops must NOT
+        // treat a "seen running, then absent" transition as success. The
+        // classifier never reports `Completed`/`Errored` for a running or
+        // missing entry, so a loop that only terminates on those terminal
+        // states cannot report a false success within its sub-age-out window.
+        let running = json!({
+            "response": {
+                "jobs": {
+                    "metadata_extract": [
+                        {"kind": "single", "node_id": "abc", "job_id": "j1", "status": "in_progress"}
+                    ]
+                }
+            }
+        });
+        assert_eq!(
+            classify_single_extract_job(&running, "abc", Some("j1")),
+            ExtractJobState::Pending
+        );
+
+        // Next poll: the entry has vanished from the list.
+        let gone = json!({
+            "response": { "jobs": { "metadata_extract": [] } }
+        });
+        let after = classify_single_extract_job(&gone, "abc", Some("j1"));
+        assert_eq!(after, ExtractJobState::NotFound);
+        // The invariant the loops depend on: neither state is terminal success.
+        assert_ne!(after, ExtractJobState::Completed);
+        assert!(!matches!(after, ExtractJobState::Errored(_)));
     }
 }
