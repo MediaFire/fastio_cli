@@ -125,6 +125,7 @@ pub async fn upload_user_asset(
             error_code: None,
             message: msg.to_owned(),
             http_status: status.as_u16(),
+            details: None,
         }));
     }
 
@@ -147,6 +148,7 @@ pub async fn upload_user_asset(
             error_code: None,
             message: msg.to_owned(),
             http_status: status.as_u16(),
+            details: None,
         }))
     }
 }
@@ -327,6 +329,7 @@ pub async fn read_user_asset(
             error_code: None,
             message: format!("asset read failed with HTTP {status}: {body}"),
             http_status: status,
+            details: None,
         }));
     }
 

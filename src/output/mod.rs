@@ -62,6 +62,60 @@ impl std::fmt::Display for OutputFormat {
     }
 }
 
+/// Server-side response-verbosity level, selected by the global `--detail`
+/// flag and threaded into envelope GET requests as `?output=<detail>`.
+///
+/// This is **orthogonal** to [`OutputFormat`]: `--detail` controls how much
+/// data the *server* returns (smaller payloads, fewer tokens), while
+/// `--format` controls how the client *renders* whatever it received. The
+/// tokens map 1:1 onto the documented server `output=` detail levels
+/// (`terse`/`standard`/`full`); `full` is the server default and equivalent
+/// to omitting the parameter.
+///
+/// `#[non_exhaustive]` because the server may add detail levels without an
+/// API-version bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OutputDetail {
+    /// Smallest useful shape: identifiers and navigation fields only.
+    Terse,
+    /// `terse` plus the operational context most list/detail views render.
+    Standard,
+    /// The complete resource shape (server default).
+    Full,
+}
+
+impl OutputDetail {
+    /// The server query token for this detail level.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Terse => "terse",
+            Self::Standard => "standard",
+            Self::Full => "full",
+        }
+    }
+
+    /// Parse a `--detail` flag value, returning `None` for an unrecognized or
+    /// absent token (the caller then injects nothing and the server applies
+    /// its `full` default).
+    #[must_use]
+    pub fn from_flag(s: Option<&str>) -> Option<Self> {
+        match s {
+            Some("terse") => Some(Self::Terse),
+            Some("standard") => Some(Self::Standard),
+            Some("full") => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for OutputDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl OutputFormat {
     /// Parse a format string (from `--format` flag).
     #[must_use]
@@ -93,7 +147,7 @@ impl OutputFormat {
 /// Configuration for output rendering.
 #[derive(Debug, Clone)]
 pub struct OutputConfig {
-    /// The output format to use.
+    /// The output format to use (how the client renders the data).
     pub format: OutputFormat,
     /// Optional field filter (comma-separated field names).
     pub fields: Option<Vec<String>>,
@@ -101,6 +155,9 @@ pub struct OutputConfig {
     pub no_color: bool,
     /// Suppress all output.
     pub quiet: bool,
+    /// Optional server-side verbosity (`--detail`); threaded into envelope
+    /// GETs as `?output=<detail>`. Orthogonal to [`OutputConfig::format`].
+    pub detail: Option<OutputDetail>,
 }
 
 impl OutputConfig {
@@ -112,11 +169,25 @@ impl OutputConfig {
         no_color: bool,
         quiet: bool,
     ) -> Self {
+        Self::from_flags_detail(format, fields, no_color, quiet, None)
+    }
+
+    /// Build an `OutputConfig` from CLI flags, including the `--detail`
+    /// server-verbosity flag.
+    #[must_use]
+    pub fn from_flags_detail(
+        format: Option<&str>,
+        fields: Option<&str>,
+        no_color: bool,
+        quiet: bool,
+        detail: Option<&str>,
+    ) -> Self {
         Self {
             format: OutputFormat::from_str_or_default(format),
             fields: fields.map(|f| f.split(',').map(|s| s.trim().to_owned()).collect()),
             no_color,
             quiet,
+            detail: OutputDetail::from_flag(detail),
         }
     }
 
@@ -264,6 +335,37 @@ mod tests {
         let result = flatten_response(&input);
         assert!(result.is_array());
         assert_eq!(result[0]["id"], "w1");
+    }
+
+    #[test]
+    fn output_detail_parses_known_tokens() {
+        assert_eq!(
+            OutputDetail::from_flag(Some("terse")),
+            Some(OutputDetail::Terse)
+        );
+        assert_eq!(
+            OutputDetail::from_flag(Some("standard")),
+            Some(OutputDetail::Standard)
+        );
+        assert_eq!(
+            OutputDetail::from_flag(Some("full")),
+            Some(OutputDetail::Full)
+        );
+    }
+
+    #[test]
+    fn output_detail_unknown_or_absent_is_none() {
+        assert_eq!(OutputDetail::from_flag(None), None);
+        assert_eq!(OutputDetail::from_flag(Some("verbose")), None);
+        assert_eq!(OutputDetail::from_flag(Some("")), None);
+    }
+
+    #[test]
+    fn output_detail_round_trips_token() {
+        assert_eq!(OutputDetail::Terse.as_str(), "terse");
+        assert_eq!(OutputDetail::Standard.as_str(), "standard");
+        assert_eq!(OutputDetail::Full.as_str(), "full");
+        assert_eq!(OutputDetail::Standard.to_string(), "standard");
     }
 
     #[test]

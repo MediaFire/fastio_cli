@@ -100,11 +100,12 @@ async fn run() -> Result<()> {
     let api_base = config.api_base(cli.api_base.as_deref(), Some(profile_name));
 
     // Build output configuration
-    let output = OutputConfig::from_flags(
+    let output = OutputConfig::from_flags_detail(
         cli.format.as_deref(),
         cli.fields.as_deref(),
         cli.no_color,
         cli.quiet,
+        cli.detail.as_deref(),
     );
 
     let ctx = commands::CommandContext {

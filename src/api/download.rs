@@ -101,6 +101,7 @@ where
             error_code: None,
             message: format!("Download failed with HTTP {status}: {body}"),
             http_status: status,
+            details: None,
         }));
     }
 

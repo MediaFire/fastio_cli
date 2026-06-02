@@ -1,6 +1,25 @@
 /// CLI argument parsing for the Fast.io CLI.
 ///
 /// Defines the root `Cli` struct and all subcommands using clap's derive API.
+//
+// ## Clap rename / alias / deprecation recipe (read before renaming a command)
+//
+// Three attributes cover the rename/deprecate patterns used throughout the
+// retool. Apply them on the `Commands` (or nested) enum variant:
+//
+//   * `#[command(visible_alias = "<new>")]` — an additional accepted name
+//     that ALSO appears in `--help` and completions. Use for surfacing a new
+//     short form alongside the canonical one (e.g. `workflow` / `wf`).
+//   * `#[command(alias = "<old>")]` — an accepted-but-HIDDEN back-compat
+//     name (does not show in `--help`/completions). Use to keep old
+//     invocations working after a rename, e.g. `ai` -> `ripley`,
+//     `info` -> `details`. Back-compat aliases that change behavior must
+//     remap the request body/endpoint, not just the name.
+//   * `#[command(hide = true)]` — hide an entire deprecated subcommand from
+//     `--help` while keeping it parseable (e.g. removed billing compat shims).
+//
+// Renames land in their owning phase (e.g. `ai` -> `ripley` is Phase 1); this
+// comment is the single documented reference for the recipe.
 use clap::{Parser, Subcommand, ValueEnum};
 use std::fmt;
 
@@ -20,6 +39,13 @@ pub struct Cli {
     /// Comma-separated list of fields to include in output.
     #[arg(long, global = true)]
     pub fields: Option<String>,
+
+    /// Server-side response verbosity (terse, standard, full). Selects how
+    /// much data the API returns via `?output=<detail>` on supported
+    /// endpoints; orthogonal to `--format` (client rendering). Defaults to
+    /// the server's `full` shape when omitted.
+    #[arg(long, global = true, value_parser = ["terse", "standard", "full"])]
+    pub detail: Option<String>,
 
     /// Disable colored output.
     #[arg(long, global = true)]
@@ -3391,6 +3417,7 @@ impl fmt::Debug for Cli {
         f.debug_struct("Cli")
             .field("format", &self.format)
             .field("fields", &self.fields)
+            .field("detail", &self.detail)
             .field("no_color", &self.no_color)
             .field("quiet", &self.quiet)
             .field("verbose", &self.verbose)

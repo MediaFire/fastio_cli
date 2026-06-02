@@ -161,6 +161,7 @@ pub async fn single_call_upload(
                     error_code: None,
                     message: message.to_owned(),
                     http_status: status.as_u16(),
+                    details: None,
                 }));
             }
             Err(err) => {
@@ -336,6 +337,7 @@ async fn handle_chunk_response(
         error_code: None,
         message: message.to_owned(),
         http_status: status.as_u16(),
+        details: None,
     }))
 }
 
@@ -364,17 +366,42 @@ async fn should_retry_network_error(
 }
 
 /// Parse the rate-limit expiry header to estimate seconds until reset.
+///
+/// Reads the modern `x-ve-limit-expires` header first, falling back to the
+/// legacy `X-Rate-Limit-Expiry` for older API deployments. HTTP header lookups
+/// are case-insensitive, so the literal casing does not matter. This mirrors
+/// the centralized parser in `crate::client` (which is private there, so the
+/// modern-with-legacy-fallback logic is duplicated here for the upload retry
+/// paths — single/chunk/stream/batch all route through this one function).
 fn parse_rate_limit_expiry(resp: &reqwest::Response) -> u64 {
-    resp.headers()
-        .get("X-Rate-Limit-Expiry")
+    let raw = rate_limit_expiry_header(resp.headers());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    rate_limit_secs_from_expiry(raw, now)
+}
+
+/// Select the rate-limit expiry header value, preferring the modern
+/// `x-ve-limit-expires` over the legacy `X-Rate-Limit-Expiry`.
+///
+/// Split out so the modern-over-legacy selection is unit-testable without
+/// depending on the system clock (which [`parse_rate_limit_expiry`] reads).
+fn rate_limit_expiry_header(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    headers
+        .get("x-ve-limit-expires")
+        .or_else(|| headers.get("X-Rate-Limit-Expiry"))
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .map_or(60, |expiry_epoch| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            expiry_epoch.saturating_sub(now)
-        })
+}
+
+/// Convert a (possibly missing) rate-limit expiry epoch string into seconds
+/// remaining relative to `now`. Falls back to 60s when absent or unparseable.
+///
+/// Split out from [`parse_rate_limit_expiry`] so the modern-with-legacy
+/// header selection and the epoch arithmetic are unit-testable without a live
+/// [`reqwest::Response`].
+fn rate_limit_secs_from_expiry(raw: Option<&str>, now: u64) -> u64 {
+    raw.and_then(|v| v.parse::<u64>().ok())
+        .map_or(60, |expiry_epoch| expiry_epoch.saturating_sub(now))
 }
 
 /// Trigger file assembly after all chunks are uploaded.
@@ -673,6 +700,7 @@ async fn handle_stream_response(resp: reqwest::Response, attempt: &mut u32) -> S
         error_code: None,
         message: message.to_owned(),
         http_status: status.as_u16(),
+        details: None,
     }))
 }
 
@@ -987,6 +1015,7 @@ fn parse_batch_response(body: &Value, http_status: u16) -> Result<BatchUploadRes
             error_code: None,
             message: message.to_owned(),
             http_status,
+            details: None,
         }));
     }
 
@@ -1377,6 +1406,61 @@ mod tests {
         assert!(validate_creator_tag("has space").is_err());
         assert!(validate_creator_tag("has_underscore").is_err());
         assert!(validate_creator_tag("unicode-☃").is_err());
+    }
+
+    /// Build a `HeaderMap` carrying the given headers so the modern-over-legacy
+    /// selection in `rate_limit_expiry_header` can be exercised directly
+    /// (no live `reqwest::Response` needed).
+    fn headers_with(pairs: &[(&str, &str)]) -> reqwest::header::HeaderMap {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let mut map = HeaderMap::new();
+        for (k, v) in pairs {
+            let name = HeaderName::from_bytes(k.as_bytes()).expect("valid header name");
+            let value = HeaderValue::from_str(v).expect("valid header value");
+            map.insert(name, value);
+        }
+        map
+    }
+
+    #[test]
+    fn rate_limit_header_prefers_modern_over_legacy() {
+        // FIX 6: the platform now emits x-ve-limit-expires; it must win over
+        // the legacy X-Rate-Limit-Expiry when both are present.
+        let headers = headers_with(&[
+            ("x-ve-limit-expires", "1000"),
+            ("X-Rate-Limit-Expiry", "2000"),
+        ]);
+        assert_eq!(rate_limit_expiry_header(&headers), Some("1000"));
+    }
+
+    #[test]
+    fn rate_limit_header_reads_modern_when_only_modern_present() {
+        let headers = headers_with(&[("x-ve-limit-expires", "1500")]);
+        assert_eq!(rate_limit_expiry_header(&headers), Some("1500"));
+    }
+
+    #[test]
+    fn rate_limit_header_falls_back_to_legacy() {
+        let headers = headers_with(&[("X-Rate-Limit-Expiry", "2000")]);
+        assert_eq!(rate_limit_expiry_header(&headers), Some("2000"));
+        // No headers at all → None (the parse path then defaults to 60s).
+        let none = headers_with(&[]);
+        assert_eq!(rate_limit_expiry_header(&none), None);
+        assert_eq!(
+            rate_limit_secs_from_expiry(rate_limit_expiry_header(&none), 1000),
+            60
+        );
+    }
+
+    #[test]
+    fn rate_limit_secs_from_expiry_arithmetic() {
+        // Future epoch: returns the difference.
+        assert_eq!(rate_limit_secs_from_expiry(Some("1100"), 1000), 100);
+        // Past epoch: saturates to 0.
+        assert_eq!(rate_limit_secs_from_expiry(Some("900"), 1000), 0);
+        // Missing / unparseable: default 60.
+        assert_eq!(rate_limit_secs_from_expiry(None, 1000), 60);
+        assert_eq!(rate_limit_secs_from_expiry(Some("abc"), 1000), 60);
     }
 
     #[tokio::test]

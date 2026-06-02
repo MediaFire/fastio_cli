@@ -135,6 +135,7 @@ fn parse_cancel_response(body: Value) -> Result<Value, CliError> {
         error_code: None,
         message,
         http_status: 406,
+        details: None,
     }))
 }
 

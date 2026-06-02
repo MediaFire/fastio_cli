@@ -19,31 +19,41 @@ pub struct CommandContext<'a> {
 
 impl CommandContext<'_> {
     /// Resolve authentication and build an API client.
+    ///
+    /// The client inherits the `--detail` server-verbosity level from the
+    /// active [`OutputConfig`], so allowlisted envelope GETs append
+    /// `?output=<detail>` automatically.
     pub fn build_client(&self) -> anyhow::Result<fastio_cli::client::ApiClient> {
-        build_client(
+        build_client_with_detail(
             self.api_base,
             self.profile_name,
             self.flag_token,
             self.config_dir,
+            self.output.detail,
         )
     }
 }
 
-/// Resolve authentication and build an API client.
+/// Resolve authentication and build an API client with an explicit
+/// server-verbosity [`fastio_cli::output::OutputDetail`].
 ///
 /// This is the shared helper used by every command module that needs an
-/// authenticated HTTP client.
-pub fn build_client(
+/// authenticated HTTP client. Prefer [`CommandContext::build_client`], which
+/// threads the active `--detail` automatically; call this directly only when
+/// you have a detail level outside a [`CommandContext`].
+pub fn build_client_with_detail(
     api_base: &str,
     profile_name: &str,
     flag_token: Option<&str>,
     config_dir: &Path,
+    detail: Option<fastio_cli::output::OutputDetail>,
 ) -> anyhow::Result<fastio_cli::client::ApiClient> {
     let resolved = fastio_cli::auth::token::resolve_token(flag_token, profile_name, config_dir)
         .context("failed to resolve token")?;
     let t = resolved
         .ok_or_else(|| anyhow::anyhow!("authentication required. Run: fastio auth login"))?;
-    fastio_cli::client::ApiClient::new(api_base, Some(t)).context("failed to create API client")
+    fastio_cli::client::ApiClient::with_detail(api_base, Some(t), detail)
+        .context("failed to create API client")
 }
 
 /// AI chat and prompt commands.
