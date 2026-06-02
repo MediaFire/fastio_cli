@@ -47,6 +47,8 @@ pub mod preview;
 pub mod search;
 /// Share link management endpoints.
 pub mod share;
+/// E-signature (SignEnvelope) endpoints (workspace- and org-parented).
+pub mod signing;
 /// Low-level storage node endpoints.
 pub mod storage;
 /// System health and status endpoints.

@@ -8,6 +8,7 @@ mod mcp;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
+use colored::Colorize;
 
 use cli::{AuthCommands, Cli, Commands};
 use commands::ai::AiCommand;
@@ -50,11 +51,52 @@ async fn main() -> Result<()> {
     if let Err(ref err) = result {
         // If the underlying error is a CliError, use rich display.
         if let Some(cli_err) = err.downcast_ref::<fastio_cli::error::CliError>() {
-            cli_err.render_stderr();
+            let (headline, hint) = cli_error_render(err, cli_err);
+            eprintln!("{} {headline}", "error:".red().bold());
+            if let Some(hint) = hint {
+                eprintln!("{} {hint}", "hint:".yellow().bold());
+            }
             std::process::exit(1);
         }
     }
     result
+}
+
+/// Decide what a `CliError`-rooted failure should print on stderr.
+///
+/// `main` intercepts an error chain whose root is a [`CliError`] and prints a
+/// red `error:` headline plus an optional yellow `hint:` line. This helper is
+/// the pure decision behind that rendering, factored out so it can be
+/// unit-tested without capturing stderr.
+///
+/// The subtlety it handles: command handlers attach signing / workflow / etc.
+/// framing via `anyhow::Error::context(...)` ON TOP OF a `CliError`. anyhow's
+/// `.context()` preserves downcastability, so `downcast_ref::<CliError>()` still
+/// succeeds — but [`CliError::render_stderr`] only prints the bare `CliError`
+/// `Display`, silently dropping every added context layer. To avoid that:
+///
+/// - **Bare `CliError`** (no context added): the anyhow top-level message equals
+///   the `CliError`'s own `Display`, so the headline is that `Display`
+///   verbatim — byte-identical to the legacy `render_stderr` output.
+/// - **Context added**: the anyhow top-level message differs from the `CliError`
+///   `Display`, so the headline is anyhow's alternate (`{err:#}`) rendering —
+///   `outer context: …: root cause` — surfacing the added framing to the user.
+///
+/// In both cases the hint is the `CliError`'s own `suggestion()` (rendered once,
+/// on its own `hint:` line), so an added-context message is strictly more
+/// informative than the bare one without ever doubling the suggestion text.
+fn cli_error_render(
+    err: &anyhow::Error,
+    cli_err: &fastio_cli::error::CliError,
+) -> (String, Option<&'static str>) {
+    let headline = if err.to_string() == cli_err.to_string() {
+        // Bare CliError — preserve the legacy headline exactly.
+        cli_err.to_string()
+    } else {
+        // Context was layered on; render the full chain so it isn't dropped.
+        format!("{err:#}")
+    };
+    (headline, cli_err.suggestion())
 }
 
 /// Core logic extracted so we can intercept errors in `main()`.
@@ -187,6 +229,7 @@ async fn dispatch(
         }
         Commands::Metadata(c) => commands::metadata::execute(&map_metadata_command(c), ctx).await,
         Commands::Workflow(c) => commands::workflow::execute(c, ctx).await,
+        Commands::Sign(c) => commands::sign::execute(c, ctx).await,
         Commands::Instructions(c) => {
             commands::instructions::execute(&map_instructions_command(c), ctx).await
         }
@@ -2635,5 +2678,72 @@ fn map_system_command(cmd: &cli::SystemCommands) -> SystemCommand {
     match cmd {
         cli::SystemCommands::Ping => SystemCommand::Ping,
         cli::SystemCommands::Status => SystemCommand::Status,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cli_error_render;
+    use fastio_cli::error::{ApiError, CliError};
+
+    /// A bare `CliError` (no `.context()` layered on) must render byte-identically
+    /// to the legacy `render_stderr`: headline == the `CliError` `Display`, hint
+    /// == its own `suggestion()`.
+    #[test]
+    fn cli_error_render_bare_uses_display_and_suggestion() {
+        let cli_err = CliError::Api(ApiError::new(1670, None, "restricted".to_owned(), 403));
+        let display = cli_err.to_string();
+        let hint = cli_err.suggestion();
+        // A bare CliError carries no added anyhow context.
+        let err = anyhow::Error::from(CliError::Api(ApiError::new(
+            1670,
+            None,
+            "restricted".to_owned(),
+            403,
+        )));
+        let (headline, got_hint) = cli_error_render(&err, &cli_err);
+        assert_eq!(
+            headline, display,
+            "bare headline must equal CliError Display"
+        );
+        assert_eq!(got_hint, hint, "bare hint must be the CliError suggestion");
+        // The chosen hint is exactly the shared restricted hint for code 1670.
+        assert_eq!(got_hint, Some(fastio_cli::error::HINT_RESTRICTED));
+    }
+
+    /// When `.context(...)` is layered on a `CliError`, the headline must surface
+    /// the full anyhow chain (the added context AND the underlying error via the
+    /// `{:#}` rendering), while the hint stays the `CliError`'s own suggestion —
+    /// shown once, not doubled into the headline.
+    #[test]
+    fn cli_error_render_with_context_surfaces_chain() {
+        let cli_err = CliError::Api(ApiError::new(0, None, "boom".to_owned(), 404));
+        let underlying = cli_err.to_string();
+        let hint = cli_err.suggestion();
+        let context_msg =
+            "envelope X: not ready yet — poll the envelope and retry once it completes";
+        // Build the same chain a command handler would: context ON TOP of the CliError.
+        let err = anyhow::Error::from(CliError::Api(ApiError::new(
+            0,
+            None,
+            "boom".to_owned(),
+            404,
+        )))
+        .context(context_msg);
+
+        let (headline, got_hint) = cli_error_render(&err, &cli_err);
+        // The added context reaches the user…
+        assert!(
+            headline.contains(context_msg),
+            "headline must contain the added context: {headline}"
+        );
+        // …AND so does the underlying CliError (the {:#} chain), not just the top.
+        assert!(
+            headline.contains(&underlying),
+            "headline must contain the underlying error: {headline}"
+        );
+        // The hint is the CliError suggestion, unchanged and not folded into the headline.
+        assert_eq!(got_hint, hint, "hint must be the CliError suggestion");
+        assert!(got_hint.is_some(), "a 404 CliError has a suggestion");
     }
 }

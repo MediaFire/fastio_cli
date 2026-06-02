@@ -1625,6 +1625,97 @@ const TOOL_DEFS: &[ToolDef] = &[
         ],
     },
     ToolDef {
+        name: "sign",
+        description: "E-signature (SignEnvelope): draft and drive electronic-signature envelopes (PDFs sent to recipients). Envelopes are parented to a workspace OR an org (parent_type + parent_id). This tool exposes READ + reversible-DRAFT-drive actions ONLY: envelope-create (creates a DRAFT — reversible), envelope-update (draft-only), envelope-list, envelope-get, document-download, signed-download, audit-download, describe. The OUTWARD-FACING / DESTRUCTIVE / TERMINAL actions — send (EMAILS REAL RECIPIENTS), void (terminal), delete — are intentionally CLI-binary-only (`fastio sign envelope send|void|delete …`) and are NOT routable over MCP (mirrors how the workflow tool keeps cancel CLI-only). Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Signing is a paid-plan feature (a non-entitled org returns 1670). Call action='describe' for the authoritative per-action reference.",
+        actions: &[
+            "describe",
+            "envelope-create",
+            "envelope-update",
+            "envelope-list",
+            "envelope-get",
+            "document-download",
+            "signed-download",
+            "audit-download",
+        ],
+        params: &[
+            ("parent_type", "Parent type: workspace or org", false),
+            ("parent_id", "Parent ID (workspace or org, 19-digit)", false),
+            (
+                "envelope_id",
+                "Envelope ID (envelope-get / -update / downloads)",
+                false,
+            ),
+            (
+                "document_id",
+                "Document OpaqueId (document-download / signed-download)",
+                false,
+            ),
+            ("name", "Display name (envelope-create / -update)", false),
+            (
+                "expires_at",
+                "UTC auto-expiry timestamp (envelope-create / -update)",
+                false,
+            ),
+            (
+                "body_json",
+                "Whole create request as a JSON object STRING (envelope-create; overrides the other create params)",
+                false,
+            ),
+            (
+                "policy_json",
+                "Policy bag as a JSON object STRING (envelope-create / -update)",
+                false,
+            ),
+            (
+                "documents_json",
+                "Documents as a JSON array STRING (envelope-create; declarative replace on envelope-update)",
+                false,
+            ),
+            (
+                "recipients_json",
+                "Recipients as a JSON array STRING (full replace on envelope-update)",
+                false,
+            ),
+            (
+                "fields_json",
+                "Field placements as a JSON array STRING (full replace on envelope-update)",
+                false,
+            ),
+            (
+                "source_node_id",
+                "Simple single-document create: source storage node id",
+                false,
+            ),
+            (
+                "source_version_id",
+                "Simple single-document create: pinned source version id",
+                false,
+            ),
+            (
+                "recipient_email",
+                "Simple single-signer create: signer email",
+                false,
+            ),
+            (
+                "recipient_name",
+                "Simple single-signer create: signer display name",
+                false,
+            ),
+            (
+                "auth_method",
+                "Simple single-signer create: none / email_otp / sms_otp",
+                false,
+            ),
+            (
+                "output_path",
+                "Local destination FILE path for a download (defaults under .fastio/downloads/)",
+                false,
+            ),
+            ("limit", "Pagination limit (envelope-list)", false),
+            ("offset", "Pagination offset (envelope-list)", false),
+        ],
+    },
+    ToolDef {
         name: "instructions",
         description: "AI instructions (markdown blob, max 65,536 raw bytes) per profile. Scopes: user (self only), org/workspace/share (profile-wide admin slot + per-user override at /me/). User has no /me/ variant. clear-* maps to DELETE; setting empty content is equivalent.",
         actions: &[
@@ -1743,6 +1834,7 @@ impl ToolRouter {
             "lock" => handle_lock(&self.state, action, &args).await,
             "metadata" => handle_metadata(&self.state, action, &args).await,
             "workflow" => handle_workflow(&self.state, action, &args).await,
+            "sign" => handle_sign(&self.state, action, &args).await,
             "instructions" => handle_instructions(&self.state, action, &args).await,
             "system" => handle_system(&self.state, action, &args).await,
             _ => Ok(error_text(&format!("Unknown tool: {name}"))),
@@ -10480,6 +10572,734 @@ async fn workflow_export_and_download(
     success_json(&result)
 }
 
+// ─── Sign (E-Signature) ─────────────────────────────────────────────────────
+
+/// Discriminates an async-artifact FETCH (signed PDF / audit certificate) from
+/// every other signing call, so a `404`/`1609` is only reframed as "not ready
+/// yet" where that is genuinely correct (`signing.txt:520`, `:531`). For
+/// [`SignOp::General`] — CRUD / list / get / update / source-download — a
+/// `404`/`1609` is a genuine not-found (`signing.txt:591`). Mirrors the CLI's
+/// `SignOp`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SignOp {
+    /// A CRUD / list / get / update call, or a source-document download.
+    General,
+    /// A signed-PDF or audit-certificate fetch.
+    ArtifactFetch,
+}
+
+/// Map a signing API error to an MCP result.
+///
+/// This adds ONLY the signing context that is genuinely correct for the
+/// operation; everything else defers to the shared `CliError::suggestion()`
+/// (which already covers `1670` → restricted, `1685` → feature-limit):
+///
+/// - `404`/`1609` is reframed as "not ready yet" ONLY for an
+///   [`SignOp::ArtifactFetch`]. For [`SignOp::General`] a `404`/`1609` is a
+///   genuine not-found and is NOT reframed (`signing.txt:591`).
+/// - `1660` (terminal conflict) / `1685` (credits) are keyed on the actual
+///   `error.code`, NOT a bare `409`/`412` status, so an unrelated
+///   conflict / precondition isn't mislabeled.
+/// - Unmatched codes append the shared `err.suggestion()`.
+fn sign_err_to_result(err: &fastio_cli::error::CliError, ctx: &str, op: SignOp) -> CallToolResult {
+    if let fastio_cli::error::CliError::Api(api) = err {
+        // Async-artifact "not ready yet" — only for a signed/audit fetch.
+        if op == SignOp::ArtifactFetch && (api.http_status == 404 || api.code == 1609) {
+            return error_text(&format!(
+                "{ctx}: not ready yet — the signed artifact / audit certificate is not generated \
+                 until the envelope reaches the required (terminal) stage; poll envelope-get and \
+                 retry. ({err})"
+            ));
+        }
+        let note = match api.code {
+            1685 => Some("insufficient signing credits for this operation (1685)."),
+            1660 => Some("the envelope is already terminal and cannot be changed (1660)."),
+            _ => None,
+        };
+        if let Some(note) = note {
+            return error_text(&format!("{ctx}: {note} ({err})"));
+        }
+        // Defer to the shared suggestion (covers 1670 → restricted, etc.).
+        if let Some(hint) = err.suggestion() {
+            return error_text(&format!("{ctx}: {hint} ({err})"));
+        }
+    }
+    error_text(&format!("{ctx}: {err}"))
+}
+
+/// Resolve an optional JSON-string array argument into typed builders via a
+/// per-element mapper. Returns `Err` (an MCP result) on a malformed value.
+fn sign_json_array(
+    args: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<Vec<Value>>, CallToolResult> {
+    match optional_str(args, key) {
+        None => Ok(None),
+        Some(raw) => match serde_json::from_str::<Value>(raw) {
+            Ok(Value::Array(items)) => Ok(Some(items)),
+            Ok(_) => Err(error_text(&format!("{key} must be a JSON array"))),
+            Err(e) => Err(error_text(&format!("{key} is not valid JSON: {e}"))),
+        },
+    }
+}
+
+/// Resolve an optional JSON-string OBJECT argument into a [`Value`].
+///
+/// `body_json` / `policy_json` are documented as OBJECTS (`signing.txt:291`);
+/// a non-object (array / scalar / null) is rejected with a clear error rather
+/// than passed through, mirroring the CLI's `resolve_opt_json_object`.
+fn sign_json_object(args: &Map<String, Value>, key: &str) -> Result<Option<Value>, CallToolResult> {
+    match optional_str(args, key) {
+        None => Ok(None),
+        Some(raw) => match serde_json::from_str::<Value>(raw) {
+            Ok(v @ Value::Object(_)) => Ok(Some(v)),
+            Ok(_) => Err(error_text(&format!("{key} must be a JSON object"))),
+            Err(e) => Err(error_text(&format!("{key} is not valid JSON: {e}"))),
+        },
+    }
+}
+
+/// Read an optional string field from a JSON object.
+///
+/// A missing key is `None`; a PRESENT key that is not a JSON string is an error
+/// (an MCP result) rather than a silent drop, so a mistyped field is rejected
+/// instead of vanishing from the request.
+fn sign_str_field(v: &Value, key: &str) -> Result<Option<String>, CallToolResult> {
+    match v.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(error_text(&format!("field '{key}' must be a JSON string"))),
+    }
+}
+
+/// Read an optional `u64` field (number or string-encoded) from a JSON object.
+///
+/// A missing key is `None`; a PRESENT key that is neither a `u64` nor a string
+/// that parses as one is an error rather than a silent drop.
+fn sign_u64_field(v: &Value, key: &str) -> Result<Option<u64>, CallToolResult> {
+    match v.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(f) => f
+            .as_u64()
+            .or_else(|| f.as_str().and_then(|s| s.parse().ok()))
+            .map(Some)
+            .ok_or_else(|| error_text(&format!("field '{key}' must be a non-negative integer"))),
+    }
+}
+
+/// Read an optional `f64` field (number or string-encoded) from a JSON object.
+///
+/// A missing key is `None`; a PRESENT key that is neither an `f64` nor a string
+/// that parses as one is an error rather than a silent drop, so a malformed
+/// coordinate (e.g. `"x_norm":"abc"`) is rejected instead of placing a field at
+/// a bogus position.
+fn sign_f64_field(v: &Value, key: &str) -> Result<Option<f64>, CallToolResult> {
+    match v.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(f) => f
+            .as_f64()
+            .or_else(|| f.as_str().and_then(|s| s.parse().ok()))
+            .map(Some)
+            .ok_or_else(|| error_text(&format!("field '{key}' must be a number"))),
+    }
+}
+
+/// Read an optional boolean field from a JSON object.
+///
+/// A missing key is `None`; a PRESENT key that is not a JSON boolean is an error
+/// rather than a silent drop.
+fn sign_bool_field(v: &Value, key: &str) -> Result<Option<bool>, CallToolResult> {
+    match v.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(error_text(&format!("field '{key}' must be a JSON boolean"))),
+    }
+}
+
+/// Map a JSON documents array into [`signing::DocumentSpec`] builders. Returns
+/// `Err` (an MCP result) on a present-but-mistyped field.
+fn sign_parse_documents(
+    items: &[Value],
+) -> Result<Vec<fastio_cli::api::signing::DocumentSpec>, CallToolResult> {
+    use fastio_cli::api::signing::DocumentSpec;
+    items
+        .iter()
+        .map(|v| {
+            Ok(DocumentSpec::new()
+                .id(sign_str_field(v, "id")?)
+                .source_node_id(sign_str_field(v, "source_node_id")?)
+                .source_version_id(sign_str_field(v, "source_version_id")?)
+                .display_order(sign_u64_field(v, "display_order")?))
+        })
+        .collect()
+}
+
+/// Map a JSON recipients array into [`signing::RecipientSpec`] builders. Returns
+/// `Err` (an MCP result) on a present-but-mistyped field.
+fn sign_parse_recipients(
+    items: &[Value],
+) -> Result<Vec<fastio_cli::api::signing::RecipientSpec>, CallToolResult> {
+    use fastio_cli::api::signing::RecipientSpec;
+    items
+        .iter()
+        .map(|v| {
+            Ok(RecipientSpec::new()
+                .email(sign_str_field(v, "email")?)
+                .display_name(sign_str_field(v, "display_name")?)
+                .phone_e164(sign_str_field(v, "phone_e164")?)
+                .role(sign_str_field(v, "role")?)
+                .routing_order(sign_u64_field(v, "routing_order")?)
+                .auth_method(sign_str_field(v, "auth_method")?))
+        })
+        .collect()
+}
+
+/// Map a JSON fields array into [`signing::FieldSpec`] builders (the `type` key
+/// carries the field type; `value_json` is preserved as a JSON string). Returns
+/// `Err` (an MCP result) on a present-but-mistyped field (e.g. a non-numeric
+/// coordinate).
+fn sign_parse_fields(
+    items: &[Value],
+) -> Result<Vec<fastio_cli::api::signing::FieldSpec>, CallToolResult> {
+    use fastio_cli::api::signing::FieldSpec;
+    items
+        .iter()
+        .map(|v| {
+            let value_json = v.get("value_json").and_then(|vj| match vj {
+                Value::Null => None,
+                Value::String(s) => Some(s.clone()),
+                other => Some(other.to_string()),
+            });
+            Ok(FieldSpec::new()
+                .recipient_email(sign_str_field(v, "recipient_email")?)
+                .document_index(sign_u64_field(v, "document_index")?)
+                .page(sign_u64_field(v, "page")?)
+                .bounding_box(
+                    sign_f64_field(v, "x_norm")?,
+                    sign_f64_field(v, "y_norm")?,
+                    sign_f64_field(v, "w_norm")?,
+                    sign_f64_field(v, "h_norm")?,
+                )
+                .field_type(sign_str_field(v, "type")?)
+                .required(sign_bool_field(v, "required")?)
+                .value_json(value_json))
+        })
+        .collect()
+}
+
+/// The authoritative per-action describe payload for the `sign` tool. Names the
+/// CLI-only outward/destructive/terminal actions under `cli_only_actions`.
+// The length is a flat action-spec table, not branching logic (mirrors
+// `workflow_describe`).
+#[allow(clippy::too_many_lines)]
+fn sign_describe() -> CallToolResult {
+    let actions: &[(&str, &[&str], &[&str], &str)] = &[
+        ("describe", &[], &[], ""),
+        (
+            "envelope-create",
+            &["parent_type", "parent_id"],
+            &[
+                "name",
+                "expires_at",
+                "body_json",
+                "policy_json",
+                "documents_json",
+                "recipients_json",
+                "fields_json",
+                "source_node_id",
+                "source_version_id",
+                "recipient_email",
+                "recipient_name",
+                "auth_method",
+            ],
+            "creates a DRAFT (reversible). Supply documents/recipients via the *_json arrays \
+             (or body_json), or the simple source_node_id + recipient_email path.",
+        ),
+        (
+            "envelope-update",
+            &["parent_type", "parent_id", "envelope_id"],
+            &[
+                "name",
+                "expires_at",
+                "policy_json",
+                "documents_json",
+                "recipients_json",
+                "fields_json",
+            ],
+            "DRAFT-only (a non-draft returns 403). recipients_json / fields_json are full \
+             replacements; documents_json is a declarative replace (omit to leave unchanged).",
+        ),
+        (
+            "envelope-list",
+            &["parent_type", "parent_id"],
+            &["limit", "offset"],
+            "offset-paginated",
+        ),
+        (
+            "envelope-get",
+            &["parent_type", "parent_id", "envelope_id"],
+            &[],
+            "inlines documents/recipients/fields",
+        ),
+        (
+            "document-download",
+            &["parent_type", "parent_id", "envelope_id", "document_id"],
+            &["output_path"],
+            "streams the SOURCE PDF to the local fs; returns a path + byte count",
+        ),
+        (
+            "signed-download",
+            &["parent_type", "parent_id", "envelope_id", "document_id"],
+            &["output_path"],
+            "streams the SIGNED PDF; 404/1609 => not ready until the document completes",
+        ),
+        (
+            "audit-download",
+            &["parent_type", "parent_id", "envelope_id"],
+            &["output_path"],
+            "streams the audit certificate (JSON); 404/1609 => not ready until terminal",
+        ),
+    ];
+
+    let mut action_map = serde_json::Map::new();
+    for (name, required, optional, note) in actions {
+        let mut spec = serde_json::Map::new();
+        spec.insert(
+            "required".to_owned(),
+            Value::Array(
+                required
+                    .iter()
+                    .map(|s| Value::String((*s).to_owned()))
+                    .collect(),
+            ),
+        );
+        spec.insert(
+            "optional".to_owned(),
+            Value::Array(
+                optional
+                    .iter()
+                    .map(|s| Value::String((*s).to_owned()))
+                    .collect(),
+            ),
+        );
+        if !note.is_empty() {
+            spec.insert("note".to_owned(), Value::String((*note).to_owned()));
+        }
+        action_map.insert((*name).to_owned(), Value::Object(spec));
+    }
+
+    let cli_only: Vec<Value> = [
+        "envelope send (EMAILS REAL RECIPIENTS)",
+        "envelope void (terminal; credits not refunded)",
+        "envelope delete (destructive)",
+    ]
+    .iter()
+    .map(|s| Value::String((*s).to_owned()))
+    .collect();
+
+    let payload = serde_json::json!({
+        "tool": "sign",
+        "summary": "E-signature SignEnvelopes — READ + reversible-DRAFT-drive only. Drafting and \
+                    downloads are exposed over MCP; the outward-facing send/void/delete are \
+                    CLI-binary-only.",
+        "common_required": ["parent_type", "parent_id"],
+        "destructive_actions": [],
+        "side_effects": "envelope-create makes a DRAFT (reversible; no recipient is notified and \
+                         no credits are reserved until a CLI `send`). Downloads write files to the \
+                         agent's local filesystem. The outward-facing send / void / delete actions \
+                         are CLI-binary-only (see cli_only_actions) and are NOT exposed over MCP.",
+        "guidance": {
+            "parent": "parent_type must be 'workspace' or 'org'; parent_id is the 19-digit owner id.",
+            "send_void_delete": "To send (emails real recipients), void, or delete an envelope, run \
+                                 the CLI: `fastio sign envelope send|void|delete …`. These are NOT \
+                                 available over MCP by design.",
+            "cli_only_actions": cli_only,
+        },
+        "actions": Value::Object(action_map),
+    });
+    success_json(&payload)
+}
+
+/// E-signature tool handler — READ + reversible-DRAFT-drive actions only. The
+/// outward-facing / destructive / terminal actions (send / void / delete) are
+/// CLI-binary-only and are routed to a guidance message BEFORE auth/parent
+/// extraction (mirrors how the `workflow` tool keeps `cancel` CLI-only).
+#[allow(clippy::too_many_lines)] // a flat dispatch over the envelope lifecycle surface
+async fn handle_sign(
+    state: &McpState,
+    action: &str,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    use fastio_cli::api::signing;
+
+    // `describe` needs no auth.
+    if action == "describe" {
+        return Ok(sign_describe());
+    }
+    // The outward-facing / destructive / terminal actions are CLI-binary-only.
+    // Route them to the CLI-only guidance FIRST — before auth and parent
+    // extraction — so e.g. `action=send` with no parent args returns the
+    // intended "this is CLI-only" message rather than "Missing required
+    // parameter: parent_type".
+    if matches!(
+        action,
+        "envelope-send" | "send" | "envelope-void" | "void" | "envelope-delete" | "delete"
+    ) {
+        return Ok(error_text(
+            "send, void, and delete are CLI-binary-only for the sign tool: send EMAILS REAL \
+             RECIPIENTS, void is terminal, and delete is destructive. Run them via the CLI — \
+             `fastio sign envelope send|void|delete …`. Call action='describe' for the MCP \
+             action list.",
+        ));
+    }
+    if let Err(e) = require_auth(state).await {
+        return Ok(e);
+    }
+    let client = state.client().read().await;
+
+    let parent_type = match required_str(args, "parent_type") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let parent_id = match required_str(args, "parent_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+
+    match action {
+        "envelope-create" => {
+            let params = match sign_build_create_params(args) {
+                Ok(p) => p,
+                Err(e) => return Ok(e),
+            };
+            if let Err(e) = params.validate() {
+                return Ok(error_text(&format!("invalid create request: {e}")));
+            }
+            match signing::create_envelope(&client, parent_type, parent_id, &params).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(sign_err_to_result(
+                    &e,
+                    "failed to create sign envelope",
+                    SignOp::General,
+                )),
+            }
+        }
+        "envelope-update" => {
+            let envelope_id = match required_str(args, "envelope_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let params = match sign_build_update_params(args) {
+                Ok(p) => p,
+                Err(e) => return Ok(e),
+            };
+            if params.is_empty() {
+                return Ok(error_text(
+                    "no fields to update were supplied (a draft-only update needs at least one of \
+                     name / expires_at / policy_json / documents_json / recipients_json / \
+                     fields_json)",
+                ));
+            }
+            if let Err(e) = params.validate() {
+                return Ok(error_text(&format!("invalid update request: {e}")));
+            }
+            match signing::update_envelope(&client, parent_type, parent_id, envelope_id, &params)
+                .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(sign_err_to_result(
+                    &e,
+                    "failed to update sign envelope",
+                    SignOp::General,
+                )),
+            }
+        }
+        "envelope-list" => {
+            match signing::list_envelopes(
+                &client,
+                parent_type,
+                parent_id,
+                optional_u32(args, "limit"),
+                optional_u32(args, "offset"),
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(sign_err_to_result(
+                    &e,
+                    "failed to list sign envelopes",
+                    SignOp::General,
+                )),
+            }
+        }
+        "envelope-get" => {
+            let envelope_id = match required_str(args, "envelope_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match signing::get_envelope(&client, parent_type, parent_id, envelope_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(sign_err_to_result(
+                    &e,
+                    "failed to get sign envelope",
+                    SignOp::General,
+                )),
+            }
+        }
+        "document-download" | "signed-download" | "audit-download" => {
+            Ok(sign_download(&client, action, parent_type, parent_id, args).await)
+        }
+        // The outward-facing / destructive / terminal actions (send / void /
+        // delete) are handled earlier — before auth/parent extraction — so they
+        // are not matched here.
+        _ => Ok(error_text(&format!(
+            "Unknown or CLI-only sign action: {action}. The outward-facing send / void / delete \
+             are CLI-binary-only (`fastio sign envelope …`). Call action='describe' for the MCP \
+             action list."
+        ))),
+    }
+}
+
+/// Build [`signing::CreateEnvelopeParams`] from the MCP create args (prefer
+/// `body_json`, then the `*_json` arrays, then the simple single-signer path).
+fn sign_build_create_params(
+    args: &Map<String, Value>,
+) -> Result<fastio_cli::api::signing::CreateEnvelopeParams, CallToolResult> {
+    use fastio_cli::api::signing::{CreateEnvelopeParams, DocumentSpec, RecipientSpec};
+
+    // body_json is the whole request when present. It is documented as an
+    // OBJECT (signing.txt:291); `sign_json_object` rejects a non-object.
+    if let Some(body) = sign_json_object(args, "body_json")? {
+        let documents = match body.get("documents") {
+            Some(Value::Array(items)) => sign_parse_documents(items)?,
+            Some(_) => return Err(error_text("body_json 'documents' must be an array")),
+            None => Vec::new(),
+        };
+        let recipients = match body.get("recipients") {
+            Some(Value::Array(items)) => sign_parse_recipients(items)?,
+            Some(_) => return Err(error_text("body_json 'recipients' must be an array")),
+            None => Vec::new(),
+        };
+        let fields = match body.get("fields") {
+            Some(Value::Array(items)) => sign_parse_fields(items)?,
+            Some(_) => return Err(error_text("body_json 'fields' must be an array")),
+            None => Vec::new(),
+        };
+        let policy_json = match body.get("policy_json") {
+            None | Some(Value::Null) => None,
+            Some(p @ Value::Object(_)) => Some(p.clone()),
+            Some(_) => return Err(error_text("body_json 'policy_json' must be a JSON object")),
+        };
+        return Ok(CreateEnvelopeParams::new()
+            .name(sign_str_field(&body, "name")?)
+            .expires_at(sign_str_field(&body, "expires_at")?)
+            .policy_json(policy_json)
+            .documents(documents)
+            .recipients(recipients)
+            .fields(fields));
+    }
+
+    let documents = match sign_json_array(args, "documents_json")? {
+        Some(items) => sign_parse_documents(&items)?,
+        None => match optional_str(args, "source_node_id") {
+            Some(node) => vec![
+                DocumentSpec::new()
+                    .source_node_id(Some(node.to_owned()))
+                    .source_version_id(optional_str(args, "source_version_id").map(str::to_owned))
+                    .display_order(Some(0)),
+            ],
+            None => {
+                return Err(error_text(
+                    "envelope-create needs documents: pass documents_json (or body_json), or the \
+                     simple source_node_id",
+                ));
+            }
+        },
+    };
+
+    let recipients = match sign_json_array(args, "recipients_json")? {
+        Some(items) => sign_parse_recipients(&items)?,
+        None => match optional_str(args, "recipient_email") {
+            Some(email) => vec![
+                RecipientSpec::new()
+                    .email(Some(email.to_owned()))
+                    .display_name(optional_str(args, "recipient_name").map(str::to_owned))
+                    .role(Some("signer".to_owned()))
+                    .routing_order(Some(1))
+                    .auth_method(optional_str(args, "auth_method").map(str::to_owned)),
+            ],
+            None => {
+                return Err(error_text(
+                    "envelope-create needs recipients: pass recipients_json (or body_json), or the \
+                     simple recipient_email",
+                ));
+            }
+        },
+    };
+
+    let fields = match sign_json_array(args, "fields_json")? {
+        Some(items) => sign_parse_fields(&items)?,
+        None => Vec::new(),
+    };
+
+    Ok(CreateEnvelopeParams::new()
+        .name(optional_str(args, "name").map(str::to_owned))
+        .expires_at(optional_str(args, "expires_at").map(str::to_owned))
+        .policy_json(sign_json_object(args, "policy_json")?)
+        .documents(documents)
+        .recipients(recipients)
+        .fields(fields))
+}
+
+/// Build [`signing::UpdateEnvelopeParams`] from the MCP update args.
+fn sign_build_update_params(
+    args: &Map<String, Value>,
+) -> Result<fastio_cli::api::signing::UpdateEnvelopeParams, CallToolResult> {
+    use fastio_cli::api::signing::UpdateEnvelopeParams;
+    let documents = match sign_json_array(args, "documents_json")? {
+        Some(i) => Some(sign_parse_documents(&i)?),
+        None => None,
+    };
+    let recipients = match sign_json_array(args, "recipients_json")? {
+        Some(i) => Some(sign_parse_recipients(&i)?),
+        None => None,
+    };
+    let fields = match sign_json_array(args, "fields_json")? {
+        Some(i) => Some(sign_parse_fields(&i)?),
+        None => None,
+    };
+    Ok(UpdateEnvelopeParams::new()
+        .name(optional_str(args, "name").map(str::to_owned))
+        .expires_at(optional_str(args, "expires_at").map(str::to_owned))
+        .policy_json(sign_json_object(args, "policy_json")?)
+        .documents(documents)
+        .recipients(recipients)
+        .fields(fields))
+}
+
+/// Recursively create a directory tree, restricting any directory this call
+/// creates to `0700` (owner rwx only) on Unix.
+///
+/// Used for the implicitly-created default download directory so the agent's
+/// downloaded signed PDFs / audit certs are not parked under a world/group
+/// listable directory. On non-Unix this is a plain `create_dir_all`. (Only the
+/// DIRECTORY is locked down here; the downloaded FILES respect the user's umask
+/// per the shared `download_file_stream` — see the call site comment.)
+fn create_dir_all_private(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// Stream a signing download (source / signed PDF, or audit cert) to the local
+/// filesystem and return a path + byte count (NEVER base64). Builds the download
+/// path, resolves the output FILE path (default under `.fastio/downloads/`), and
+/// streams via [`ApiClient::download_file_stream`] — never routing a signing
+/// node id through `/storage/{node}/read/` (`signing.txt:155`).
+async fn sign_download(
+    client: &fastio_cli::client::ApiClient,
+    action: &str,
+    parent_type: &str,
+    parent_id: &str,
+    args: &Map<String, Value>,
+) -> CallToolResult {
+    use fastio_cli::api::signing;
+    let envelope_id = match required_str(args, "envelope_id") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // Resolve the api path + a sensible default filename per artifact, plus the
+    // SignOp discriminator: only the SIGNED PDF and the AUDIT certificate are
+    // generated asynchronously (a 404/1609 there means "not ready yet"); a
+    // SOURCE-document download is a plain fetch where a 404 is a genuine
+    // not-found (signing.txt:520/531/591).
+    let (api_path_res, default_name, what, op) = match action {
+        "document-download" => {
+            let doc = match required_str(args, "document_id") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            (
+                signing::document_download_path(parent_type, parent_id, envelope_id, doc),
+                format!("{envelope_id}-{doc}-source.pdf"),
+                "source document",
+                SignOp::General,
+            )
+        }
+        "signed-download" => {
+            let doc = match required_str(args, "document_id") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            (
+                signing::signed_document_download_path(parent_type, parent_id, envelope_id, doc),
+                format!("{envelope_id}-{doc}-signed.pdf"),
+                "signed document",
+                SignOp::ArtifactFetch,
+            )
+        }
+        // audit-download
+        _ => (
+            signing::audit_download_path(parent_type, parent_id, envelope_id),
+            format!("{envelope_id}-audit.json"),
+            "audit certificate",
+            SignOp::ArtifactFetch,
+        ),
+    };
+
+    let api_path = match api_path_res {
+        Ok(p) => p,
+        Err(e) => return error_text(&format!("invalid download request: {e}")),
+    };
+
+    // Resolve the output file path: an explicit output_path is used verbatim;
+    // otherwise a default filename under .fastio/downloads/.
+    //
+    // Perms split: the DEFAULT download DIRECTORY is created 0700 (owner-only)
+    // on Unix — it holds the agent's signed PDFs / audit certs and is created
+    // implicitly, so it should not be world/group-listable. The downloaded
+    // FILES themselves are left to the user's umask (the shared
+    // `download_file_stream` does not force 0600): a downloaded document written
+    // to a user-chosen path is correct CLI behavior, like `curl`/`cp`.
+    let out_path = if let Some(p) = optional_str(args, "output_path") {
+        std::path::PathBuf::from(p)
+    } else {
+        let dir = std::path::Path::new(".fastio/downloads");
+        if let Err(e) = create_dir_all_private(dir) {
+            return error_text(&format!(
+                "failed to create output directory '{}': {e}",
+                dir.display()
+            ));
+        }
+        dir.join(default_name)
+    };
+
+    match client.download_file_stream(&api_path, &out_path).await {
+        Ok(bytes) => {
+            let result = serde_json::json!({
+                "result": "yes",
+                "downloaded": {
+                    "artifact": what,
+                    "path": out_path.display().to_string(),
+                    "byte_count": bytes,
+                },
+            });
+            success_json(&result)
+        }
+        Err(e) => sign_err_to_result(&e, &format!("failed to download {what}"), op),
+    }
+}
+
 /// AI instructions tool handler.
 #[allow(clippy::too_many_lines)]
 async fn handle_instructions(
@@ -12166,6 +12986,444 @@ mod ripley_tool_tests {
         assert!(
             text.contains("Missing required parameter: workflow_id"),
             "obligation-list must require workflow_id, got: {text}"
+        );
+    }
+
+    // ─── Sign (E-Signature) MCP discipline ────────────────────────────────────
+
+    fn sign_tool_actions() -> Vec<&'static str> {
+        super::TOOL_DEFS
+            .iter()
+            .find(|d| d.name == "sign")
+            .expect("sign tool registered")
+            .actions
+            .to_vec()
+    }
+
+    #[test]
+    fn sign_tool_is_registered_and_read_draft_oriented() {
+        let tools = ToolRouter::list_tools().tools;
+        let sign = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "sign")
+            .expect("sign tool present");
+        let desc = sign.description.as_deref().unwrap_or_default();
+        // The description must honestly state send/void/delete are CLI-only.
+        assert!(
+            desc.contains("CLI-binary-only") && desc.to_lowercase().contains("send"),
+            "sign tool must state send/void/delete are CLI-only, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn sign_tool_omits_outward_destructive_terminal_actions() {
+        // send / void / delete are CLI-binary-only and MUST NOT be advertised.
+        let actions = sign_tool_actions();
+        for forbidden in [
+            "envelope-send",
+            "send",
+            "envelope-void",
+            "void",
+            "envelope-delete",
+            "delete",
+        ] {
+            assert!(
+                !actions.contains(&forbidden),
+                "sign MCP tool must NOT advertise outward/destructive action '{forbidden}'"
+            );
+        }
+        // The reversible read + draft-drive actions MUST be present.
+        for present in [
+            "envelope-create",
+            "envelope-update",
+            "envelope-list",
+            "envelope-get",
+            "document-download",
+            "signed-download",
+            "audit-download",
+            "describe",
+        ] {
+            assert!(
+                actions.contains(&present),
+                "sign MCP tool must advertise read/draft action '{present}'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_describe_needs_no_auth_and_lists_actions() {
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("describe".to_owned()));
+        let res = router.call_tool("sign", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("cli_only_actions") || text.contains("cli only"),
+            "describe should name CLI-only ops, got: {text}"
+        );
+        // describe accuracy: every advertised action appears in the payload.
+        for action in sign_tool_actions() {
+            assert!(
+                text.contains(action),
+                "describe payload must document advertised action '{action}'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_send_void_delete_are_cli_only() {
+        // The outward/destructive/terminal actions must route to the CLI-only
+        // fallback with a clear pointer, and must not be advertised.
+        let router = authed_router().await;
+        for action in ["send", "void", "delete"] {
+            let mut args = Map::new();
+            args.insert("action".to_owned(), Value::String(action.to_owned()));
+            args.insert(
+                "parent_type".to_owned(),
+                Value::String("workspace".to_owned()),
+            );
+            args.insert("parent_id".to_owned(), Value::String("ws1".to_owned()));
+            args.insert("envelope_id".to_owned(), Value::String("env1".to_owned()));
+            let res = router.call_tool("sign", args).await.expect("ok");
+            let text = result_to_string(&res);
+            assert!(
+                text.contains("CLI-binary-only") && text.contains("fastio sign envelope"),
+                "'{action}' must be rejected over MCP with a CLI pointer, got: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_create_rejects_missing_documents_and_recipients() {
+        // No *_json and no simple flags → rejected before any network call.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("envelope-create".to_owned()),
+        );
+        args.insert(
+            "parent_type".to_owned(),
+            Value::String("workspace".to_owned()),
+        );
+        args.insert("parent_id".to_owned(), Value::String("ws1".to_owned()));
+        let res = router.call_tool("sign", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("needs documents"),
+            "create without documents must be rejected, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_create_rejects_bad_parent_type() {
+        // parent_path validation rejects a non-workspace/org parent (after the
+        // simple single-signer path assembles a valid request, the API builder
+        // rejects the parent before the network).
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("envelope-create".to_owned()),
+        );
+        args.insert("parent_type".to_owned(), Value::String("share".to_owned()));
+        args.insert("parent_id".to_owned(), Value::String("s1".to_owned()));
+        args.insert(
+            "source_node_id".to_owned(),
+            Value::String("node-1".to_owned()),
+        );
+        args.insert(
+            "recipient_email".to_owned(),
+            Value::String("a@b.com".to_owned()),
+        );
+        let res = router.call_tool("sign", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.to_lowercase().contains("parent"),
+            "a non-workspace/org parent must be rejected, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_envelope_get_requires_envelope_id() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("envelope-get".to_owned()),
+        );
+        args.insert("parent_type".to_owned(), Value::String("org".to_owned()));
+        args.insert("parent_id".to_owned(), Value::String("org1".to_owned()));
+        let res = router.call_tool("sign", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("Missing required parameter: envelope_id"),
+            "envelope-get must require envelope_id, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_update_requires_a_field() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("envelope-update".to_owned()),
+        );
+        args.insert(
+            "parent_type".to_owned(),
+            Value::String("workspace".to_owned()),
+        );
+        args.insert("parent_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("envelope_id".to_owned(), Value::String("env1".to_owned()));
+        let res = router.call_tool("sign", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("no fields to update"),
+            "empty update must be rejected, got: {text}"
+        );
+    }
+
+    // ─── FIX 1: empty recipient replace on update rejected pre-network ─────────
+
+    #[tokio::test]
+    async fn sign_update_empty_recipients_rejected() {
+        // recipients_json:"[]" is a full-replacement wipe; reject before PATCH.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("envelope-update".to_owned()),
+        );
+        args.insert(
+            "parent_type".to_owned(),
+            Value::String("workspace".to_owned()),
+        );
+        args.insert("parent_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("envelope_id".to_owned(), Value::String("env1".to_owned()));
+        args.insert("recipients_json".to_owned(), Value::String("[]".to_owned()));
+        let res = router.call_tool("sign", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.to_lowercase().contains("recipient"),
+            "empty recipient replace must be rejected, got: {text}"
+        );
+    }
+
+    // ─── FIX 3: present-but-mistyped JSON field rejected, not dropped ──────────
+
+    #[tokio::test]
+    async fn sign_create_rejects_non_numeric_coordinate() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("envelope-create".to_owned()),
+        );
+        args.insert(
+            "parent_type".to_owned(),
+            Value::String("workspace".to_owned()),
+        );
+        args.insert("parent_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert(
+            "source_node_id".to_owned(),
+            Value::String("node-1".to_owned()),
+        );
+        args.insert(
+            "recipient_email".to_owned(),
+            Value::String("a@b.com".to_owned()),
+        );
+        args.insert(
+            "fields_json".to_owned(),
+            Value::String(r#"[{"recipient_email":"a@b.com","x_norm":"abc"}]"#.to_owned()),
+        );
+        let res = router.call_tool("sign", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("x_norm") && text.to_lowercase().contains("number"),
+            "a non-numeric x_norm must be rejected, got: {text}"
+        );
+    }
+
+    // ─── FIX 4: non-object body_json / policy_json rejected ────────────────────
+
+    #[tokio::test]
+    async fn sign_create_rejects_non_object_body_json() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("envelope-create".to_owned()),
+        );
+        args.insert(
+            "parent_type".to_owned(),
+            Value::String("workspace".to_owned()),
+        );
+        args.insert("parent_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("body_json".to_owned(), Value::String("[1,2,3]".to_owned()));
+        let res = router.call_tool("sign", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("body_json") && text.to_lowercase().contains("object"),
+            "a non-object body_json must be rejected, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_create_rejects_non_object_policy_json() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("envelope-create".to_owned()),
+        );
+        args.insert(
+            "parent_type".to_owned(),
+            Value::String("workspace".to_owned()),
+        );
+        args.insert("parent_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert(
+            "source_node_id".to_owned(),
+            Value::String("node-1".to_owned()),
+        );
+        args.insert(
+            "recipient_email".to_owned(),
+            Value::String("a@b.com".to_owned()),
+        );
+        args.insert("policy_json".to_owned(), Value::String("[1,2]".to_owned()));
+        let res = router.call_tool("sign", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("policy_json") && text.to_lowercase().contains("object"),
+            "a non-object policy_json must be rejected, got: {text}"
+        );
+    }
+
+    // ─── FIX 6: CLI-only actions route to guidance BEFORE auth/parent ──────────
+
+    #[tokio::test]
+    async fn sign_send_cli_only_without_parent_args() {
+        // action=send with NO parent_type/parent_id must return the CLI-only
+        // guidance, not "Missing required parameter".
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("send".to_owned()));
+        let res = router.call_tool("sign", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("CLI-binary-only") && text.contains("fastio sign envelope"),
+            "send with no parent args must return the CLI-only message, got: {text}"
+        );
+        assert!(
+            !text.contains("Missing required parameter"),
+            "must not surface a parent-arg error, got: {text}"
+        );
+    }
+
+    // ─── FIX 2: action/code-specific error mapping ─────────────────────────────
+
+    fn sign_api_err(code: u32, http_status: u16) -> fastio_cli::error::CliError {
+        fastio_cli::error::CliError::Api(fastio_cli::error::ApiError::new(
+            code,
+            None,
+            "boom".to_owned(),
+            http_status,
+        ))
+    }
+
+    #[test]
+    fn sign_err_artifact_fetch_404_1609_says_not_ready() {
+        use super::{SignOp, sign_err_to_result};
+        let m = result_to_string(&sign_err_to_result(
+            &sign_api_err(0, 404),
+            "failed to download signed document",
+            SignOp::ArtifactFetch,
+        ));
+        assert!(m.contains("not ready yet"), "got: {m}");
+        let m = result_to_string(&sign_err_to_result(
+            &sign_api_err(1609, 404),
+            "failed to download audit certificate",
+            SignOp::ArtifactFetch,
+        ));
+        assert!(m.contains("not ready yet"), "got: {m}");
+    }
+
+    #[test]
+    fn sign_err_general_404_does_not_say_not_ready() {
+        use super::{SignOp, sign_err_to_result};
+        // get / list / delete / source-download: a 404/1609 is a genuine
+        // not-found and must NOT be reframed as "not ready".
+        for ctx in [
+            "failed to get sign envelope",
+            "failed to download source document",
+        ] {
+            let m = result_to_string(&sign_err_to_result(
+                &sign_api_err(1609, 404),
+                ctx,
+                SignOp::General,
+            ));
+            assert!(
+                !m.contains("not ready"),
+                "general 404 must not say ready: {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_err_restricted_1670_uses_shared_suggestion() {
+        use super::{SignOp, sign_err_to_result};
+        let m = result_to_string(&sign_err_to_result(
+            &sign_api_err(1670, 403),
+            "failed to create sign envelope",
+            SignOp::General,
+        ));
+        assert!(
+            m.contains(fastio_cli::error::HINT_RESTRICTED),
+            "1670 must reuse the shared restricted hint: {m}"
+        );
+    }
+
+    #[test]
+    fn sign_err_credits_1685_and_terminal_1660_code_specific() {
+        use super::{SignOp, sign_err_to_result};
+        let credits = result_to_string(&sign_err_to_result(
+            &sign_api_err(1685, 412),
+            "failed to send",
+            SignOp::General,
+        ));
+        assert!(credits.contains("1685"), "got: {credits}");
+        let terminal = result_to_string(&sign_err_to_result(
+            &sign_api_err(1660, 409),
+            "failed to void",
+            SignOp::General,
+        ));
+        assert!(terminal.contains("1660"), "got: {terminal}");
+        assert!(
+            terminal.to_lowercase().contains("terminal"),
+            "got: {terminal}"
+        );
+    }
+
+    #[test]
+    fn sign_err_unrelated_409_412_not_mislabeled() {
+        use super::{SignOp, sign_err_to_result};
+        let m = result_to_string(&sign_err_to_result(
+            &sign_api_err(0, 409),
+            "failed to create",
+            SignOp::General,
+        ));
+        assert!(
+            !m.to_lowercase().contains("already terminal"),
+            "unrelated 409 must not claim terminal: {m}"
+        );
+        let m = result_to_string(&sign_err_to_result(
+            &sign_api_err(0, 412),
+            "failed to update",
+            SignOp::General,
+        ));
+        assert!(
+            !m.to_lowercase().contains("insufficient signing credits"),
+            "unrelated 412 must not claim credits: {m}"
         );
     }
 }

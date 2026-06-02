@@ -96,6 +96,8 @@ pub mod preview;
 pub mod search;
 /// Share link management commands.
 pub mod share;
+/// E-signature (SignEnvelope) commands.
+pub mod sign;
 /// System health and status commands.
 pub mod system;
 /// Task management commands.

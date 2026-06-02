@@ -206,6 +206,12 @@ pub enum Commands {
     #[command(subcommand, visible_alias = "wf")]
     Workflow(WorkflowCommands),
 
+    /// E-signature: draft, send, void, and download `SignEnvelopes` (PDFs sent
+    /// to recipients for electronic signature). Parented to a workspace OR an
+    /// org. Signing is a paid-plan feature.
+    #[command(subcommand)]
+    Sign(SignCommands),
+
     /// AI instructions for user / org / workspace / share profiles.
     #[command(subcommand)]
     Instructions(InstructionsCommands),
@@ -1207,6 +1213,257 @@ pub enum WorkflowReviewCommands {
         surface_id: String,
         /// Resolution: approved, rejected, or cancelled.
         resolution: String,
+    },
+}
+
+// ─── Sign (E-Signature) ────────────────────────────────────────────────────────
+
+/// E-signature subcommands (`fastio sign`).
+///
+/// `SignEnvelopes` are parented to a Workspace OR an Organization; the
+/// `--parent-type` / `--parent-id` pair selects the owner. Drafts are created
+/// and edited via these commands, then `send` emails real recipients. Signing
+/// is a paid-plan feature (a non-entitled org returns `1670`).
+// Justification: the envelope-lifecycle variant carries the create/update
+// flag set and is larger than the download variants. This is a clap subcommand
+// enum constructed once at parse time and immediately dispatched (never stored
+// in bulk or passed by value in a hot path), so the size difference is
+// immaterial; boxing a clap subcommand payload is non-idiomatic here.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum SignCommands {
+    /// Envelope lifecycle (create / list / get / update / delete / send / void).
+    #[command(subcommand)]
+    Envelope(SignEnvelopeCommands),
+    /// Document byte downloads (source PDF, signed PDF).
+    #[command(subcommand)]
+    Document(SignDocumentCommands),
+    /// Audit certificate download.
+    #[command(subcommand)]
+    Audit(SignAuditCommands),
+}
+
+/// `SignEnvelope` lifecycle subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum SignEnvelopeCommands {
+    /// Create a draft envelope.
+    ///
+    /// Use the ergonomic `--documents-json` / `--recipients-json` /
+    /// `--fields-json` (or one `--body-json` for the whole request; each
+    /// accepts `@file.json`) for non-trivial envelopes. For a trivial
+    /// single-signer single-document draft, the simple flags
+    /// `--source-node-id` + `--recipient-email` suffice.
+    Create {
+        /// Parent type: `workspace` or `org`.
+        #[arg(long)]
+        parent_type: String,
+        /// Parent ID (workspace or org, 19-digit).
+        #[arg(long)]
+        parent_id: String,
+        /// Display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// UTC auto-expiry timestamp (e.g. "2026-06-15 14:30:00 UTC").
+        #[arg(long)]
+        expires_at: Option<String>,
+        /// Whole request body as a JSON object (or `@file.json`). When set, the
+        /// other create flags are ignored.
+        #[arg(long)]
+        body_json: Option<String>,
+        /// Policy bag as a JSON object (or `@file.json`).
+        #[arg(long)]
+        policy_json: Option<String>,
+        /// Documents as a JSON array (or `@file.json`).
+        #[arg(long)]
+        documents_json: Option<String>,
+        /// Recipients as a JSON array (or `@file.json`).
+        #[arg(long)]
+        recipients_json: Option<String>,
+        /// Field placements as a JSON array (or `@file.json`).
+        #[arg(long)]
+        fields_json: Option<String>,
+        /// Simple path: a single source document storage node id.
+        #[arg(long)]
+        source_node_id: Option<String>,
+        /// Simple path: pinned source version id for `--source-node-id`.
+        #[arg(long)]
+        source_version_id: Option<String>,
+        /// Simple path: a single signer's email address.
+        #[arg(long)]
+        recipient_email: Option<String>,
+        /// Simple path: the signer's display name.
+        #[arg(long)]
+        recipient_name: Option<String>,
+        /// Simple path: the signer's auth method (`none` / `email_otp` /
+        /// `sms_otp`).
+        #[arg(long)]
+        auth_method: Option<String>,
+    },
+    /// List envelopes for the parent (offset-paginated).
+    List {
+        /// Parent type: `workspace` or `org`.
+        #[arg(long)]
+        parent_type: String,
+        /// Parent ID.
+        #[arg(long)]
+        parent_id: String,
+        /// Pagination limit.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Pagination offset.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Get a single envelope (documents/recipients/fields inlined).
+    Get {
+        /// Parent type: `workspace` or `org`.
+        #[arg(long)]
+        parent_type: String,
+        /// Parent ID.
+        #[arg(long)]
+        parent_id: String,
+        /// Envelope ID.
+        envelope_id: String,
+    },
+    /// Update mutable fields on a DRAFT envelope (a non-draft returns 403).
+    ///
+    /// `--recipients-json` / `--fields-json` are FULL replacements;
+    /// `--documents-json` is a declarative replacement (omit to leave the
+    /// document set unchanged). Each accepts `@file.json`.
+    Update {
+        /// Parent type: `workspace` or `org`.
+        #[arg(long)]
+        parent_type: String,
+        /// Parent ID.
+        #[arg(long)]
+        parent_id: String,
+        /// Envelope ID.
+        envelope_id: String,
+        /// New display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// New UTC expiry timestamp.
+        #[arg(long)]
+        expires_at: Option<String>,
+        /// New policy bag as a JSON object (or `@file.json`).
+        #[arg(long)]
+        policy_json: Option<String>,
+        /// Declarative document replacement as a JSON array (or `@file.json`).
+        #[arg(long)]
+        documents_json: Option<String>,
+        /// Full recipient replacement as a JSON array (or `@file.json`).
+        #[arg(long)]
+        recipients_json: Option<String>,
+        /// Full field replacement as a JSON array (or `@file.json`).
+        #[arg(long)]
+        fields_json: Option<String>,
+    },
+    /// Soft-delete a DRAFT envelope (terminal envelopes refuse). Destructive.
+    Delete {
+        /// Parent type: `workspace` or `org`.
+        #[arg(long)]
+        parent_type: String,
+        /// Parent ID.
+        #[arg(long)]
+        parent_id: String,
+        /// Envelope ID.
+        envelope_id: String,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Send a draft envelope (draft → sent). EMAILS REAL RECIPIENTS; idempotent.
+    Send {
+        /// Parent type: `workspace` or `org`.
+        #[arg(long)]
+        parent_type: String,
+        /// Parent ID.
+        #[arg(long)]
+        parent_id: String,
+        /// Envelope ID.
+        envelope_id: String,
+        /// Skip the interactive confirmation prompt (send notifies recipients).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Void a non-terminal envelope (cascades to Voided). Credits NOT refunded.
+    Void {
+        /// Parent type: `workspace` or `org`.
+        #[arg(long)]
+        parent_type: String,
+        /// Parent ID.
+        #[arg(long)]
+        parent_id: String,
+        /// Envelope ID.
+        envelope_id: String,
+        /// Reason for voiding (REQUIRED, max 1024 bytes).
+        #[arg(long)]
+        reason: String,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// `SignEnvelope` document-download subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum SignDocumentCommands {
+    /// Download a document's SOURCE PDF (the file uploaded at create time).
+    Download {
+        /// Parent type: `workspace` or `org`.
+        #[arg(long)]
+        parent_type: String,
+        /// Parent ID.
+        #[arg(long)]
+        parent_id: String,
+        /// Envelope ID.
+        envelope_id: String,
+        /// Document ID.
+        document_id: String,
+        /// Output file path.
+        #[arg(long, short)]
+        output: String,
+    },
+    /// Download a document's SIGNED PDF (not ready until the document completes).
+    #[command(name = "signed-download")]
+    SignedDownload {
+        /// Parent type: `workspace` or `org`.
+        #[arg(long)]
+        parent_type: String,
+        /// Parent ID.
+        #[arg(long)]
+        parent_id: String,
+        /// Envelope ID.
+        envelope_id: String,
+        /// Document ID.
+        document_id: String,
+        /// Output file path.
+        #[arg(long, short)]
+        output: String,
+    },
+}
+
+/// `SignEnvelope` audit-certificate subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum SignAuditCommands {
+    /// Download the envelope's audit certificate (JSON; not ready until the
+    /// envelope reaches a terminal state).
+    Download {
+        /// Parent type: `workspace` or `org`.
+        #[arg(long)]
+        parent_type: String,
+        /// Parent ID.
+        #[arg(long)]
+        parent_id: String,
+        /// Envelope ID.
+        envelope_id: String,
+        /// Output file path.
+        #[arg(long, short)]
+        output: String,
     },
 }
 
