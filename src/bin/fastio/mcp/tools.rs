@@ -681,8 +681,9 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "ripley",
-        description: "Offload multi-step work to Ripley, Fast.io's AI agent: ask questions about your content (chat create/list/details/update/delete/publish/cancel, message send/list/details/read), semantic search, generate AI shares (share-generate), transactions, autotitle. (Formerly the `ai` tool; `ai` still works as a hidden alias.)",
+        description: "Offload multi-step work to Ripley, Fast.io's AI agent: ask a question and get the answer (ask — creates a chat and waits), lower-level chat create/list/details/update/delete/publish/cancel, message send/list/details/read, semantic search, generate AI shares (share-generate), transactions, autotitle, and self-only AI memory (memory-get/memory-set/memory-delete). (Formerly the `ai` tool; `ai` still works as a hidden alias.)",
         actions: &[
+            "ask",
             "chat-create",
             "chat-list",
             "chat-details",
@@ -698,11 +699,23 @@ const TOOL_DEFS: &[ToolDef] = &[
             "transactions",
             "autotitle",
             "search",
+            "memory-get",
+            "memory-set",
+            "memory-delete",
         ],
         params: &[
-            ("context_type", "Context: workspace or share", false),
-            ("context_id", "Workspace or share ID", false),
-            ("query_text", "Question or search query", false),
+            (
+                "context_type",
+                "Context: workspace or share (chat/message/share/transactions/autotitle); \
+                 org or workspace for memory-* actions",
+                false,
+            ),
+            ("context_id", "Workspace, share, or org ID", false),
+            (
+                "query_text",
+                "Question or search query (ask, chat-create, message-send, search)",
+                false,
+            ),
             (
                 "type",
                 "Chat type: chat or chat_with_files (chat-create)",
@@ -718,7 +731,19 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             (
                 "kind",
-                "user or agent (chat-create; workspace-only, rejected for share)",
+                "user, agent, or all. Chat kind on chat-create/ask (workspace-only, rejected \
+                 for share); kind filter on chat-list (user|agent|all)",
+                false,
+            ),
+            (
+                "no_wait",
+                "ask: return chat/message IDs immediately without waiting for the answer",
+                false,
+            ),
+            ("content", "Memory content, max 64KB (memory-set)", false),
+            (
+                "revision",
+                "Optimistic-concurrency revision; write only if it matches (memory-set)",
                 false,
             ),
             (
@@ -5145,6 +5170,7 @@ async fn handle_ai(
         return Ok(e);
     }
     match action {
+        "ask" => handle_ai_ask(state, args).await,
         "chat-create" => handle_ai_chat_create(state, args).await,
         "chat-list" => handle_ai_chat_list(state, args).await,
         "chat-details" => handle_ai_chat_details(state, args).await,
@@ -5159,6 +5185,9 @@ async fn handle_ai(
         "transactions" => handle_ai_transactions(state, args).await,
         "autotitle" => handle_ai_autotitle(state, args).await,
         "search" => handle_ai_search(state, args).await,
+        "memory-get" => handle_ai_memory_get(state, args).await,
+        "memory-set" => handle_ai_memory_set(state, args).await,
+        "memory-delete" => handle_ai_memory_delete(state, args).await,
         _ => Ok(error_text(&format!("Unknown ripley action: {action}"))),
     }
 }
@@ -5213,7 +5242,9 @@ async fn handle_ai_chat_create(
         form.insert("name".to_owned(), v.to_owned());
     }
     // `privacy`/`kind` are workspace-only — share chats reject them, so only
-    // forward in a workspace context.
+    // forward in a workspace context. For a share, a supplied `kind` is dropped
+    // rather than forwarded; surface a one-line note instead of swallowing it.
+    let mut kind_warning: Option<String> = None;
     if ctx_type == "workspace" {
         if let Some(v) = optional_str(args, "privacy") {
             form.insert("privacy".to_owned(), v.to_owned());
@@ -5221,6 +5252,8 @@ async fn handle_ai_chat_create(
         if let Some(v) = optional_str(args, "kind") {
             form.insert("kind".to_owned(), v.to_owned());
         }
+    } else if optional_str(args, "kind").is_some() {
+        kind_warning = Some(KIND_SHARE_WARNING.to_owned());
     }
     if let Some(err) = check_files_attach_exclusion(args) {
         return Ok(err);
@@ -5235,7 +5268,10 @@ async fn handle_ai_chat_create(
         form.insert("files_attach".to_owned(), v.to_owned());
     }
     match api::ai::ai_api_form(&client, ctx_type, ctx_id, "agent/", &form).await {
-        Ok(v) => Ok(success_json(&v)),
+        Ok(mut v) => {
+            attach_warning(&mut v, kind_warning.as_deref());
+            Ok(success_json(&v))
+        }
         Err(e) => Ok(cli_err_to_result(&e)),
     }
 }
@@ -5256,6 +5292,10 @@ async fn handle_ai_chat_list(
     }
     if let Some(o) = optional_str(args, "offset") {
         params.insert("offset".to_owned(), o.to_owned());
+    }
+    // `kind` filters by chat kind (`user`/`agent`/`all`, ai.txt:331).
+    if let Some(k) = optional_str(args, "kind") {
+        params.insert("kind".to_owned(), k.to_owned());
     }
     let sub = if optional_bool(args, "include_deleted").unwrap_or(false) {
         "agent/list/deleted"
@@ -5559,17 +5599,16 @@ async fn handle_ai_transactions(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    match api::ai::ai_api(
-        &client,
-        ctx_type,
-        ctx_id,
-        "transactions/",
-        "GET",
-        None,
-        None,
-    )
-    .await
-    {
+    // AI transactions is WORKSPACE-ONLY (ai.txt:935-981) — there is no share
+    // equivalent. Reject a share (or any non-workspace) context rather than
+    // mis-route to a non-existent `/share/{id}/ai/transactions/` endpoint.
+    if ctx_type != "workspace" {
+        return Ok(error_text(
+            "transactions is workspace-only; set context_type=\"workspace\" (no share equivalent)",
+        ));
+    }
+    // Delegate to the library helper, which builds the documented path.
+    match api::ai::transactions(&client, ctx_id).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5585,21 +5624,18 @@ async fn handle_ai_autotitle(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let mut body = serde_json::Map::new();
-    if let Some(c) = optional_str(args, "context") {
-        body.insert("context".to_owned(), Value::String(c.to_owned()));
+    // Autotitle is SHARE-ONLY (ai.txt:1079-1112). Reject a workspace (or any
+    // non-share) context rather than mis-route to a non-existent
+    // `/workspace/{id}/ai/autotitle/` endpoint.
+    if ctx_type != "share" {
+        return Ok(error_text(
+            "autotitle is share-only; set context_type=\"share\" (no workspace equivalent)",
+        ));
     }
-    match api::ai::ai_api(
-        &client,
-        ctx_type,
-        ctx_id,
-        "autotitle/",
-        "POST",
-        Some(&Value::Object(body)),
-        None,
-    )
-    .await
-    {
+    // Delegate to the library helper, which form-encodes the optional
+    // user-context under the contract key `user_context` (NOT `context`).
+    // The MCP arg is advertised as `context`; map it to the library param.
+    match api::ai::autotitle(&client, ctx_id, optional_str(args, "context")).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5645,6 +5681,346 @@ async fn handle_ai_search(
     )
     .await
     {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// Maximum wall-clock the MCP `ask` wait loop spends before returning the
+/// chat/message IDs with a `processing` state, in seconds. Kept under the
+/// JWT lifetime so a stuck answer surfaces a clear partial result rather than
+/// hanging the tool call. Mirrors the CLI `ask` budget.
+const MCP_ASK_MAX_WAIT_SECS: u64 = 120;
+
+/// Per-iteration activity long-poll `wait` hint (seconds); the server caps at 95s.
+const MCP_ASK_POLL_WAIT_SECS: u32 = 20;
+
+/// `ask`: create a chat, then synchronously wait (bounded activity-poll +
+/// message-details confirmation) and return the final answer. This is the MCP
+/// expression of "offload to Ripley" — MCP results are not streams, so a
+/// synchronous wait + final answer is the right shape. `no_wait=true` returns
+/// the chat/message IDs immediately.
+async fn handle_ai_ask(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let ctx_type = optional_str(args, "context_type").unwrap_or("workspace");
+    let ctx_id = match required_str(args, "context_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let question = match required_str(args, "query_text") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    if let Some(err) = check_files_attach_exclusion(args) {
+        return Ok(err);
+    }
+    let mut form = std::collections::HashMap::new();
+    form.insert("type".to_owned(), "chat_with_files".to_owned());
+    form.insert("question".to_owned(), question.to_owned());
+    form.insert(
+        "personality".to_owned(),
+        optional_str(args, "personality")
+            .unwrap_or("detailed")
+            .to_owned(),
+    );
+    // `kind` is workspace-only — share chats reject it, so forward it only in a
+    // workspace context and, for a share, surface a one-line note (rather than
+    // silently dropping it). Keep the call lenient — no hard error.
+    let mut kind_warning: Option<String> = None;
+    if let Some(k) = optional_str(args, "kind") {
+        if ctx_type == "workspace" {
+            form.insert("kind".to_owned(), k.to_owned());
+        } else {
+            kind_warning = Some(KIND_SHARE_WARNING.to_owned());
+        }
+    }
+    if let Some(v) = optional_str(args, "files_scope") {
+        form.insert("files_scope".to_owned(), v.to_owned());
+    }
+    if let Some(v) = optional_str(args, "folders_scope") {
+        form.insert("folders_scope".to_owned(), v.to_owned());
+    }
+    if let Some(v) = optional_str(args, "files_attach") {
+        form.insert("files_attach".to_owned(), v.to_owned());
+    }
+
+    let resp = match api::ai::ai_api_form(&client, ctx_type, ctx_id, "agent/", &form).await {
+        Ok(v) => v,
+        Err(e) => return Ok(cli_err_to_result(&e)),
+    };
+
+    let chat_id = resp
+        .get("chat_id")
+        .or_else(|| resp.get("chat").and_then(|c| c.get("id")))
+        .or_else(|| resp.get("id"))
+        .and_then(json_value_id_to_string);
+    let message_id = resp
+        .get("message_id")
+        .or_else(|| {
+            resp.get("chat")
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("id"))
+        })
+        .or_else(|| resp.get("message").and_then(|m| m.get("id")))
+        .and_then(json_value_id_to_string);
+
+    let (Some(chat_id), Some(message_id)) = (chat_id, message_id) else {
+        // No usable IDs — return the raw create response so the caller can see
+        // what came back rather than failing opaquely.
+        let mut resp = resp;
+        attach_warning(&mut resp, kind_warning.as_deref());
+        return Ok(success_json(&resp));
+    };
+
+    if optional_bool(args, "no_wait").unwrap_or(false) {
+        let mut payload = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "state": "processing",
+        });
+        attach_warning(&mut payload, kind_warning.as_deref());
+        return Ok(success_json(&payload));
+    }
+
+    Ok(mcp_ask_wait(
+        &client,
+        ctx_type,
+        ctx_id,
+        &chat_id,
+        &message_id,
+        kind_warning.as_deref(),
+    )
+    .await)
+}
+
+/// Stderr/response note emitted when `kind` is supplied for a share context.
+/// `kind` is workspace-only (a share rejects it), so it is dropped rather than
+/// forwarded; this surfaces the drop instead of silently swallowing the arg.
+const KIND_SHARE_WARNING: &str = "kind is workspace-only and was ignored for this share";
+
+/// Append a free-form `warning` string to a JSON object payload under a
+/// `warnings` array (creating it if absent). No-op for `None` or non-object
+/// values. Lets the MCP `ask`/`chat-create` handlers surface a lenient note
+/// (e.g. a dropped workspace-only `kind`) without changing the success shape.
+fn attach_warning(payload: &mut Value, warning: Option<&str>) {
+    let Some(warning) = warning else { return };
+    if let Some(obj) = payload.as_object_mut() {
+        obj.entry("warnings")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(Value::Array(arr)) = obj.get_mut("warnings") {
+            arr.push(Value::String(warning.to_owned()));
+        }
+    }
+}
+
+/// Build the auth-expired recovery message for the MCP `ask` wait loop.
+///
+/// On a mid-wait 401 the chat already exists; the message embeds the
+/// `chat_id`/`message_id` and a re-check hint so an agent can recover after
+/// re-authenticating, mirroring the CLI `ask` path.
+fn ask_auth_expired_text(chat_id: &str, message_id: &str) -> String {
+    format!(
+        "authentication expired while waiting for the answer. The chat was created \
+         (chat_id={chat_id}, message_id={message_id}); re-authenticate, then re-check with \
+         action=message-details (chat_id={chat_id}, message_id={message_id})."
+    )
+}
+
+/// Bounded wait for an `ask` answer in the MCP path: activity long-poll +
+/// message-details confirmation, bounded by [`MCP_ASK_MAX_WAIT_SECS`].
+///
+/// Returns the completed message-details body on success, a `processing`
+/// payload on timeout, or an auth-expired error result on a 401. Extracted
+/// from `handle_ai_ask` to keep that handler within the line budget.
+async fn mcp_ask_wait(
+    client: &fastio_cli::client::ApiClient,
+    ctx_type: &str,
+    ctx_id: &str,
+    chat_id: &str,
+    message_id: &str,
+    warning: Option<&str>,
+) -> CallToolResult {
+    // On a mid-wait 401 (JWT expired) the chat was already created, so surface
+    // the recovery IDs and a re-check hint — mirroring the CLI `ask` path —
+    // rather than an opaque "authentication expired" with no way to recover.
+    let auth_expired = || error_text(&ask_auth_expired_text(chat_id, message_id));
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(MCP_ASK_MAX_WAIT_SECS);
+    let details_sub = format!(
+        "agent/{}/message/{}/details/",
+        urlencoding::encode(chat_id),
+        urlencoding::encode(message_id),
+    );
+    let mut lastactivity: Option<String> = None;
+    loop {
+        match api::ai::ai_api(client, ctx_type, ctx_id, &details_sub, "GET", None, None).await {
+            Ok(msg_data) => {
+                let msg = msg_data.get("message").unwrap_or(&msg_data);
+                // `state` may be a string OR a numeric JSON value; normalise via
+                // the same string-or-numeric extraction the CLI wait loop uses.
+                let state_str = json_value_field_to_string(msg, "state").unwrap_or_default();
+                if state_str == "complete" || state_str == "errored" {
+                    let mut msg_data = msg_data;
+                    attach_warning(&mut msg_data, warning);
+                    return success_json(&msg_data);
+                }
+            }
+            Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 401 => {
+                return auth_expired();
+            }
+            Err(_) => {}
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            let mut payload = serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "state": "processing",
+                "message": "Timed out waiting for the answer; re-check with action=message-details.",
+            });
+            attach_warning(&mut payload, warning);
+            return success_json(&payload);
+        }
+        let remaining = deadline.saturating_duration_since(now).as_secs();
+        let wait =
+            MCP_ASK_POLL_WAIT_SECS.min(u32::try_from(remaining).unwrap_or(MCP_ASK_POLL_WAIT_SECS));
+        match api::event::poll_activity(client, ctx_id, lastactivity.as_deref(), Some(wait), false)
+            .await
+        {
+            Ok(poll) => {
+                if let Some(ts) = poll.get("lastactivity").and_then(Value::as_str) {
+                    lastactivity = Some(ts.to_owned());
+                }
+            }
+            Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 401 => {
+                return auth_expired();
+            }
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+/// Normalise a JSON id value (string or numeric) to `String`.
+fn json_value_id_to_string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Read a JSON object field and normalise it (string OR numeric) to `String`.
+///
+/// Mirrors the CLI `extract_string_field` helper so the MCP `ask` wait loop
+/// reads `state` identically whether the server returns it as a string or a
+/// numeric JSON value.
+fn json_value_field_to_string(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(json_value_id_to_string)
+}
+
+/// Resolve the AI-memory scope from the MCP `context_type` arg, which for
+/// memory actions accepts `org` or `workspace` (NOT `share` — memory has no
+/// share scope). Returns an error result for any other value.
+fn resolve_memory_scope(
+    args: &Map<String, Value>,
+) -> Result<fastio_cli::api::ai_memory::MemoryScope, CallToolResult> {
+    match optional_str(args, "context_type").unwrap_or("workspace") {
+        "org" => Ok(fastio_cli::api::ai_memory::MemoryScope::Org),
+        "workspace" => Ok(fastio_cli::api::ai_memory::MemoryScope::Workspace),
+        other => Err(error_text(&format!(
+            "memory context_type must be \"org\" or \"workspace\", got {other:?}"
+        ))),
+    }
+}
+
+async fn handle_ai_memory_get(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let scope = match resolve_memory_scope(args) {
+        Ok(s) => s,
+        Err(e) => return Ok(e),
+    };
+    let ctx_id = match required_str(args, "context_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::ai_memory::get(&client, scope, ctx_id).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+async fn handle_ai_memory_set(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let scope = match resolve_memory_scope(args) {
+        Ok(s) => s,
+        Err(e) => return Ok(e),
+    };
+    let ctx_id = match required_str(args, "context_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let content = match required_str(args, "content") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    // `revision` is optional. Distinguish three cases:
+    //   - key ABSENT              → unconditional (last-writer-wins) write
+    //   - present, valid u64       → conditional (optimistic-concurrency) write
+    //   - present, NOT a valid u64 → reject BEFORE the write. This includes an
+    //     explicit `null`. Only a truly absent key means "unconditional"; a
+    //     present-but-invalid value (null, bool, float, object, array,
+    //     non-numeric string) is rejected. Silently dropping such a value —
+    //     including treating `null` as absent — would downgrade an intended
+    //     conditional write to an unconditional one (lost-update risk;
+    //     orgs.txt:2265).
+    // Accept both a JSON number and a numeric string (mirrors other MCP args).
+    let revision = match args.get("revision") {
+        None => None,
+        Some(v) => {
+            let parsed = v
+                .as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
+            match parsed {
+                Some(rev) => Some(rev),
+                None => {
+                    return Ok(error_text(
+                        "revision must be a non-negative integer (a number or numeric string)",
+                    ));
+                }
+            }
+        }
+    };
+    match api::ai_memory::set(&client, scope, ctx_id, content, revision).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+async fn handle_ai_memory_delete(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let scope = match resolve_memory_scope(args) {
+        Ok(s) => s,
+        Err(e) => return Ok(e),
+    };
+    let ctx_id = match required_str(args, "context_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::ai_memory::delete(&client, scope, ctx_id).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -8462,5 +8838,386 @@ mod ripley_tool_tests {
             !text.contains("failed to parse") && !text.contains("at least one file ID"),
             "JSON-array files should parse cleanly, got: {text}"
         );
+    }
+
+    #[test]
+    fn ripley_tool_advertises_phase2_actions() {
+        let tools = ToolRouter::list_tools().tools;
+        let ripley = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "ripley")
+            .expect("ripley tool present");
+        let schema = serde_json::to_string(&ripley.input_schema).unwrap_or_default();
+        for action in ["ask", "memory-get", "memory-set", "memory-delete"] {
+            assert!(
+                schema.contains(action),
+                "ripley schema must advertise the `{action}` action, got: {schema}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_get_routes_to_handler() {
+        // Unauthenticated → short-circuits at the auth gate inside handle_ai,
+        // proving `memory-get` routed (vs the unknown-action arm).
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("memory-get".to_owned()));
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(text.contains("Not authenticated"), "got: {text}");
+        assert!(!text.contains("Unknown ripley action"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_set_rejects_over_cap_content() {
+        // ai.txt: content is capped at 64KB; the api layer validates before
+        // the round-trip, so an over-cap write surfaces a Parse error.
+        let router = authed_router().await;
+        let big = "a".repeat(65_537);
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("memory-set".to_owned()));
+        args.insert("context_type".to_owned(), Value::String("org".to_owned()));
+        args.insert("context_id".to_owned(), Value::String("o1".to_owned()));
+        args.insert("content".to_owned(), Value::String(big));
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("65536") || text.contains("at most"),
+            "over-cap memory content must be rejected, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_set_rejects_non_numeric_revision() {
+        // A present-but-invalid revision must NOT be silently dropped (which
+        // would downgrade a conditional write to last-writer-wins). It must be
+        // rejected pre-network, BEFORE api::ai_memory::set runs. We pair it with
+        // an over-cap content so that, had the revision been silently dropped,
+        // the request would instead surface the 64KB content-cap error — proving
+        // the revision check fires first.
+        let router = authed_router().await;
+        let big = "a".repeat(65_537);
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("memory-set".to_owned()));
+        args.insert("context_type".to_owned(), Value::String("org".to_owned()));
+        args.insert("context_id".to_owned(), Value::String("o1".to_owned()));
+        args.insert("content".to_owned(), Value::String(big));
+        args.insert("revision".to_owned(), Value::String("abc".to_owned()));
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("revision must be a non-negative integer"),
+            "non-numeric revision must be rejected, got: {text}"
+        );
+        assert!(
+            !text.contains("65536") && !text.contains("at most"),
+            "revision check must fire before api::ai_memory::set, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_set_rejects_null_revision() {
+        // An explicit `null` revision is PRESENT-but-invalid, not absent. Per the
+        // lost-update contract (orgs.txt:2265) only a truly absent key means an
+        // unconditional write; a present `null` must be rejected pre-network so a
+        // conditional write is never silently downgraded to last-writer-wins. As
+        // with the other rejection test we pair it with over-cap content: surfacing
+        // the revision error (and NOT the 64KB content-cap error) proves the
+        // revision check fires before api::ai_memory::set.
+        let router = authed_router().await;
+        let big = "a".repeat(65_537);
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("memory-set".to_owned()));
+        args.insert("context_type".to_owned(), Value::String("org".to_owned()));
+        args.insert("context_id".to_owned(), Value::String("o1".to_owned()));
+        args.insert("content".to_owned(), Value::String(big));
+        args.insert("revision".to_owned(), Value::Null);
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("revision must be a non-negative integer"),
+            "a null revision must be rejected, got: {text}"
+        );
+        assert!(
+            !text.contains("65536") && !text.contains("at most"),
+            "revision check must fire before api::ai_memory::set, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_set_accepts_numeric_string_revision() {
+        // A valid numeric-string revision passes the MCP-handler check and
+        // proceeds into api::ai_memory::set as a CONDITIONAL write. With over-cap
+        // content, reaching the content-cap error (rather than the revision
+        // error) proves the revision was accepted and forwarded.
+        let router = authed_router().await;
+        let big = "a".repeat(65_537);
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("memory-set".to_owned()));
+        args.insert("context_type".to_owned(), Value::String("org".to_owned()));
+        args.insert("context_id".to_owned(), Value::String("o1".to_owned()));
+        args.insert("content".to_owned(), Value::String(big));
+        args.insert("revision".to_owned(), Value::String("5".to_owned()));
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("revision must be a non-negative integer"),
+            "a valid numeric-string revision must be accepted, got: {text}"
+        );
+        assert!(
+            text.contains("65536") || text.contains("at most"),
+            "a valid revision should proceed into the write path, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_set_accepts_number_revision() {
+        // Same as above but the revision arrives as a JSON number, not a string.
+        let router = authed_router().await;
+        let big = "a".repeat(65_537);
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("memory-set".to_owned()));
+        args.insert("context_type".to_owned(), Value::String("org".to_owned()));
+        args.insert("context_id".to_owned(), Value::String("o1".to_owned()));
+        args.insert("content".to_owned(), Value::String(big));
+        args.insert("revision".to_owned(), Value::Number(5.into()));
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("revision must be a non-negative integer"),
+            "a valid JSON-number revision must be accepted, got: {text}"
+        );
+        assert!(
+            text.contains("65536") || text.contains("at most"),
+            "a valid revision should proceed into the write path, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_set_omitted_revision_proceeds_unconditionally() {
+        // No revision key → unconditional write. The handler must NOT emit the
+        // revision-validation error and must proceed into the write path (here
+        // surfacing the over-cap content error, proving it got past the
+        // revision logic).
+        let router = authed_router().await;
+        let big = "a".repeat(65_537);
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("memory-set".to_owned()));
+        args.insert("context_type".to_owned(), Value::String("org".to_owned()));
+        args.insert("context_id".to_owned(), Value::String("o1".to_owned()));
+        args.insert("content".to_owned(), Value::String(big));
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("revision must be a non-negative integer"),
+            "an omitted revision must not trigger the revision error, got: {text}"
+        );
+        assert!(
+            text.contains("65536") || text.contains("at most"),
+            "an omitted revision should proceed unconditionally, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_rejects_share_context_type() {
+        // Memory has no share scope; context_type must be org or workspace.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("memory-get".to_owned()));
+        args.insert("context_type".to_owned(), Value::String("share".to_owned()));
+        args.insert("context_id".to_owned(), Value::String("s1".to_owned()));
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("org") && text.contains("workspace"),
+            "share context_type must be rejected for memory, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_autotitle_rejects_workspace_context() {
+        // autotitle is SHARE-ONLY (ai.txt:1079-1112). A workspace context must
+        // be rejected pre-network rather than mis-routed.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("autotitle".to_owned()));
+        args.insert(
+            "context_type".to_owned(),
+            Value::String("workspace".to_owned()),
+        );
+        args.insert("context_id".to_owned(), Value::String("ws1".to_owned()));
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("share-only"),
+            "autotitle with workspace context must be rejected, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_autotitle_share_delegates_not_rejected() {
+        // A share context is valid for autotitle; it must NOT hit the share-only
+        // rejection. The fake-token network attempt then fails, but the failure
+        // is a network/auth error — not the pre-network context rejection.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("autotitle".to_owned()));
+        args.insert("context_type".to_owned(), Value::String("share".to_owned()));
+        args.insert("context_id".to_owned(), Value::String("sh1".to_owned()));
+        args.insert("context".to_owned(), Value::String("focus hint".to_owned()));
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("share-only"),
+            "autotitle with a share context must reach delegation, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_transactions_rejects_share_context() {
+        // transactions is WORKSPACE-ONLY (ai.txt:935-981). A share context must
+        // be rejected pre-network rather than mis-routed.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("transactions".to_owned()),
+        );
+        args.insert("context_type".to_owned(), Value::String("share".to_owned()));
+        args.insert("context_id".to_owned(), Value::String("sh1".to_owned()));
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("workspace-only"),
+            "transactions with share context must be rejected, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_chat_create_share_kind_emits_warning() {
+        // `kind` is workspace-only; for a share it is dropped, and the handler
+        // surfaces a one-line warning rather than swallowing it silently. The
+        // network call fails on the fake token, but the chat-create warning is
+        // only attached on a successful create — so instead assert the request
+        // is NOT rejected for `kind` (lenient: no hard error mentioning kind).
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("chat-create".to_owned()));
+        args.insert("context_type".to_owned(), Value::String("share".to_owned()));
+        args.insert("context_id".to_owned(), Value::String("sh1".to_owned()));
+        args.insert("query_text".to_owned(), Value::String("hi".to_owned()));
+        args.insert("kind".to_owned(), Value::String("agent".to_owned()));
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        // Lenient: a share+kind create must not hard-error about `kind`.
+        assert!(
+            !text.contains("kind is not allowed") && !text.contains("invalid kind"),
+            "share+kind must be lenient (no hard kind error), got: {text}"
+        );
+    }
+
+    #[test]
+    fn ask_auth_expired_text_carries_recovery_ids() {
+        // FIX 3: the MCP `ask` 401 path must surface chat_id + message_id and a
+        // re-check hint so an agent can recover after re-authenticating.
+        let text = super::ask_auth_expired_text("chat-42", "msg-7");
+        assert!(text.contains("chat-42"), "must carry chat_id, got: {text}");
+        assert!(text.contains("msg-7"), "must carry message_id, got: {text}");
+        assert!(
+            text.contains("message-details"),
+            "must include a re-check hint, got: {text}"
+        );
+    }
+
+    #[test]
+    fn json_value_field_to_string_handles_string_and_numeric() {
+        // FIX 4: state normalisation must accept a string OR a numeric value,
+        // matching the CLI wait loop's `extract_string_field`.
+        let s = json!({"state": "complete"});
+        assert_eq!(
+            super::json_value_field_to_string(&s, "state").as_deref(),
+            Some("complete")
+        );
+        let n = json!({"state": 3});
+        assert_eq!(
+            super::json_value_field_to_string(&n, "state").as_deref(),
+            Some("3")
+        );
+        let missing = json!({});
+        assert!(super::json_value_field_to_string(&missing, "state").is_none());
+    }
+
+    #[test]
+    fn attach_warning_appends_to_warnings_array() {
+        // FIX 5: the lenient kind-drop note is surfaced under a `warnings` array.
+        let mut payload = json!({"chat_id": "c1"});
+        super::attach_warning(&mut payload, Some(super::KIND_SHARE_WARNING));
+        let warnings = payload
+            .get("warnings")
+            .and_then(Value::as_array)
+            .expect("warnings array present");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0].as_str(),
+            Some(super::KIND_SHARE_WARNING),
+            "warning text must match the kind-share note"
+        );
+        // None is a no-op.
+        let mut clean = json!({"chat_id": "c2"});
+        super::attach_warning(&mut clean, None);
+        assert!(clean.get("warnings").is_none());
+    }
+
+    #[tokio::test]
+    async fn unknown_ripley_action_reports_unknown() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("not-an-action".to_owned()),
+        );
+        let res = router
+            .call_tool("ripley", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(text.contains("Unknown ripley action"), "got: {text}");
     }
 }

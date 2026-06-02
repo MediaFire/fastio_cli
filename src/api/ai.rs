@@ -294,24 +294,70 @@ pub async fn list_messages(
     }
 }
 
-/// List all chats in a workspace.
+/// Optional filters for [`list_chats`].
 ///
-/// `GET /workspace/{workspace_id}/ai/agent/list/`
+/// Mirrors the `/ai/agent/list/` query surface
+/// (`~/vividengine/llms/ai.txt:320-333`):
+/// - `kind` — `user` (default), `agent`, or `all` (`ai.txt:331`).
+/// - `deleted` — when `true`, the `/deleted` path variant is requested
+///   instead (`ai.txt:333`).
+#[derive(Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct ListChatsOptions {
+    /// Maximum number of chats to return.
+    pub limit: Option<u32>,
+    /// Number of chats to skip for pagination.
+    pub offset: Option<u32>,
+    /// Filter by chat kind: `user`, `agent`, or `all`. `None` defers to the
+    /// server default (`user`).
+    pub kind: Option<String>,
+    /// List soft-deleted chats via the `/deleted` path variant.
+    pub deleted: bool,
+}
+
+impl ListChatsOptions {
+    /// Construct options carrying only `limit`/`offset` (no `kind` filter,
+    /// not deleted). Provided because the `#[non_exhaustive]` attribute
+    /// prevents struct-literal construction from other crates.
+    #[must_use]
+    pub fn paged(limit: Option<u32>, offset: Option<u32>) -> Self {
+        Self {
+            limit,
+            offset,
+            kind: None,
+            deleted: false,
+        }
+    }
+}
+
+/// List chats in a workspace.
+///
+/// `GET /workspace/{workspace_id}/ai/agent/list/` (or
+/// `.../ai/agent/list/deleted` when `options.deleted` is set —
+/// `~/vividengine/llms/ai.txt:333`). The `kind` filter
+/// (`user`/`agent`/`all`, `ai.txt:331`) is threaded through as a query param.
 pub async fn list_chats(
     client: &ApiClient,
     workspace_id: &str,
-    limit: Option<u32>,
-    offset: Option<u32>,
+    options: &ListChatsOptions,
 ) -> Result<Value, CliError> {
     let mut params = HashMap::new();
-    if let Some(l) = limit {
+    if let Some(l) = options.limit {
         params.insert("limit".to_owned(), l.to_string());
     }
-    if let Some(o) = offset {
+    if let Some(o) = options.offset {
         params.insert("offset".to_owned(), o.to_string());
     }
+    if let Some(k) = &options.kind {
+        params.insert("kind".to_owned(), k.clone());
+    }
+    let suffix = if options.deleted {
+        "list/deleted"
+    } else {
+        "list/"
+    };
     let path = format!(
-        "/workspace/{}/ai/agent/list/",
+        "/workspace/{}/ai/agent/{suffix}",
         urlencoding::encode(workspace_id),
     );
     if params.is_empty() {
@@ -319,6 +365,139 @@ pub async fn list_chats(
     } else {
         client.get_with_params(&path, &params).await
     }
+}
+
+/// List AI token-usage transactions for a workspace.
+///
+/// `GET /workspace/{workspace_id}/ai/transactions/`
+///
+/// Returns up to 40 most-recent transactions. **Workspace-only** — there is
+/// no share equivalent (`~/vividengine/llms/ai.txt:935-981`); the caller is
+/// responsible for rejecting a share context before calling this.
+pub async fn transactions(client: &ApiClient, workspace_id: &str) -> Result<Value, CliError> {
+    let path = format!(
+        "/workspace/{}/ai/transactions/",
+        urlencoding::encode(workspace_id),
+    );
+    client.get(&path).await
+}
+
+/// AI-generate a title, description, and display type for a share.
+///
+/// `POST /share/{share_id}/ai/autotitle/`
+///
+/// **Share-only** (`~/vividengine/llms/ai.txt:1079-1112`); the caller must
+/// reject a workspace context before calling this. The optional
+/// `user_context` form field guides generation. Generated values are applied
+/// directly to the share server-side.
+pub async fn autotitle(
+    client: &ApiClient,
+    share_id: &str,
+    user_context: Option<&str>,
+) -> Result<Value, CliError> {
+    let path = format!("/share/{}/ai/autotitle/", urlencoding::encode(share_id),);
+    let mut form = HashMap::new();
+    if let Some(c) = user_context {
+        form.insert("user_context".to_owned(), c.to_owned());
+    }
+    client.post(&path, &form).await
+}
+
+/// Get full details (and history) for a single chat.
+///
+/// `GET /{context_type}/{context_id}/ai/agent/{chat_id}/details/`
+///
+/// `context_type` must be `workspace` or `share`; any other value is rejected
+/// before a request is issued so a typo cannot mis-route.
+pub async fn chat_details(
+    client: &ApiClient,
+    context_type: &str,
+    context_id: &str,
+    chat_id: &str,
+) -> Result<Value, CliError> {
+    let path = agent_chat_path(context_type, context_id, chat_id, "details/")?;
+    client.get(&path).await
+}
+
+/// Rename a chat.
+///
+/// `POST /{context_type}/{context_id}/ai/agent/{chat_id}/update/` with a
+/// **form-encoded** `name` field. The chat `kind` is immutable and any `kind`
+/// in the body is ignored server-side (`~/vividengine/llms/ai.txt:499`).
+pub async fn update_chat(
+    client: &ApiClient,
+    context_type: &str,
+    context_id: &str,
+    chat_id: &str,
+    name: &str,
+) -> Result<Value, CliError> {
+    let path = agent_chat_path(context_type, context_id, chat_id, "update/")?;
+    let mut form = HashMap::new();
+    form.insert("name".to_owned(), name.to_owned());
+    client.post(&path, &form).await
+}
+
+/// Publish a private chat (make it public; one-way).
+///
+/// `POST /{context_type}/{context_id}/ai/agent/{chat_id}/publish/`. The body
+/// is empty — an empty form is sent.
+pub async fn publish_chat(
+    client: &ApiClient,
+    context_type: &str,
+    context_id: &str,
+    chat_id: &str,
+) -> Result<Value, CliError> {
+    let path = agent_chat_path(context_type, context_id, chat_id, "publish/")?;
+    let form: HashMap<String, String> = HashMap::new();
+    client.post(&path, &form).await
+}
+
+/// Soft-delete a chat.
+///
+/// `DELETE /{context_type}/{context_id}/ai/agent/{chat_id}/`. Deleted chats
+/// can still be listed via the `/deleted` list variant.
+pub async fn delete_chat(
+    client: &ApiClient,
+    context_type: &str,
+    context_id: &str,
+    chat_id: &str,
+) -> Result<Value, CliError> {
+    let path = agent_chat_path(context_type, context_id, chat_id, "")?;
+    client.delete(&path).await
+}
+
+/// Build a `/{context_type}/{context_id}/ai/agent/{chat_id}/{suffix}` path.
+///
+/// `context_type` is whitelisted to `workspace`/`share` so a typo cannot
+/// mis-route to an unintended endpoint; the IDs are trimmed and rejected if
+/// empty, then URL-encoded. `suffix` is appended verbatim (already a trusted
+/// literal at every call site, e.g. `details/`, `update/`, `publish/`, or
+/// `""` for the bare chat path).
+fn agent_chat_path(
+    context_type: &str,
+    context_id: &str,
+    chat_id: &str,
+    suffix: &str,
+) -> Result<String, CliError> {
+    if !matches!(context_type, "workspace" | "share") {
+        return Err(CliError::Parse(format!(
+            "context_type must be \"workspace\" or \"share\", got {context_type:?}",
+        )));
+    }
+    let context_id = context_id.trim();
+    let chat_id = chat_id.trim();
+    if context_id.is_empty() {
+        return Err(CliError::Parse("context_id must not be empty".to_owned()));
+    }
+    if chat_id.is_empty() {
+        return Err(CliError::Parse("chat_id must not be empty".to_owned()));
+    }
+    Ok(format!(
+        "/{}/{}/ai/agent/{}/{suffix}",
+        urlencoding::encode(context_type),
+        urlencoding::encode(context_id),
+        urlencoding::encode(chat_id),
+    ))
 }
 
 /// Semantic search over indexed workspace files.
@@ -460,10 +639,42 @@ pub async fn ai_api_form(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatCreateOptions, ChatScope, build_cancel_path, build_share_form, parse_cancel_response,
+        ChatCreateOptions, ChatScope, agent_chat_path, build_cancel_path, build_share_form,
+        parse_cancel_response,
     };
     use crate::error::CliError;
     use serde_json::json;
+
+    #[test]
+    fn agent_chat_path_builds_details_with_trailing_slash() {
+        let p = agent_chat_path("workspace", "WS1", "C1", "details/").expect("valid");
+        assert_eq!(p, "/workspace/WS1/ai/agent/C1/details/");
+    }
+
+    #[test]
+    fn agent_chat_path_bare_delete_path() {
+        // `delete_chat` passes an empty suffix → bare `/ai/agent/{id}/`.
+        let p = agent_chat_path("share", "S1", "C1", "").expect("valid");
+        assert_eq!(p, "/share/S1/ai/agent/C1/");
+    }
+
+    #[test]
+    fn agent_chat_path_rejects_bad_context_type() {
+        let err = agent_chat_path("org", "O1", "C1", "details/").expect_err("must reject");
+        assert!(matches!(err, CliError::Parse(_)));
+    }
+
+    #[test]
+    fn agent_chat_path_rejects_empty_ids() {
+        assert!(agent_chat_path("workspace", "  ", "C1", "update/").is_err());
+        assert!(agent_chat_path("workspace", "WS1", "", "update/").is_err());
+    }
+
+    #[test]
+    fn agent_chat_path_url_encodes_segments() {
+        let p = agent_chat_path("workspace", "ws id", "c/2", "publish/").expect("valid");
+        assert_eq!(p, "/workspace/ws%20id/ai/agent/c%2F2/publish/");
+    }
 
     #[test]
     fn cancel_path_workspace_scope_uses_agent_with_trailing_slash() {

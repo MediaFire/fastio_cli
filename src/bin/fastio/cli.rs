@@ -2122,6 +2122,38 @@ pub enum AssetCommands {
 #[derive(Subcommand, Debug)]
 #[non_exhaustive]
 pub enum RipleyCommands {
+    /// Ask Ripley a question and wait for the answer (headline verb).
+    Ask {
+        /// Workspace ID.
+        #[arg(long, required_unless_present = "share")]
+        workspace: Option<String>,
+        /// Share ID (alternative to workspace).
+        #[arg(long, conflicts_with = "workspace")]
+        share: Option<String>,
+        /// The question to ask.
+        question: String,
+        /// Scope to specific file versions: comma-separated `nodeId:versionId`
+        /// pairs (max 100). Cannot be combined with `--files-attach`.
+        #[arg(long)]
+        files_scope: Option<String>,
+        /// Scope to folders: comma-separated `nodeId:depth` pairs (max 100,
+        /// depth 1-10). Cannot be combined with `--files-attach`.
+        #[arg(long)]
+        folders_scope: Option<String>,
+        /// Attach specific file versions: comma-separated `nodeId:versionId`
+        /// pairs (max 20). Cannot be combined with the scope flags.
+        #[arg(long)]
+        files_attach: Option<String>,
+        /// Response style.
+        #[arg(long, value_parser = ["concise", "detailed"])]
+        personality: Option<String>,
+        /// Chat kind (workspace-only; `agent` requires the `ai_agent` plan feature).
+        #[arg(long, value_parser = ["user", "agent"])]
+        kind: Option<String>,
+        /// Return the chat/message IDs immediately without waiting for the answer.
+        #[arg(long)]
+        no_wait: bool,
+    },
     /// Send a chat message and get the AI response.
     Chat {
         /// Workspace ID.
@@ -2205,6 +2237,191 @@ pub enum RipleyCommands {
         /// Chat ID.
         #[arg(long)]
         chat_id: String,
+    },
+    /// List the caller's chats.
+    List {
+        /// Workspace ID.
+        #[arg(long, required_unless_present = "share")]
+        workspace: Option<String>,
+        /// Share ID (alternative to workspace).
+        #[arg(long, conflicts_with = "workspace")]
+        share: Option<String>,
+        /// Filter by chat kind.
+        #[arg(long, value_parser = ["user", "agent", "all"])]
+        kind: Option<String>,
+        /// List soft-deleted chats instead.
+        #[arg(long)]
+        deleted: bool,
+        /// Maximum number of results.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Show full details and history for a chat.
+    Details {
+        /// Workspace ID.
+        #[arg(long, required_unless_present = "share")]
+        workspace: Option<String>,
+        /// Share ID (alternative to workspace).
+        #[arg(long, conflicts_with = "workspace")]
+        share: Option<String>,
+        /// Chat ID.
+        chat_id: String,
+    },
+    /// List messages in a chat (oldest-first).
+    Messages {
+        /// Workspace ID.
+        #[arg(long, required_unless_present = "share")]
+        workspace: Option<String>,
+        /// Share ID (alternative to workspace).
+        #[arg(long, conflicts_with = "workspace")]
+        share: Option<String>,
+        /// Chat ID.
+        chat_id: String,
+        /// Maximum number of results.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Show a single message's details.
+    Message {
+        /// Workspace ID.
+        #[arg(long, required_unless_present = "share")]
+        workspace: Option<String>,
+        /// Share ID (alternative to workspace).
+        #[arg(long, conflicts_with = "workspace")]
+        share: Option<String>,
+        /// Chat ID.
+        chat_id: String,
+        /// Message ID.
+        message_id: String,
+    },
+    /// Rename a chat.
+    Update {
+        /// Workspace ID.
+        #[arg(long, required_unless_present = "share")]
+        workspace: Option<String>,
+        /// Share ID (alternative to workspace).
+        #[arg(long, conflicts_with = "workspace")]
+        share: Option<String>,
+        /// Chat ID.
+        chat_id: String,
+        /// New chat name.
+        #[arg(long)]
+        name: String,
+    },
+    /// Publish a private chat (make it public; one-way).
+    Publish {
+        /// Workspace ID.
+        #[arg(long, required_unless_present = "share")]
+        workspace: Option<String>,
+        /// Share ID (alternative to workspace).
+        #[arg(long, conflicts_with = "workspace")]
+        share: Option<String>,
+        /// Chat ID.
+        chat_id: String,
+    },
+    /// Soft-delete a chat.
+    Delete {
+        /// Workspace ID.
+        #[arg(long, required_unless_present = "share")]
+        workspace: Option<String>,
+        /// Share ID (alternative to workspace).
+        #[arg(long, conflicts_with = "workspace")]
+        share: Option<String>,
+        /// Chat ID.
+        chat_id: String,
+    },
+    /// List recent AI token-usage transactions (workspace-only).
+    Transactions {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+    },
+    /// AI-generate a title and description for a share (share-only).
+    Autotitle {
+        /// Share ID.
+        #[arg(long)]
+        share: String,
+        /// Optional context to guide generation.
+        #[arg(long)]
+        user_context: Option<String>,
+    },
+    /// Manage the caller's AI-memory blob (org or workspace; self-only).
+    #[command(subcommand)]
+    Memory(RipleyMemoryCommands),
+    /// Hand work to Ripley to run on your behalf (not yet available).
+    #[command(hide = true, alias = "run")]
+    Delegate {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Share ID (alternative to workspace).
+        #[arg(long, conflicts_with = "workspace")]
+        share: Option<String>,
+        /// The instruction to delegate.
+        instruction: String,
+    },
+    /// Show the status of a delegated job (not yet available).
+    #[command(hide = true)]
+    Status {
+        /// Delegated-job ID.
+        id: String,
+    },
+    /// Show the tool-call log of a delegated job (not yet available).
+    #[command(hide = true)]
+    Logs {
+        /// Delegated-job ID.
+        id: String,
+    },
+    /// Cancel an in-flight delegated job (not yet available).
+    #[command(hide = true, name = "cancel-job")]
+    CancelJob {
+        /// Delegated-job ID.
+        id: String,
+    },
+}
+
+/// Ripley AI-memory subcommands (self-only; org or workspace scope).
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum RipleyMemoryCommands {
+    /// Read the caller's AI-memory blob.
+    Get {
+        /// Organization ID.
+        #[arg(long, required_unless_present = "workspace")]
+        org: Option<String>,
+        /// Workspace ID (alternative to org).
+        #[arg(long, conflicts_with = "org")]
+        workspace: Option<String>,
+    },
+    /// Write the caller's AI-memory blob (≤64KB; optional revision CAS).
+    Set {
+        /// Organization ID.
+        #[arg(long, required_unless_present = "workspace")]
+        org: Option<String>,
+        /// Workspace ID (alternative to org).
+        #[arg(long, conflicts_with = "org")]
+        workspace: Option<String>,
+        /// New markdown content (max 64KB; empty string stores an empty row).
+        content: String,
+        /// Optimistic-concurrency revision: write only if the row's current
+        /// revision matches (409 on mismatch).
+        #[arg(long)]
+        revision: Option<u64>,
+    },
+    /// Hard-delete the caller's AI-memory blob.
+    Delete {
+        /// Organization ID.
+        #[arg(long, required_unless_present = "workspace")]
+        org: Option<String>,
+        /// Workspace ID (alternative to org).
+        #[arg(long, conflicts_with = "org")]
+        workspace: Option<String>,
     },
 }
 
@@ -3639,5 +3856,236 @@ mod ripley_alias_tests {
             }
             other => panic!("expected Ripley(Chat), got {other:?}"),
         }
+    }
+
+    // ── Phase 2 surface parse tests ──────────────────────────────────────
+
+    use super::RipleyMemoryCommands;
+
+    #[test]
+    fn ask_parses_with_workspace_and_no_wait() {
+        let cli = Cli::try_parse_from([
+            "fastio",
+            "ripley",
+            "ask",
+            "--workspace",
+            "ws1",
+            "--no-wait",
+            "what is up?",
+        ])
+        .expect("ripley ask should parse");
+        match cli.command {
+            Commands::Ripley(RipleyCommands::Ask {
+                workspace,
+                share,
+                question,
+                no_wait,
+                ..
+            }) => {
+                assert_eq!(workspace.as_deref(), Some("ws1"));
+                assert!(share.is_none());
+                assert_eq!(question, "what is up?");
+                assert!(no_wait);
+            }
+            other => panic!("expected Ripley(Ask), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_workspace_and_share_conflict() {
+        // --workspace and --share are mutually exclusive.
+        let res = Cli::try_parse_from([
+            "fastio",
+            "ripley",
+            "ask",
+            "--workspace",
+            "ws1",
+            "--share",
+            "s1",
+            "q",
+        ]);
+        assert!(res.is_err(), "workspace + share must conflict");
+    }
+
+    #[test]
+    fn ask_requires_workspace_or_share() {
+        let res = Cli::try_parse_from(["fastio", "ripley", "ask", "q"]);
+        assert!(res.is_err(), "ask must require --workspace or --share");
+    }
+
+    #[test]
+    fn list_parses_kind_and_deleted() {
+        let cli = Cli::try_parse_from([
+            "fastio",
+            "ripley",
+            "list",
+            "--share",
+            "s1",
+            "--kind",
+            "agent",
+            "--deleted",
+        ])
+        .expect("ripley list should parse");
+        match cli.command {
+            Commands::Ripley(RipleyCommands::List {
+                share,
+                kind,
+                deleted,
+                ..
+            }) => {
+                assert_eq!(share.as_deref(), Some("s1"));
+                assert_eq!(kind.as_deref(), Some("agent"));
+                assert!(deleted);
+            }
+            other => panic!("expected Ripley(List), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_rejects_bad_kind() {
+        let res = Cli::try_parse_from([
+            "fastio",
+            "ripley",
+            "list",
+            "--workspace",
+            "ws1",
+            "--kind",
+            "bogus",
+        ]);
+        assert!(res.is_err(), "invalid --kind must be rejected");
+    }
+
+    #[test]
+    fn transactions_is_workspace_only() {
+        let cli = Cli::try_parse_from(["fastio", "ripley", "transactions", "--workspace", "ws1"])
+            .expect("transactions should parse");
+        match cli.command {
+            Commands::Ripley(RipleyCommands::Transactions { workspace }) => {
+                assert_eq!(workspace, "ws1");
+            }
+            other => panic!("expected Ripley(Transactions), got {other:?}"),
+        }
+        // No `--share` flag exists on transactions.
+        let res = Cli::try_parse_from(["fastio", "ripley", "transactions", "--share", "s1"]);
+        assert!(res.is_err(), "transactions must not accept --share");
+    }
+
+    #[test]
+    fn autotitle_is_share_only() {
+        let cli = Cli::try_parse_from(["fastio", "ripley", "autotitle", "--share", "s1"])
+            .expect("autotitle should parse");
+        match cli.command {
+            Commands::Ripley(RipleyCommands::Autotitle { share, .. }) => {
+                assert_eq!(share, "s1");
+            }
+            other => panic!("expected Ripley(Autotitle), got {other:?}"),
+        }
+        let res = Cli::try_parse_from(["fastio", "ripley", "autotitle", "--workspace", "ws1"]);
+        assert!(res.is_err(), "autotitle must not accept --workspace");
+    }
+
+    #[test]
+    fn memory_set_parses_org_content_revision() {
+        let cli = Cli::try_parse_from([
+            "fastio",
+            "ripley",
+            "memory",
+            "set",
+            "--org",
+            "o1",
+            "--revision",
+            "7",
+            "hello",
+        ])
+        .expect("memory set should parse");
+        match cli.command {
+            Commands::Ripley(RipleyCommands::Memory(RipleyMemoryCommands::Set {
+                org,
+                workspace,
+                content,
+                revision,
+            })) => {
+                assert_eq!(org.as_deref(), Some("o1"));
+                assert!(workspace.is_none());
+                assert_eq!(content, "hello");
+                assert_eq!(revision, Some(7));
+            }
+            other => panic!("expected Ripley(Memory(Set)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_get_requires_org_or_workspace() {
+        let res = Cli::try_parse_from(["fastio", "ripley", "memory", "get"]);
+        assert!(res.is_err(), "memory get must require --org or --workspace");
+    }
+
+    #[test]
+    fn memory_org_and_workspace_conflict() {
+        let res = Cli::try_parse_from([
+            "fastio",
+            "ripley",
+            "memory",
+            "get",
+            "--org",
+            "o1",
+            "--workspace",
+            "ws1",
+        ]);
+        assert!(res.is_err(), "memory --org + --workspace must conflict");
+    }
+
+    #[test]
+    fn delegated_job_stubs_parse_but_are_hidden() {
+        // The hidden stubs still parse (so the "pending" message can fire),
+        // but must not be advertised in help.
+        let cli = Cli::try_parse_from(["fastio", "ripley", "delegate", "do a thing"])
+            .expect("delegate should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Ripley(RipleyCommands::Delegate { .. })
+        ));
+        // `run` is a hidden alias of `delegate`.
+        let cli = Cli::try_parse_from(["fastio", "ripley", "run", "do a thing"])
+            .expect("run alias should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Ripley(RipleyCommands::Delegate { .. })
+        ));
+        for verb in ["status", "logs", "cancel-job"] {
+            let cli = Cli::try_parse_from(["fastio", "ripley", verb, "JOB123"])
+                .unwrap_or_else(|e| panic!("`ripley {verb}` should parse: {e}"));
+            assert!(matches!(cli.command, Commands::Ripley(_)));
+        }
+    }
+
+    #[test]
+    fn delegated_job_verbs_are_not_listed_in_ripley_help() {
+        // Render the `ripley` subcommand's help and confirm the hidden
+        // delegated-job verbs do not appear as listed subcommands.
+        let mut cmd = Cli::command();
+        let ripley = cmd
+            .find_subcommand_mut("ripley")
+            .expect("ripley subcommand present");
+        let help = ripley.render_long_help().to_string();
+        for hidden in ["delegate", "status", "logs", "cancel-job"] {
+            let listed = help.lines().any(|l| {
+                let t = l.trim_start();
+                t == hidden || t.starts_with(&format!("{hidden} "))
+            });
+            assert!(
+                !listed,
+                "hidden delegated-job verb `{hidden}` must not be listed in help"
+            );
+        }
+        // The headline `ask` and `memory` verbs ARE visible.
+        assert!(
+            help.contains("ask"),
+            "`ask` should be visible in ripley help"
+        );
+        assert!(
+            help.contains("memory"),
+            "`memory` should be visible in ripley help"
+        );
     }
 }

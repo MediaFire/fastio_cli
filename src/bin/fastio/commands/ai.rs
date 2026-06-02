@@ -19,10 +19,187 @@ const MAX_POLL_ATTEMPTS: u32 = 15;
 /// Delay between poll attempts in seconds.
 const POLL_DELAY_SECS: u64 = 2;
 
+/// Resolved scope/attachment flags for the `ask`/`chat` verbs, carried from
+/// the clap layer into the internal command enum.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct AskScopeFlags {
+    /// `--files-scope`: comma-separated `nodeId:versionId` pairs.
+    pub files_scope: Option<String>,
+    /// `--folders-scope`: comma-separated `nodeId:depth` pairs.
+    pub folders_scope: Option<String>,
+    /// `--files-attach`: comma-separated `nodeId:versionId` pairs.
+    pub files_attach: Option<String>,
+}
+
+/// AI-memory scope, resolved from the clap `--org` XOR `--workspace` flags.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum MemoryTarget {
+    /// Organization-scoped memory.
+    Org(String),
+    /// Workspace-scoped memory.
+    Workspace(String),
+}
+
+/// AI-memory subcommand variants.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum MemoryCommand {
+    /// Read the caller's memory row.
+    Get(MemoryTarget),
+    /// Write the caller's memory row (optional revision CAS).
+    Set {
+        /// Org- or workspace-scoped target.
+        target: MemoryTarget,
+        /// New content (≤64KB).
+        content: String,
+        /// Optimistic-concurrency revision.
+        revision: Option<u64>,
+    },
+    /// Hard-delete the caller's memory row.
+    Delete(MemoryTarget),
+}
+
 /// AI subcommand variants.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum AiCommand {
+    /// Ask a question and wait for the answer (headline verb).
+    Ask {
+        /// Profile type: `workspace` or `share`.
+        profile_type: String,
+        /// Profile ID (workspace ID or share ID).
+        profile_id: String,
+        /// The question to ask.
+        question: String,
+        /// Scope/attachment flags.
+        scope: AskScopeFlags,
+        /// Response style (`concise` / `detailed`).
+        personality: Option<String>,
+        /// Chat kind (`user` / `agent`; workspace-only).
+        kind: Option<String>,
+        /// Return IDs immediately without waiting for the answer.
+        no_wait: bool,
+    },
+    /// Show full details (and history) for a chat.
+    Details {
+        /// Profile type: `workspace` or `share`.
+        profile_type: String,
+        /// Profile ID.
+        profile_id: String,
+        /// Chat ID.
+        chat_id: String,
+    },
+    /// List messages in a chat.
+    Messages {
+        /// Profile type: `workspace` or `share`.
+        profile_type: String,
+        /// Profile ID.
+        profile_id: String,
+        /// Chat ID.
+        chat_id: String,
+        /// Max results.
+        limit: Option<u32>,
+        /// Offset for pagination.
+        offset: Option<u32>,
+    },
+    /// Show a single message's details.
+    Message {
+        /// Profile type: `workspace` or `share`.
+        profile_type: String,
+        /// Profile ID.
+        profile_id: String,
+        /// Chat ID.
+        chat_id: String,
+        /// Message ID.
+        message_id: String,
+    },
+    /// List the caller's chats (workspace context only for `kind`/`deleted`).
+    List {
+        /// Profile type: `workspace` or `share`.
+        profile_type: String,
+        /// Profile ID.
+        profile_id: String,
+        /// Filter by chat kind (`user`/`agent`/`all`).
+        kind: Option<String>,
+        /// List soft-deleted chats.
+        deleted: bool,
+        /// Max results.
+        limit: Option<u32>,
+        /// Offset for pagination.
+        offset: Option<u32>,
+    },
+    /// Rename a chat.
+    Update {
+        /// Profile type: `workspace` or `share`.
+        profile_type: String,
+        /// Profile ID.
+        profile_id: String,
+        /// Chat ID.
+        chat_id: String,
+        /// New name.
+        name: String,
+    },
+    /// Publish a private chat (make it public; one-way).
+    Publish {
+        /// Profile type: `workspace` or `share`.
+        profile_type: String,
+        /// Profile ID.
+        profile_id: String,
+        /// Chat ID.
+        chat_id: String,
+    },
+    /// Soft-delete a chat.
+    Delete {
+        /// Profile type: `workspace` or `share`.
+        profile_type: String,
+        /// Profile ID.
+        profile_id: String,
+        /// Chat ID.
+        chat_id: String,
+    },
+    /// List recent AI token-usage transactions (workspace-only).
+    Transactions {
+        /// Workspace ID.
+        workspace: String,
+    },
+    /// AI-generate a title/description for a share (share-only).
+    Autotitle {
+        /// Share ID.
+        share: String,
+        /// Optional context to guide generation.
+        user_context: Option<String>,
+    },
+    /// Manage the caller's AI memory (org or workspace; self-only).
+    Memory(MemoryCommand),
+    /// Hand work to Ripley to run on the caller's behalf. The server
+    /// delegation contract is not finalized, so this is a guarded stub —
+    /// the payload is retained for the forthcoming wiring but unread today
+    /// (the handler emits a "pending" message and calls no endpoint).
+    Delegate {
+        /// The instruction the caller wanted to delegate (unused while pending).
+        #[allow(dead_code)]
+        instruction: String,
+    },
+    /// Show the status of a delegated job (guarded stub; see [`AiCommand::Delegate`]).
+    JobStatus {
+        /// Delegated-job ID (unused while pending).
+        #[allow(dead_code)]
+        id: String,
+    },
+    /// Show the tool-call log of a delegated job (guarded stub; see [`AiCommand::Delegate`]).
+    JobLogs {
+        /// Delegated-job ID (unused while pending).
+        #[allow(dead_code)]
+        id: String,
+    },
+    /// Cancel an in-flight delegated job (guarded stub; see [`AiCommand::Delegate`]).
+    JobCancel {
+        /// Delegated-job ID (unused while pending).
+        #[allow(dead_code)]
+        id: String,
+    },
     /// Send a chat message and poll for the AI response.
     Chat {
         /// Workspace ID.
@@ -85,8 +262,124 @@ pub enum AiCommand {
 }
 
 /// Execute an AI subcommand.
+#[allow(clippy::too_many_lines)]
 pub async fn execute(command: &AiCommand, ctx: &CommandContext<'_>) -> Result<()> {
     match command {
+        AiCommand::Ask {
+            profile_type,
+            profile_id,
+            question,
+            scope,
+            personality,
+            kind,
+            no_wait,
+        } => {
+            ask(
+                ctx,
+                profile_type,
+                profile_id,
+                question,
+                scope,
+                personality.as_deref(),
+                kind.as_deref(),
+                *no_wait,
+            )
+            .await
+        }
+        AiCommand::Details {
+            profile_type,
+            profile_id,
+            chat_id,
+        } => {
+            let client = ctx.build_client()?;
+            let value = api::ai::chat_details(&client, profile_type, profile_id, chat_id)
+                .await
+                .context("failed to get chat details")?;
+            ctx.output.render(&value)?;
+            Ok(())
+        }
+        AiCommand::Messages {
+            profile_type,
+            profile_id,
+            chat_id,
+            limit,
+            offset,
+        } => messages(ctx, profile_type, profile_id, chat_id, *limit, *offset).await,
+        AiCommand::Message {
+            profile_type,
+            profile_id,
+            chat_id,
+            message_id,
+        } => message(ctx, profile_type, profile_id, chat_id, message_id).await,
+        AiCommand::List {
+            profile_type,
+            profile_id,
+            kind,
+            deleted,
+            limit,
+            offset,
+        } => {
+            list_chats(
+                ctx,
+                profile_type,
+                profile_id,
+                kind.as_deref(),
+                *deleted,
+                *limit,
+                *offset,
+            )
+            .await
+        }
+        AiCommand::Update {
+            profile_type,
+            profile_id,
+            chat_id,
+            name,
+        } => {
+            let client = ctx.build_client()?;
+            let value = api::ai::update_chat(&client, profile_type, profile_id, chat_id, name)
+                .await
+                .context("failed to rename chat")?;
+            ctx.output.render(&value)?;
+            Ok(())
+        }
+        AiCommand::Publish {
+            profile_type,
+            profile_id,
+            chat_id,
+        } => {
+            let client = ctx.build_client()?;
+            let value = api::ai::publish_chat(&client, profile_type, profile_id, chat_id)
+                .await
+                .context("failed to publish chat")?;
+            ctx.output.render(&value)?;
+            Ok(())
+        }
+        AiCommand::Delete {
+            profile_type,
+            profile_id,
+            chat_id,
+        } => {
+            let client = ctx.build_client()?;
+            let value = api::ai::delete_chat(&client, profile_type, profile_id, chat_id)
+                .await
+                .context("failed to delete chat")?;
+            ctx.output.render(&value)?;
+            Ok(())
+        }
+        AiCommand::Transactions { workspace } => transactions(ctx, workspace).await,
+        AiCommand::Autotitle {
+            share,
+            user_context,
+        } => autotitle(ctx, share, user_context.as_deref()).await,
+        AiCommand::Memory(mem) => memory(ctx, mem).await,
+        // All four delegated-job stubs share the same guarded "pending"
+        // response and call no endpoint (the server delegation contract is
+        // not finalized — see phase2.log "Delegated-job contract").
+        AiCommand::Delegate { .. }
+        | AiCommand::JobStatus { .. }
+        | AiCommand::JobLogs { .. }
+        | AiCommand::JobCancel { .. } => delegated_jobs_unavailable(),
         AiCommand::Chat {
             workspace,
             message,
@@ -483,7 +776,8 @@ async fn history(
             .context("failed to list chat messages")?;
         ctx.output.render(&value)?;
     } else {
-        let value = api::ai::list_chats(&client, workspace, limit, offset)
+        let options = api::ai::ListChatsOptions::paged(limit, offset);
+        let value = api::ai::list_chats(&client, workspace, &options)
             .await
             .context("failed to list chats")?;
         ctx.output.render(&value)?;
@@ -535,6 +829,576 @@ async fn cancel(
         .context("failed to cancel AI chat message")?;
     ctx.output.render(&value)?;
     Ok(())
+}
+
+/// Maximum wall-clock the `ask` wait loop will spend before giving up, in
+/// seconds. The activity-poll long-poll holds the connection up to ~95s
+/// server-side; a JWT also expires after ~1 hour. We bound total waiting well
+/// under the JWT lifetime so a stuck/very-slow answer surfaces a clear timeout
+/// rather than hanging indefinitely (and eventually 401-ing mid-loop).
+const ASK_MAX_WAIT_SECS: u64 = 300;
+
+/// Per-iteration long-poll `wait` hint passed to the activity endpoint, in
+/// seconds. The server caps this at 95s; we use a smaller value so each
+/// iteration returns promptly and the overall budget is checked frequently.
+const ASK_POLL_WAIT_SECS: u32 = 20;
+
+/// Ask Ripley a question: create a chat, then (unless `--no-wait`) wait for
+/// the answer via the existing activity-poll loop and a message-details fetch.
+///
+/// Both workspace and share contexts are supported via the context-aware
+/// `ai_api_form`/`ai_api` builders. `privacy`/`kind` are workspace-only, so
+/// `kind` is forwarded only in a workspace context (share rejects it).
+#[allow(clippy::too_many_arguments)]
+async fn ask(
+    ctx: &CommandContext<'_>,
+    profile_type: &str,
+    profile_id: &str,
+    question: &str,
+    scope: &AskScopeFlags,
+    personality: Option<&str>,
+    kind: Option<&str>,
+    no_wait: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        !profile_id.trim().is_empty(),
+        "{profile_type} ID must not be empty"
+    );
+    anyhow::ensure!(!question.trim().is_empty(), "question must not be empty");
+    // Mutual exclusion: files_attach cannot combine with files_scope/folders_scope
+    // (ai.txt:115,311,609). Enforce client-side before the round-trip.
+    anyhow::ensure!(
+        !(scope.files_attach.is_some()
+            && (scope.files_scope.is_some() || scope.folders_scope.is_some())),
+        "files_attach cannot be combined with files_scope/folders_scope — use one or the other"
+    );
+    // `kind` is workspace-only; a share rejects it, so it's silently dropped for
+    // a share context. Note the drop on stderr (gated on quiet, like the
+    // deprecation notices) rather than hard-erroring — keep the call lenient.
+    if profile_type == "share" && kind.is_some() && !ctx.output.quiet {
+        eprintln!("Note: --kind is workspace-only and was ignored for this share.");
+    }
+
+    let client = ctx.build_client()?;
+
+    // Build the create form (always form-encoded; documented field set only).
+    let mut form = std::collections::HashMap::new();
+    form.insert("type".to_owned(), "chat_with_files".to_owned());
+    form.insert("question".to_owned(), question.to_owned());
+    form.insert(
+        "personality".to_owned(),
+        personality.unwrap_or("detailed").to_owned(),
+    );
+    // `kind` is workspace-only — share chats reject it.
+    if profile_type == "workspace"
+        && let Some(k) = kind
+    {
+        form.insert("kind".to_owned(), k.to_owned());
+    }
+    if let Some(v) = &scope.files_scope {
+        form.insert("files_scope".to_owned(), v.clone());
+    }
+    if let Some(v) = &scope.folders_scope {
+        form.insert("folders_scope".to_owned(), v.clone());
+    }
+    if let Some(v) = &scope.files_attach {
+        form.insert("files_attach".to_owned(), v.clone());
+    }
+
+    let resp = api::ai::ai_api_form(&client, profile_type, profile_id, "agent/", &form)
+        .await
+        .context("failed to create AI chat")?;
+
+    let chat_id =
+        extract_chat_id(&resp).ok_or_else(|| anyhow::anyhow!("no chat_id in response"))?;
+    let message_id =
+        extract_message_id(&resp).ok_or_else(|| anyhow::anyhow!("no message_id in response"))?;
+
+    if no_wait {
+        let result = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "state": "processing",
+        });
+        ctx.output.render(&result)?;
+        return Ok(());
+    }
+
+    if !ctx.output.quiet {
+        eprintln!("Waiting for Ripley's answer...");
+    }
+
+    let final_msg = wait_for_answer(&client, profile_type, profile_id, &chat_id, &message_id).await;
+    match final_msg {
+        WaitOutcome::Complete(msg) => {
+            let result = render_answer(&chat_id, &message_id, &msg);
+            ctx.output.render(&result)?;
+            Ok(())
+        }
+        WaitOutcome::TimedOut => {
+            let result = serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "state": "processing",
+                "message": format!(
+                    "Timed out after ~{ASK_MAX_WAIT_SECS}s waiting for the answer. \
+                     The AI may still be processing — re-check with \
+                     `fastio ripley message --{profile_type} {profile_id} {chat_id} {message_id}`."
+                ),
+            });
+            ctx.output.render(&result)?;
+            Ok(())
+        }
+        WaitOutcome::AuthExpired => {
+            anyhow::bail!(
+                "authentication expired while waiting for the answer. The chat was created \
+                 (chat_id={chat_id}, message_id={message_id}); re-authenticate \
+                 (`fastio auth login`) and re-check with \
+                 `fastio ripley message --{profile_type} {profile_id} {chat_id} {message_id}`."
+            );
+        }
+    }
+}
+
+/// Outcome of the bounded `ask` wait loop.
+enum WaitOutcome {
+    /// The message reached `complete`/`errored`; carries its details body.
+    Complete(Value),
+    /// The wait budget elapsed without a terminal state.
+    TimedOut,
+    /// A 401 surfaced (JWT expired mid-wait).
+    AuthExpired,
+}
+
+/// Bounded wait for an answer using the documented activity-poll + a
+/// message-details confirmation.
+///
+/// Strategy (per `~/vividengine/llms/ai.txt:1000-1014,1812-1830`): long-poll
+/// the workspace/share activity endpoint (which returns promptly on any
+/// change and otherwise holds ~95s), then fetch message details once to read
+/// the authoritative `state`. We do NOT poll message-details in a tight loop
+/// (the doc's anti-pattern). The loop is bounded by [`ASK_MAX_WAIT_SECS`] so
+/// it cannot hang past a JWT's lifetime; a 401 short-circuits to
+/// [`WaitOutcome::AuthExpired`] with a re-auth hint.
+async fn wait_for_answer(
+    client: &fastio_cli::client::ApiClient,
+    profile_type: &str,
+    profile_id: &str,
+    chat_id: &str,
+    message_id: &str,
+) -> WaitOutcome {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(ASK_MAX_WAIT_SECS);
+    let mut lastactivity: Option<String> = None;
+    // Context-aware message-details sub-path. `get_message_details` is
+    // workspace-hardcoded, so use the context-aware `ai_api` builder here —
+    // `profile_id` may be a share id when `ask` is share-scoped.
+    let details_sub = format!(
+        "agent/{}/message/{}/details/",
+        urlencoding::encode(chat_id),
+        urlencoding::encode(message_id),
+    );
+
+    loop {
+        // First, read the authoritative message state. If it's already
+        // terminal, we're done (also covers a fast/cached answer before the
+        // first poll). A 401 here means the JWT expired.
+        match api::ai::ai_api(
+            client,
+            profile_type,
+            profile_id,
+            &details_sub,
+            "GET",
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(msg_data) => {
+                let msg = msg_data.get("message").unwrap_or(&msg_data);
+                let state = extract_string_field(msg, "state").unwrap_or_default();
+                if state == "complete" || state == "errored" {
+                    return WaitOutcome::Complete(msg_data);
+                }
+            }
+            Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 401 => {
+                return WaitOutcome::AuthExpired;
+            }
+            // Transient details errors are tolerated — fall through to the
+            // long-poll and retry on the next iteration.
+            Err(_) => {}
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return WaitOutcome::TimedOut;
+        }
+
+        // Long-poll activity. The server returns promptly when the
+        // `ai_chat:{chatId}` key fires; otherwise it holds the connection.
+        // Activity-poll uses the same `/activity/poll/{id}/` endpoint for both
+        // workspace and share profile ids.
+        let remaining = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_secs();
+        if remaining == 0 {
+            return WaitOutcome::TimedOut;
+        }
+        let wait = ASK_POLL_WAIT_SECS.min(u32::try_from(remaining).unwrap_or(ASK_POLL_WAIT_SECS));
+        match api::event::poll_activity(
+            client,
+            profile_id,
+            lastactivity.as_deref(),
+            Some(wait),
+            false,
+        )
+        .await
+        {
+            Ok(poll) => {
+                if let Some(ts) = poll.get("lastactivity").and_then(Value::as_str) {
+                    lastactivity = Some(ts.to_owned());
+                }
+            }
+            Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 401 => {
+                return WaitOutcome::AuthExpired;
+            }
+            // A transient poll error shouldn't abort the wait; back off briefly
+            // and retry the details check.
+            Err(_) => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return WaitOutcome::TimedOut;
+        }
+    }
+}
+
+/// Extract the chat id from a create-chat response, handling the documented
+/// `chat.id` shape plus the legacy `chat_id`/`id` fallbacks.
+fn extract_chat_id(resp: &Value) -> Option<String> {
+    let v = resp
+        .get("chat_id")
+        .or_else(|| resp.get("chat").and_then(|c| c.get("id")))
+        .or_else(|| resp.get("id"))?;
+    json_id_to_string(v)
+}
+
+/// Extract the initial message id from a create-chat response, handling the
+/// documented `chat.message.id` shape plus the legacy fallbacks.
+fn extract_message_id(resp: &Value) -> Option<String> {
+    let v = resp
+        .get("message_id")
+        .or_else(|| {
+            resp.get("chat")
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("id"))
+        })
+        .or_else(|| resp.get("message").and_then(|m| m.get("id")))
+        .or_else(|| resp.get("message").and_then(|m| m.get("message_id")))?;
+    json_id_to_string(v)
+}
+
+/// Normalise a JSON id (string or numeric) to `String`.
+fn json_id_to_string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Build the rendered answer payload from a completed message-details body.
+fn render_answer(chat_id: &str, message_id: &str, msg_data: &Value) -> Value {
+    let msg = msg_data.get("message").unwrap_or(msg_data);
+    let state = extract_string_field(msg, "state").unwrap_or_default();
+    // The response text lives at top-level `text` (ai.txt:761) or
+    // `response.text`; accept either.
+    let response_text = msg_data
+        .get("text")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            msg.get("response")
+                .and_then(|r| r.get("text"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| msg.get("text").and_then(Value::as_str))
+        .unwrap_or_default();
+
+    let mut result = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "state": state,
+        "response": response_text,
+    });
+    // Citations may appear at top-level, `response.citations`, or `citations`.
+    let citations = msg_data
+        .get("citations")
+        .cloned()
+        .or_else(|| extract_citations(msg));
+    if let Some(c) = citations
+        && let Some(obj) = result.as_object_mut()
+    {
+        obj.insert("citations".to_owned(), c);
+    }
+    result
+}
+
+/// List messages in a chat (context-aware).
+async fn messages(
+    ctx: &CommandContext<'_>,
+    profile_type: &str,
+    profile_id: &str,
+    chat_id: &str,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let mut params = std::collections::HashMap::new();
+    if let Some(l) = limit {
+        params.insert("limit".to_owned(), l.to_string());
+    }
+    if let Some(o) = offset {
+        params.insert("offset".to_owned(), o.to_string());
+    }
+    let sub = format!("agent/{}/messages/list/", urlencoding::encode(chat_id));
+    let p = if params.is_empty() {
+        None
+    } else {
+        Some(&params)
+    };
+    let value = api::ai::ai_api(&client, profile_type, profile_id, &sub, "GET", None, p)
+        .await
+        .context("failed to list chat messages")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Show a single message's details (context-aware).
+async fn message(
+    ctx: &CommandContext<'_>,
+    profile_type: &str,
+    profile_id: &str,
+    chat_id: &str,
+    message_id: &str,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let sub = format!(
+        "agent/{}/message/{}/details/",
+        urlencoding::encode(chat_id),
+        urlencoding::encode(message_id),
+    );
+    let value = api::ai::ai_api(&client, profile_type, profile_id, &sub, "GET", None, None)
+        .await
+        .context("failed to get message details")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// List the caller's chats (context-aware; `kind`/`deleted` filters).
+async fn list_chats(
+    ctx: &CommandContext<'_>,
+    profile_type: &str,
+    profile_id: &str,
+    kind: Option<&str>,
+    deleted: bool,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let mut params = std::collections::HashMap::new();
+    if let Some(l) = limit {
+        params.insert("limit".to_owned(), l.to_string());
+    }
+    if let Some(o) = offset {
+        params.insert("offset".to_owned(), o.to_string());
+    }
+    if let Some(k) = kind {
+        params.insert("kind".to_owned(), k.to_owned());
+    }
+    let sub = if deleted {
+        "agent/list/deleted"
+    } else {
+        "agent/list/"
+    };
+    let p = if params.is_empty() {
+        None
+    } else {
+        Some(&params)
+    };
+    let value = api::ai::ai_api(&client, profile_type, profile_id, sub, "GET", None, p)
+        .await
+        .context("failed to list chats")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// List recent AI token-usage transactions (workspace-only).
+async fn transactions(ctx: &CommandContext<'_>, workspace: &str) -> Result<()> {
+    anyhow::ensure!(
+        !workspace.trim().is_empty(),
+        "workspace ID must not be empty"
+    );
+    let client = ctx.build_client()?;
+    let value = api::ai::transactions(&client, workspace)
+        .await
+        .context("failed to list AI transactions")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// AI-generate a title/description for a share (share-only).
+async fn autotitle(
+    ctx: &CommandContext<'_>,
+    share: &str,
+    user_context: Option<&str>,
+) -> Result<()> {
+    anyhow::ensure!(!share.trim().is_empty(), "share ID must not be empty");
+    let client = ctx.build_client()?;
+    let value = api::ai::autotitle(&client, share, user_context)
+        .await
+        .context("failed to generate share title")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Dispatch a memory subcommand to the `ai_memory` API.
+async fn memory(ctx: &CommandContext<'_>, cmd: &MemoryCommand) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = match cmd {
+        MemoryCommand::Get(target) => {
+            let (scope, id) = memory_scope(target);
+            api::ai_memory::get(&client, scope, id)
+                .await
+                .context("failed to read AI memory")?
+        }
+        MemoryCommand::Set {
+            target,
+            content,
+            revision,
+        } => {
+            let (scope, id) = memory_scope(target);
+            api::ai_memory::set(&client, scope, id, content, *revision)
+                .await
+                .context("failed to write AI memory")?
+        }
+        MemoryCommand::Delete(target) => {
+            let (scope, id) = memory_scope(target);
+            api::ai_memory::delete(&client, scope, id)
+                .await
+                .context("failed to delete AI memory")?
+        }
+    };
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Map an internal [`MemoryTarget`] to the `ai_memory` scope + id.
+fn memory_scope(target: &MemoryTarget) -> (api::ai_memory::MemoryScope, &str) {
+    match target {
+        MemoryTarget::Org(id) => (api::ai_memory::MemoryScope::Org, id),
+        MemoryTarget::Workspace(id) => (api::ai_memory::MemoryScope::Workspace, id),
+    }
+}
+
+/// The shared "delegation not yet available" message emitted by every hidden
+/// delegated-job stub. Returns an `Err` so a caller/script sees a non-success
+/// exit, but with a clear, non-alarming message rather than a guessed endpoint
+/// call. The server delegation contract is not finalized (see
+/// `phase2.log` → "Delegated-job contract — OPEN QUESTIONS"); these commands
+/// MUST NOT call any endpoint.
+fn delegated_jobs_unavailable() -> Result<()> {
+    anyhow::bail!(
+        "Ripley delegated jobs are not yet available — the server delegation contract is \
+         being finalized. Use `fastio ripley ask` for synchronous Q&A in the meantime."
+    )
+}
+
+#[cfg(test)]
+mod phase2_tests {
+    use super::{
+        MemoryTarget, delegated_jobs_unavailable, extract_chat_id, extract_message_id, memory_scope,
+    };
+    use fastio_cli::api::ai_memory::MemoryScope;
+    use serde_json::json;
+
+    #[test]
+    fn delegated_jobs_unavailable_returns_pending_error() {
+        // The hidden delegated-job stubs MUST emit the "pending" message and
+        // call no endpoint. This helper is the sole body of all four arms.
+        let err = delegated_jobs_unavailable().expect_err("must be an Err (pending)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not yet available"),
+            "expected the pending message, got: {msg}"
+        );
+        assert!(
+            msg.contains("delegation contract"),
+            "expected the contract-pending wording, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn memory_scope_maps_org_and_workspace() {
+        let org = MemoryTarget::Org("o1".to_owned());
+        let (scope, id) = memory_scope(&org);
+        assert_eq!(scope, MemoryScope::Org);
+        assert_eq!(id, "o1");
+        let ws = MemoryTarget::Workspace("ws1".to_owned());
+        let (scope, id) = memory_scope(&ws);
+        assert_eq!(scope, MemoryScope::Workspace);
+        assert_eq!(id, "ws1");
+    }
+
+    #[test]
+    fn extract_ids_handle_documented_chat_message_shape() {
+        // ai.txt:288-303 — the documented create response is
+        // {"chat": {"id": ..., "message": {"id": ...}}}.
+        let resp = json!({"chat": {"id": "C1", "message": {"id": "M1"}}});
+        assert_eq!(extract_chat_id(&resp).as_deref(), Some("C1"));
+        assert_eq!(extract_message_id(&resp).as_deref(), Some("M1"));
+    }
+
+    #[test]
+    fn extract_ids_handle_flat_fallback_shape() {
+        let resp = json!({"chat_id": "C2", "message_id": "M2"});
+        assert_eq!(extract_chat_id(&resp).as_deref(), Some("C2"));
+        assert_eq!(extract_message_id(&resp).as_deref(), Some("M2"));
+    }
+
+    #[test]
+    fn extract_ids_normalize_numeric() {
+        let resp = json!({"chat_id": 12345, "message_id": 678});
+        assert_eq!(extract_chat_id(&resp).as_deref(), Some("12345"));
+        assert_eq!(extract_message_id(&resp).as_deref(), Some("678"));
+    }
+
+    #[test]
+    fn extract_ids_missing_returns_none() {
+        let resp = json!({"result": true});
+        assert!(extract_chat_id(&resp).is_none());
+        assert!(extract_message_id(&resp).is_none());
+    }
+
+    #[test]
+    fn render_answer_pulls_text_and_citations() {
+        use super::render_answer;
+        // Top-level `text` (ai.txt:761) plus citations.
+        let msg = json!({
+            "message": {"state": "complete"},
+            "text": "the answer",
+            "citations": [{"nodeId": "n1"}],
+        });
+        let out = render_answer("C1", "M1", &msg);
+        assert_eq!(out.get("state").and_then(|v| v.as_str()), Some("complete"));
+        assert_eq!(
+            out.get("response").and_then(|v| v.as_str()),
+            Some("the answer")
+        );
+        assert!(
+            out.get("citations").is_some(),
+            "citations should be surfaced"
+        );
+    }
 }
 
 #[cfg(test)]

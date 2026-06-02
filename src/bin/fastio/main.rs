@@ -1355,8 +1355,176 @@ fn map_asset_command(cmd: cli::AssetCommands) -> AssetCommand {
 }
 
 /// Convert clap-parsed Ripley (AI agent) commands to the internal enum.
+#[allow(clippy::too_many_lines)]
 fn map_ripley_command(cmd: cli::RipleyCommands) -> AiCommand {
+    use commands::ai::{AskScopeFlags, MemoryCommand, MemoryTarget};
     match cmd {
+        cli::RipleyCommands::Ask {
+            workspace,
+            share,
+            question,
+            files_scope,
+            folders_scope,
+            files_attach,
+            personality,
+            kind,
+            no_wait,
+        } => {
+            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
+            AiCommand::Ask {
+                profile_type,
+                profile_id,
+                question,
+                scope: AskScopeFlags {
+                    files_scope,
+                    folders_scope,
+                    files_attach,
+                },
+                personality,
+                kind,
+                no_wait,
+            }
+        }
+        cli::RipleyCommands::List {
+            workspace,
+            share,
+            kind,
+            deleted,
+            limit,
+            offset,
+        } => {
+            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
+            AiCommand::List {
+                profile_type,
+                profile_id,
+                kind,
+                deleted,
+                limit,
+                offset,
+            }
+        }
+        cli::RipleyCommands::Details {
+            workspace,
+            share,
+            chat_id,
+        } => {
+            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
+            AiCommand::Details {
+                profile_type,
+                profile_id,
+                chat_id,
+            }
+        }
+        cli::RipleyCommands::Messages {
+            workspace,
+            share,
+            chat_id,
+            limit,
+            offset,
+        } => {
+            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
+            AiCommand::Messages {
+                profile_type,
+                profile_id,
+                chat_id,
+                limit,
+                offset,
+            }
+        }
+        cli::RipleyCommands::Message {
+            workspace,
+            share,
+            chat_id,
+            message_id,
+        } => {
+            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
+            AiCommand::Message {
+                profile_type,
+                profile_id,
+                chat_id,
+                message_id,
+            }
+        }
+        cli::RipleyCommands::Update {
+            workspace,
+            share,
+            chat_id,
+            name,
+        } => {
+            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
+            AiCommand::Update {
+                profile_type,
+                profile_id,
+                chat_id,
+                name,
+            }
+        }
+        cli::RipleyCommands::Publish {
+            workspace,
+            share,
+            chat_id,
+        } => {
+            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
+            AiCommand::Publish {
+                profile_type,
+                profile_id,
+                chat_id,
+            }
+        }
+        cli::RipleyCommands::Delete {
+            workspace,
+            share,
+            chat_id,
+        } => {
+            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
+            AiCommand::Delete {
+                profile_type,
+                profile_id,
+                chat_id,
+            }
+        }
+        cli::RipleyCommands::Transactions { workspace } => AiCommand::Transactions { workspace },
+        cli::RipleyCommands::Autotitle {
+            share,
+            user_context,
+        } => AiCommand::Autotitle {
+            share,
+            user_context,
+        },
+        cli::RipleyCommands::Memory(mem) => {
+            let target = |org: Option<String>, workspace: Option<String>| {
+                // clap enforces --org XOR --workspace (one required); prefer
+                // workspace if both somehow slip through.
+                if let Some(wid) = workspace {
+                    MemoryTarget::Workspace(wid)
+                } else {
+                    MemoryTarget::Org(org.unwrap_or_default())
+                }
+            };
+            let mapped = match mem {
+                cli::RipleyMemoryCommands::Get { org, workspace } => {
+                    MemoryCommand::Get(target(org, workspace))
+                }
+                cli::RipleyMemoryCommands::Set {
+                    org,
+                    workspace,
+                    content,
+                    revision,
+                } => MemoryCommand::Set {
+                    target: target(org, workspace),
+                    content,
+                    revision,
+                },
+                cli::RipleyMemoryCommands::Delete { org, workspace } => {
+                    MemoryCommand::Delete(target(org, workspace))
+                }
+            };
+            AiCommand::Memory(mapped)
+        }
+        cli::RipleyCommands::Delegate { instruction, .. } => AiCommand::Delegate { instruction },
+        cli::RipleyCommands::Status { id } => AiCommand::JobStatus { id },
+        cli::RipleyCommands::Logs { id } => AiCommand::JobLogs { id },
+        cli::RipleyCommands::CancelJob { id } => AiCommand::JobCancel { id },
         cli::RipleyCommands::Chat {
             workspace,
             message,
