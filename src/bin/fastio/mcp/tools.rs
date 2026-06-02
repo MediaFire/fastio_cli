@@ -6669,6 +6669,15 @@ async fn mcp_ask_wait(
     );
     let mut lastactivity: Option<String> = None;
     loop {
+        // Re-check the deadline at the TOP of every iteration, before issuing
+        // the message-details GET. Either poll arm below may sleep up to the
+        // remaining wait (a 429 clamp can land exactly on the deadline); without
+        // this check a woken iteration would issue one more details request that
+        // could add the client's request timeout and overrun MCP_ASK_MAX_WAIT_SECS.
+        // Mirrors the CLI `wait_for_answer` post-activity deadline check.
+        if tokio::time::Instant::now() >= deadline {
+            return timeout_payload();
+        }
         match api::ai::ai_api(client, ctx_type, ctx_id, &details_sub, "GET", None, None).await {
             Ok(msg_data) => {
                 let msg = msg_data.get("message").unwrap_or(&msg_data);
