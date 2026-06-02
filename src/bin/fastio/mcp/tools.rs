@@ -390,21 +390,21 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "org",
-        description: "Organizations: list, create, view, update, delete orgs; billing, members, invitations, transfer tokens, discovery, assets, workspaces, shares.",
+        description: "Organizations: list, create, view, update, delete orgs; billing, members, invitations, transfer tokens, discovery, assets, workspaces, shares. DESTRUCTIVE/FLOW billing actions: 'billing-subscribe' (starts a paid subscription — returns a setup_intent + onboarding URL the user completes; the one-time client_secret and public_key are stripped from the result), 'billing-cancel' (schedules cancel at period end — REQUIRES confirm_cancel=true), 'billing-reactivate' (owner-only; reverses a scheduled cancel).",
         actions: &[
             "list",
             "create",
             "info",
             "update",
             "delete",
-            "billing-info",
+            "billing-details",
             "billing-plans",
+            "billing-usage",
             "billing-meters",
             "billing-cancel",
-            "billing-activate",
-            "billing-reset",
+            "billing-reactivate",
             "billing-members",
-            "billing-create",
+            "billing-subscribe",
             "billing-invoices",
             "members-list",
             "members-invite",
@@ -444,16 +444,44 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("billing_email", "Billing email", false),
             ("homepage_url", "Homepage URL", false),
             ("confirm", "Confirmation string (delete)", false),
+            (
+                "confirm_cancel",
+                "REQUIRED to proceed (true/false) for billing-cancel; the action is rejected unless confirm_cancel=true (mirrors the CLI --yes gate).",
+                false,
+            ),
             ("email", "Member email (invite)", false),
             ("role", "Member role", false),
             ("member_id", "Member ID", false),
             ("new_owner_id", "New owner user ID (transfer)", false),
-            ("meter", "Meter name (billing-meters)", false),
+            (
+                "meter",
+                "Meter name, e.g. storage_bytes / bandwidth_bytes / ai_tokens (billing-meters)",
+                false,
+            ),
             ("start_time", "Start time (billing-meters)", false),
             ("end_time", "End time (billing-meters)", false),
+            (
+                "workspace_id",
+                "Filter meters by workspace; XOR with share_id (billing-meters)",
+                false,
+            ),
+            (
+                "share_id",
+                "Filter meters by share; XOR with workspace_id (billing-meters)",
+                false,
+            ),
             ("limit", "Pagination limit", false),
             ("offset", "Pagination offset", false),
-            ("plan_id", "Billing plan ID (billing-create)", false),
+            (
+                "starting_after",
+                "Invoice-ID cursor for the next page (billing-invoices)",
+                false,
+            ),
+            (
+                "plan_id",
+                "Billing plan ID, e.g. solo_monthly / business_v2_monthly / growth_monthly (billing-subscribe)",
+                false,
+            ),
             ("invitation_id", "Invitation ID", false),
             (
                 "state",
@@ -2676,8 +2704,10 @@ async fn handle_org(
         "info" => handle_org_info(state, args).await,
         "update" => handle_org_update(state, args).await,
         "delete" => handle_org_delete(state, args).await,
-        "billing-info" => handle_org_billing_info(state, args).await,
+        // `billing-info` is the hidden back-compat alias for `billing-details`.
+        "billing-details" | "billing-info" => handle_org_billing_details(state, args).await,
         "billing-plans" => handle_org_billing_plans(state, args).await,
+        "billing-usage" => handle_org_billing_usage(state, args).await,
         "billing-meters" => handle_org_billing_meters(state, args).await,
         "members-list" => handle_org_members_list(state, args).await,
         "members-invite" => handle_org_members_invite(state, args).await,
@@ -2686,10 +2716,10 @@ async fn handle_org(
         "transfer" => handle_org_transfer(state, args).await,
         "discover" | "discover-available" => handle_org_discover(state, args).await,
         "billing-cancel" => handle_org_billing_cancel(state, args).await,
-        "billing-activate" => handle_org_billing_activate(state, args).await,
-        "billing-reset" => handle_org_billing_reset(state, args).await,
+        "billing-reactivate" => handle_org_billing_reactivate(state, args).await,
         "billing-members" => handle_org_billing_members(state, args).await,
-        "billing-create" => handle_org_billing_create(state, args).await,
+        // `billing-create` is the hidden back-compat alias for `billing-subscribe`.
+        "billing-subscribe" | "billing-create" => handle_org_billing_subscribe(state, args).await,
         "billing-invoices" => handle_org_billing_invoices(state, args).await,
         "members-details" => handle_org_members_details(state, args).await,
         "members-leave" => handle_org_members_leave(state, args).await,
@@ -2823,7 +2853,19 @@ async fn handle_org_delete(
     }
 }
 
-async fn handle_org_billing_info(
+/// Map a billing API error to an MCP result, appending the shared billing
+/// recovery hint (`CliError::suggestion()` — which covers 402 / 1688 / 1695 /
+/// 1696) so a subscription/credit error steers the agent to the plan surface.
+/// The generic [`cli_err_to_result`] drops the suggestion; billing actions need
+/// it to surface, mirroring `sign_err_to_result`.
+fn billing_err_to_result(err: &fastio_cli::error::CliError) -> CallToolResult {
+    if let Some(hint) = err.suggestion() {
+        return error_text(&format!("{err} ({hint})"));
+    }
+    error_text(&err.to_string())
+}
+
+async fn handle_org_billing_details(
     state: &McpState,
     args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
@@ -2834,7 +2876,22 @@ async fn handle_org_billing_info(
     };
     match api::org::get_billing_details(&client, org_id).await {
         Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
+        Err(e) => Ok(billing_err_to_result(&e)),
+    }
+}
+
+async fn handle_org_billing_usage(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let org_id = match required_str(args, "org_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::org::get_credit_usage(&client, org_id).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(billing_err_to_result(&e)),
     }
 }
 
@@ -2845,7 +2902,7 @@ async fn handle_org_billing_plans(
     let client = state.client().read().await;
     match api::org::list_billing_plans(&client).await {
         Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
+        Err(e) => Ok(billing_err_to_result(&e)),
     }
 }
 
@@ -2864,15 +2921,19 @@ async fn handle_org_billing_meters(
     };
     match api::org::get_billing_meters(
         &client,
-        org_id,
-        meter,
-        optional_str(args, "start_time"),
-        optional_str(args, "end_time"),
+        &api::org::BillingMetersParams {
+            org_id,
+            meter,
+            start_time: optional_str(args, "start_time"),
+            end_time: optional_str(args, "end_time"),
+            workspace_id: optional_str(args, "workspace_id"),
+            share_id: optional_str(args, "share_id"),
+        },
     )
     .await
     {
         Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
+        Err(e) => Ok(billing_err_to_result(&e)),
     }
 }
 
@@ -2993,18 +3054,33 @@ async fn handle_org_billing_cancel(
     state: &McpState,
     args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
+    // The interactive CLI gates this DELETE behind `--yes`. The MCP surface is
+    // non-interactive, so the same protection is a required-to-proceed
+    // `confirm_cancel` boolean: reject BEFORE any API call unless it is
+    // explicitly true, so an agent cannot cancel a paid subscription unprompted.
+    if optional_bool(args, "confirm_cancel") != Some(true) {
+        return Ok(error_text(BILLING_CANCEL_REJECTION));
+    }
     let client = state.client().read().await;
     let org_id = match required_str(args, "org_id") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    // DELETE schedules cancellation at the end of the current billing period;
+    // the org keeps access until cancel_at. Reversible via billing-reactivate.
     match api::org::billing_cancel(&client, org_id).await {
         Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
+        Err(e) => Ok(billing_err_to_result(&e)),
     }
 }
 
-async fn handle_org_billing_activate(
+/// Error message returned when `billing-cancel` is invoked without an explicit
+/// `confirm_cancel=true`. Mirrors the CLI `--yes` confirmation.
+const BILLING_CANCEL_REJECTION: &str = "billing-cancel schedules the subscription to end at the close of the current billing \
+     period; pass confirm_cancel=true to proceed (reverse it with billing-reactivate before \
+     it executes).";
+
+async fn handle_org_billing_reactivate(
     state: &McpState,
     args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
@@ -3013,24 +3089,10 @@ async fn handle_org_billing_activate(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    match api::org::billing_activate(&client, org_id).await {
+    // PUT — owner-only. Reverses a scheduled cancellation (no-op if none).
+    match api::org::billing_reactivate(&client, org_id).await {
         Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_org_billing_reset(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let org_id = match required_str(args, "org_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::org::billing_reset(&client, org_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
+        Err(e) => Ok(billing_err_to_result(&e)),
     }
 }
 
@@ -3043,13 +3105,20 @@ async fn handle_org_billing_members(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    match api::org::billing_members(&client, org_id, None, None).await {
+    match api::org::billing_members(
+        &client,
+        org_id,
+        optional_u32(args, "limit"),
+        optional_u32(args, "offset"),
+    )
+    .await
+    {
         Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
+        Err(e) => Ok(billing_err_to_result(&e)),
     }
 }
 
-async fn handle_org_billing_create(
+async fn handle_org_billing_subscribe(
     state: &McpState,
     args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
@@ -3058,9 +3127,56 @@ async fn handle_org_billing_create(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    // POST — starts/updates a paid subscription. Returns a setup_intent +
+    // public_key the user completes via the onboarding flow. plan_id is passed
+    // through unvalidated (plan IDs drift; the server returns 1605 for a bad
+    // plan). client_secret / public_key are sensitive and are NOT logged at
+    // trace (the client redacts client_secret) and not cached here.
     match api::org::billing_create(&client, org_id, optional_str(args, "plan_id")).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
+        Ok(mut v) => {
+            // The server response carries setup_intent / public_key but NOT the
+            // hosted onboarding URL (a client-side constant). Surface the link
+            // the tool promises (only when a new subscription still needs a
+            // payment method) and strip the one-time secret + public_key so the
+            // agent context never receives them.
+            inject_onboarding_url(&mut v);
+            sanitize_subscribe_response(&mut v);
+            Ok(success_json(&v))
+        }
+        Err(e) => Ok(billing_err_to_result(&e)),
+    }
+}
+
+/// Strip the sensitive fields from a `billing-subscribe` response BEFORE it is
+/// returned to the MCP caller.
+///
+/// The 201 create response (orgs.txt:1671) carries `setup_intent.client_secret`
+/// (a real one-time secret) and a top-level `public_key`. The caller completes
+/// payment via the injected `onboarding_url`, never by handling the raw secret,
+/// so both are removed; `setup_intent.id` / `setup_intent.status` and the rest
+/// of the response are retained. Call AFTER [`inject_onboarding_url`] so the
+/// onboarding decision still sees the untouched `setup_intent` / `is_active`.
+fn sanitize_subscribe_response(value: &mut Value) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("public_key");
+        if let Some(si) = obj.get_mut("setup_intent").and_then(Value::as_object_mut) {
+            si.remove("client_secret");
+        }
+    }
+}
+
+/// Add the hosted onboarding URL to a subscribe response when the subscription
+/// still needs a payment method (a `setup_intent` is present and the
+/// subscription is not yet active). Mutates the response in place; a no-op for
+/// the already-active update path. Does NOT echo `client_secret`/`public_key`.
+fn inject_onboarding_url(value: &mut Value) {
+    let needs_payment = value.get("setup_intent").is_some_and(|si| !si.is_null())
+        && value.get("is_active").and_then(Value::as_bool) != Some(true);
+    if needs_payment && let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "onboarding_url".to_owned(),
+            Value::String("https://go.fast.io/onboarding".to_owned()),
+        );
     }
 }
 
@@ -3077,12 +3193,12 @@ async fn handle_org_billing_invoices(
         &client,
         org_id,
         optional_u32(args, "limit"),
-        optional_u32(args, "offset"),
+        optional_str(args, "starting_after"),
     )
     .await
     {
         Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
+        Err(e) => Ok(billing_err_to_result(&e)),
     }
 }
 
@@ -3159,9 +3275,12 @@ async fn handle_org_limits(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    // `limits` reaches the credit-usage billing endpoint, so its errors must
+    // surface the shared billing hint (402 / 1688 / 1695 / 1696) too — route
+    // through the billing-specific error mapper, not the generic one.
     match api::org::get_limits(&client, org_id).await {
         Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
+        Err(e) => Ok(billing_err_to_result(&e)),
     }
 }
 
@@ -11574,7 +11693,9 @@ async fn handle_system(
 
 #[cfg(test)]
 mod ripley_tool_tests {
-    use super::{McpState, ToolRouter};
+    use super::{
+        McpState, TOOL_DEFS, ToolRouter, inject_onboarding_url, sanitize_subscribe_response,
+    };
     use serde_json::{Map, Value, json};
     use std::sync::Arc;
 
@@ -13424,6 +13545,136 @@ mod ripley_tool_tests {
         assert!(
             !m.to_lowercase().contains("insufficient signing credits"),
             "unrelated 412 must not claim credits: {m}"
+        );
+    }
+
+    // ─── Phase 7 billing: org tool action surface + subscribe onboarding ─────
+
+    #[test]
+    fn org_tool_advertises_renamed_billing_actions_and_drops_removed() {
+        let org = TOOL_DEFS
+            .iter()
+            .find(|d| d.name == "org")
+            .expect("org tool registered");
+        for required in [
+            "billing-details",
+            "billing-usage",
+            "billing-subscribe",
+            "billing-reactivate",
+        ] {
+            assert!(
+                org.actions.contains(&required),
+                "org tool must advertise '{required}'"
+            );
+        }
+        for removed in ["billing-activate", "billing-reset"] {
+            assert!(
+                !org.actions.contains(&removed),
+                "org tool must NOT advertise removed action '{removed}'"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_onboarding_url_added_only_when_payment_needed() {
+        // New subscription needing a payment method → URL injected.
+        let mut v = json!({
+            "setup_intent": {"id": "seti_1", "status": "requires_payment_method"},
+            "is_active": false
+        });
+        inject_onboarding_url(&mut v);
+        assert_eq!(v["onboarding_url"], "https://go.fast.io/onboarding");
+        // client_secret / public_key are not invented by us.
+        assert!(v.get("public_key").is_none());
+
+        // Already-active update → no URL injected.
+        let mut active = json!({"setup_intent": null, "is_active": true});
+        inject_onboarding_url(&mut active);
+        assert!(active.get("onboarding_url").is_none());
+
+        // No setup_intent → no URL injected.
+        let mut none = json!({"is_active": false});
+        inject_onboarding_url(&mut none);
+        assert!(none.get("onboarding_url").is_none());
+    }
+
+    #[test]
+    fn sanitize_subscribe_strips_client_secret_and_public_key_but_keeps_onboarding() {
+        // Reproduces the handler's post-inject composition: a 201 subscribe
+        // response with a real client_secret + public_key, after onboarding
+        // injection, must surface onboarding_url but echo NEITHER secret.
+        let mut v = json!({
+            "result": true,
+            "setup_intent": {
+                "id": "seti_1",
+                "client_secret": "seti_1_secret_LIVE",
+                "status": "requires_payment_method"
+            },
+            "is_active": false,
+            "public_key": "pk_live_should_never_log"
+        });
+        inject_onboarding_url(&mut v);
+        sanitize_subscribe_response(&mut v);
+        let rendered = v.to_string();
+        assert!(
+            !rendered.contains("client_secret"),
+            "client_secret key/value leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("seti_1_secret_LIVE"),
+            "client_secret value leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("public_key"),
+            "public_key leaked: {rendered}"
+        );
+        assert!(
+            rendered.contains("onboarding_url"),
+            "onboarding_url must be present: {rendered}"
+        );
+        assert_eq!(v["onboarding_url"], "https://go.fast.io/onboarding");
+        // Non-sensitive setup_intent fields retained.
+        assert_eq!(v["setup_intent"]["id"], "seti_1");
+        assert_eq!(v["setup_intent"]["status"], "requires_payment_method");
+    }
+
+    #[tokio::test]
+    async fn billing_cancel_rejected_without_confirm() {
+        // billing-cancel must reject pre-network unless confirm_cancel=true,
+        // mirroring the CLI --yes gate. The authed router points at an
+        // unroutable base URL, so a rejection (not a network error) proves the
+        // gate fired before any API call.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("billing-cancel".to_owned()),
+        );
+        args.insert("org_id".to_owned(), Value::String("123".to_owned()));
+        let res = router.call_tool("org", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("confirm_cancel=true"),
+            "missing confirm should be rejected with the gate message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn billing_cancel_false_confirm_also_rejected() {
+        // An explicit confirm_cancel=false is still a rejection.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("billing-cancel".to_owned()),
+        );
+        args.insert("org_id".to_owned(), Value::String("123".to_owned()));
+        args.insert("confirm_cancel".to_owned(), Value::Bool(false));
+        let res = router.call_tool("org", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("confirm_cancel=true"),
+            "confirm_cancel=false must be rejected, got: {text}"
         );
     }
 }

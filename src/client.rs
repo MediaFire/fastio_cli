@@ -107,6 +107,13 @@ const SECRET_LOG_KEYS: &[&str] = &[
     "password2",
     "private_key",
     "client_secret",
+    // Billing: `public_key` is a Stripe *publishable* key (not strictly secret),
+    // redacted for defense-in-depth; the invoice URLs grant access to hosted
+    // invoice / PDF views and genuinely should not appear in trace logs
+    // (orgs.txt:1671/1836/2157).
+    "public_key",
+    "hosted_invoice_url",
+    "invoice_pdf",
     // OAuth PKCE token-exchange form fields (one-time, but still credentials).
     "code",
     "code_verifier",
@@ -1677,6 +1684,52 @@ mod tests {
         assert_eq!(redacted["response"]["items"][1]["label"], "second");
         // Case-insensitive: the original (unredacted) body is unchanged.
         assert_eq!(body["response"]["token"], "tok_LIVE_should_never_log");
+    }
+
+    #[test]
+    fn redact_secret_values_masks_billing_url_and_key_fields() {
+        // Billing responses nest a one-time client_secret, a publishable
+        // public_key, and access-granting invoice URLs (orgs.txt:1671/2157);
+        // all three new keys must be masked, top-level and nested.
+        let body = serde_json::json!({
+            "response": {
+                "setup_intent": {"client_secret": "seti_secret_LIVE"},
+                "public_key": "pk_live_should_hide",
+                "hosted_invoice_url": "https://pay.example/i/secret",
+                "invoice_pdf": "https://pay.example/invoice/secret.pdf",
+                "id": "in_keep_me",
+            },
+        });
+        let redacted = redact_secret_values_for_log(&body);
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("seti_secret_LIVE"),
+            "client_secret leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("pk_live_should_hide"),
+            "public_key leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("pay.example/i/secret"),
+            "hosted_invoice_url leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("pay.example/invoice/secret.pdf"),
+            "invoice_pdf leaked: {rendered}"
+        );
+        assert_eq!(
+            redacted["response"]["setup_intent"]["client_secret"],
+            REDACTED_PLACEHOLDER
+        );
+        assert_eq!(redacted["response"]["public_key"], REDACTED_PLACEHOLDER);
+        assert_eq!(
+            redacted["response"]["hosted_invoice_url"],
+            REDACTED_PLACEHOLDER
+        );
+        assert_eq!(redacted["response"]["invoice_pdf"], REDACTED_PLACEHOLDER);
+        // Non-secret sibling preserved.
+        assert_eq!(redacted["response"]["id"], "in_keep_me");
     }
 
     #[test]

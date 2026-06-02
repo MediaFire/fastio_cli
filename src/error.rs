@@ -77,10 +77,10 @@ impl CliError {
 /// a consistent recovery path for HTTP 402 and code `1688`. Plan IDs/names are
 /// deliberately NOT hardcoded here — callers drive them off
 /// `GET /org/billing/plan/list/`. References only commands that exist in the
-/// current CLI surface (`org billing plans`); subscription creation is via
-/// `org billing create`, but the onboarding URL is the canonical recovery path.
+/// current CLI surface (`org billing plans`, `org billing subscribe`, both
+/// landed in Phase 7); the onboarding URL is the canonical recovery path.
 pub const HINT_SUBSCRIPTION_REQUIRED: &str = "No active paid plan or credits exhausted. \
-     Run `fastio org billing plans` to see options, then `fastio org billing create <org> --plan-id <id>`, \
+     Run `fastio org billing plans` to see options, then `fastio org billing subscribe <org> --plan <id>`, \
      or visit https://go.fast.io/onboarding.";
 
 /// Shared "feature requires a higher tier" upgrade hint (code `1695`).
@@ -338,19 +338,17 @@ mod tests {
     #[test]
     fn billing_hints_reference_only_existing_commands() {
         // The hints must not reference commands that don't exist in the current
-        // CLI surface. `subscribe` and `usage` are planned-but-absent today.
+        // CLI surface. `billing usage` and `billing subscribe` BOTH landed in
+        // Phase 7, so they are now valid targets; the deprecated `--plan-id`
+        // flag (the canonical flag is `--plan`) must NOT appear.
         for hint in [
             HINT_SUBSCRIPTION_REQUIRED,
             HINT_UPGRADE_REQUIRED,
             HINT_CREDIT_LIMIT,
         ] {
             assert!(
-                !hint.contains("billing subscribe"),
-                "hint references non-existent `billing subscribe`: {hint}"
-            );
-            assert!(
-                !hint.contains("billing usage"),
-                "hint references non-existent `billing usage`: {hint}"
+                !hint.contains("--plan-id"),
+                "hint references the removed `--plan-id` flag (use `--plan`): {hint}"
             );
         }
     }

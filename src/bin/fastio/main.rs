@@ -557,22 +557,30 @@ fn map_org_members_command(m: cli::OrgMembersCommands) -> OrgMembersCommand {
 /// Convert clap-parsed org billing subcommands to the internal enum.
 fn map_org_billing_command(b: cli::OrgBillingCommands) -> BillingCommand {
     match b {
-        cli::OrgBillingCommands::Info { org_id } => BillingCommand::Info { org_id },
+        cli::OrgBillingCommands::Details { org_id } => BillingCommand::Details { org_id },
         cli::OrgBillingCommands::Plans => BillingCommand::Plans,
+        cli::OrgBillingCommands::Usage { org_id } => BillingCommand::Usage { org_id },
         cli::OrgBillingCommands::Meters {
             org_id,
             meter,
             start_time,
             end_time,
+            workspace_id,
+            share_id,
         } => BillingCommand::Meters {
             org_id,
             meter,
             start_time,
             end_time,
+            workspace_id,
+            share_id,
         },
-        cli::OrgBillingCommands::Cancel { org_id } => BillingCommand::Cancel { org_id },
-        cli::OrgBillingCommands::Activate { org_id } => BillingCommand::Activate { org_id },
-        cli::OrgBillingCommands::Reset { org_id } => BillingCommand::Reset { org_id },
+        cli::OrgBillingCommands::Cancel { org_id, yes } => BillingCommand::Cancel { org_id, yes },
+        cli::OrgBillingCommands::Reactivate { org_id } => BillingCommand::Reactivate { org_id },
+        // The deprecated shims never call the server, so the parsed `org_id`
+        // positional is intentionally discarded here.
+        cli::OrgBillingCommands::Activate { .. } => BillingCommand::Activate,
+        cli::OrgBillingCommands::Reset { .. } => BillingCommand::Reset,
         cli::OrgBillingCommands::Members {
             org_id,
             limit,
@@ -582,17 +590,18 @@ fn map_org_billing_command(b: cli::OrgBillingCommands) -> BillingCommand {
             limit,
             offset,
         },
-        cli::OrgBillingCommands::Create { org_id, plan_id } => {
-            BillingCommand::Create { org_id, plan_id }
-        }
+        cli::OrgBillingCommands::Subscribe { org_id, plan } => BillingCommand::Subscribe {
+            org_id,
+            plan_id: Some(plan),
+        },
         cli::OrgBillingCommands::Invoices {
             org_id,
             limit,
-            offset,
+            starting_after,
         } => BillingCommand::Invoices {
             org_id,
             limit,
-            offset,
+            starting_after,
         },
     }
 }

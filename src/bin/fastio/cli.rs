@@ -1914,6 +1914,11 @@ pub enum OrgCommands {
         org_id: String,
     },
     /// Get plan limits.
+    ///
+    /// Hidden: credit usage moved under `org billing usage` (which keeps a
+    /// hidden `limits` alias). This top-level command still ROUTES for one-release
+    /// back-compat but is hidden from help.
+    #[command(hide = true)]
     Limits {
         /// Organization ID.
         org_id: String,
@@ -2012,17 +2017,28 @@ pub enum OrgCommands {
 #[non_exhaustive]
 pub enum OrgBillingCommands {
     /// Get billing details for an organization.
-    Info {
+    ///
+    /// Renamed from `info` (kept as a hidden back-compat alias).
+    #[command(alias = "info")]
+    Details {
         /// Organization ID.
         org_id: String,
     },
     /// List available billing plans.
     Plans,
+    /// Get credit usage and limits for an organization.
+    ///
+    /// Renamed from `limits` (kept as a hidden back-compat alias).
+    #[command(alias = "limits")]
+    Usage {
+        /// Organization ID.
+        org_id: String,
+    },
     /// Get usage meters/metrics for an organization.
     Meters {
         /// Organization ID.
         org_id: String,
-        /// Meter type (e.g. `storage_bytes`, `transfer_bytes`, `ai_tokens`).
+        /// Meter type (e.g. `storage_bytes`, `bandwidth_bytes`, `ai_tokens`).
         #[arg(long)]
         meter: String,
         /// Start time for the meter range.
@@ -2031,18 +2047,34 @@ pub enum OrgBillingCommands {
         /// End time for the meter range.
         #[arg(long)]
         end_time: Option<String>,
+        /// Filter by workspace ID (mutually exclusive with `--share-id`).
+        #[arg(long)]
+        workspace_id: Option<String>,
+        /// Filter by share ID (mutually exclusive with `--workspace-id`).
+        #[arg(long)]
+        share_id: Option<String>,
     },
-    /// Cancel a billing subscription.
+    /// Schedule a subscription to cancel at the end of the billing period.
     Cancel {
         /// Organization ID.
         org_id: String,
+        /// Confirm the scheduled cancellation.
+        #[arg(long)]
+        yes: bool,
     },
-    /// Activate a billing subscription.
+    /// Reactivate a subscription scheduled to cancel (owner-only).
+    Reactivate {
+        /// Organization ID.
+        org_id: String,
+    },
+    /// Deprecated: removed. Use `reactivate` (hidden compat shim, no network).
+    #[command(hide = true)]
     Activate {
         /// Organization ID.
         org_id: String,
     },
-    /// Reset billing.
+    /// Deprecated: removed. Use `reactivate` (hidden compat shim, no network).
+    #[command(hide = true)]
     Reset {
         /// Organization ID.
         org_id: String,
@@ -2058,24 +2090,31 @@ pub enum OrgBillingCommands {
         #[arg(long)]
         offset: Option<u32>,
     },
-    /// Create a billing subscription.
-    Create {
+    /// Subscribe to a paid plan.
+    ///
+    /// Renamed from `create` (kept as a hidden back-compat alias).
+    #[command(alias = "create")]
+    Subscribe {
         /// Organization ID.
         org_id: String,
-        /// Plan ID.
-        #[arg(long)]
-        plan_id: Option<String>,
+        /// Plan ID (e.g. `solo_monthly`, `business_v2_monthly`, `growth_monthly`).
+        ///
+        /// Accepts the legacy `--plan-id` spelling as a hidden alias so the
+        /// old `org billing create <org> --plan-id <id>` invocation keeps
+        /// parsing for one-release back-compat.
+        #[arg(long, alias = "plan-id")]
+        plan: String,
     },
-    /// List billing invoices.
+    /// List billing invoices (cursor-paginated).
     Invoices {
         /// Organization ID.
         org_id: String,
         /// Maximum number of results per page.
         #[arg(long)]
         limit: Option<u32>,
-        /// Offset for pagination.
+        /// Invoice-ID cursor: return invoices after this ID.
         #[arg(long)]
-        offset: Option<u32>,
+        starting_after: Option<String>,
     },
 }
 
@@ -5312,8 +5351,8 @@ impl fmt::Debug for AuthCommands {
 #[cfg(test)]
 mod ripley_alias_tests {
     use super::{
-        ApprovalCommands, Cli, Commands, RipleyCommands, SearchCommands, TaskCommands,
-        TodoCommands, WorklogCommands,
+        ApprovalCommands, Cli, Commands, OrgBillingCommands, OrgCommands, RipleyCommands,
+        SearchCommands, TaskCommands, TodoCommands, WorklogCommands,
     };
     use clap::{CommandFactory, Parser};
 
@@ -6012,5 +6051,70 @@ mod ripley_alias_tests {
             cli.command,
             Commands::Todo(TodoCommands::Summary { .. })
         ));
+    }
+
+    // ── Phase 7 billing parse tests ──────────────────────────────────────
+
+    #[test]
+    fn billing_subscribe_accepts_plan_and_legacy_plan_id() {
+        // Both the canonical --plan and the legacy --plan-id alias parse to the
+        // same value (one-release back-compat for `org billing create`).
+        for flag in ["--plan", "--plan-id"] {
+            let cli = Cli::try_parse_from([
+                "fastio",
+                "org",
+                "billing",
+                "subscribe",
+                "org123",
+                flag,
+                "business_v2_monthly",
+            ])
+            .unwrap_or_else(|e| panic!("billing subscribe {flag} should parse: {e}"));
+            match cli.command {
+                Commands::Org(OrgCommands::Billing(OrgBillingCommands::Subscribe {
+                    org_id,
+                    plan,
+                })) => {
+                    assert_eq!(org_id, "org123");
+                    assert_eq!(plan, "business_v2_monthly", "via {flag}");
+                }
+                other => panic!("expected Org Billing Subscribe via {flag}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn billing_create_alias_with_legacy_plan_id_parses() {
+        // The hidden `create` alias + legacy `--plan-id` together (the exact
+        // pre-retool invocation) must still parse.
+        let cli = Cli::try_parse_from([
+            "fastio",
+            "org",
+            "billing",
+            "create",
+            "org123",
+            "--plan-id",
+            "solo_monthly",
+        ])
+        .expect("`billing create --plan-id` should still parse");
+        match cli.command {
+            Commands::Org(OrgCommands::Billing(OrgBillingCommands::Subscribe { org_id, plan })) => {
+                assert_eq!(org_id, "org123");
+                assert_eq!(plan, "solo_monthly");
+            }
+            other => panic!("expected Org Billing Subscribe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_level_org_limits_still_routes_when_hidden() {
+        // `org limits` is hidden from help but must still parse/route for
+        // one-release back-compat.
+        let cli = Cli::try_parse_from(["fastio", "org", "limits", "org123"])
+            .expect("top-level `org limits` should still parse");
+        match cli.command {
+            Commands::Org(OrgCommands::Limits { org_id }) => assert_eq!(org_id, "org123"),
+            other => panic!("expected Org Limits, got {other:?}"),
+        }
     }
 }

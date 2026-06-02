@@ -124,12 +124,16 @@ pub async fn close_org(client: &ApiClient, org_id: &str, confirm: &str) -> Resul
     client.post(&path, &form).await
 }
 
+/// Build the path for the billing-details endpoint.
+fn billing_details_path(org_id: &str) -> String {
+    format!("/org/{}/billing/details/", urlencoding::encode(org_id))
+}
+
 /// Get billing details.
 ///
 /// `GET /org/{org_id}/billing/details/`
 pub async fn get_billing_details(client: &ApiClient, org_id: &str) -> Result<Value, CliError> {
-    let path = format!("/org/{}/billing/details/", urlencoding::encode(org_id));
-    client.get(&path).await
+    client.get(&billing_details_path(org_id)).await
 }
 
 /// List available billing plans.
@@ -139,29 +143,74 @@ pub async fn list_billing_plans(client: &ApiClient) -> Result<Value, CliError> {
     client.get("/org/billing/plan/list/").await
 }
 
+/// Parameters for [`get_billing_meters`].
+pub struct BillingMetersParams<'a> {
+    /// Organization to query.
+    pub org_id: &'a str,
+    /// Meter type (e.g. `storage_bytes`, `bandwidth_bytes`, `ai_tokens`).
+    pub meter: &'a str,
+    /// Start of the time range (`YYYY-MM-DD HH:MM:SS`). Defaults to 30 days ago.
+    pub start_time: Option<&'a str>,
+    /// End of the time range (`YYYY-MM-DD HH:MM:SS`). Defaults to now.
+    pub end_time: Option<&'a str>,
+    /// Filter by workspace (19-digit ID). Mutually exclusive with `share_id`.
+    pub workspace_id: Option<&'a str>,
+    /// Filter by share (19-digit ID). Mutually exclusive with `workspace_id`.
+    pub share_id: Option<&'a str>,
+}
+
+/// Build the path for the usage-meters endpoint.
+fn billing_meters_path(org_id: &str) -> String {
+    format!(
+        "/org/{}/billing/usage/meters/list/",
+        urlencoding::encode(org_id),
+    )
+}
+
+/// Build the query map for the usage-meters endpoint, enforcing the
+/// `workspace_id` / `share_id` XOR BEFORE any HTTP request is issued.
+///
+/// Supplying both filters returns a clear [`CliError`] (the server would
+/// otherwise reject it with `1605`).
+fn billing_meters_query(
+    params: &BillingMetersParams<'_>,
+) -> Result<HashMap<String, String>, CliError> {
+    if params.workspace_id.is_some() && params.share_id.is_some() {
+        return Err(CliError::Parse(
+            "only one of --workspace-id or --share-id may be specified".to_owned(),
+        ));
+    }
+    let mut query = HashMap::new();
+    query.insert("meter".to_owned(), params.meter.to_owned());
+    if let Some(v) = params.start_time {
+        query.insert("start_time".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.end_time {
+        query.insert("end_time".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.workspace_id {
+        query.insert("workspace_id".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.share_id {
+        query.insert("share_id".to_owned(), v.to_owned());
+    }
+    Ok(query)
+}
+
 /// Get usage meters.
 ///
 /// `GET /org/{org_id}/billing/usage/meters/list/`
+///
+/// `workspace_id` and `share_id` are mutually exclusive; supplying both is
+/// rejected with a clear [`CliError`] BEFORE any HTTP request is issued (the
+/// server would otherwise reject it with `1605`).
 pub async fn get_billing_meters(
     client: &ApiClient,
-    org_id: &str,
-    meter: &str,
-    start_time: Option<&str>,
-    end_time: Option<&str>,
+    params: &BillingMetersParams<'_>,
 ) -> Result<Value, CliError> {
-    let mut params = HashMap::new();
-    params.insert("meter".to_owned(), meter.to_owned());
-    if let Some(v) = start_time {
-        params.insert("start_time".to_owned(), v.to_owned());
-    }
-    if let Some(v) = end_time {
-        params.insert("end_time".to_owned(), v.to_owned());
-    }
-    let path = format!(
-        "/org/{}/billing/usage/meters/list/",
-        urlencoding::encode(org_id),
-    );
-    client.get_with_params(&path, &params).await
+    let query = billing_meters_query(params)?;
+    let path = billing_meters_path(params.org_id);
+    client.get_with_params(&path, &query).await
 }
 
 /// List organization members.
@@ -291,15 +340,33 @@ pub async fn get_public_details(client: &ApiClient, org_id: &str) -> Result<Valu
     client.get(&path).await
 }
 
-/// Get plan limits for an org.
-///
-/// `GET /org/{org_id}/billing/usage/limits/credits/`
-pub async fn get_limits(client: &ApiClient, org_id: &str) -> Result<Value, CliError> {
-    let path = format!(
+/// Build the path for the credit-usage endpoint.
+fn billing_credit_usage_path(org_id: &str) -> String {
+    format!(
         "/org/{}/billing/usage/limits/credits/",
         urlencoding::encode(org_id),
-    );
-    client.get(&path).await
+    )
+}
+
+/// Get credit usage and limits for an org.
+///
+/// `GET /org/{org_id}/billing/usage/limits/credits/`
+///
+/// Returns the org's per-period credit consumption, remaining budget, and
+/// renewal window. Reached by both `org billing usage` (canonical) and the
+/// hidden `org limits` alias via [`get_limits`].
+pub async fn get_credit_usage(client: &ApiClient, org_id: &str) -> Result<Value, CliError> {
+    client.get(&billing_credit_usage_path(org_id)).await
+}
+
+/// Get plan limits for an org (hidden `org limits` alias).
+///
+/// `GET /org/{org_id}/billing/usage/limits/credits/`
+///
+/// Thin alias for [`get_credit_usage`], retained so the deprecated
+/// `org limits` command keeps reaching the same endpoint for one release.
+pub async fn get_limits(client: &ApiClient, org_id: &str) -> Result<Value, CliError> {
+    get_credit_usage(client, org_id).await
 }
 
 /// Get member details by user ID.
@@ -335,35 +402,60 @@ pub async fn join_org(client: &ApiClient, org_id: &str) -> Result<Value, CliErro
     client.post(&path, &form).await
 }
 
+/// Build the root billing path (`/org/{org_id}/billing/`).
+///
+/// Shared by the subscription create (`POST`), cancel (`DELETE`), and
+/// reactivate (`PUT`) calls — the three verbs the server multiplexes on this
+/// single path.
+fn billing_root_path(org_id: &str) -> String {
+    format!("/org/{}/billing/", urlencoding::encode(org_id))
+}
+
 /// Cancel a billing subscription.
 ///
 /// `DELETE /org/{org_id}/billing/`
+///
+/// Schedules cancellation at the end of the current billing period — the org
+/// keeps full access until `cancel_at`. Use [`billing_reactivate`] to reverse
+/// the schedule before it executes.
 pub async fn billing_cancel(client: &ApiClient, org_id: &str) -> Result<Value, CliError> {
-    let path = format!("/org/{}/billing/", urlencoding::encode(org_id));
-    client.delete(&path).await
+    client.delete(&billing_root_path(org_id)).await
 }
 
-/// Activate a billing subscription.
+/// Reactivate a subscription scheduled to cancel at period end.
 ///
-/// `POST /org/{org_id}/billing/activate/`
-pub async fn billing_activate(client: &ApiClient, org_id: &str) -> Result<Value, CliError> {
-    let form = HashMap::new();
-    let path = format!("/org/{}/billing/activate/", urlencoding::encode(org_id));
-    client.post(&path, &form).await
+/// `PUT /org/{org_id}/billing/`
+///
+/// Owner-only on the server. Clears `cancel_at_period_end` so the
+/// subscription renews normally. Calling this on a subscription that is not
+/// scheduled to cancel is a successful no-op; once the subscription has fully
+/// terminated the server returns `1683`/404 (use [`billing_create`] to start a
+/// new subscription instead). Replaces the removed `activate`/`reset` calls,
+/// whose endpoints do not exist.
+pub async fn billing_reactivate(client: &ApiClient, org_id: &str) -> Result<Value, CliError> {
+    // The reactivate endpoint takes no request body; send an empty JSON object
+    // via the shared `put_json` helper.
+    client
+        .put_json(
+            &billing_root_path(org_id),
+            &Value::Object(serde_json::Map::new()),
+        )
+        .await
 }
 
-/// Reset billing.
-///
-/// `POST /org/{org_id}/billing/reset/`
-pub async fn billing_reset(client: &ApiClient, org_id: &str) -> Result<Value, CliError> {
-    let form = HashMap::new();
-    let path = format!("/org/{}/billing/reset/", urlencoding::encode(org_id));
-    client.post(&path, &form).await
+/// Build the path for the billable-members endpoint.
+fn billing_members_path(org_id: &str) -> String {
+    format!(
+        "/org/{}/billing/usage/members/list/",
+        urlencoding::encode(org_id),
+    )
 }
 
 /// List billable members.
 ///
 /// `GET /org/{org_id}/billing/usage/members/list/`
+///
+/// Offset-paginated (unlike the cursor-paginated invoices endpoint).
 pub async fn billing_members(
     client: &ApiClient,
     org_id: &str,
@@ -377,10 +469,7 @@ pub async fn billing_members(
     if let Some(o) = offset {
         params.insert("offset".to_owned(), o.to_string());
     }
-    let path = format!(
-        "/org/{}/billing/usage/members/list/",
-        urlencoding::encode(org_id),
-    );
+    let path = billing_members_path(org_id);
     if params.is_empty() {
         client.get(&path).await
     } else {
@@ -400,8 +489,7 @@ pub async fn billing_create(
     if let Some(p) = plan_id {
         form.insert("billing_plan".to_owned(), p.to_owned());
     }
-    let path = format!("/org/{}/billing/", urlencoding::encode(org_id));
-    client.post(&path, &form).await
+    client.post(&billing_root_path(org_id), &form).await
 }
 
 /// List org invitations.
@@ -671,23 +759,44 @@ pub async fn delete_org_asset(
     client.delete(&path).await
 }
 
-/// List billing invoices.
+/// Build the path for the invoices endpoint.
+fn billing_invoices_path(org_id: &str) -> String {
+    format!("/org/{}/billing/invoices/", urlencoding::encode(org_id))
+}
+
+/// Build the cursor-pagination query for the invoices endpoint.
 ///
-/// `GET /org/{org_id}/billing/invoices/`
-pub async fn billing_invoices(
-    client: &ApiClient,
-    org_id: &str,
+/// Emits `limit` and/or `starting_after` (the invoice-ID cursor) — never
+/// `offset`. Returns an empty map when neither is supplied.
+fn billing_invoices_query(
     limit: Option<u32>,
-    offset: Option<u32>,
-) -> Result<Value, CliError> {
+    starting_after: Option<&str>,
+) -> HashMap<String, String> {
     let mut params = HashMap::new();
     if let Some(l) = limit {
         params.insert("limit".to_owned(), l.to_string());
     }
-    if let Some(o) = offset {
-        params.insert("offset".to_owned(), o.to_string());
+    if let Some(cursor) = starting_after {
+        params.insert("starting_after".to_owned(), cursor.to_owned());
     }
-    let path = format!("/org/{}/billing/invoices/", urlencoding::encode(org_id),);
+    params
+}
+
+/// List billing invoices.
+///
+/// `GET /org/{org_id}/billing/invoices/`
+///
+/// Cursor-paginated: pass the `id` of the last invoice from the previous page
+/// as `starting_after` to fetch the next page (NOT offset-based). The response
+/// carries `has_more` to indicate whether further pages exist.
+pub async fn billing_invoices(
+    client: &ApiClient,
+    org_id: &str,
+    limit: Option<u32>,
+    starting_after: Option<&str>,
+) -> Result<Value, CliError> {
+    let params = billing_invoices_query(limit, starting_after);
+    let path = billing_invoices_path(org_id);
     if params.is_empty() {
         client.get(&path).await
     } else {
@@ -713,4 +822,162 @@ pub async fn create_workspace(
         form.insert("description".to_owned(), d.to_owned());
     }
     client.post("/workspace/create/", &form).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BillingMetersParams, billing_credit_usage_path, billing_details_path,
+        billing_invoices_path, billing_invoices_query, billing_members_path, billing_meters_path,
+        billing_meters_query, billing_root_path,
+    };
+    use crate::error::CliError;
+
+    // ─── path builders ──────────────────────────────────────────────────────
+
+    #[test]
+    fn billing_root_path_is_canonical() {
+        // The PUT (reactivate), DELETE (cancel), and POST (subscribe) all hit
+        // this exact path. `put_json` then sends it via the PUT verb (covered
+        // by client.rs::put_json_uses_put_method_and_url).
+        assert_eq!(
+            billing_root_path("1234567890123456789"),
+            "/org/1234567890123456789/billing/"
+        );
+    }
+
+    #[test]
+    fn billing_root_path_url_encodes_id() {
+        assert_eq!(billing_root_path("a/b c"), "/org/a%2Fb%20c/billing/");
+    }
+
+    #[test]
+    fn billing_details_path_builds() {
+        assert_eq!(billing_details_path("19"), "/org/19/billing/details/");
+    }
+
+    #[test]
+    fn billing_credit_usage_path_builds() {
+        // Reached by both `org billing usage` and the `org limits` alias.
+        assert_eq!(
+            billing_credit_usage_path("19"),
+            "/org/19/billing/usage/limits/credits/"
+        );
+    }
+
+    #[test]
+    fn billing_meters_path_builds() {
+        assert_eq!(
+            billing_meters_path("19"),
+            "/org/19/billing/usage/meters/list/"
+        );
+    }
+
+    #[test]
+    fn billing_members_path_builds() {
+        assert_eq!(
+            billing_members_path("19"),
+            "/org/19/billing/usage/members/list/"
+        );
+    }
+
+    #[test]
+    fn billing_invoices_path_builds() {
+        assert_eq!(billing_invoices_path("19"), "/org/19/billing/invoices/");
+    }
+
+    // ─── invoices cursor pagination (NOT offset) ────────────────────────────
+
+    #[test]
+    fn invoices_query_uses_limit_and_starting_after_not_offset() {
+        let q = billing_invoices_query(Some(25), Some("in_abc"));
+        assert_eq!(q.get("limit").map(String::as_str), Some("25"));
+        assert_eq!(q.get("starting_after").map(String::as_str), Some("in_abc"));
+        assert!(
+            !q.contains_key("offset"),
+            "invoices must paginate by cursor, never offset"
+        );
+    }
+
+    #[test]
+    fn invoices_query_empty_when_no_args() {
+        assert!(billing_invoices_query(None, None).is_empty());
+    }
+
+    #[test]
+    fn invoices_query_cursor_only() {
+        let q = billing_invoices_query(None, Some("in_last"));
+        assert_eq!(q.get("starting_after").map(String::as_str), Some("in_last"));
+        assert!(!q.contains_key("limit"));
+    }
+
+    // ─── meters XOR validation (before any HTTP) ────────────────────────────
+
+    #[test]
+    fn meters_query_rejects_both_filters() {
+        let params = BillingMetersParams {
+            org_id: "19",
+            meter: "storage_bytes",
+            start_time: None,
+            end_time: None,
+            workspace_id: Some("ws1"),
+            share_id: Some("sh1"),
+        };
+        let err = billing_meters_query(&params).unwrap_err();
+        assert!(
+            matches!(err, CliError::Parse(_)),
+            "both filters must be rejected before the HTTP call, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn meters_query_accepts_workspace_only() {
+        let params = BillingMetersParams {
+            org_id: "19",
+            meter: "storage_bytes",
+            start_time: Some("2024-01-01 00:00:00"),
+            end_time: Some("2024-01-31 23:59:59"),
+            workspace_id: Some("ws1"),
+            share_id: None,
+        };
+        let q = billing_meters_query(&params).expect("workspace-only is valid");
+        assert_eq!(q.get("meter").map(String::as_str), Some("storage_bytes"));
+        assert_eq!(q.get("workspace_id").map(String::as_str), Some("ws1"));
+        assert_eq!(
+            q.get("start_time").map(String::as_str),
+            Some("2024-01-01 00:00:00")
+        );
+        assert!(!q.contains_key("share_id"));
+    }
+
+    #[test]
+    fn meters_query_accepts_share_only() {
+        let params = BillingMetersParams {
+            org_id: "19",
+            meter: "ai_tokens",
+            start_time: None,
+            end_time: None,
+            workspace_id: None,
+            share_id: Some("sh1"),
+        };
+        let q = billing_meters_query(&params).expect("share-only is valid");
+        assert_eq!(q.get("share_id").map(String::as_str), Some("sh1"));
+        assert!(!q.contains_key("workspace_id"));
+    }
+
+    #[test]
+    fn meters_query_accepts_neither_filter() {
+        let params = BillingMetersParams {
+            org_id: "19",
+            meter: "bandwidth_bytes",
+            start_time: None,
+            end_time: None,
+            workspace_id: None,
+            share_id: None,
+        };
+        let q = billing_meters_query(&params).expect("no filter is valid");
+        assert_eq!(q.get("meter").map(String::as_str), Some("bandwidth_bytes"));
+        assert!(!q.contains_key("workspace_id"));
+        assert!(!q.contains_key("share_id"));
+    }
 }
