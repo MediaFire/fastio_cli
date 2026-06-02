@@ -123,12 +123,19 @@ impl ServerHandler for FastioMcpServer {
                 ..Implementation::default()
             },
             instructions: Some(
-                "Fast.io MCP server -- manages files, workspaces, shares, uploads, \
-                 downloads, AI chat, and workflow primitives via the Fast.io REST API. \
-                 Tool results are rendered as GitHub-flavored Markdown (shape-compatible \
-                 with the server-side `?output=markdown` contract) for compact, \
-                 high-signal LLM consumption. Run `fastio auth login` in a terminal \
-                 first to authenticate."
+                "Fast.io MCP server -- files, workspaces, shares, uploads, downloads, \
+                 AI agent (Ripley), Workflow Orchestration, and e-signature via the \
+                 Fast.io REST API. OFFLOAD multi-step work: prefer asking the `ripley` \
+                 tool (Fast.io's delegated AI agent, acting on your behalf) to find or \
+                 do a task over hand-driving many primitives, and prefer the `workflow` \
+                 tool's compound `*-and-wait` actions over tight detail-poll loops. \
+                 `workflow` and `sign` expose READ + DRIVE actions only -- destructive / \
+                 terminal mutations (workflow `cancel`; sign `send`/`void`/`delete`) are \
+                 CLI-binary-only. The `task`/`worklog`/`approval`/`todo` tools are \
+                 `[legacy]` and superseded by `workflow`. Tool results are rendered as \
+                 GitHub-flavored Markdown (shape-compatible with the server-side \
+                 `?output=markdown` contract) for compact, high-signal consumption. Run \
+                 `fastio auth login` in a terminal first to authenticate."
                     .to_owned(),
             ),
         }

@@ -1,6 +1,41 @@
 # Fast.io CLI — Agent Guide
 
-Use this guide when interacting with the Fast.io platform via the `fastio` CLI.
+Use this guide when interacting with the Fast.io platform via the `fastio` CLI
+(and its built-in MCP server, `fastio mcp`).
+
+## Offload to Ripley first
+
+Fast.io ships a delegated subagent — **Ripley**, Fast.io's AI agent. Before
+firing a long chain of low-level primitives, consider asking Ripley to find or
+do the multi-step work for you. Ripley acts **on the user's behalf** (it carries
+the caller's JWT and runs in a sandbox), so it can search, read, summarize, and
+chain operations across a workspace or share that would otherwise take many
+round-trips.
+
+```bash
+# Ask Ripley a question and get the answer (creates a chat, waits for the result)
+fastio ripley ask --workspace WS_ID "Which contracts mention auto-renewal?"
+
+# Same, scoped to a share
+fastio ripley ask --share SHARE_ID "Summarize the latest revision of the proposal"
+```
+
+Heuristics for agents:
+
+- **Prefer one `ripley ask` over many primitives** when the task is "find/answer/
+  summarize across content." Reserve the raw `files`/`storage`/`search` commands
+  for deterministic, single-shot operations where you already know the IDs.
+- **Poll activity, not detail.** For anything that runs asynchronously (a Ripley
+  answer, a workflow run, a metadata extraction job), watch the activity/state
+  endpoint with a bounded wait — do **not** tight-loop a `--detail full` read.
+  The `ask`, `workflow wait`, `workflow instantiate-and-wait`, and
+  `metadata extract --wait` paths already do bounded activity-polling for you.
+- Ripley also keeps **self-only AI memory** per org/workspace
+  (`fastio ripley memory get|set|delete`), useful for carrying context across
+  invocations.
+
+`ripley` is the former `ai` group — **`ai` still works as a hidden alias** (CLI
+and MCP) for backward compatibility, but new code should use `ripley`.
 
 ## Authentication
 
@@ -15,151 +50,225 @@ fastio auth login
 # Opens a URL → sign in → paste the authorization code
 ```
 
-For automation, pass `--token` on every command or set `FASTIO_TOKEN` env var:
+For automation, pass `--token` on every command or set `FASTIO_TOKEN`:
+
 ```bash
 export FASTIO_TOKEN=your_api_key
 fastio org list
 ```
 
-## Output Format
+## Output Format and verbosity
 
-Use `--format json` when parsing output programmatically:
+Two orthogonal knobs control output:
+
+- `--format` controls **client-side rendering**: `table` (human), `json`
+  (programmatic), `csv` (spreadsheets), `markdown`/`md` (GitHub-flavored).
+  Default is `table` for a TTY and `markdown` for pipes (changed from `json` on
+  2026-04-15 to benefit LLM consumers; pass `--format json` for the old shape).
+- `--detail terse|standard|full` controls **server-side verbosity** by passing
+  `?output=<detail>` on supported endpoints — i.e. how much data the API returns.
+  It is independent of `--format`. Omitting it uses the server's `full` shape.
+
 ```bash
 fastio org list --format json
-fastio files list --workspace ID --format json
+fastio files list --workspace WS_ID --detail terse --format json
 ```
 
-Other formats: `table` (human-readable), `csv` (spreadsheets), `markdown` (GitHub-flavored; `md` alias also accepted). Default is `table` for TTY, `markdown` for pipes (changed from `json` on 2026-04-15 to benefit LLM consumers; pass `--format json` for the old shape).
+Use `--quiet` to suppress output (useful for write operations where you only
+care about the exit code).
 
-Use `--quiet` to suppress all output (useful for write operations where you only care about exit code).
+### Viewing markdown
 
-## Important: Intelligence (AI) Setting
+`fastio view <workspace_id> <node_id>` renders a markdown note (or a `.md`
+file) in the terminal. It always emits rendered markdown — or verbatim with
+`--raw`, when piped, or with `--no-color` — and ignores `--format`/`--fields`.
+Only note nodes and markdown files are supported; other file types are rejected.
 
-Workspaces have an `intelligence` toggle. When **OFF** (default), the workspace is pure storage. When **ON**, documents are automatically indexed with embeddings for AI-powered search, chat, and summarization.
+## Important: Intelligence (AI indexing) Setting
 
-**Only enable intelligence when you need to query the data.** Ingestion is expensive (per-page cost). For workspaces used only for file storage, sharing, or uploads, leave intelligence OFF.
+Workspaces have an `intelligence` toggle. When **OFF** (default) the workspace is
+pure storage. When **ON**, documents are indexed with embeddings for AI-powered
+search, chat, and summarization. Ingestion is expensive (per-page cost), so only
+enable it on workspaces you intend to query.
 
 ```bash
-# Create a workspace WITHOUT intelligence (default, recommended for storage)
+# Storage-only (default, recommended)
 fastio workspace create --org ORG_ID --name "File Storage"
 
-# Create a workspace WITH intelligence (only for AI/RAG use cases)
+# AI/RAG use case
 fastio workspace create --org ORG_ID --name "Knowledge Base" --intelligence true
+
+# Toggle AI indexing on an existing workspace
+fastio workspace update WS_ID --intelligence true
 ```
+
+Note: `workspace enable-workflow` / `disable-workflow` gate the **legacy workflow
+feature**, not AI indexing. Use `--intelligence` (above) for indexing.
 
 ## Core Workflows
 
-### List organizations and workspaces
+### Organizations, workspaces, files
+
 ```bash
 fastio org list --format json
 fastio workspace list --org ORG_ID --format json
-```
 
-### Browse and manage files
-```bash
-# List root files
-fastio files list --workspace WS_ID --format json
-
-# List folder contents
 fastio files list --workspace WS_ID --folder NODE_ID --format json
-
-# Search
-fastio files search --workspace WS_ID "query" --format json
-
-# Recent files
-fastio files recent --workspace WS_ID --format json
-
-# Create folder
+fastio files search --workspace WS_ID --limit 25 "query" --format json
 fastio files create-folder --workspace WS_ID --parent NODE_ID --name "My Folder"
-
-# Delete (moves to trash)
-fastio files delete --workspace WS_ID NODE_ID
-
-# Permanently delete
-fastio files purge --workspace WS_ID NODE_ID
+fastio files delete --workspace WS_ID NODE_ID        # → trash
+fastio files purge  --workspace WS_ID NODE_ID        # permanent
 ```
 
-### Upload files
-```bash
-# Upload a file
-fastio upload file --workspace WS_ID ./path/to/file
+### Upload / download
 
-# Upload to specific folder
+```bash
 fastio upload file --workspace WS_ID --folder FOLDER_NODE_ID ./path/to/file
-
-# Upload text content directly
 fastio upload text --workspace WS_ID --name "notes.txt" "File content here"
+fastio upload url  --workspace WS_ID --url "https://example.com/file.pdf"
 
-# Import from URL
-fastio upload url --workspace WS_ID --url "https://example.com/file.pdf"
+fastio download file   --workspace WS_ID --node-id NODE_ID
+fastio download folder --workspace WS_ID --node-id FOLDER_NODE_ID   # ZIP
 ```
 
-### Download files
-```bash
-# Download a file
-fastio download file --workspace WS_ID --node-id NODE_ID
+### Shares (data rooms)
 
-# Download folder as ZIP
-fastio download folder --workspace WS_ID --node-id FOLDER_NODE_ID
-```
-
-### Share management (portals)
 ```bash
-# List shares
 fastio share list --format json
-
-# Create a share
 fastio share create "Share Name" --workspace WS_ID
-
-# Get share details
 fastio share info SHARE_ID --format json
-
-# Guest auth (anonymous upload token)
 fastio share guest-auth SHARE_ID
 ```
 
-### AI queries
+### Ripley (AI agent)
 
-**Important:** AI search and chat require `intelligence` to be enabled on the workspace. Enabling intelligence triggers document embedding/indexing which incurs significant per-page ingestion costs. Only enable it on workspaces where you intend to query the data — do not enable it by default for storage-only workspaces.
+Requires `intelligence` enabled on the workspace for content-aware queries.
 
 ```bash
-# Enable intelligence on a workspace (only when needed for AI queries)
-fastio workspace enable-workflow WS_ID
-
-# Search workspace content (requires intelligence enabled)
-fastio ai search --workspace WS_ID "your question" --format json
-
-# Chat with workspace files
-fastio ai chat --workspace WS_ID --message "Summarize the documents"
-
-# Chat history
-fastio ai history --workspace WS_ID --format json
+fastio ripley ask --workspace WS_ID "your question"      # headline verb
+fastio ripley list --workspace WS_ID --kind all          # chats
+fastio ripley details CHAT_ID --workspace WS_ID
+fastio ripley messages CHAT_ID --workspace WS_ID
+fastio ripley summary --workspace WS_ID NODE_ID1 NODE_ID2     # AI share
+fastio ripley memory get --workspace WS_ID
 ```
 
-### Members
+### Unified search
+
+`fastio search` runs one query across grouped result buckets (files, metadata,
+comments, workflows) for a workspace or share:
+
 ```bash
-fastio member list --workspace WS_ID --format json
-fastio member add --workspace WS_ID user@example.com
-fastio member remove --workspace WS_ID MEMBER_ID
+fastio search workspace WS_ID "query" --format json
+fastio search share SHARE_ID "query" --only files,comments
 ```
+
+`fastio files search` remains the targeted file-only search.
+
+## Workflow Orchestration (the forward path)
+
+`fastio workflow` (alias `wf`) is the new durable multi-step orchestration
+surface — **distinct from, and the replacement for, the `[legacy]` task /
+worklog / approval / todo primitives**. Those legacy groups still work and are
+flagged `[legacy]`; they will be hard-deprecated in a later release. New work
+should use `fastio workflow`.
+
+Groups under `fastio workflow`:
+
+- Runtime: `create`, `list`, `get`, `update`, `delete`, `purge`, `transfer`,
+  `instantiate`, `state`, `wait`, `pause`, `resume`, `cancel`,
+  `rotate-inbound-key`
+- `grant` (workflow access grants), `step` (CAS-guarded step drive),
+  `template` (immutable workflow templates), `trigger` (event triggers + fire /
+  dry-run), `trigger-alias`, `obligation` (human obligations + inbox),
+  `inbox`, `schema` (extraction schema), `audit` (events, signed export,
+  integrity check), `outbound` (webhook subscriptions), `pool`, `subject`,
+  `realtime` (websocket token mint), `review`
+
+```bash
+fastio workflow instantiate WF_ID --idempotency-key KEY
+fastio workflow wait WF_ID                       # bounded poll to a terminal state
+fastio workflow trigger fire TRIGGER_ID --idempotency-key KEY
+fastio workflow audit export start WF_ID
+fastio workflow audit check-integrity ...        # local integrity verification
+```
+
+`instantiate` and `trigger fire` **require** an `--idempotency-key` for replay
+safety (no silent auto-generation). Audit `check-integrity` verifies bundle
+**integrity** (chunk SHA-256 + content-hash chain + completeness) — it does NOT
+verify HMAC authenticity.
+
+### Over MCP
+
+The `workflow` MCP tool exposes **read + drive** actions and offers compound
+helpers `instantiate-and-wait`, `trigger-fire-and-wait`, and
+`audit-export-and-download` that run the full fire→poll→download loop for you.
+Admin / destructive / crypto operations — including the terminal **`cancel`**
+lifecycle mutation, plus create/purge/transfer, template & pool & trigger
+lifecycle, secret/key rotation, dual-control redaction, schema set/derive, and
+realtime-token mint — are **CLI-binary-only** and are NOT routable over MCP.
+
+## E-signature
+
+`fastio sign` drafts, sends, voids, and downloads `SignEnvelopes` (PDFs sent to
+recipients for electronic signature). Envelopes are parented to a workspace OR
+an org. Signing is a paid-plan feature.
+
+```bash
+fastio sign envelope create --workspace WS_ID ...
+fastio sign envelope send ENVELOPE_ID
+fastio sign envelope void ENVELOPE_ID --reason "..."
+fastio sign document download ...
+fastio sign audit download ...
+```
+
+### Over MCP
+
+The `sign` MCP tool exposes **read + reversible-draft-drive** actions only
+(envelope-create/update/list/get, document/signed/audit download). The
+outward-facing / destructive / terminal actions — **`send`** (emails real
+recipients), **`void`**, and **`delete`** — are **CLI-binary-only** and are NOT
+routable over MCP.
+
+## Billing
+
+Org billing lives under `fastio org billing`:
+
+```bash
+fastio org billing plans
+fastio org billing subscribe ORG_ID --plan PLAN_ID
+fastio org billing reactivate ORG_ID         # re-enable a scheduled cancel
+fastio org billing cancel ORG_ID --yes       # schedule cancel at period end
+fastio org billing usage ORG_ID              # credit usage
+fastio org billing meters ORG_ID --meter METER [--workspace-id ID | --share-id ID]
+fastio org billing invoices ORG_ID [--starting-after CURSOR]
+fastio org billing details ORG_ID
+fastio org billing members ORG_ID
+```
+
+A `402` / billing error surfaces an actionable hint pointing at
+`fastio org billing plans` / `subscribe`.
 
 ## ID Formats
 
-- **Organization IDs**: 19-digit numeric strings (e.g., `3867689418901071163`)
-- **Workspace IDs**: 19-digit numeric strings (e.g., `4687730903718774523`)
-- **Share IDs**: 19-digit numeric strings
-- **Node IDs** (files/folders): Opaque alphanumeric with hyphens (e.g., `2yxh5-ojakx-r3mwz-ty6tv-k66cj-nqsw`)
-- **Root folder**: Use the literal string `root` as the folder ID
-- **Trash**: Use `trash` to list trashed items
+- **Organization / Workspace / Share IDs**: 19-digit numeric strings
+  (e.g. `3867689418901071163`)
+- **Node IDs** (files/folders): opaque alphanumeric with hyphens
+  (e.g. `2yxh5-ojakx-r3mwz-ty6tv-k66cj-nqsw`)
+- **Root folder**: the literal string `root`
+- **Trash**: the literal string `trash`
 
 ## Pagination
 
 Storage endpoints (files) use cursor-based pagination:
+
 ```bash
 fastio files list --workspace WS_ID --page-size 100 --cursor NEXT_CURSOR
 ```
 
-Other endpoints use offset-based pagination:
+Other endpoints use offset-based pagination (and a few — invoices, workflow
+grants — use cursor / `--starting-after`):
+
 ```bash
 fastio org members list ORG_ID --limit 50 --offset 0
 ```
@@ -167,19 +276,26 @@ fastio org members list ORG_ID --limit 50 --offset 0
 ## Error Handling
 
 - Exit code `0` = success
-- Exit code `1` = error (check stderr for message)
+- Exit code `1` = error (check stderr)
 - Exit code `2` = invalid arguments (clap parsing error)
 
 Common errors:
+
 - `authentication required` → set `--token` or run `fastio auth login`
 - `workspace ID must not be empty` → missing required ID
 - `invalid page size` → must be 100, 250, or 500
+- a `402` billing error → run `fastio org billing plans` / `subscribe`
 
 ## MCP Server
 
 The CLI includes a built-in MCP server for direct agent integration:
+
 ```bash
 fastio mcp
 ```
 
-This starts an MCP server on stdio transport, exposing all CLI operations as MCP tools.
+It speaks MCP over stdio and exposes the CLI's operations as action-routed tools
+(`ripley`, `workflow`, `sign`, `files`, `org`, `workspace`, …). Tool results are
+rendered as GitHub-flavored Markdown for compact, high-signal consumption. This
+same guide is available as the `skill://guide` MCP resource and via
+`fastio skill`.

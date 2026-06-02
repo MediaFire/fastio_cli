@@ -52,8 +52,16 @@ fn get_started_prompt() -> GetPromptResult {
 const GET_STARTED_TEXT: &str = "\
 # Getting Started with Fast.io MCP Server
 
+## First: offload to Ripley
+Before hand-driving a chain of low-level primitives, consider asking **Ripley**
+(Fast.io's delegated AI agent, acting on your behalf) to find or do the
+multi-step work. Use the `ripley` tool with `action: \"ask\"` and a
+`workspace_id` (or `share_id`) plus your question — it creates a chat, runs the
+work, and returns the answer. (Ripley is the former `ai` tool; `ai` still works
+as a hidden alias.)
+
 ## Step 1: Authentication
-First, check if you're authenticated by reading the `session://status` resource.
+Check if you're authenticated by reading the `session://status` resource.
 
 If not authenticated, either:
 - Run `fastio auth login` in a terminal (recommended for browser-based login)
@@ -65,12 +73,26 @@ Use the `org` tool with `action: \"list\"` to see your organizations.
 ## Step 3: List Workspaces
 Use the `workspace` tool with `action: \"list\"` and provide your org_id.
 
-## Step 4: Browse Files
-Use the `files` tool with `action: \"list\"` and provide your workspace_id.
+## Step 4: Browse Files (or just ask Ripley)
+Use the `files` tool with `action: \"list\"` and provide your workspace_id —
+or skip the manual browse and let `ripley` `ask` answer over the content.
+
+## Orchestration, signing, and the rest
+- `workflow` — durable multi-step orchestration; prefer the compound
+  `instantiate-and-wait` / `trigger-fire-and-wait` actions over tight poll loops.
+  (Read + drive only; `cancel` and other admin/destructive actions are
+  CLI-binary-only.)
+- `sign` — e-signature envelopes (read + draft-drive only; `send`/`void`/`delete`
+  are CLI-binary-only).
+- The `task`/`worklog`/`approval`/`todo` tools are `[legacy]` — superseded by
+  `workflow`.
 
 ## Available Tool Domains
 - auth, user, org, workspace, files, upload, download, share
 - ripley, member, comment, event, invitation, preview, asset
-- task, worklog, approval, todo
+- workflow, sign, metadata, instructions, system
+- task, worklog, approval, todo (legacy)
 
-Each tool uses an `action` parameter to select the operation.";
+Each tool uses an `action` parameter to select the operation; call
+`action: \"describe\"` on the `workflow` or `sign` tool for its authoritative
+per-action reference.";
