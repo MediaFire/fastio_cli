@@ -428,7 +428,21 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("share_id", "Share ID (import-share)", false),
             ("node_id", "Node ID (notes, quickshare, metadata)", false),
             ("parent_id", "Parent folder ID (create-note)", false),
-            ("content", "Note content", false),
+            (
+                "content",
+                "Note markdown content, max 100KB (required for create-note)",
+                false,
+            ),
+            (
+                "if_version_id",
+                "Compare-and-swap version precondition (update-note); 409 on mismatch",
+                false,
+            ),
+            (
+                "version_id",
+                "Specific note version to read (read-note)",
+                false,
+            ),
             ("template_id", "Metadata template ID", false),
             ("category", "Metadata template category", false),
             ("fields", "JSON-encoded field definitions (metadata)", false),
@@ -526,6 +540,28 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("to", "Target parent folder ID (move, copy)", false),
             ("new_name", "New name (rename)", false),
             ("query", "Search query (search)", false),
+            ("limit", "Max results (search)", false),
+            ("offset", "Result offset (search)", false),
+            (
+                "files_scope",
+                "Comma-separated nodeId:versionId pairs to narrow search (search)",
+                false,
+            ),
+            (
+                "folders_scope",
+                "Comma-separated nodeId:depth pairs to narrow search (search)",
+                false,
+            ),
+            (
+                "details",
+                "Enrich each search hit with the full node resource (search)",
+                false,
+            ),
+            (
+                "output",
+                "content_snippet verbosity: terse/standard/full (search)",
+                false,
+            ),
             ("sort_by", "Sort field (list)", false),
             ("sort_dir", "Sort direction: asc/desc", false),
             ("page_size", "Page size (list, trash)", false),
@@ -3026,16 +3062,17 @@ async fn handle_workspace(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            match api::workspace::search_workspace(
-                &client,
-                ws_id,
-                query,
-                optional_u32(args, "limit"),
-                optional_u32(args, "offset"),
-            )
-            .await
-            {
-                Ok(v) => Ok(success_json(&v)),
+            // Decoupled (Phase 3) from `api::workspace::search_workspace`
+            // (removed): route through the single `search_files` builder so
+            // the action keeps the standard file-search shape.
+            let params = api::storage::SearchFilesParams::new()
+                .limit(optional_u32(args, "limit"))
+                .offset(optional_u32(args, "offset"));
+            match api::storage::search_files(&client, ws_id, query, params).await {
+                // Normalize the node-id-keyed `files` MAP into a one-row-per-file
+                // ARRAY so MCP renders the search result the same way the CLI
+                // does (CLI/MCP parity).
+                Ok(v) => Ok(success_json(&api::storage::normalize_search_response(v))),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
@@ -3142,15 +3179,12 @@ async fn handle_workspace(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            match api::workspace::create_note(
-                &client,
-                ws_id,
-                parent,
-                name,
-                optional_str(args, "content"),
-            )
-            .await
-            {
+            // `content` is required by `createnote/` (storage.txt:553).
+            let content = match required_str(args, "content") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::workspace::create_note(&client, ws_id, parent, name, content).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -3170,6 +3204,7 @@ async fn handle_workspace(
                 node_id,
                 optional_str(args, "name"),
                 optional_str(args, "content"),
+                optional_str(args, "if_version_id"),
             )
             .await
             {
@@ -3186,7 +3221,14 @@ async fn handle_workspace(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            match api::workspace::read_note(&client, ws_id, node_id).await {
+            match api::workspace::read_note(
+                &client,
+                ws_id,
+                node_id,
+                optional_str(args, "version_id"),
+            )
+            .await
+            {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -4090,10 +4132,26 @@ async fn handle_files_search(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    match api::storage::search_files(&client, ws_id, query, None, None).await {
-        Ok(v) => Ok(success_json(&v)),
+    let params = build_search_files_params(args);
+    match api::storage::search_files(&client, ws_id, query, params).await {
+        // Normalize the node-id-keyed `files` MAP into a one-row-per-file ARRAY
+        // so MCP matches the CLI search renderer (CLI/MCP parity). The
+        // `details` (results[]) shape is left untouched by the normalizer.
+        Ok(v) => Ok(success_json(&api::storage::normalize_search_response(v))),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
+}
+
+/// Build [`api::storage::SearchFilesParams`] from MCP tool arguments, shared by
+/// `handle_files_search` and the re-pointed `handle_ai_search`.
+fn build_search_files_params(args: &Map<String, Value>) -> api::storage::SearchFilesParams<'_> {
+    api::storage::SearchFilesParams::new()
+        .files_scope(optional_str(args, "files_scope"))
+        .folders_scope(optional_str(args, "folders_scope"))
+        .limit(optional_u32(args, "limit"))
+        .offset(optional_u32(args, "offset"))
+        .details(optional_bool(args, "details").unwrap_or(false))
+        .output(optional_str(args, "output"))
 }
 
 async fn handle_files_recent(
@@ -5651,37 +5709,28 @@ async fn handle_ai_search(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let query = match required_str(args, "query_text") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
+    // Accept either `query_text` (legacy `/ai/search/` name) or `search`
+    // (the storage-search name) so old callers keep working. Falls back to
+    // `required_str` so a missing query yields the standard missing-arg error.
+    let query = match optional_str(args, "query_text").or_else(|| optional_str(args, "search")) {
+        Some(v) => v,
+        None => match required_str(args, "query_text") {
+            Ok(v) => v,
+            Err(e) => return Ok(e),
+        },
     };
-    // `/ai/search/` requires `query_text` (ai.txt:1647), not `question`.
-    let mut params = std::collections::HashMap::new();
-    params.insert("query_text".to_owned(), query.to_owned());
-    if let Some(l) = optional_str(args, "limit") {
-        params.insert("limit".to_owned(), l.to_owned());
-    }
-    if let Some(o) = optional_str(args, "offset") {
-        params.insert("offset".to_owned(), o.to_owned());
-    }
-    if let Some(v) = optional_str(args, "files_scope") {
-        params.insert("files_scope".to_owned(), v.to_owned());
-    }
-    if let Some(v) = optional_str(args, "folders_scope") {
-        params.insert("folders_scope".to_owned(), v.to_owned());
-    }
-    match api::ai::ai_api(
-        &client,
-        ctx_type,
-        ctx_id,
-        "search/",
-        "GET",
-        None,
-        Some(&params),
-    )
-    .await
-    {
-        Ok(v) => Ok(success_json(&v)),
+    // Re-pointed (Phase 3) off the deprecated `/ai/search/` onto the single
+    // `api::storage::search_files` builder (`/storage/search/`).
+    let params = build_search_files_params(args);
+    let result = match ctx_type {
+        "share" => api::storage::search_files_share(&client, ctx_id, query, params).await,
+        _ => api::storage::search_files(&client, ctx_id, query, params).await,
+    };
+    match result {
+        // Normalize the node-id-keyed `files` MAP into a one-row-per-file ARRAY
+        // so MCP matches the CLI `ai search` renderer (CLI/MCP parity). Both the
+        // workspace and share search contracts share the files-map shape.
+        Ok(v) => Ok(success_json(&api::storage::normalize_search_response(v))),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
 }
@@ -8742,6 +8791,41 @@ mod ripley_tool_tests {
             .expect("call_tool ok");
         let text = result_to_string(&res);
         assert!(text.contains("Unknown tool"), "got: {text}");
+    }
+
+    #[test]
+    fn mcp_search_success_normalizes_files_map_to_array_rows() {
+        // The three MCP storage-search handlers (workspace `search`,
+        // `handle_files_search`, `handle_ai_search`) emit
+        // `success_json(&normalize_search_response(v))`. This reproduces that
+        // exact composition on a node-id-keyed `files` MAP and asserts the
+        // rendered markdown is a one-row-per-file table (CLI/MCP parity), not a
+        // node-id-keyed object dump.
+        let raw = json!({
+            "result": true,
+            "files": {
+                "f1": {"name": "File 1", "type": "file"},
+                "f2": {"name": "File 2", "type": "file"}
+            }
+        });
+        let normalized = super::api::storage::normalize_search_response(raw);
+        let result = super::success_json(&normalized);
+        let text = result_to_string(&result);
+        // A record-shaped array renders as a GFM pipe table with a `node_id`
+        // column header and one cell per file id — the array shape, not the
+        // map shape.
+        assert!(
+            text.contains("node_id"),
+            "normalized search output should render a node_id table column, got: {text}"
+        );
+        assert!(
+            text.contains("f1") && text.contains("f2"),
+            "both file ids should appear as row values, got: {text}"
+        );
+        assert!(
+            text.contains("File 1") && text.contains("File 2"),
+            "both file names should appear in the table, got: {text}"
+        );
     }
 
     #[test]

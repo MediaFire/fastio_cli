@@ -30,6 +30,7 @@ use commands::org::{
     OrgMembersCommand, OrgTransferTokenCommand,
 };
 use commands::preview::PreviewCommand;
+use commands::search::SearchCommand;
 use commands::share::{ShareCommand, ShareFilesCommand, ShareMembersCommand};
 use commands::system::SystemCommand;
 use commands::task::{TaskCommand, TaskListCommand};
@@ -152,6 +153,26 @@ async fn dispatch(
         Commands::Apps(c) => commands::apps::execute(&map_apps_command(&c), ctx).await,
         Commands::Import(c) => commands::import::execute(&map_import_command(&c), ctx).await,
         Commands::Lock(c) => commands::lock::execute(&map_lock_command(&c), ctx).await,
+        Commands::Search(c) => commands::search::execute(map_search_command(c), ctx).await,
+        Commands::View {
+            workspace_id,
+            node_id,
+            raw,
+            version,
+            no_pager,
+        } => {
+            commands::view::execute(
+                &commands::view::ViewCommand {
+                    workspace_id,
+                    node_id,
+                    raw,
+                    version,
+                    no_pager,
+                },
+                ctx,
+            )
+            .await
+        }
         Commands::Metadata(c) => commands::metadata::execute(&map_metadata_command(c), ctx).await,
         Commands::Instructions(c) => {
             commands::instructions::execute(&map_instructions_command(c), ctx).await
@@ -809,13 +830,21 @@ fn map_files_command(cmd: cli::FilesCommands) -> FilesCommand {
         cli::FilesCommands::Search {
             workspace,
             query,
-            page_size,
-            cursor,
+            limit,
+            offset,
+            scope,
+            folder_scope,
+            details,
+            page_size: _,
+            cursor: _,
         } => FilesCommand::Search {
             workspace,
             query,
-            page_size,
-            cursor,
+            limit,
+            offset,
+            scope,
+            folder_scope,
+            details,
         },
         cli::FilesCommands::Recent {
             workspace,
@@ -2130,6 +2159,51 @@ fn map_lock_command(cmd: &cli::LockCommands) -> LockCommand {
             context_id: context_id.clone(),
             node_id: node_id.clone(),
             lock_token: lock_token.clone(),
+        },
+    }
+}
+
+/// Convert clap-parsed unified-search commands to the internal enum.
+fn map_search_command(cmd: cli::SearchCommands) -> SearchCommand {
+    use fastio_cli::api::search::UnifiedSearchParams;
+    match cmd {
+        cli::SearchCommands::Workspace {
+            workspace_id,
+            query,
+            files_limit,
+            files_offset,
+            metadata_limit,
+            metadata_offset,
+            comments_limit,
+            comments_offset,
+            workflows_limit,
+            workflows_offset,
+            only,
+        } => SearchCommand::Workspace {
+            workspace_id,
+            query,
+            params: UnifiedSearchParams::new()
+                .files(files_offset, files_limit)
+                .metadata(metadata_offset, metadata_limit)
+                .comments(comments_offset, comments_limit)
+                .workflows(workflows_offset, workflows_limit),
+            only,
+        },
+        cli::SearchCommands::Share {
+            share_id,
+            query,
+            files_limit,
+            files_offset,
+            comments_limit,
+            comments_offset,
+            only,
+        } => SearchCommand::Share {
+            share_id,
+            query,
+            params: UnifiedSearchParams::new()
+                .files(files_offset, files_limit)
+                .comments(comments_offset, comments_limit),
+            only,
         },
     }
 }

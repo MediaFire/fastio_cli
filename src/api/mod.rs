@@ -35,6 +35,8 @@ pub mod metadata;
 pub mod org;
 /// File preview endpoints.
 pub mod preview;
+/// Unified (grouped-bucket) search endpoints across a workspace or share.
+pub mod search;
 /// Share link management endpoints.
 pub mod share;
 /// Low-level storage node endpoints.

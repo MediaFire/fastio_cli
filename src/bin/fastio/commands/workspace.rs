@@ -288,6 +288,12 @@ async fn jobs_status(ctx: &CommandContext<'_>, workspace_id: &str) -> Result<()>
 }
 
 /// Search workspace content.
+///
+/// Re-pointed (Phase 3) onto the unified grouped-bucket search
+/// (`api::search::unified_search_workspace`, `/search/`), sharing its
+/// implementation with `fastio search workspace`. `limit`/`offset`, when
+/// supplied, page the `files` bucket (the primary bucket for this legacy
+/// entry point); the response renders as grouped buckets.
 async fn search(
     ctx: &CommandContext<'_>,
     workspace_id: &str,
@@ -296,7 +302,8 @@ async fn search(
     offset: Option<u32>,
 ) -> Result<()> {
     let client = ctx.build_client()?;
-    let value = api::workspace::search_workspace(&client, workspace_id, query, limit, offset)
+    let params = api::search::UnifiedSearchParams::new().files(offset, limit);
+    let value = api::search::unified_search_workspace(&client, workspace_id, query, params)
         .await
         .context("failed to search workspace")?;
     ctx.output.render(&value)?;

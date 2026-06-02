@@ -152,6 +152,33 @@ pub enum Commands {
     #[command(subcommand)]
     Lock(LockCommands),
 
+    /// Unified search across a workspace or share (grouped result buckets).
+    #[command(subcommand)]
+    Search(SearchCommands),
+
+    /// Render a markdown note or `.md` file in the terminal.
+    ///
+    /// This is a dedicated markdown viewer: it always emits rendered (or, with
+    /// `--raw`/when piped, verbatim) markdown and ignores the global `--format`
+    /// and `--fields` flags. Only note nodes and markdown files are supported;
+    /// other file types are rejected rather than dumped as raw bytes.
+    View {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Node ID of the note or `.md` file to view.
+        node_id: String,
+        /// Print the raw markdown without terminal rendering.
+        #[arg(long)]
+        raw: bool,
+        /// Read a specific version (note version `OpaqueId`).
+        #[arg(long)]
+        version: Option<String>,
+        /// Reserved: disable paging. (No pager is ever launched; accepted for
+        /// forward-compatibility and to make non-interactive intent explicit.)
+        #[arg(long)]
+        no_pager: bool,
+    },
+
     /// Metadata extraction and template management.
     #[command(subcommand)]
     Metadata(MetadataCommands),
@@ -184,6 +211,79 @@ pub enum Commands {
 
     /// Print the agent skill guide (usage patterns for AI agents and automation).
     Skill,
+}
+
+// ─── Search ──────────────────────────────────────────────────────────────────
+
+/// Unified-search subcommands.
+///
+/// One query, results **grouped by type** into buckets (files, metadata,
+/// comments, workflows for a workspace; files + comments for a share). Each
+/// bucket paginates independently via its own `--<bucket>-limit/offset`.
+/// `--only` filters which buckets are *displayed* client-side — the server
+/// always searches every applicable bucket (there is no server `only`
+/// parameter), so it does not reduce server work.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum SearchCommands {
+    /// Search everything in a workspace (files + metadata + comments + workflows).
+    Workspace {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Search query (max 1024 characters; must not be blank).
+        query: String,
+        /// Page size for the files bucket.
+        #[arg(long)]
+        files_limit: Option<u32>,
+        /// Offset for the files bucket.
+        #[arg(long)]
+        files_offset: Option<u32>,
+        /// Page size for the metadata bucket.
+        #[arg(long)]
+        metadata_limit: Option<u32>,
+        /// Offset for the metadata bucket.
+        #[arg(long)]
+        metadata_offset: Option<u32>,
+        /// Page size for the comments bucket.
+        #[arg(long)]
+        comments_limit: Option<u32>,
+        /// Offset for the comments bucket.
+        #[arg(long)]
+        comments_offset: Option<u32>,
+        /// Page size for the workflows bucket.
+        #[arg(long)]
+        workflows_limit: Option<u32>,
+        /// Offset for the workflows bucket.
+        #[arg(long)]
+        workflows_offset: Option<u32>,
+        /// Comma-separated buckets to DISPLAY (e.g. `files,comments`).
+        /// Client-side filter only; the server still searches every bucket.
+        #[arg(long)]
+        only: Option<String>,
+    },
+    /// Search everything in a share (files + comments; metadata is workspace-only).
+    Share {
+        /// Share ID.
+        share_id: String,
+        /// Search query (max 1024 characters; must not be blank).
+        query: String,
+        /// Page size for the files bucket.
+        #[arg(long)]
+        files_limit: Option<u32>,
+        /// Offset for the files bucket.
+        #[arg(long)]
+        files_offset: Option<u32>,
+        /// Page size for the comments bucket.
+        #[arg(long)]
+        comments_limit: Option<u32>,
+        /// Offset for the comments bucket.
+        #[arg(long)]
+        comments_offset: Option<u32>,
+        /// Comma-separated buckets to DISPLAY (e.g. `files`).
+        /// Client-side filter only; the server still searches every bucket.
+        #[arg(long)]
+        only: Option<String>,
+    },
 }
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
@@ -1291,18 +1391,38 @@ pub enum FilesCommands {
         /// Node ID.
         node_id: String,
     },
-    /// Search for files in a workspace.
+    /// Search for files in a workspace (keyword + semantic when intelligence
+    /// is enabled).
     Search {
         /// Workspace ID.
         #[arg(long)]
         workspace: String,
         /// Search query.
         query: String,
-        /// Page size: 100, 250, 500.
+        /// Maximum number of results (1-500; capped to 10 when --details).
         #[arg(long)]
+        limit: Option<u32>,
+        /// Result offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
+        /// Comma-separated `nodeId:versionId` pairs (max 100) to narrow the
+        /// searched files.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Comma-separated `nodeId:depth` pairs (max 100) to narrow the
+        /// searched folders.
+        #[arg(long)]
+        folder_scope: Option<String>,
+        /// Enrich each hit with the full node resource (caps default limit to 10).
+        #[arg(long)]
+        details: bool,
+        /// [deprecated] Ignored — the search endpoint does not use keyset
+        /// pagination. Use --limit/--offset instead.
+        #[arg(long, hide = true)]
         page_size: Option<u32>,
-        /// Cursor for next page of results.
-        #[arg(long)]
+        /// [deprecated] Ignored — the search endpoint does not use keyset
+        /// pagination. Use --limit/--offset instead.
+        #[arg(long, hide = true)]
         cursor: Option<String>,
     },
     /// List recently accessed files.
@@ -3725,7 +3845,7 @@ impl fmt::Debug for AuthCommands {
 
 #[cfg(test)]
 mod ripley_alias_tests {
-    use super::{Cli, Commands, RipleyCommands};
+    use super::{Cli, Commands, RipleyCommands, SearchCommands};
     use clap::{CommandFactory, Parser};
 
     /// Clap's own internal invariant checker — catches duplicate/ambiguous
@@ -3733,6 +3853,124 @@ mod ripley_alias_tests {
     #[test]
     fn cli_command_debug_assert() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn search_workspace_parses_with_bucket_flags() {
+        let cli = Cli::try_parse_from([
+            "fastio",
+            "search",
+            "workspace",
+            "ws1",
+            "quarterly report",
+            "--files-limit",
+            "10",
+            "--comments-offset",
+            "5",
+            "--only",
+            "files,comments",
+        ])
+        .expect("search workspace should parse");
+        match cli.command {
+            Commands::Search(SearchCommands::Workspace {
+                workspace_id,
+                query,
+                files_limit,
+                comments_offset,
+                only,
+                ..
+            }) => {
+                assert_eq!(workspace_id, "ws1");
+                assert_eq!(query, "quarterly report");
+                assert_eq!(files_limit, Some(10));
+                assert_eq!(comments_offset, Some(5));
+                assert_eq!(only.as_deref(), Some("files,comments"));
+            }
+            other => panic!("expected Search(Workspace), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_share_parses() {
+        let cli = Cli::try_parse_from(["fastio", "search", "share", "sh1", "report"])
+            .expect("search share should parse");
+        match cli.command {
+            Commands::Search(SearchCommands::Share {
+                share_id, query, ..
+            }) => {
+                assert_eq!(share_id, "sh1");
+                assert_eq!(query, "report");
+            }
+            other => panic!("expected Search(Share), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn view_parses_with_flags() {
+        let cli = Cli::try_parse_from([
+            "fastio",
+            "view",
+            "ws1",
+            "n1",
+            "--raw",
+            "--version",
+            "v3",
+            "--no-pager",
+        ])
+        .expect("view should parse");
+        match cli.command {
+            Commands::View {
+                workspace_id,
+                node_id,
+                raw,
+                version,
+                no_pager,
+            } => {
+                assert_eq!(workspace_id, "ws1");
+                assert_eq!(node_id, "n1");
+                assert!(raw);
+                assert_eq!(version.as_deref(), Some("v3"));
+                assert!(no_pager);
+            }
+            other => panic!("expected View, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn files_search_accepts_new_and_hidden_deprecated_flags() {
+        // New flags parse; the hidden deprecated --page-size/--cursor are still
+        // accepted (ignored at dispatch) so old scripts don't break.
+        let cli = Cli::try_parse_from([
+            "fastio",
+            "files",
+            "search",
+            "--workspace",
+            "ws1",
+            "q",
+            "--limit",
+            "20",
+            "--scope",
+            "f1:v1",
+            "--details",
+            "--page-size",
+            "100",
+        ])
+        .expect("files search should parse new + deprecated flags");
+        match cli.command {
+            Commands::Files(super::FilesCommands::Search {
+                limit,
+                scope,
+                details,
+                page_size,
+                ..
+            }) => {
+                assert_eq!(limit, Some(20));
+                assert_eq!(scope.as_deref(), Some("f1:v1"));
+                assert!(details);
+                assert_eq!(page_size, Some(100));
+            }
+            other => panic!("expected Files(Search), got {other:?}"),
+        }
     }
 
     /// The canonical `ripley` group parses to the `Ripley` variant.

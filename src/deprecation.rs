@@ -76,6 +76,30 @@ pub fn warn_legacy(group: &'static str, replacement: &str, quiet: bool) -> bool 
     true
 }
 
+/// Emit a one-time free-form deprecation `message` to stderr, de-duplicated
+/// by `key`.
+///
+/// Unlike [`warn_legacy`] (which prints a fixed `[legacy]`-prefixed sentence
+/// for whole command groups), this lets a caller supply its own wording —
+/// used for individual re-pointed commands such as `ripley search`, whose
+/// notice steers to `files search` / `ripley ask` rather than to
+/// `fastio workflow`. Same guarantees: at most once per `key` per process,
+/// suppressed under `quiet` (and the gate is not consumed when suppressed),
+/// stderr-only so machine-readable stdout is never corrupted, thread-safe.
+///
+/// Returns `true` if a notice was actually printed.
+#[allow(clippy::must_use_candidate)]
+pub fn warn_once(key: &'static str, message: &str, quiet: bool) -> bool {
+    if quiet {
+        return false;
+    }
+    if !mark_warned(key) {
+        return false;
+    }
+    eprintln!("{} {}", "[deprecated]".yellow().bold(), message);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +116,17 @@ mod tests {
             Err(p) => p.into_inner(),
         };
         guard.remove(key);
+    }
+
+    #[test]
+    fn warn_once_fires_once_and_respects_quiet() {
+        fresh_key("warn-once-test");
+        // Quiet suppresses AND does not consume the gate.
+        assert!(!warn_once("warn-once-test", "use the new thing", true));
+        // First non-quiet call prints.
+        assert!(warn_once("warn-once-test", "use the new thing", false));
+        // Second call is de-duplicated.
+        assert!(!warn_once("warn-once-test", "use the new thing", false));
     }
 
     #[test]

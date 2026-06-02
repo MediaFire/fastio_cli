@@ -52,7 +52,10 @@ pub fn render(value: &Value) -> Result<(), io::Error> {
 }
 
 /// Collect column headers from an array of JSON objects.
-fn collect_headers(items: &[Value]) -> Vec<String> {
+///
+/// `pub(crate)` so the bucket-aware CSV path can assert header order/shape in
+/// tests; otherwise an internal helper of the CSV renderer.
+pub(crate) fn collect_headers(items: &[Value]) -> Vec<String> {
     let mut headers = Vec::new();
     let mut seen = std::collections::HashSet::new();
 

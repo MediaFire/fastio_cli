@@ -110,30 +110,11 @@ pub async fn delete_workspace(
     client.delete_with_params(&path, &params).await
 }
 
-/// Search workspace content.
-///
-/// `GET /workspace/{workspace_id}/storage/search/`
-pub async fn search_workspace(
-    client: &ApiClient,
-    workspace_id: &str,
-    query: &str,
-    limit: Option<u32>,
-    offset: Option<u32>,
-) -> Result<Value, CliError> {
-    let mut params = HashMap::new();
-    params.insert("search".to_owned(), query.to_owned());
-    if let Some(l) = limit {
-        params.insert("limit".to_owned(), l.to_string());
-    }
-    if let Some(o) = offset {
-        params.insert("offset".to_owned(), o.to_string());
-    }
-    let path = format!(
-        "/workspace/{}/storage/search/",
-        urlencoding::encode(workspace_id),
-    );
-    client.get_with_params(&path, &params).await
-}
+// `search_workspace` (`GET /workspace/{id}/storage/search/`) was removed in
+// Phase 3: it duplicated `api::storage::search_files`. The CLI
+// `workspace search` command now forwards to `api::search::unified_search_workspace`
+// (`/search/`, grouped buckets), and the MCP `workspace search` action routes
+// to the single `api::storage::search_files` builder. See `api/search.rs`.
 
 /// Get workspace limits/usage.
 ///
@@ -263,67 +244,136 @@ pub async fn check_workspace_name(client: &ApiClient, name: &str) -> Result<Valu
     client.get(&path).await
 }
 
-/// Create a note in a workspace.
+/// Create a markdown note in a workspace.
 ///
-/// `POST /workspace/{workspace_id}/storage/{parent_id}/notes/`
+/// `POST /workspace/{workspace_id}/storage/{parent_id}/createnote/`
+///
+/// The body is **form-encoded** (not JSON) per
+/// `~/vividengine/llms/storage.txt:534-561`. Both `name` (must end in `.md`)
+/// and `content` (≤100 KB markdown) are **required** by the server.
 pub async fn create_note(
     client: &ApiClient,
     workspace_id: &str,
     parent_id: &str,
     name: &str,
-    content: Option<&str>,
+    content: &str,
 ) -> Result<Value, CliError> {
-    let mut body = serde_json::json!({ "name": name });
-    if let Some(c) = content {
-        body["content"] = Value::String(c.to_owned());
-    }
-    let path = format!(
-        "/workspace/{}/storage/{}/notes/",
-        urlencoding::encode(workspace_id),
-        urlencoding::encode(parent_id),
-    );
-    client.post_json(&path, &body).await
+    let mut form = HashMap::new();
+    form.insert("name".to_owned(), name.to_owned());
+    form.insert("content".to_owned(), content.to_owned());
+    client
+        .post(&note_path(workspace_id, parent_id, "createnote"), &form)
+        .await
 }
 
-/// Update a note in a workspace.
+/// Build a workspace note endpoint path (`createnote` / `updatenote` /
+/// `readnote`). Path params are URL-encoded.
+fn note_path(workspace_id: &str, node_id: &str, action: &str) -> String {
+    format!(
+        "/workspace/{}/storage/{}/{action}/",
+        urlencoding::encode(workspace_id),
+        urlencoding::encode(node_id),
+    )
+}
+
+/// Build the form body for `updatenote/`: `name`/`content` (at least one) plus
+/// the optional `if_version_id` CAS precondition. Extracted so the field set
+/// is unit-testable without an HTTP client.
+fn build_update_note_form(
+    name: Option<&str>,
+    content: Option<&str>,
+    if_version_id: Option<&str>,
+) -> HashMap<String, String> {
+    let mut form = HashMap::new();
+    if let Some(n) = name {
+        form.insert("name".to_owned(), n.to_owned());
+    }
+    if let Some(c) = content {
+        form.insert("content".to_owned(), c.to_owned());
+    }
+    if let Some(v) = if_version_id {
+        form.insert("if_version_id".to_owned(), v.to_owned());
+    }
+    form
+}
+
+/// Update a markdown note in a workspace.
 ///
-/// `POST /workspace/{workspace_id}/storage/{node_id}/notes/update/`
+/// `POST /workspace/{workspace_id}/storage/{node_id}/updatenote/`
+///
+/// The body is **form-encoded** per `~/vividengine/llms/storage.txt:594-626`.
+/// At least one of `name`/`content` must be supplied. When `if_version_id` is
+/// passed it is a compare-and-swap precondition: the update only proceeds if
+/// the note's current version matches, otherwise the server returns
+/// `409 Conflict` (code `1660`) with the current state under
+/// `error.params.current`.
 pub async fn update_note(
     client: &ApiClient,
     workspace_id: &str,
     node_id: &str,
     name: Option<&str>,
     content: Option<&str>,
+    if_version_id: Option<&str>,
 ) -> Result<Value, CliError> {
-    let mut body = serde_json::Map::new();
-    if let Some(n) = name {
-        body.insert("name".to_owned(), Value::String(n.to_owned()));
-    }
-    if let Some(c) = content {
-        body.insert("content".to_owned(), Value::String(c.to_owned()));
-    }
-    let path = format!(
-        "/workspace/{}/storage/{}/notes/update/",
-        urlencoding::encode(workspace_id),
-        urlencoding::encode(node_id),
-    );
-    client.post_json(&path, &Value::Object(body)).await
+    let form = build_update_note_form(name, content, if_version_id);
+    client
+        .post(&note_path(workspace_id, node_id, "updatenote"), &form)
+        .await
 }
 
-/// Read a note's content.
+/// Read a note's content as JSON.
 ///
-/// `GET /workspace/{workspace_id}/storage/{node_id}/notes/`
+/// `GET /workspace/{workspace_id}/storage/{node_id}/readnote/`
+///
+/// Returns the structured `{result, content, note}` envelope per
+/// `~/vividengine/llms/storage.txt:684-740`: `content` is the sanitized
+/// markdown string and `note` is the full node resource. An optional
+/// `version_id` reads a specific version.
 pub async fn read_note(
     client: &ApiClient,
     workspace_id: &str,
     node_id: &str,
+    version_id: Option<&str>,
+) -> Result<Value, CliError> {
+    let path = note_path(workspace_id, node_id, "readnote");
+    read_note_at(client, &path, version_id).await
+}
+
+/// Issue the `readnote/` GET at `path`, threading the optional `version_id`
+/// query parameter. Shared by the workspace and share read paths.
+async fn read_note_at(
+    client: &ApiClient,
+    path: &str,
+    version_id: Option<&str>,
+) -> Result<Value, CliError> {
+    if let Some(v) = version_id {
+        let mut params = HashMap::new();
+        params.insert("version_id".to_owned(), v.to_owned());
+        client.get_with_params(path, &params).await
+    } else {
+        client.get(path).await
+    }
+}
+
+/// Read a note's content as JSON from a **share**.
+///
+/// `GET /share/{share_id}/storage/{node_id}/readnote/`
+///
+/// Share-scoped sibling of [`read_note`] (`storage.txt:685`). Used by the
+/// deferred `fastio view share` surface; available now so the share path is
+/// not re-implemented later.
+pub async fn read_note_share(
+    client: &ApiClient,
+    share_id: &str,
+    node_id: &str,
+    version_id: Option<&str>,
 ) -> Result<Value, CliError> {
     let path = format!(
-        "/workspace/{}/storage/{}/notes/",
-        urlencoding::encode(workspace_id),
+        "/share/{}/storage/{}/readnote/",
+        urlencoding::encode(share_id),
         urlencoding::encode(node_id),
     );
-    client.get(&path).await
+    read_note_at(client, &path, version_id).await
 }
 
 /// Get quickshare details.
@@ -489,5 +539,56 @@ pub async fn metadata_api(
         }
         "DELETE" => client.delete(&path).await,
         _ => client.get(&path).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_update_note_form, note_path};
+
+    #[test]
+    fn note_paths_use_correct_endpoints() {
+        // The retired `notes/` and `notes/update/` paths must NOT appear; the
+        // correct endpoints are `createnote/`, `updatenote/`, `readnote/`.
+        assert_eq!(
+            note_path("123", "root", "createnote"),
+            "/workspace/123/storage/root/createnote/"
+        );
+        assert_eq!(
+            note_path("123", "n1", "updatenote"),
+            "/workspace/123/storage/n1/updatenote/"
+        );
+        assert_eq!(
+            note_path("123", "n1", "readnote"),
+            "/workspace/123/storage/n1/readnote/"
+        );
+    }
+
+    #[test]
+    fn note_path_url_encodes_params() {
+        // A node id with a slash/space must be percent-encoded so it can't
+        // break out of the path segment.
+        let p = note_path("ws id", "a/b", "readnote");
+        assert!(p.contains("ws%20id"), "{p}");
+        assert!(p.contains("a%2Fb"), "{p}");
+    }
+
+    #[test]
+    fn update_note_form_carries_if_version_id() {
+        let form = build_update_note_form(Some("x.md"), Some("body"), Some("v9"));
+        assert_eq!(form.get("name").map(String::as_str), Some("x.md"));
+        assert_eq!(form.get("content").map(String::as_str), Some("body"));
+        assert_eq!(form.get("if_version_id").map(String::as_str), Some("v9"));
+    }
+
+    #[test]
+    fn update_note_form_omits_unset_fields() {
+        let form = build_update_note_form(None, Some("only content"), None);
+        assert!(!form.contains_key("name"));
+        assert!(!form.contains_key("if_version_id"));
+        assert_eq!(
+            form.get("content").map(String::as_str),
+            Some("only content")
+        );
     }
 }

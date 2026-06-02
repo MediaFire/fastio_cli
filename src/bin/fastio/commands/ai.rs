@@ -737,6 +737,12 @@ async fn chat(
 }
 
 /// Semantic search over indexed workspace files.
+///
+/// Re-pointed (Phase 3) off the deprecated `/ai/search/` onto the single
+/// `api::storage::search_files` builder (`/storage/search/`), which performs
+/// semantic search automatically when workspace intelligence is enabled. This
+/// is now a thin deprecated alias; a one-time stderr notice steers callers to
+/// `fastio files search` / `fastio ripley ask`.
 async fn search(
     ctx: &CommandContext<'_>,
     workspace: &str,
@@ -748,10 +754,23 @@ async fn search(
         !workspace.trim().is_empty(),
         "workspace ID must not be empty"
     );
+    anyhow::ensure!(!query.trim().is_empty(), "search query must not be empty");
+    fastio_cli::deprecation::warn_once(
+        "ripley-search",
+        "`ripley search` (formerly `ai search`) now uses `/storage/search/`. \
+         Prefer `fastio files search` for file search, or `fastio ripley ask` \
+         to have Ripley answer a question over your content.",
+        ctx.output.quiet,
+    );
     let client = ctx.build_client()?;
-    let value = api::ai::search(&client, workspace, query, limit, offset)
+    let params = api::storage::SearchFilesParams::new()
+        .limit(limit)
+        .offset(offset);
+    let value = api::storage::search_files(&client, workspace, query, params)
         .await
-        .context("failed to perform AI search")?;
+        .context("failed to perform search")?;
+    // Same files-MAP → rows normalization as `fastio files search`.
+    let value = api::storage::normalize_search_response(value);
     ctx.output.render(&value)?;
     Ok(())
 }

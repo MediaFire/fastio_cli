@@ -115,16 +115,22 @@ pub enum FilesCommand {
         /// Node ID.
         node_id: String,
     },
-    /// Search for files in a workspace.
+    /// Search for files in a workspace (keyword + semantic).
     Search {
         /// Workspace ID.
         workspace: String,
         /// Search query.
         query: String,
-        /// Page size: 100, 250, 500.
-        page_size: Option<u32>,
-        /// Cursor for next page.
-        cursor: Option<String>,
+        /// Maximum number of results.
+        limit: Option<u32>,
+        /// Result offset for pagination.
+        offset: Option<u32>,
+        /// Comma-separated `nodeId:versionId` pairs (max 100).
+        scope: Option<String>,
+        /// Comma-separated `nodeId:depth` pairs (max 100).
+        folder_scope: Option<String>,
+        /// Enrich each hit with the full node resource.
+        details: bool,
     },
     /// List recently accessed files.
     Recent {
@@ -349,9 +355,24 @@ pub async fn execute(command: &FilesCommand, ctx: &CommandContext<'_>) -> Result
         FilesCommand::Search {
             workspace,
             query,
-            page_size,
-            cursor,
-        } => search(ctx, workspace, query, *page_size, cursor.as_deref()).await,
+            limit,
+            offset,
+            scope,
+            folder_scope,
+            details,
+        } => {
+            search(
+                ctx,
+                workspace,
+                query,
+                *limit,
+                *offset,
+                scope.as_deref(),
+                folder_scope.as_deref(),
+                *details,
+            )
+            .await
+        }
         FilesCommand::Recent {
             workspace,
             page_size,
@@ -828,21 +849,33 @@ async fn list_versions(ctx: &CommandContext<'_>, workspace: &str, node_id: &str)
     Ok(())
 }
 
-/// Search for files.
+/// Search for files (keyword + semantic).
+#[allow(clippy::too_many_arguments)]
 async fn search(
     ctx: &CommandContext<'_>,
     workspace: &str,
     query: &str,
-    page_size: Option<u32>,
-    cursor: Option<&str>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    scope: Option<&str>,
+    folder_scope: Option<&str>,
+    details: bool,
 ) -> Result<()> {
     validate_workspace_id(workspace)?;
-    validate_page_size(page_size)?;
     anyhow::ensure!(!query.trim().is_empty(), "search query must not be empty");
     let client = ctx.build_client()?;
-    let value = api::storage::search_files(&client, workspace, query, page_size, cursor)
+    let params = api::storage::SearchFilesParams::new()
+        .files_scope(scope)
+        .folders_scope(folder_scope)
+        .limit(limit)
+        .offset(offset)
+        .details(details);
+    let value = api::storage::search_files(&client, workspace, query, params)
         .await
         .context("failed to search files")?;
+    // The keyword-only response returns `files` as a MAP keyed by node id;
+    // normalize it to an array so every format renders one row per file.
+    let value = api::storage::normalize_search_response(value);
     ctx.output.render(&value)?;
     Ok(())
 }

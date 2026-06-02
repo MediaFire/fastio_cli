@@ -317,6 +317,40 @@ impl ApiClient {
         .await
     }
 
+    /// Perform an authenticated GET that returns the response body as raw
+    /// text, WITHOUT requesting `?output=markdown` and WITHOUT envelope
+    /// unwrapping.
+    ///
+    /// This is for genuinely-raw content endpoints (e.g. a storage node's
+    /// `/read/` endpoint, which streams the raw file bytes — for a `.md` file
+    /// that is the markdown source). Optional query `params` are forwarded
+    /// verbatim (e.g. `version_id`, `token`). On a non-2xx HTTP status the body
+    /// is surfaced as `CliError::Api.message` (capped) by the shared
+    /// text-response handler; a JSON error envelope from the server is left
+    /// intact for the caller to inspect if needed.
+    ///
+    /// Note: this does NOT use [`Self::build_get`], so the `--detail`
+    /// `?output=` injection never fires here — correct, because a raw content
+    /// endpoint must not receive `?output=`.
+    pub async fn get_raw_text(
+        &self,
+        path: &str,
+        params: Option<&HashMap<String, String>>,
+    ) -> Result<String, CliError> {
+        tracing::trace!(method = "GET", path, "api request (raw text)");
+        self.send_raw_text_with_retry(|| {
+            let mut req = self.inner.get(self.url(path));
+            if let Some(p) = params {
+                req = req.query(p);
+            }
+            if let Some(auth) = self.auth_header() {
+                req = req.header(AUTHORIZATION, auth);
+            }
+            req
+        })
+        .await
+    }
+
     /// Build the `Authorization: Bearer <token>` header value.
     fn auth_header(&self) -> Option<String> {
         self.token

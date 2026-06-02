@@ -672,6 +672,24 @@ fn push_sanitized_inline(out: &mut String, s: &str) {
     }
 }
 
+/// Sanitize an arbitrary user-controlled string for safe **inline** display
+/// (single-line contexts: bucket table cells, labels), returning a new
+/// `String`.
+///
+/// This is the public, allocation-returning counterpart to the streaming
+/// [`push_sanitized_inline`] helper, exposed so other renderers (e.g. the
+/// bucket-aware unified-search path in [`super`]) can reuse the exact same
+/// Trojan-Source / control-character stripping rather than re-implementing
+/// it. Newlines and carriage returns collapse to a single space; C0/C1
+/// controls and Unicode bidi / zero-width / BOM code points are removed. The
+/// output is capped at [`MAX_OUTPUT_BYTES`].
+#[must_use]
+pub fn sanitize_inline(s: &str) -> String {
+    let mut out = String::new();
+    push_sanitized_inline(&mut out, s);
+    out
+}
+
 fn is_stripped_char(ch: char) -> bool {
     let code = ch as u32;
     if code < 0x20 && ch != '\n' && ch != '\t' {

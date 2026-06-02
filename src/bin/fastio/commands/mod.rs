@@ -92,6 +92,8 @@ pub mod metadata;
 pub mod org;
 /// File preview commands.
 pub mod preview;
+/// Unified (grouped-bucket) search commands.
+pub mod search;
 /// Share link management commands.
 pub mod share;
 /// System health and status commands.
@@ -104,6 +106,8 @@ pub mod todo;
 pub mod upload;
 /// User profile commands.
 pub mod user;
+/// Terminal markdown viewer command (`fastio view`).
+pub mod view;
 /// Work log commands.
 pub mod worklog;
 /// Workspace management commands.

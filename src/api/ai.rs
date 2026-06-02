@@ -500,37 +500,13 @@ fn agent_chat_path(
     ))
 }
 
-/// Semantic search over indexed workspace files.
-///
-/// `GET /workspace/{workspace_id}/ai/search/?query_text=<query>`
-///
-/// The endpoint's required query parameter is `query_text`
-/// (`~/vividengine/llms/ai.txt:1647`), not `question`.
-///
-/// NOTE: this stays on the **deprecated** `/ai/search/` endpoint for now —
-/// it is NOT migrated to `/ai/agent/search/` (no such endpoint). Phase 3
-/// re-points it to `/storage/search/`.
-pub async fn search(
-    client: &ApiClient,
-    workspace_id: &str,
-    query: &str,
-    limit: Option<u32>,
-    offset: Option<u32>,
-) -> Result<Value, CliError> {
-    let mut params = HashMap::new();
-    params.insert("query_text".to_owned(), query.to_owned());
-    if let Some(l) = limit {
-        params.insert("limit".to_owned(), l.to_string());
-    }
-    if let Some(o) = offset {
-        params.insert("offset".to_owned(), o.to_string());
-    }
-    let path = format!(
-        "/workspace/{}/ai/search/",
-        urlencoding::encode(workspace_id),
-    );
-    client.get_with_params(&path, &params).await
-}
+// Semantic search over indexed workspace files formerly lived here as
+// `search` (`GET /workspace/{id}/ai/search/`). Phase 3 retired it: the
+// deprecated `/ai/search/` endpoint and the duplicate builder are gone, and
+// `ripley search` / the MCP search action now forward to the single
+// `api::storage::search_files` builder (`/storage/search/`), which performs
+// semantic search automatically when workspace intelligence is enabled. There
+// is intentionally NO second search builder in this module.
 
 /// Generate a shareable AI summary from specific workspace files.
 ///
