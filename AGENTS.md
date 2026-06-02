@@ -37,6 +37,13 @@ Heuristics for agents:
 `ripley` is the former `ai` group — **`ai` still works as a hidden alias** (CLI
 and MCP) for backward compatibility, but new code should use `ripley`.
 
+> **Deferred / pending.** The Ripley delegated-**job** lifecycle
+> (`ripley delegate` / `run` / `status` / `logs` / `cancel-job`) is **not yet
+> available** — it is pending the server-side delegation contract, which has not
+> been finalized. Those verbs are hidden stubs that call no endpoint and exit
+> with a "not yet available" message. Until the contract ships, delegate work via
+> `ripley ask` / `ripley chat`, which run today.
+
 ## Authentication
 
 Authenticate before using any command. Two methods:
@@ -214,12 +221,18 @@ realtime-token mint — are **CLI-binary-only** and are NOT routable over MCP.
 recipients for electronic signature). Envelopes are parented to a workspace OR
 an org. Signing is a paid-plan feature.
 
+Every `sign` subcommand requires the `--parent-type` / `--parent-id` pair that
+selects the owner (`workspace` or `org`). Destructive / outward-facing verbs
+(`send`, `void`, `delete`) prompt interactively; pass `--yes` to run them
+non-interactively.
+
 ```bash
-fastio sign envelope create --workspace WS_ID ...
-fastio sign envelope send ENVELOPE_ID
-fastio sign envelope void ENVELOPE_ID --reason "..."
-fastio sign document download ...
-fastio sign audit download ...
+fastio sign envelope create --parent-type workspace --parent-id WS_ID ...
+fastio sign envelope send   --parent-type workspace --parent-id WS_ID ENVELOPE_ID --yes
+fastio sign envelope void   --parent-type workspace --parent-id WS_ID ENVELOPE_ID --reason "..." --yes
+fastio sign envelope delete --parent-type workspace --parent-id WS_ID ENVELOPE_ID --yes
+fastio sign document download --parent-type workspace --parent-id WS_ID ENVELOPE_ID DOCUMENT_ID -o ./doc.pdf
+fastio sign audit download    --parent-type workspace --parent-id WS_ID ENVELOPE_ID -o ./audit.json
 ```
 
 ### Over MCP

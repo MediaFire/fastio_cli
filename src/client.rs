@@ -119,6 +119,11 @@ const SECRET_LOG_KEYS: &[&str] = &[
     "code_verifier",
     // Storage/file lock ownership token (form field).
     "lock_token",
+    // Preview-access JWT returned by `get_preview_url` (`downloadToken` →
+    // case-insensitive `downloadtoken`): a bearer-equivalent read token.
+    "downloadtoken",
+    // Invitation bearer capability (org/workspace/share invite acceptance).
+    "invitation_key",
 ];
 
 /// Placeholder written in place of a redacted secret value when trace-logging
@@ -664,6 +669,29 @@ impl ApiClient {
     pub async fn post_empty_raw<T: DeserializeOwned>(&self, path: &str) -> Result<T, CliError> {
         tracing::trace!(method = "POST", path, "api request (empty body, raw)");
         self.send_with_retry_raw(|| {
+            let mut req = self.inner.post(self.url(path));
+            if let Some(auth) = self.auth_header() {
+                req = req.header(AUTHORIZATION, auth);
+            }
+            req
+        })
+        .await
+    }
+
+    /// Perform an authenticated POST with **no request body at all** and
+    /// unwrap the standard `{"result": …, "response": …}` envelope.
+    ///
+    /// The envelope-unwrapping counterpart to [`Self::post_empty_raw`]: like
+    /// [`Self::post_json`] it routes through the shared retry / rate-limit /
+    /// envelope-unwrap path, but the wire request carries neither a body nor a
+    /// `Content-Type` header. Use it for endpoints whose contract is literally
+    /// "Body: Empty" yet still return the standard envelope (e.g. the
+    /// `sign_envelopes/{id}/send/` action, `signing.txt:364-371`), where sending
+    /// `{}` with `Content-Type: application/json` would diverge from the
+    /// documented bodyless contract.
+    pub async fn post_empty<T: DeserializeOwned>(&self, path: &str) -> Result<T, CliError> {
+        tracing::trace!(method = "POST", path, "api request (empty body)");
+        self.send_with_retry(|| {
             let mut req = self.inner.post(self.url(path));
             if let Some(auth) = self.auth_header() {
                 req = req.header(AUTHORIZATION, auth);
@@ -1653,6 +1681,10 @@ mod tests {
                     {"api_key": "k_1", "label": "first"},
                     {"refresh_token": "r_1", "label": "second"},
                 ],
+                // Preview-access JWT (camelCase, must match case-insensitively)
+                // and invitation bearer capability.
+                "downloadToken": "dl_jwt_should_hide",
+                "invitation_key": "inv_key_should_hide",
             },
         });
         let redacted = redact_secret_values_for_log(&body);
@@ -1668,6 +1700,14 @@ mod tests {
         assert!(!rendered.contains("at_abc"), "nested access_token leaked");
         assert!(!rendered.contains("k_1"), "array api_key leaked");
         assert!(!rendered.contains("r_1"), "array refresh_token leaked");
+        assert!(
+            !rendered.contains("dl_jwt_should_hide"),
+            "downloadToken (preview JWT) leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("inv_key_should_hide"),
+            "invitation_key leaked: {rendered}"
+        );
 
         // The placeholder is present and non-secret fields are untouched.
         assert_eq!(redacted["response"]["token"], REDACTED_PLACEHOLDER);
@@ -1677,6 +1717,11 @@ mod tests {
             redacted["response"]["nested"]["access_token"],
             REDACTED_PLACEHOLDER
         );
+        assert_eq!(
+            redacted["response"]["downloadToken"], REDACTED_PLACEHOLDER,
+            "downloadToken must redact case-insensitively"
+        );
+        assert_eq!(redacted["response"]["invitation_key"], REDACTED_PLACEHOLDER);
         assert_eq!(redacted["result"], "yes");
         assert_eq!(redacted["response"]["id"], "sub_123");
         assert_eq!(redacted["response"]["nested"]["description"], "keep me");
@@ -2790,6 +2835,62 @@ mod tests {
         assert!(
             after_headers.is_empty(),
             "empty-body POST must send no payload, got body: {after_headers:?}"
+        );
+    }
+
+    /// End-to-end: `post_empty` (the envelope-unwrapping bodyless POST used by
+    /// `sign envelope send`) sends a POST with a zero-length body and no
+    /// `Content-Type`, AND unwraps the standard `{"result","response"}`
+    /// envelope (unlike `post_empty_raw`, which returns the body verbatim).
+    #[tokio::test]
+    async fn post_empty_sends_no_body_and_unwraps_envelope() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = br#"{"result":"yes","response":{"id":"env1","status":"sent"}}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+                let _ = tx.send(request);
+            }
+        });
+        let client = ApiClient::new(&format!("http://{addr}"), Some("tok".to_owned()))
+            .expect("client builds");
+        let resp: Value = client
+            .post_empty("/workspace/ws1/sign_envelopes/env1/send/")
+            .await
+            .expect("bodyless send succeeds");
+        // Envelope unwrapped: the `response` object is returned, not the wrapper.
+        assert_eq!(resp["status"], Value::String("sent".to_owned()));
+        assert_eq!(resp["id"], Value::String("env1".to_owned()));
+
+        let request = rx.await.expect("server captured request");
+        assert!(
+            request.starts_with("POST /workspace/ws1/sign_envelopes/env1/send/"),
+            "expected bodyless POST to the send path, got: {request}"
+        );
+        let lower = request.to_ascii_lowercase();
+        assert!(
+            !lower.contains("content-type:"),
+            "bodyless send must not set a Content-Type: {request}"
+        );
+        let after_headers = request.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(
+            after_headers.is_empty(),
+            "bodyless send must send no payload, got body: {after_headers:?}"
         );
     }
 }

@@ -278,35 +278,55 @@ fn extract_secret(value: &Value, key: &str) -> Option<SecretString> {
         .map(|s| SecretString::from(s.to_owned()))
 }
 
-/// The placeholder substituted for a redacted secret field.
-const REDACTED_PLACEHOLDER: &str = "<redacted; see --secret-file>";
+/// Build the placeholder substituted for a redacted secret field, naming the
+/// flag the caller should pass to capture it (e.g. `--secret-file` for webhook
+/// secrets, `--token-file` for realtime tokens).
+fn redacted_placeholder(capture_flag: &str) -> String {
+    format!("<redacted; see {capture_flag}>")
+}
 
 /// Replace `key` with the redaction placeholder in a serde object, if present.
-fn redact_in_object(obj: &mut serde_json::Map<String, Value>, key: &str) {
+fn redact_in_object(obj: &mut serde_json::Map<String, Value>, key: &str, placeholder: &str) {
     if obj.contains_key(key) {
-        obj.insert(
-            key.to_owned(),
-            Value::String(REDACTED_PLACEHOLDER.to_owned()),
-        );
+        obj.insert(key.to_owned(), Value::String(placeholder.to_owned()));
     }
 }
 
 /// Redact a named secret field in a response so it is not rendered to stdout.
 ///
-/// Covers the three shapes the secret can appear in: top-level, under
-/// `response`, and under `response.outbound_webhook_subscription`.
-fn redact_secret_field(value: &mut Value, key: &str) {
+/// Covers every shape the secret can appear in:
+/// - top-level `key`;
+/// - top-level `outbound_webhook_subscription.key` (the POST-envelope-unwrap
+///   shape `{result:true, outbound_webhook_subscription:{secret:...}}` that
+///   [`crate::handle_response`](-) produces — there is no `response` wrapper
+///   left by the time the command renders);
+/// - under `response.key`;
+/// - under `response.outbound_webhook_subscription.key`.
+///
+/// `capture_flag` names the CLI flag (`--secret-file` / `--token-file`) the user
+/// should re-run with to capture the value, so the rendered placeholder points
+/// at the right flag.
+fn redact_secret_field(value: &mut Value, key: &str, capture_flag: &str) {
+    let placeholder = redacted_placeholder(capture_flag);
     if let Some(obj) = value.get_mut("response").and_then(Value::as_object_mut) {
-        redact_in_object(obj, key);
+        redact_in_object(obj, key, &placeholder);
         if let Some(sub) = obj
             .get_mut("outbound_webhook_subscription")
             .and_then(Value::as_object_mut)
         {
-            redact_in_object(sub, key);
+            redact_in_object(sub, key, &placeholder);
         }
     }
     if let Some(obj) = value.as_object_mut() {
-        redact_in_object(obj, key);
+        redact_in_object(obj, key, &placeholder);
+        // Post-unwrap shape: the subscription is a top-level child (no
+        // `response` wrapper). Descend into it too.
+        if let Some(sub) = obj
+            .get_mut("outbound_webhook_subscription")
+            .and_then(Value::as_object_mut)
+        {
+            redact_in_object(sub, key, &placeholder);
+        }
     }
 }
 
@@ -359,7 +379,11 @@ pub(crate) fn jittered(interval_secs: u64) -> Duration {
 ///   retry on the next tick;
 /// - [`PollAction::Fatal`] — a persistent, non-transient error (404 / 403 /
 ///   400 / parse / a non-rate-limit 4xx). Surface it instead of looping.
-enum PollAction {
+///
+/// `pub(crate)` so the Ripley `ask`/`chat` and metadata `extract --wait` poll
+/// loops (CLI + MCP) reuse the SAME classification rather than each
+/// re-collapsing every error into a silent timeout.
+pub(crate) enum PollAction {
     /// Server asked us to wait this many seconds before the next request.
     RateLimited { retry_after_secs: u64 },
     /// A transient failure worth one more poll on the regular cadence.
@@ -375,7 +399,9 @@ enum PollAction {
 /// request timeouts, transport, and I/O errors are transient; everything else
 /// (4xx other than 408/429, parse, config) is fatal so a 404/403 no longer
 /// loops silently to the deadline.
-fn classify_poll_error(err: CliError) -> PollAction {
+///
+/// `pub(crate)` so the Ripley/metadata wait loops share this exact policy.
+pub(crate) fn classify_poll_error(err: CliError) -> PollAction {
     match err {
         CliError::RateLimit { retry_after_secs } => PollAction::RateLimited { retry_after_secs },
         CliError::Api(ref e) => match e.http_status {
@@ -1072,7 +1098,39 @@ async fn execute_trigger_alias(
             ctx.output.render(&v)?;
             Ok(())
         }
+        WorkflowTriggerAliasCommands::Replace {
+            workspace_id,
+            aliases_json,
+        } => {
+            // Normalise + validate the supplied map client-side before the
+            // network: it MUST be a JSON object (verb→template). Re-serializing
+            // the parsed value drops insignificant whitespace and rejects
+            // non-object input deterministically rather than letting the server
+            // reject a malformed body.
+            let normalized = normalize_alias_map_json(&aliases_json)?;
+            let v = orchestration::set_trigger_aliases(&client, &workspace_id, &normalized)
+                .await
+                .context("failed to replace trigger aliases")?;
+            ctx.output.render(&v)?;
+            Ok(())
+        }
     }
+}
+
+/// Validate `--aliases-json` is a JSON object and re-serialize it canonically.
+///
+/// The contract's `workflow_trigger_aliases` field is a verb→template map, so a
+/// non-object (array, string, number) is rejected client-side with a clear
+/// error rather than forwarded.
+fn normalize_alias_map_json(aliases_json: &str) -> Result<String> {
+    let parsed: Value =
+        serde_json::from_str(aliases_json).context("--aliases-json is not valid JSON")?;
+    anyhow::ensure!(
+        parsed.is_object(),
+        "--aliases-json must be a JSON object mapping verb→template, e.g. \
+         '{{\"redact\":\"redact-tpl\"}}'"
+    );
+    serde_json::to_string(&parsed).context("failed to serialize alias map")
 }
 
 /// Extract the `workflow_trigger_aliases` object from a workspace response as a
@@ -1624,7 +1682,7 @@ fn handle_secret_response(
                  --secret-file <path> to capture it (written 0600), or rotate the secret if lost."
             );
         }
-        redact_secret_field(&mut value, "secret");
+        redact_secret_field(&mut value, "secret", "--secret-file");
     }
     ctx.output.render(&value)?;
     Ok(())
@@ -1717,8 +1775,8 @@ async fn execute_realtime(
                          into logs. Re-run with --token-file <path> to capture it (written 0600)."
                     );
                 }
-                redact_secret_field(&mut v, "token");
-                redact_secret_field(&mut v, "auth_token");
+                redact_secret_field(&mut v, "token", "--token-file");
+                redact_secret_field(&mut v, "auth_token", "--token-file");
             }
             ctx.output.render(&v)?;
             Ok(())
@@ -1959,15 +2017,86 @@ mod tests {
     }
 
     #[test]
-    fn redact_secret_field_replaces_value() {
-        let mut v = serde_json::json!({"response": {"secret": "leak", "id": "s1"}});
-        redact_secret_field(&mut v, "secret");
-        assert_ne!(
-            v["response"]["secret"].as_str(),
-            Some("leak"),
-            "secret must be redacted"
+    fn redact_secret_field_post_unwrap_webhook_shape() {
+        // The shape `handle_response` actually produces for outbound webhook
+        // create/rotate: the envelope is already unwrapped, so the subscription
+        // is a TOP-LEVEL child with no `response` wrapper. The pre-fix code only
+        // looked under `response`/`response.outbound_webhook_subscription` and
+        // missed this, leaking the HMAC secret to stdout.
+        let mut v = serde_json::json!({
+            "result": true,
+            "outbound_webhook_subscription": {"secret": "leak-me", "id": "s1"}
+        });
+        redact_secret_field(&mut v, "secret", "--secret-file");
+        let rendered = serde_json::to_string(&v).unwrap();
+        assert!(
+            !rendered.contains("leak-me"),
+            "secret must be ABSENT from rendered output, got: {rendered}"
         );
-        assert_eq!(v["response"]["id"].as_str(), Some("s1"));
+        // Non-secret fields are preserved.
+        assert_eq!(
+            v["outbound_webhook_subscription"]["id"].as_str(),
+            Some("s1")
+        );
+    }
+
+    #[test]
+    fn redact_secret_field_post_unwrap_realtime_token_shape() {
+        // The realtime-token mint also renders post-unwrap; its secret lives in
+        // a top-level `token` (or `auth_token`) field.
+        let mut v = serde_json::json!({"result": true, "token": "secret-jwt", "expires": 60});
+        redact_secret_field(&mut v, "token", "--token-file");
+        redact_secret_field(&mut v, "auth_token", "--token-file");
+        let rendered = serde_json::to_string(&v).unwrap();
+        assert!(
+            !rendered.contains("secret-jwt"),
+            "realtime token must be ABSENT from rendered output, got: {rendered}"
+        );
+        assert_eq!(v["expires"].as_i64(), Some(60));
+        // The placeholder names the realtime capture flag, not --secret-file.
+        assert_eq!(
+            v["token"].as_str(),
+            Some("<redacted; see --token-file>"),
+            "placeholder must cite the realtime token flag"
+        );
+    }
+
+    #[test]
+    fn redact_secret_field_wrapped_shapes_still_covered() {
+        // Defensive: the older wrapped shapes remain redacted too.
+        let mut nested = serde_json::json!({
+            "response": {"outbound_webhook_subscription": {"secret": "leak", "id": "s1"}}
+        });
+        redact_secret_field(&mut nested, "secret", "--secret-file");
+        assert!(!serde_json::to_string(&nested).unwrap().contains("leak"));
+
+        let mut top = serde_json::json!({"response": {"secret": "leak", "id": "s2"}});
+        redact_secret_field(&mut top, "secret", "--secret-file");
+        assert!(!serde_json::to_string(&top).unwrap().contains("leak"));
+        assert_eq!(top["response"]["id"].as_str(), Some("s2"));
+    }
+
+    #[test]
+    fn normalize_alias_map_json_accepts_object_and_rejects_non_object() {
+        // FIX M: `replace` validates the full map client-side. A valid object is
+        // re-serialized canonically (insignificant whitespace dropped); this is
+        // the exact string `set_trigger_aliases` forwards as the
+        // `workflow_trigger_aliases` form value.
+        let ok = normalize_alias_map_json("{ \"redact\": \"redact-tpl\" }").unwrap();
+        let parsed: Value = serde_json::from_str(&ok).unwrap();
+        assert_eq!(
+            parsed.get("redact").and_then(Value::as_str),
+            Some("redact-tpl")
+        );
+        // An empty map is valid (clears all aliases).
+        assert_eq!(normalize_alias_map_json("{}").unwrap(), "{}");
+        // Non-object inputs are rejected before the network.
+        for bad in [r#"["a","b"]"#, "\"str\"", "42", "not json"] {
+            assert!(
+                normalize_alias_map_json(bad).is_err(),
+                "non-object/invalid input must be rejected: {bad}"
+            );
+        }
     }
 
     #[test]

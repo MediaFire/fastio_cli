@@ -67,8 +67,8 @@ pub fn warn_legacy(group: &'static str, replacement: &str, quiet: bool) -> bool 
         return false;
     }
     eprintln!(
-        "{} `{}` is a legacy command group and will be replaced by {} \
-         (landing later in this release).",
+        "{} `{}` is a legacy command group, superseded by {}; it remains \
+         functional for now.",
         "[legacy]".yellow().bold(),
         group,
         replacement,

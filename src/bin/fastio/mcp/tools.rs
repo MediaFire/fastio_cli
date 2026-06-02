@@ -792,7 +792,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "download",
-        description: "Downloads: get file download URLs, folder ZIP URLs, quickshare details.",
+        description: "Downloads: get file download URLs, folder ZIP URLs, quickshare details. file-url returns a secret-bearing URL (short-lived scoped read token) — do not log or share it.",
         actions: &["file-url", "zip-url", "quickshare-details"],
         params: &[
             ("context_type", "Context: workspace or share", false),
@@ -919,13 +919,13 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("name", "Chat name (chat-create, chat-update)", false),
             (
                 "privacy",
-                "private or public (chat-create; workspace-only, rejected for share)",
+                "private or public (chat-create; workspace-only, ignored for share with a warning)",
                 false,
             ),
             (
                 "kind",
-                "user, agent, or all. Chat kind on chat-create/ask (workspace-only, rejected \
-                 for share); kind filter on chat-list (user|agent|all)",
+                "user, agent, or all. Chat kind on chat-create/ask (workspace-only, ignored \
+                 for share with a warning); kind filter on chat-list (user|agent|all)",
                 false,
             ),
             (
@@ -1121,7 +1121,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "task",
-        description: "[legacy] Tasks: manage task lists and tasks. Legacy workflow primitive, will be replaced by the new `workflow` orchestration tool (landing later this release). list-lists, create-list, list-details, update-list, delete-list, list-tasks, create-task, task-details, update-task, delete-task, change-status, assign-task, bulk-status, move-task, reorder-tasks, reorder-lists, filter, summary.",
+        description: "[legacy] Tasks: manage task lists and tasks. Legacy workflow primitive, superseded by the `workflow` orchestration tool; remains functional for now. list-lists, create-list, list-details, update-list, delete-list, list-tasks, create-task, task-details, update-task, delete-task, change-status, assign-task, bulk-status, move-task, reorder-tasks, reorder-lists, filter, summary.",
         actions: &[
             "list-lists",
             "create-list",
@@ -1189,7 +1189,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "worklog",
-        description: "[legacy] Worklogs: list, append, interject, details, acknowledge, unacknowledged, list-all, filter, summary. Legacy workflow primitive, will be replaced by the new `workflow` orchestration tool (landing later this release).",
+        description: "[legacy] Worklogs: list, append, interject, details, acknowledge, unacknowledged, list-all, filter, summary. Legacy workflow primitive, superseded by the `workflow` orchestration tool; remains functional for now.",
         actions: &[
             "list",
             "append",
@@ -1232,7 +1232,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "approval",
-        description: "[legacy] Approvals: list, request, details, approve, reject, update, delete, filter, summary, user-approvals. Legacy workflow primitive, will be replaced by the new `workflow` orchestration tool (landing later this release).",
+        description: "[legacy] Approvals: list, request, details, approve, reject, update, delete, filter, summary, user-approvals. Legacy workflow primitive, superseded by the `workflow` orchestration tool; remains functional for now.",
         actions: &[
             "list",
             "request",
@@ -1298,7 +1298,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "todo",
-        description: "[legacy] Todos: list, create, details, update, delete, toggle, bulk-toggle, filter, summary. Legacy workflow primitive, will be replaced by the new `workflow` orchestration tool (landing later this release).",
+        description: "[legacy] Todos: list, create, details, update, delete, toggle, bulk-toggle, filter, summary. Legacy workflow primitive, superseded by the `workflow` orchestration tool; remains functional for now.",
         actions: &[
             "list",
             "create",
@@ -5526,9 +5526,13 @@ async fn handle_download(
                         node_id,
                         &token,
                     );
+                    // The URL already embeds the scoped read token in its
+                    // `?token=` query param; surfacing the raw token separately
+                    // is redundant secret exposure, so it is omitted. The URL
+                    // itself is secret-bearing — do not log or share it.
                     Ok(success_json(&json!({
                         "download_url": url,
-                        "download_token": token,
+                        "note": "download_url is secret-bearing (carries a short-lived scoped read token). Do not log or share it.",
                     })))
                 }
                 Err(e) => Ok(cli_err_to_result(&e)),
@@ -6034,10 +6038,11 @@ async fn handle_ai_chat_create(
     if let Some(v) = optional_str(args, "name") {
         form.insert("name".to_owned(), v.to_owned());
     }
-    // `privacy`/`kind` are workspace-only — share chats reject them, so only
-    // forward in a workspace context. For a share, a supplied `kind` is dropped
-    // rather than forwarded; surface a one-line note instead of swallowing it.
-    let mut kind_warning: Option<String> = None;
+    // `privacy`/`kind` are workspace-only — a share ignores them, so only
+    // forward in a workspace context. For a share, a supplied `kind` OR
+    // `privacy` is dropped rather than forwarded; surface a one-line note for
+    // each instead of swallowing it silently.
+    let mut warnings: Vec<&str> = Vec::new();
     if ctx_type == "workspace" {
         if let Some(v) = optional_str(args, "privacy") {
             form.insert("privacy".to_owned(), v.to_owned());
@@ -6045,8 +6050,13 @@ async fn handle_ai_chat_create(
         if let Some(v) = optional_str(args, "kind") {
             form.insert("kind".to_owned(), v.to_owned());
         }
-    } else if optional_str(args, "kind").is_some() {
-        kind_warning = Some(KIND_SHARE_WARNING.to_owned());
+    } else {
+        if optional_str(args, "kind").is_some() {
+            warnings.push(KIND_SHARE_WARNING);
+        }
+        if optional_str(args, "privacy").is_some() {
+            warnings.push(PRIVACY_SHARE_WARNING);
+        }
     }
     if let Some(err) = check_files_attach_exclusion(args) {
         return Ok(err);
@@ -6062,7 +6072,9 @@ async fn handle_ai_chat_create(
     }
     match api::ai::ai_api_form(&client, ctx_type, ctx_id, "agent/", &form).await {
         Ok(mut v) => {
-            attach_warning(&mut v, kind_warning.as_deref());
+            for w in &warnings {
+                attach_warning(&mut v, Some(w));
+            }
             Ok(success_json(&v))
         }
         Err(e) => Ok(cli_err_to_result(&e)),
@@ -6581,9 +6593,14 @@ async fn handle_ai_ask(
 }
 
 /// Stderr/response note emitted when `kind` is supplied for a share context.
-/// `kind` is workspace-only (a share rejects it), so it is dropped rather than
+/// `kind` is workspace-only (a share ignores it), so it is dropped rather than
 /// forwarded; this surfaces the drop instead of silently swallowing the arg.
 const KIND_SHARE_WARNING: &str = "kind is workspace-only and was ignored for this share";
+
+/// Response note emitted when `privacy` is supplied for a share context.
+/// `privacy` is workspace-only (a share ignores it), so it is dropped rather
+/// than forwarded; this surfaces the drop instead of silently swallowing it.
+const PRIVACY_SHARE_WARNING: &str = "privacy is workspace-only and was ignored for this share";
 
 /// Append a free-form `warning` string to a JSON object payload under a
 /// `warnings` array (creating it if absent). No-op for `None` or non-object
@@ -6655,7 +6672,17 @@ async fn mcp_ask_wait(
             Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 401 => {
                 return auth_expired();
             }
-            Err(_) => {}
+            // Classify rather than swallow: a transient blip falls through to the
+            // long-poll; a persistent 4xx (403/404/402/parse) is surfaced.
+            Err(other) => match classify_wf_poll_error(&other) {
+                WfPollAction::RateLimited { retry_after_secs } => {
+                    if retry_after_secs > 0 {
+                        tokio::time::sleep(std::time::Duration::from_secs(retry_after_secs)).await;
+                    }
+                }
+                WfPollAction::RetryTransient => {}
+                WfPollAction::Fatal(result) => return result,
+            },
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -6682,9 +6709,18 @@ async fn mcp_ask_wait(
             Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 401 => {
                 return auth_expired();
             }
-            Err(_) => {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
+            // A transient poll error backs off briefly and retries; a persistent
+            // 4xx is surfaced instead of looping to a misleading timeout.
+            Err(other) => match classify_wf_poll_error(&other) {
+                WfPollAction::RateLimited { retry_after_secs } => {
+                    tokio::time::sleep(std::time::Duration::from_secs(retry_after_secs.max(2)))
+                        .await;
+                }
+                WfPollAction::RetryTransient => {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                WfPollAction::Fatal(result) => return result,
+            },
         }
     }
 }
@@ -9632,8 +9668,23 @@ async fn metadata_extract_and_wait(
                      metadata-details action."
                 ));
             }
-            // Transient errors are tolerated; retry on the next tick.
-            Err(_) => {}
+            // Classify rather than swallow: a transient blip retries on the next
+            // tick; a persistent 4xx (403/404/402/parse) is surfaced instead of
+            // looping silently to the deadline.
+            Err(other) => match classify_wf_poll_error(&other) {
+                WfPollAction::RateLimited { retry_after_secs } => {
+                    if retry_after_secs > 0 {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        tokio::time::sleep(
+                            remaining.min(std::time::Duration::from_secs(retry_after_secs)),
+                        )
+                        .await;
+                    }
+                }
+                WfPollAction::RetryTransient => {}
+                WfPollAction::Fatal(result) => return result,
+            },
         }
 
         if tokio::time::Instant::now() >= deadline {
@@ -10648,10 +10699,13 @@ async fn workflow_export_and_download(
         .and_then(Value::as_u64)
         .unwrap_or(0);
 
-    // Resolve the output directory (default .fastio/downloads/).
+    // Resolve the output directory (default .fastio/downloads/). Create it 0700
+    // (private) — the audit bundle can carry sensitive workflow data, and this
+    // mirrors the sign-download path's `create_dir_all_private` for the SAME
+    // default dir.
     let out_dir =
         std::path::PathBuf::from(optional_str(args, "output_path").unwrap_or(".fastio/downloads"));
-    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+    if let Err(e) = create_dir_all_private(&out_dir) {
         return error_text(&format!(
             "failed to create output directory '{}': {e}",
             out_dir.display()

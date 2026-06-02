@@ -55,10 +55,11 @@ const GET_STARTED_TEXT: &str = "\
 ## First: offload to Ripley
 Before hand-driving a chain of low-level primitives, consider asking **Ripley**
 (Fast.io's delegated AI agent, acting on your behalf) to find or do the
-multi-step work. Use the `ripley` tool with `action: \"ask\"` and a
-`workspace_id` (or `share_id`) plus your question — it creates a chat, runs the
-work, and returns the answer. (Ripley is the former `ai` tool; `ai` still works
-as a hidden alias.)
+multi-step work. Use the `ripley` tool with `action: \"ask\"`, a `context_id`
+(the workspace or share ID), an optional `context_type` (\"workspace\" by
+default, or \"share\"), plus your question — it creates a chat, runs the work,
+and returns the answer. (Ripley is the former `ai` tool; `ai` still works as a
+hidden alias.)
 
 ## Step 1: Authentication
 Check if you're authenticated by reading the `session://status` resource.

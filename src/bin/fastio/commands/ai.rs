@@ -10,14 +10,10 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use super::CommandContext;
+use super::workflow::{PollAction, classify_poll_error};
 use fastio_cli::api;
 use fastio_cli::api::ai::{ChatCreateOptions, ChatScope};
-
-/// Maximum polling attempts for AI response.
-const MAX_POLL_ATTEMPTS: u32 = 15;
-
-/// Delay between poll attempts in seconds.
-const POLL_DELAY_SECS: u64 = 2;
+use fastio_cli::error::CliError;
 
 /// Resolved scope/attachment flags for the `ask`/`chat` verbs, carried from
 /// the clap layer into the internal command enum.
@@ -682,58 +678,48 @@ async fn chat(
         })
         .ok_or_else(|| anyhow::anyhow!("no message_id in response"))?;
 
-    // Step 3: Poll for AI response
+    // Step 3: Wait for the AI response using the SAME bounded activity-poll
+    // path as `ask` — long-poll activity and confirm via a single message-
+    // details read (never a tight `--detail`-style loop), with the shared
+    // error classifier so a persistent 403/404/402 is surfaced instead of
+    // looping to a misleading timeout. `chat` is workspace-only, so the
+    // profile is always `("workspace", workspace)`.
     if !ctx.output.quiet {
         eprintln!("Waiting for AI response...");
     }
 
-    for attempt in 0..MAX_POLL_ATTEMPTS {
-        let details = api::ai::get_message_details(&client, workspace, &chat_id, &message_id).await;
-
-        if let Ok(msg_data) = details {
-            let msg = msg_data.get("message").unwrap_or(&msg_data);
-            let state = extract_string_field(msg, "state").unwrap_or_default();
-
-            if state == "complete" || state == "errored" {
-                let response_text = msg
-                    .get("response")
-                    .and_then(|r| r.get("text"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-
-                let mut result = serde_json::json!({
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "state": state,
-                    "response": response_text,
-                });
-
-                // Include citations if present in the AI response
-                if let Some(citations) = extract_citations(msg)
-                    && let Some(obj) = result.as_object_mut()
-                {
-                    obj.insert("citations".to_owned(), citations);
-                }
-
-                ctx.output.render(&result)?;
-                return Ok(());
-            }
+    match wait_for_answer(&client, "workspace", workspace, &chat_id, &message_id).await {
+        WaitOutcome::Complete(msg) => {
+            let result = render_answer(&chat_id, &message_id, &msg);
+            ctx.output.render(&result)?;
+            Ok(())
         }
-
-        if attempt < MAX_POLL_ATTEMPTS - 1 {
-            tokio::time::sleep(Duration::from_secs(POLL_DELAY_SECS)).await;
+        WaitOutcome::TimedOut => {
+            let result = serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "state": "processing",
+                "message": format!(
+                    "Timed out after ~{ASK_MAX_WAIT_SECS}s waiting for the answer. \
+                     The AI may still be processing — re-check with \
+                     `fastio ripley message --workspace {workspace} {chat_id} {message_id}`."
+                ),
+            });
+            ctx.output.render(&result)?;
+            Ok(())
         }
+        WaitOutcome::AuthExpired => anyhow::bail!(
+            "authentication expired while waiting for the answer. The chat was created \
+             (chat_id={chat_id}, message_id={message_id}); re-authenticate \
+             (`fastio auth login`) and re-check with \
+             `fastio ripley message --workspace {workspace} {chat_id} {message_id}`."
+        ),
+        WaitOutcome::Failed(err) => Err(anyhow::Error::new(err).context(format!(
+            "error while waiting for the AI response (chat_id={chat_id}, \
+             message_id={message_id}); re-check with \
+             `fastio ripley message --workspace {workspace} {chat_id} {message_id}`"
+        ))),
     }
-
-    // Timed out
-    let result = serde_json::json!({
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "state": "processing",
-        "message": "Polling timed out after ~30 seconds. The AI may still be processing.",
-    });
-    ctx.output.render(&result)?;
-    Ok(())
 }
 
 /// Semantic search over indexed workspace files.
@@ -976,6 +962,11 @@ async fn ask(
                  `fastio ripley message --{profile_type} {profile_id} {chat_id} {message_id}`."
             );
         }
+        WaitOutcome::Failed(err) => Err(anyhow::Error::new(err).context(format!(
+            "error while waiting for Ripley's answer (chat_id={chat_id}, \
+             message_id={message_id}); re-check with \
+             `fastio ripley message --{profile_type} {profile_id} {chat_id} {message_id}`"
+        ))),
     }
 }
 
@@ -987,6 +978,10 @@ enum WaitOutcome {
     TimedOut,
     /// A 401 surfaced (JWT expired mid-wait).
     AuthExpired,
+    /// A persistent, non-transient error (403 / 404 / 402 / parse) surfaced
+    /// mid-wait. Carries the underlying error so it is reported rather than
+    /// silently looping to a misleading timeout.
+    Failed(CliError),
 }
 
 /// Bounded wait for an answer using the documented activity-poll + a
@@ -1039,12 +1034,22 @@ async fn wait_for_answer(
                     return WaitOutcome::Complete(msg_data);
                 }
             }
-            Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 401 => {
+            Err(CliError::Api(e)) if e.http_status == 401 => {
                 return WaitOutcome::AuthExpired;
             }
-            // Transient details errors are tolerated — fall through to the
-            // long-poll and retry on the next iteration.
-            Err(_) => {}
+            // Classify the error rather than swallowing it: a transient blip
+            // falls through to the long-poll and retries; a persistent 4xx
+            // (403/404/402/parse) is surfaced instead of looping to a
+            // misleading timeout.
+            Err(e) => match classify_poll_error(e) {
+                PollAction::RateLimited { retry_after_secs } => {
+                    if retry_after_secs > 0 {
+                        tokio::time::sleep(Duration::from_secs(retry_after_secs)).await;
+                    }
+                }
+                PollAction::RetryTransient => {}
+                PollAction::Fatal(err) => return WaitOutcome::Failed(err),
+            },
         }
 
         if tokio::time::Instant::now() >= deadline {
@@ -1076,14 +1081,20 @@ async fn wait_for_answer(
                     lastactivity = Some(ts.to_owned());
                 }
             }
-            Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 401 => {
+            Err(CliError::Api(e)) if e.http_status == 401 => {
                 return WaitOutcome::AuthExpired;
             }
             // A transient poll error shouldn't abort the wait; back off briefly
-            // and retry the details check.
-            Err(_) => {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
+            // and retry the details check. A persistent 4xx is fatal.
+            Err(e) => match classify_poll_error(e) {
+                PollAction::RateLimited { retry_after_secs } => {
+                    tokio::time::sleep(Duration::from_secs(retry_after_secs.max(2))).await;
+                }
+                PollAction::RetryTransient => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                PollAction::Fatal(err) => return WaitOutcome::Failed(err),
+            },
         }
 
         if tokio::time::Instant::now() >= deadline {
@@ -1335,10 +1346,33 @@ fn delegated_jobs_unavailable() -> Result<()> {
 #[cfg(test)]
 mod phase2_tests {
     use super::{
-        MemoryTarget, delegated_jobs_unavailable, extract_chat_id, extract_message_id, memory_scope,
+        MemoryTarget, PollAction, classify_poll_error, delegated_jobs_unavailable, extract_chat_id,
+        extract_message_id, memory_scope,
     };
     use fastio_cli::api::ai_memory::MemoryScope;
+    use fastio_cli::error::{ApiError, CliError};
     use serde_json::json;
+
+    #[test]
+    fn fatal_wait_error_is_surfaced_not_swallowed() {
+        // FIX G: a persistent 4xx during the Ripley `ask`/`chat` wait must be
+        // classified Fatal so the loop returns `WaitOutcome::Failed(err)`
+        // instead of swallowing it and looping to a misleading timeout. The
+        // `ask`/`chat` loops reuse this exact `classify_poll_error`.
+        for status in [403u16, 404, 402] {
+            let err = CliError::Api(ApiError::new(0, None, "boom".to_owned(), status));
+            assert!(
+                matches!(classify_poll_error(err), PollAction::Fatal(_)),
+                "HTTP {status} during the wait must be Fatal (surfaced), not swallowed"
+            );
+        }
+        // A 500 is transient (keeps polling), not fatal.
+        let transient = CliError::Api(ApiError::new(0, None, "boom".to_owned(), 503));
+        assert!(matches!(
+            classify_poll_error(transient),
+            PollAction::RetryTransient
+        ));
+    }
 
     #[test]
     fn delegated_jobs_unavailable_returns_pending_error() {

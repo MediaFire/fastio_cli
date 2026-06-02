@@ -129,32 +129,32 @@ pub enum Commands {
     /// Organization and workspace assets.
     #[command(subcommand)]
     Asset(AssetCommands),
-    /// [legacy] Task management. Superseded by the new `fastio workflow`
-    /// orchestration (coming in this release).
+    /// [legacy] Task management. Superseded by `fastio workflow`; remains
+    /// functional for now.
     #[command(
         subcommand,
-        long_about = "[legacy] Task management.\n\nThis is a legacy primitive that will be replaced by the new `fastio workflow` orchestration group (landing later in this release). It remains fully functional for now; prefer `fastio workflow` for new work once it ships."
+        long_about = "[legacy] Task management.\n\nThis is a legacy primitive, superseded by `fastio workflow`; it remains functional for now. Prefer `fastio workflow` for new work."
     )]
     Task(TaskCommands),
-    /// [legacy] Worklog management. Superseded by the new `fastio workflow`
-    /// orchestration (coming in this release).
+    /// [legacy] Worklog management. Superseded by `fastio workflow`; remains
+    /// functional for now.
     #[command(
         subcommand,
-        long_about = "[legacy] Worklog management.\n\nThis is a legacy primitive that will be replaced by the new `fastio workflow` orchestration group (landing later in this release). It remains fully functional for now; prefer `fastio workflow` for new work once it ships."
+        long_about = "[legacy] Worklog management.\n\nThis is a legacy primitive, superseded by `fastio workflow`; it remains functional for now. Prefer `fastio workflow` for new work."
     )]
     Worklog(WorklogCommands),
-    /// [legacy] Approval workflows. Superseded by the new `fastio workflow`
-    /// orchestration (coming in this release).
+    /// [legacy] Approval workflows. Superseded by `fastio workflow`; remains
+    /// functional for now.
     #[command(
         subcommand,
-        long_about = "[legacy] Approval workflows.\n\nThis is a legacy primitive that will be replaced by the new `fastio workflow` orchestration group (landing later in this release). It remains fully functional for now; prefer `fastio workflow` for new work once it ships."
+        long_about = "[legacy] Approval workflows.\n\nThis is a legacy primitive, superseded by `fastio workflow`; it remains functional for now. Prefer `fastio workflow` for new work."
     )]
     Approval(ApprovalCommands),
-    /// [legacy] Todo items. Superseded by the new `fastio workflow`
-    /// orchestration (coming in this release).
+    /// [legacy] Todo items. Superseded by `fastio workflow`; remains functional
+    /// for now.
     #[command(
         subcommand,
-        long_about = "[legacy] Todo items.\n\nThis is a legacy primitive that will be replaced by the new `fastio workflow` orchestration group (landing later in this release). It remains fully functional for now; prefer `fastio workflow` for new work once it ships."
+        long_about = "[legacy] Todo items.\n\nThis is a legacy primitive, superseded by `fastio workflow`; it remains functional for now. Prefer `fastio workflow` for new work."
     )]
     Todo(TodoCommands),
 
@@ -807,6 +807,19 @@ pub enum WorkflowTriggerAliasCommands {
         workspace_id: String,
         /// Alias verb to remove.
         verb: String,
+    },
+    /// Replace the ENTIRE alias map with a supplied JSON object (verb→template).
+    ///
+    /// Unlike `set`/`remove` (which read-modify-write a single verb), this sets
+    /// the whole map in one shot — any verb not present in the JSON is dropped.
+    Replace {
+        /// Workspace ID.
+        workspace_id: String,
+        /// The full verb→template map as a JSON object string (e.g.
+        /// `'{"redact":"redact-tpl","summarize":"sum-tpl"}'`). `@file.json` is
+        /// NOT expanded — pass the literal JSON.
+        #[arg(long)]
+        aliases_json: String,
     },
 }
 

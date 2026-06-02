@@ -8,8 +8,10 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use super::CommandContext;
+use super::workflow::{PollAction, classify_poll_error};
 use fastio_cli::api;
 use fastio_cli::api::metadata::ExtractJobState;
+use fastio_cli::error::CliError;
 
 /// Metadata subcommand variants.
 #[derive(Debug, Clone)]
@@ -816,15 +818,33 @@ async fn wait_for_extract_job(
                     _ => {}
                 }
             }
-            Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 401 => {
+            Err(CliError::Api(e)) if e.http_status == 401 => {
                 anyhow::bail!(
                     "authentication expired while waiting for extraction job {job_id}. The job \
                      may still complete server-side; re-authenticate (fastio auth login) and read \
                      values via 'fastio metadata details --workspace {workspace} {node_id}'."
                 );
             }
-            // Transient errors are tolerated; retry on the next tick.
-            Err(_) => {}
+            // Classify rather than swallow: a transient blip retries on the next
+            // tick; a persistent 4xx (403/404/402/parse) is surfaced instead of
+            // looping silently to the deadline.
+            Err(e) => match classify_poll_error(e) {
+                PollAction::RateLimited { retry_after_secs } => {
+                    if retry_after_secs > 0 {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        tokio::time::sleep(remaining.min(Duration::from_secs(retry_after_secs)))
+                            .await;
+                    }
+                }
+                PollAction::RetryTransient => {}
+                PollAction::Fatal(err) => {
+                    return Err(anyhow::Error::new(err).context(format!(
+                        "error while waiting for extraction job {job_id}; read values via \
+                         'fastio metadata details --workspace {workspace} {node_id}'"
+                    )));
+                }
+            },
         }
 
         if tokio::time::Instant::now() >= deadline {

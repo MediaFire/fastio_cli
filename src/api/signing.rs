@@ -847,8 +847,11 @@ pub async fn send_envelope(
     envelope_id: &str,
 ) -> Result<Value, CliError> {
     let path = envelope_action_path(parent_type, parent_id, envelope_id, "send")?;
-    // `/send/` has no documented body; post an empty JSON object.
-    client.post_json(&path, &json!({})).await
+    // `/send/` is a bodyless POST per the contract (`signing.txt:364-371`):
+    // send no body and no `Content-Type`, matching the documented shape exactly
+    // rather than posting `{}` with a JSON content-type. The standard envelope
+    // is still unwrapped via `post_empty`.
+    client.post_empty(&path).await
 }
 
 /// Validate a void/decline `reason` against the contract caps

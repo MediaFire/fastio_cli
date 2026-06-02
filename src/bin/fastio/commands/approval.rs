@@ -3,8 +3,8 @@
 /// Handles listing, requesting, approving, rejecting, updating, deleting,
 /// filtered listing, summaries, and the per-user approvals dashboard.
 ///
-/// Part of the `[legacy]` workflow primitives, superseded by the forthcoming
-/// `fastio workflow` orchestration group.
+/// Part of the `[legacy]` workflow primitives, superseded by the `fastio
+/// workflow` orchestration group; remains functional for now.
 ///
 /// Approval **creation** is always routed through the **scoped**
 /// `/{profile_type}/{profile_id}/approvals/create/` endpoint (never the
