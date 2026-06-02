@@ -1091,7 +1091,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "preview",
-        description: "Previews: get preview URLs and transform URLs for files.",
+        description: "Previews: get preview URLs and transform URLs for files. The returned `path`/url is a secret-bearing read capability (carries a short-lived embedded token) — do not log or share it.",
         actions: &["get", "thumbnail", "transform"],
         params: &[
             ("context_type", "Context: workspace or share", false),
@@ -6648,6 +6648,18 @@ async fn mcp_ask_wait(
     // the recovery IDs and a re-check hint — mirroring the CLI `ask` path —
     // rather than an opaque "authentication expired" with no way to recover.
     let auth_expired = || error_text(&ask_auth_expired_text(chat_id, message_id));
+    // Build the on-timeout `processing` payload. Used both by the deadline
+    // checks and by the rate-limit clamp when the remaining wait is exhausted.
+    let timeout_payload = || {
+        let mut payload = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "state": "processing",
+            "message": "Timed out waiting for the answer; re-check with action=message-details.",
+        });
+        attach_warning(&mut payload, warning);
+        success_json(&payload)
+    };
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(MCP_ASK_MAX_WAIT_SECS);
     let details_sub = format!(
@@ -6677,7 +6689,18 @@ async fn mcp_ask_wait(
             Err(other) => match classify_wf_poll_error(&other) {
                 WfPollAction::RateLimited { retry_after_secs } => {
                     if retry_after_secs > 0 {
-                        tokio::time::sleep(std::time::Duration::from_secs(retry_after_secs)).await;
+                        // Clamp the rate-limit backoff to the remaining wait so a
+                        // 429 with a long reset cannot push us past the deadline;
+                        // a ~0 remaining returns the timeout payload.
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            return timeout_payload();
+                        }
+                        tokio::time::sleep(
+                            remaining.min(std::time::Duration::from_secs(retry_after_secs)),
+                        )
+                        .await;
                     }
                 }
                 WfPollAction::RetryTransient => {}
@@ -6686,14 +6709,7 @@ async fn mcp_ask_wait(
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            let mut payload = serde_json::json!({
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "state": "processing",
-                "message": "Timed out waiting for the answer; re-check with action=message-details.",
-            });
-            attach_warning(&mut payload, warning);
-            return success_json(&payload);
+            return timeout_payload();
         }
         let remaining = deadline.saturating_duration_since(now).as_secs();
         let wait =
@@ -6713,8 +6729,17 @@ async fn mcp_ask_wait(
             // 4xx is surfaced instead of looping to a misleading timeout.
             Err(other) => match classify_wf_poll_error(&other) {
                 WfPollAction::RateLimited { retry_after_secs } => {
-                    tokio::time::sleep(std::time::Duration::from_secs(retry_after_secs.max(2)))
-                        .await;
+                    // Clamp the rate-limit backoff (with its 2s floor) to the
+                    // remaining wait so a long 429 reset cannot overshoot the
+                    // deadline; a ~0 remaining returns the timeout payload.
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return timeout_payload();
+                    }
+                    tokio::time::sleep(
+                        remaining.min(std::time::Duration::from_secs(retry_after_secs.max(2))),
+                    )
+                    .await;
                 }
                 WfPollAction::RetryTransient => {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -7556,6 +7581,29 @@ async fn handle_invitation(
     }
 }
 
+/// Strip the redundant standalone `downloadToken` from a preview response BEFORE
+/// it is returned to the MCP caller, and attach a secret-bearing note.
+///
+/// The `get` / `thumbnail` preauthorize response (storage.txt:2343) carries
+/// `{result, downloadToken, path, primaryFilename}` where the tokenized `path`
+/// (`.../preview/.../read/<token>/file/...`) ALREADY embeds the token. Surfacing
+/// the standalone `downloadToken` is therefore redundant secret exposure, so it is
+/// removed; the tokenized `path` remains the deliverable the agent fetches. Mirrors
+/// the `download.file-url` treatment of its redundant `download_token`.
+fn sanitize_preview_response(value: &mut Value) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("downloadToken");
+        obj.insert(
+            "note".to_owned(),
+            Value::String(
+                "path is secret-bearing (carries a short-lived embedded read token). \
+                 Do not log or share it."
+                    .to_owned(),
+            ),
+        );
+    }
+}
+
 /// Preview tool handler.
 async fn handle_preview(
     state: &McpState,
@@ -7588,7 +7636,10 @@ async fn handle_preview(
             match api::preview::get_preview_url(&client, ctx_type, ctx_id, node_id, preview_type)
                 .await
             {
-                Ok(v) => Ok(success_json(&v)),
+                Ok(mut v) => {
+                    sanitize_preview_response(&mut v);
+                    Ok(success_json(&v))
+                }
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
@@ -7624,6 +7675,12 @@ async fn handle_preview(
             )
             .await
             {
+                // The `transform` requestread response (storage.txt:2503) is
+                // `{result, token}` with NO tokenized `path`/url — the bare
+                // `token` IS the sole deliverable the agent uses to build the
+                // read URL. Stripping it would break the tool, so it is kept
+                // (an accepted secret deliverable; redaction is handled by
+                // SECRET_LOG_KEYS on the trace side).
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -11748,7 +11805,8 @@ async fn handle_system(
 #[cfg(test)]
 mod ripley_tool_tests {
     use super::{
-        McpState, TOOL_DEFS, ToolRouter, inject_onboarding_url, sanitize_subscribe_response,
+        McpState, TOOL_DEFS, ToolRouter, inject_onboarding_url, sanitize_preview_response,
+        sanitize_subscribe_response,
     };
     use serde_json::{Map, Value, json};
     use std::sync::Arc;
@@ -13690,6 +13748,34 @@ mod ripley_tool_tests {
         // Non-sensitive setup_intent fields retained.
         assert_eq!(v["setup_intent"]["id"], "seti_1");
         assert_eq!(v["setup_intent"]["status"], "requires_payment_method");
+    }
+
+    #[test]
+    fn sanitize_preview_strips_redundant_download_token_keeps_path() {
+        // The get/thumbnail preauthorize response (storage.txt:2343) carries a
+        // redundant standalone downloadToken alongside a tokenized path; the MCP
+        // output must drop the standalone token but keep the tokenized path.
+        let mut v = json!({
+            "result": true,
+            "downloadToken": "eyJhbGciOiJIUzI1NiJ9.SHOULD_NOT_SURFACE",
+            "path": "/current/workspace/123/storage/abc/preview/thumbnail/read/eyJhbGci.../file/preview.png",
+            "primaryFilename": "preview.png"
+        });
+        sanitize_preview_response(&mut v);
+        let obj = v.as_object().expect("object");
+        assert!(
+            !obj.contains_key("downloadToken"),
+            "standalone downloadToken key must be removed: {v}"
+        );
+        assert!(
+            obj.contains_key("path"),
+            "tokenized path must be retained: {v}"
+        );
+        assert_eq!(
+            obj.get("primaryFilename").and_then(Value::as_str),
+            Some("preview.png")
+        );
+        assert_eq!(obj.get("result").and_then(Value::as_bool), Some(true));
     }
 
     #[tokio::test]

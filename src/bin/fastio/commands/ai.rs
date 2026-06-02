@@ -1044,7 +1044,16 @@ async fn wait_for_answer(
             Err(e) => match classify_poll_error(e) {
                 PollAction::RateLimited { retry_after_secs } => {
                     if retry_after_secs > 0 {
-                        tokio::time::sleep(Duration::from_secs(retry_after_secs)).await;
+                        // Clamp the rate-limit backoff to the remaining wait so a
+                        // 429 with a long reset cannot push us past the deadline;
+                        // a ~0 remaining breaks to the timeout path below.
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            return WaitOutcome::TimedOut;
+                        }
+                        tokio::time::sleep(remaining.min(Duration::from_secs(retry_after_secs)))
+                            .await;
                     }
                 }
                 PollAction::RetryTransient => {}
@@ -1088,7 +1097,15 @@ async fn wait_for_answer(
             // and retry the details check. A persistent 4xx is fatal.
             Err(e) => match classify_poll_error(e) {
                 PollAction::RateLimited { retry_after_secs } => {
-                    tokio::time::sleep(Duration::from_secs(retry_after_secs.max(2))).await;
+                    // Clamp the rate-limit backoff (with its 2s floor) to the
+                    // remaining wait so a long 429 reset cannot overshoot the
+                    // deadline; a ~0 remaining breaks to the timeout path.
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return WaitOutcome::TimedOut;
+                    }
+                    tokio::time::sleep(remaining.min(Duration::from_secs(retry_after_secs.max(2))))
+                        .await;
                 }
                 PollAction::RetryTransient => {
                     tokio::time::sleep(Duration::from_secs(2)).await;
