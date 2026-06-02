@@ -31,6 +31,14 @@ pub mod locking;
 pub mod member;
 /// Metadata extraction and template management endpoints.
 pub mod metadata;
+/// Workflow Orchestration (v3.2) durable-runtime endpoints.
+///
+/// Distinct from the legacy task-management primitives in [`workflow`]: this
+/// surface ships the workflow profile + runtime, immutable templates,
+/// triggers, obligations, extraction schemas, the signed audit chain,
+/// outbound webhook subscriptions, concurrency pools, external subjects, the
+/// realtime-token mint, and the v3.5b review surface.
+pub mod orchestration;
 /// Organization management endpoints.
 pub mod org;
 /// File preview endpoints.

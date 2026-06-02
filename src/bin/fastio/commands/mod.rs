@@ -108,6 +108,8 @@ pub mod upload;
 pub mod user;
 /// Terminal markdown viewer command (`fastio view`).
 pub mod view;
+/// Workflow Orchestration (v3.2) commands.
+pub mod workflow;
 /// Work log commands.
 pub mod worklog;
 /// Workspace management commands.

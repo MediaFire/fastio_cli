@@ -202,8 +202,107 @@ impl fmt::Display for ApiError {
         if let Some(ref ec) = self.error_code {
             write!(f, " [{ec}]")?;
         }
+        if let Some(ref details) = self.details {
+            render_details(f, details)?;
+        }
         Ok(())
     }
+}
+
+/// Render the structured server `details` onto an [`ApiError`]'s `Display`.
+///
+/// Without this, the Phase-0 enrichment (`reason`, `validation_report`,
+/// `params[]`, `documentation_url`, `resource`) harvested into
+/// [`ApiError::details`] is invisible to both the CLI (anyhow → `Display` →
+/// stderr) and MCP (`cli_err_to_result` → `to_string`). The rendering is a
+/// compact, multi-line digest appended after the headline so a 422 template
+/// `validation_report`, a trigger-fire 409 `reason`, and 400 `params[]`
+/// surface through one shared path.
+///
+/// The contained JSON is server diagnostics (never a credential), but it is
+/// still untrusted text; long values are truncated so the message stays
+/// readable on a terminal.
+fn render_details(f: &mut fmt::Formatter<'_>, details: &serde_json::Value) -> fmt::Result {
+    use serde_json::Value;
+
+    // `reason` (409 fire/conflict): a string or a structured object.
+    if let Some(reason) = details.get("reason").filter(|v| !v.is_null()) {
+        match reason {
+            Value::String(s) => write!(f, "\n  reason: {}", truncate_detail(s))?,
+            other => write!(f, "\n  reason: {}", truncate_detail(&compact_json(other)))?,
+        }
+    }
+
+    // `params[]` (400): per-field validation failures. Cap the number of
+    // rendered entries so a pathological response can't flood stderr / MCP.
+    if let Some(Value::Array(params)) = details.get("params") {
+        for p in params.iter().take(MAX_RENDERED_PARAMS) {
+            let name = p.get("name").and_then(Value::as_str).unwrap_or("?");
+            let msg = p
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| p.get("kind").and_then(Value::as_str))
+                .unwrap_or("invalid");
+            // Both the field name and the message are untrusted server text;
+            // bound each so a pathological name can't blow up the render either.
+            write!(
+                f,
+                "\n  param {}: {}",
+                truncate_detail(name),
+                truncate_detail(msg)
+            )?;
+        }
+        if params.len() > MAX_RENDERED_PARAMS {
+            write!(f, "\n  … ({} more)", params.len() - MAX_RENDERED_PARAMS)?;
+        }
+    }
+
+    // `validation_report` (422): structured template/schema report.
+    if let Some(report) = details.get("validation_report").filter(|v| !v.is_null()) {
+        write!(
+            f,
+            "\n  validation_report: {}",
+            truncate_detail(&compact_json(report))
+        )?;
+    }
+
+    // Doc + resource links, when present. Bounded like every other detail
+    // value so an oversized server-supplied link can't blow up stderr / MCP.
+    if let Some(url) = details.get("documentation_url").and_then(Value::as_str) {
+        write!(f, "\n  see: {}", truncate_detail(url))?;
+    }
+    if let Some(res) = details.get("resource").and_then(Value::as_str) {
+        write!(f, "\n  resource: {}", truncate_detail(res))?;
+    }
+    Ok(())
+}
+
+/// Maximum number of `params[]` entries rendered onto an [`ApiError`]'s
+/// `Display`; further entries are summarized as `… (N more)` so a pathological
+/// validation response cannot flood stderr or an MCP error payload.
+const MAX_RENDERED_PARAMS: usize = 10;
+
+/// Maximum rendered length of a single detail value (keeps stderr readable).
+const DETAIL_MAX_LEN: usize = 400;
+
+/// Serialize a JSON value compactly, falling back to its `Debug` form if
+/// serialization somehow fails (it cannot for in-memory `Value`s, but the
+/// no-`unwrap` rule forbids relying on that).
+fn compact_json(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
+}
+
+/// Truncate a detail string on a char boundary, appending an ellipsis marker
+/// so the reader knows it was clipped.
+fn truncate_detail(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.len() <= DETAIL_MAX_LEN {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut end = DETAIL_MAX_LEN;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}… (truncated)", &s[..end]))
 }
 
 impl std::error::Error for ApiError {}
@@ -311,6 +410,155 @@ mod tests {
             ApiError::new(0, None, "x".to_owned(), 500)
                 .details
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn display_without_details_is_unchanged() {
+        // The headline shape must be byte-stable when there are no details.
+        let e = ApiError::new(1650, Some("APP_X".to_owned()), "boom".to_owned(), 400);
+        assert_eq!(e.to_string(), "[HTTP 400] boom (code 1650) [APP_X]");
+    }
+
+    #[test]
+    fn display_renders_422_validation_report() {
+        // A 422 template-validation report must surface in Display so the CLI
+        // (anyhow→Display→stderr) and MCP (to_string) both show it.
+        let details = serde_json::json!({
+            "validation_report": {"ok": false, "fields": ["name", "steps[0].kind"]},
+        });
+        let e = ApiError {
+            code: 1665,
+            error_code: None,
+            message: "template invalid".to_owned(),
+            http_status: 422,
+            details: Some(Box::new(details)),
+        };
+        let rendered = e.to_string();
+        assert!(rendered.contains("validation_report:"), "got: {rendered}");
+        assert!(rendered.contains("name"), "field name surfaced: {rendered}");
+        assert!(
+            rendered.contains("steps[0].kind"),
+            "nested field surfaced: {rendered}"
+        );
+    }
+
+    #[test]
+    fn display_renders_409_reason() {
+        // A trigger-fire 409 reason must surface in Display.
+        let details = serde_json::json!({"reason": "dedup_hit"});
+        let e = ApiError {
+            code: 1660,
+            error_code: None,
+            message: "fire denied".to_owned(),
+            http_status: 409,
+            details: Some(Box::new(details)),
+        };
+        let rendered = e.to_string();
+        assert!(rendered.contains("reason: dedup_hit"), "got: {rendered}");
+    }
+
+    #[test]
+    fn display_renders_400_params_and_links() {
+        let details = serde_json::json!({
+            "params": [
+                {"name": "agent_credit_cap", "message": "must be a positive integer"},
+                {"name": "visibility", "kind": "enum"},
+            ],
+            "documentation_url": "https://api.fast.io/docs",
+            "resource": "workflow/123",
+        });
+        let e = ApiError {
+            code: 1640,
+            error_code: None,
+            message: "bad request".to_owned(),
+            http_status: 400,
+            details: Some(Box::new(details)),
+        };
+        let rendered = e.to_string();
+        assert!(
+            rendered.contains("param agent_credit_cap: must be a positive integer"),
+            "got: {rendered}"
+        );
+        // A param without a message falls back to its kind.
+        assert!(
+            rendered.contains("param visibility: enum"),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("see: https://api.fast.io/docs"));
+        assert!(rendered.contains("resource: workflow/123"));
+    }
+
+    #[test]
+    fn display_bounds_doc_url_resource_and_param_count() {
+        let long_url = format!("https://api.fast.io/docs/{}", "u".repeat(1000));
+        let long_resource = format!("workflow/{}", "r".repeat(1000));
+        // 25 params — well past the MAX_RENDERED_PARAMS cap of 10.
+        let params: Vec<_> = (0..25)
+            .map(|i| serde_json::json!({"name": format!("field_{i}"), "message": "bad"}))
+            .collect();
+        let details = serde_json::json!({
+            "documentation_url": long_url,
+            "resource": long_resource,
+            "params": params,
+        });
+        let e = ApiError {
+            code: 1640,
+            error_code: None,
+            message: "bad request".to_owned(),
+            http_status: 400,
+            details: Some(Box::new(details)),
+        };
+        let rendered = e.to_string();
+
+        // The doc URL and resource are truncated, not emitted raw.
+        assert!(
+            rendered.contains("(truncated)"),
+            "doc/resource must be bounded: {}",
+            rendered.len()
+        );
+        assert!(
+            !rendered.contains(&"u".repeat(1000)),
+            "raw oversized doc URL leaked"
+        );
+        assert!(
+            !rendered.contains(&"r".repeat(1000)),
+            "raw oversized resource leaked"
+        );
+        // Only the first 10 params render, plus a "… (15 more)" note.
+        assert!(rendered.contains("param field_0: bad"));
+        assert!(rendered.contains("param field_9: bad"));
+        assert!(
+            !rendered.contains("param field_10:"),
+            "params past the cap must not render: {rendered}"
+        );
+        assert!(
+            rendered.contains("… (15 more)"),
+            "must summarize the elided params: {rendered}"
+        );
+    }
+
+    #[test]
+    fn display_truncates_overlong_detail() {
+        let long = "x".repeat(1000);
+        let details = serde_json::json!({ "reason": long });
+        let e = ApiError {
+            code: 0,
+            error_code: None,
+            message: "m".to_owned(),
+            http_status: 409,
+            details: Some(Box::new(details)),
+        };
+        let rendered = e.to_string();
+        assert!(
+            rendered.contains("(truncated)"),
+            "got len {}",
+            rendered.len()
+        );
+        assert!(
+            rendered.len() < 600,
+            "render stayed bounded: {}",
+            rendered.len()
         );
     }
 }

@@ -79,16 +79,12 @@ fn set_dir_permissions(_path: &std::path::Path) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Restrict file permissions to owner-only on Unix systems (mode 0600).
-#[cfg(unix)]
-fn set_file_permissions(path: &std::path::Path) -> Result<(), CliError> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
-/// No-op on non-Unix platforms.
+/// Best-effort owner-only file permissions on non-Unix platforms.
+///
+/// On Unix the owner-only (0600) mode is set atomically at file-creation time
+/// via `OpenOptionsExt::mode` in [`write_secure_file`], so this helper exists
+/// only for the non-Unix fallback (where no mode-at-open API is available); it
+/// is a no-op there.
 #[cfg(not(unix))]
 fn set_file_permissions(_path: &std::path::Path) -> Result<(), CliError> {
     Ok(())
@@ -106,18 +102,124 @@ pub fn ensure_config_dir(dir: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Compute a UNIQUE sibling temp path for an atomic [`write_secure_file`].
+///
+/// Appends a `.<pid>.<counter>.tmp` suffix to the destination name so the temp
+/// lives in the **same directory** as `path` — a prerequisite for the atomic
+/// rename (rename is only atomic within one filesystem, and a sibling is
+/// guaranteed to be on the same one) — while remaining unique per call. The
+/// PID disambiguates concurrent processes and a process-global [`AtomicU64`]
+/// counter disambiguates concurrent in-process writes, so two callers never
+/// collide on a predictable `<path>.tmp` sibling (which was also symlink/
+/// pre-creation prone). Mirrors the `partial_path` pattern in
+/// `client.rs::download_file_stream`; deliberately does NOT use wall-clock time.
+fn secure_tmp_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{}.{n}.tmp", std::process::id()));
+    std::path::PathBuf::from(name)
+}
+
 /// Write data to a file atomically and restrict its permissions to owner-only.
 ///
-/// The data is first written to a temporary file in the same directory, then
-/// permissions are applied, and finally the temp file is renamed to the target
-/// path. Because `rename` is atomic on the same filesystem, this prevents
-/// corruption if the process crashes mid-write.
+/// The data is written to a UNIQUE temporary sibling, durably flushed, then
+/// atomically renamed over the target path (`rename` is atomic on the same
+/// filesystem, preventing a truncated/corrupt file if the process crashes
+/// mid-write). An existing destination is replaced even on Windows (where
+/// `rename` refuses to overwrite) via a backup swap.
+///
+/// On Unix the temp is created with `create_new(true)` at mode `0600` so it is
+/// **never** world-readable for any window (the previous `std::fs::write`
+/// followed by a separate chmod left a predictable `<path>.tmp` sibling briefly
+/// at the umask default, ~0644 — a permission race and a symlink/collision
+/// target). On non-Unix the temp is created best-effort (no mode-at-open API)
+/// but still uses a unique name.
+///
+/// Temp creation is a DISTINCT first step: if `create_new` fails (the unique
+/// path is somehow already taken, a permission error, a symlink, …) the call
+/// returns immediately WITHOUT cleanup — we must never `remove_file` a path
+/// this invocation did not create. Only once the temp is confirmed ours does
+/// the write/rename run with best-effort cleanup on any error.
 pub fn write_secure_file(path: &std::path::Path, data: &str) -> Result<(), CliError> {
-    let tmp_path = path.with_extension("tmp");
-    std::fs::write(&tmp_path, data)?;
-    set_file_permissions(&tmp_path)?;
-    std::fs::rename(&tmp_path, path)?;
+    let tmp_path = secure_tmp_path(path);
+    // Establish ownership of the temp BEFORE entering the cleanup-bearing path.
+    let file = create_secure_temp(&tmp_path)?;
+    finalize_secure_write(file, &tmp_path, path, data).inspect_err(|_| {
+        // The temp is ours now; remove it best-effort on any failure so we
+        // never leak a partially-written sibling.
+        let _ = std::fs::remove_file(&tmp_path);
+    })
+}
+
+/// Create the unique temp sibling, owner-only at creation time on Unix.
+///
+/// Uses `create_new(true)` so the call FAILS (rather than truncating /
+/// following a symlink) if anything already exists at the unique path. On Unix
+/// the mode is set atomically via `OpenOptionsExt::mode(0o600)`; on non-Unix
+/// the (no-op) [`set_file_permissions`] is applied after creation as a
+/// best-effort fallback.
+fn create_secure_temp(tmp_path: &std::path::Path) -> Result<std::fs::File, CliError> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(tmp_path)?;
+    #[cfg(not(unix))]
+    set_file_permissions(tmp_path)?;
+    Ok(file)
+}
+
+/// Write `data` into the already-owned temp `file`, durably flush it, then
+/// atomically replace `path` with the temp. The caller owns temp cleanup on
+/// any error returned here.
+fn finalize_secure_write(
+    mut file: std::fs::File,
+    tmp_path: &std::path::Path,
+    path: &std::path::Path,
+    data: &str,
+) -> Result<(), CliError> {
+    use std::io::Write;
+    file.write_all(data.as_bytes())?;
+    file.flush()?;
+    // Durability barrier so the renamed file's contents are on disk.
+    file.sync_all()?;
+    drop(file);
+    atomic_replace(tmp_path, path)?;
     Ok(())
+}
+
+/// Atomically replace `dest` with `tmp`.
+///
+/// On Unix `rename` replaces an existing `dest` in one step. On Windows
+/// `rename` refuses to overwrite an existing file (`AlreadyExists`); mirror the
+/// backup-swap used by `client.rs::download_file_stream`: move `dest` aside to a
+/// unique sibling backup, rename `tmp` into place, then remove the backup
+/// (rolling back if the second rename fails so `dest` is never left missing).
+fn atomic_replace(tmp: &std::path::Path, dest: &std::path::Path) -> Result<(), CliError> {
+    match std::fs::rename(tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let backup = secure_tmp_path(dest);
+            std::fs::rename(dest, &backup)?;
+            match std::fs::rename(tmp, dest) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&backup);
+                    Ok(())
+                }
+                Err(replace_err) => {
+                    // Restore the original so `dest` is never left missing.
+                    let _ = std::fs::rename(&backup, dest);
+                    Err(replace_err.into())
+                }
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 impl Config {
@@ -251,5 +353,61 @@ impl Config {
         }
         self.profiles.remove(name);
         self.save()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a unique temp directory under the system temp dir without pulling
+    /// in a dev-dependency. Uses pid + an atomic counter for uniqueness.
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("fastio-cli-test-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn write_secure_file_writes_contents_and_is_atomic() {
+        let dir = unique_temp_dir("write");
+        let path = dir.join("secret.txt");
+        write_secure_file(&path, "hunter2").expect("write");
+        let read_back = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(read_back, "hunter2");
+        // No predictable `<path>.tmp` sibling and no leftover temp siblings.
+        assert!(!path.with_extension("tmp").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("secret.txt.") && name.ends_with(".tmp")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "left an orphaned temp sibling: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secure_file_result_is_0600_and_leaves_no_world_readable_temp() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("perms");
+        let path = dir.join("creds.json");
+        write_secure_file(&path, "{\"token\":\"x\"}").expect("write");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "result file must be 0600, got {mode:o}");
+        // The predictable race-prone sibling must never exist after the call.
+        assert!(!path.with_extension("tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

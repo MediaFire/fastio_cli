@@ -1473,6 +1473,158 @@ const TOOL_DEFS: &[ToolDef] = &[
         ],
     },
     ToolDef {
+        name: "workflow",
+        description: "Workflow Orchestration (v3.2): the durable multi-step runtime — distinct from the legacy task/approval/todo primitives. OFFLOAD multi-step orchestration here instead of hand-driving primitives: the compound actions 'instantiate-and-wait', 'trigger-fire-and-wait', and 'audit-export-and-download' do the full fire→poll→download loop for you. This tool exposes READ + DRIVE actions only; admin/destructive/crypto operations (workflow cancel + purge, template/pool/trigger create+lifecycle, outbound subscription management, secret/key rotation, dual-control redaction, schema set/derive, realtime token mint) are intentionally CLI-binary-only (`fastio workflow …`) — including the terminal 'cancel' lifecycle mutation, which is NOT available over MCP. Call action='describe' for the authoritative action/param reference. Idempotency keys for instantiate/fire are REQUIRED for replay safety and have no MCP auto-generate. CAS step output/advance surfaces 409 conflicts by default. The audit 'check-integrity' is integrity-only (chunk SHA-256 + content-hash chain + completeness), NOT HMAC authenticity.",
+        actions: &[
+            "describe",
+            "get",
+            "list",
+            "state",
+            "instantiate",
+            "instantiate-and-wait",
+            "pause",
+            "resume",
+            "grant-list",
+            "step-get",
+            "step-output",
+            "step-advance",
+            "step-occurrences",
+            "template-list",
+            "template-get",
+            "trigger-list",
+            "trigger-get",
+            "trigger-fire",
+            "trigger-fire-and-wait",
+            "trigger-dry-run",
+            "obligation-list",
+            "obligation-get",
+            "obligation-claim",
+            "obligation-release",
+            "obligation-resolve",
+            "inbox-me",
+            "inbox-workspace",
+            "inbox-pool",
+            "schema-get",
+            "audit-events",
+            "audit-export-start",
+            "audit-export-list",
+            "audit-export-get",
+            "audit-export-and-download",
+            "subject-workflows",
+        ],
+        params: &[
+            ("workspace_id", "Workspace ID (19-digit)", false),
+            ("workflow_id", "Workflow ID (19-digit profile id)", false),
+            ("template_id", "Template revision OpaqueId", false),
+            ("trigger_id", "Trigger OpaqueId", false),
+            ("job_id", "Audit export job OpaqueId", false),
+            ("step_occurrence_id", "Step occurrence OpaqueId", false),
+            ("step_id", "Step definition OpaqueId", false),
+            (
+                "obligation_id",
+                "Obligation id (plain numeric sequence)",
+                false,
+            ),
+            ("subject_id", "External-subject correlation handle", false),
+            ("pool_key", "Concurrency pool key", false),
+            (
+                "idempotency_key",
+                "REQUIRED for instantiate / instantiate-and-wait / trigger-fire / trigger-fire-and-wait — replay-safe key. There is NO MCP auto-generate.",
+                false,
+            ),
+            (
+                "trigger_payload",
+                "Resolved input bindings as a JSON string (instantiate / trigger-fire)",
+                false,
+            ),
+            (
+                "external_subject_id",
+                "Integrator correlation handle (instantiate)",
+                false,
+            ),
+            (
+                "output",
+                "Step output envelope as a JSON string (step-output / step-advance)",
+                false,
+            ),
+            (
+                "retry_on_conflict",
+                "Re-read and retry once on a CAS 409 (step-output / step-advance); default false surfaces the conflict",
+                false,
+            ),
+            (
+                "role",
+                "Grant role: viewer / participant / admin (grant-add — CLI only)",
+                false,
+            ),
+            (
+                "status",
+                "Obligation status filter (obligation-list)",
+                false,
+            ),
+            (
+                "assigned_user_id",
+                "Assigned-user filter (obligation-list)",
+                false,
+            ),
+            (
+                "resolution_payload",
+                "Resolution payload as a JSON string (obligation-resolve)",
+                false,
+            ),
+            (
+                "enabled_filter",
+                "Trigger filter: true / false / all (trigger-list)",
+                false,
+            ),
+            (
+                "include_payload",
+                "Inline audit event payload (audit-events)",
+                false,
+            ),
+            ("include_body", "Inline template_body (template-get)", false),
+            (
+                "scope",
+                "Audit export scope, e.g. full (audit-export-*)",
+                false,
+            ),
+            (
+                "include_overlays",
+                "Include redaction overlays (audit-export-*)",
+                false,
+            ),
+            (
+                "redaction_pin_strategy",
+                "Redaction pin strategy (audit-export-*)",
+                false,
+            ),
+            (
+                "window_days",
+                "Backtest window in days, ≤90 (trigger-dry-run)",
+                false,
+            ),
+            ("sample_limit", "Sample-match cap (trigger-dry-run)", false),
+            (
+                "apply_guards",
+                "Apply guard checks during a backtest (trigger-dry-run)",
+                false,
+            ),
+            (
+                "output_path",
+                "Destination directory for downloaded bundle files (audit-export-and-download; default .fastio/downloads/)",
+                false,
+            ),
+            (
+                "poll_interval",
+                "Seconds between polls, 1-60, default 3 (instantiate-and-wait / trigger-fire-and-wait)",
+                false,
+            ),
+            ("limit", "Pagination limit", false),
+            ("offset", "Pagination offset", false),
+            ("cursor", "Cursor for grant-list pagination", false),
+        ],
+    },
+    ToolDef {
         name: "instructions",
         description: "AI instructions (markdown blob, max 65,536 raw bytes) per profile. Scopes: user (self only), org/workspace/share (profile-wide admin slot + per-user override at /me/). User has no /me/ variant. clear-* maps to DELETE; setting empty content is equivalent.",
         actions: &[
@@ -1590,6 +1742,7 @@ impl ToolRouter {
             "import" => handle_import(&self.state, action, &args).await,
             "lock" => handle_lock(&self.state, action, &args).await,
             "metadata" => handle_metadata(&self.state, action, &args).await,
+            "workflow" => handle_workflow(&self.state, action, &args).await,
             "instructions" => handle_instructions(&self.state, action, &args).await,
             "system" => handle_system(&self.state, action, &args).await,
             _ => Ok(error_text(&format!("Unknown tool: {name}"))),
@@ -9294,6 +9447,1039 @@ async fn metadata_extract_and_wait(
     }
 }
 
+// ─── Workflow Orchestration tool ──────────────────────────────────────────────
+
+/// Default seconds between `workflow` compound-wait polls.
+const WORKFLOW_WAIT_POLL_DEFAULT_SECS: u64 = 3;
+/// Lower bound on the `workflow` compound-wait poll interval.
+const WORKFLOW_WAIT_POLL_MIN_SECS: u64 = 1;
+/// Upper bound on the `workflow` compound-wait poll interval.
+const WORKFLOW_WAIT_POLL_MAX_SECS: u64 = 60;
+/// Hard ceiling on the `workflow` compound-wait poll loop (well under the
+/// ~1-hour JWT lifetime).
+const WORKFLOW_WAIT_MAX_SECS: u64 = 600;
+
+/// The structured `describe` payload for the `workflow` tool — the
+/// authoritative per-action reference. Admin/destructive/crypto actions are
+/// intentionally ABSENT from this tool (they are CLI-binary-only); the
+/// `cli_only_actions` field names them so an agent knows where they live.
+// The length is a flat action-spec table, not branching logic.
+#[allow(clippy::too_many_lines)]
+fn workflow_describe() -> CallToolResult {
+    // (action, required[], optional[], note). Built programmatically to keep
+    // the `json!` macro shallow (a single deeply-nested literal blows the
+    // macro recursion limit).
+    let actions: &[(&str, &[&str], &[&str], &str)] = &[
+        ("describe", &[], &[], ""),
+        ("get", &["workflow_id"], &[], ""),
+        ("list", &["workspace_id"], &["limit", "offset"], ""),
+        ("state", &["workflow_id"], &[], ""),
+        (
+            "instantiate",
+            &["workflow_id", "idempotency_key"],
+            &["trigger_payload", "external_subject_id", "pool_key"],
+            "",
+        ),
+        (
+            "instantiate-and-wait",
+            &["workflow_id", "idempotency_key"],
+            &[
+                "trigger_payload",
+                "external_subject_id",
+                "pool_key",
+                "poll_interval",
+            ],
+            "fires then polls to a terminal lifecycle",
+        ),
+        ("pause", &["workflow_id"], &[], ""),
+        ("resume", &["workflow_id"], &[], ""),
+        // NOTE: `cancel` is intentionally NOT an MCP action — it is a terminal,
+        // irreversible lifecycle mutation and is listed under cli_only below.
+        (
+            "grant-list",
+            &["workflow_id"],
+            &["limit", "cursor"],
+            "cursor-paginated",
+        ),
+        ("step-get", &["workflow_id", "step_occurrence_id"], &[], ""),
+        (
+            "step-output",
+            &["workflow_id", "step_occurrence_id", "output"],
+            &["retry_on_conflict"],
+            "CAS-guarded; 409 surfaced unless retry_on_conflict=true",
+        ),
+        (
+            "step-advance",
+            &["workflow_id", "step_occurrence_id"],
+            &["output", "retry_on_conflict"],
+            "CAS-guarded",
+        ),
+        (
+            "step-occurrences",
+            &["workflow_id", "step_id"],
+            &["limit", "offset"],
+            "",
+        ),
+        ("template-list", &["workspace_id"], &["limit", "offset"], ""),
+        ("template-get", &["template_id"], &["include_body"], ""),
+        ("trigger-list", &["workspace_id"], &["enabled_filter"], ""),
+        ("trigger-get", &["trigger_id"], &[], ""),
+        (
+            "trigger-fire",
+            &["trigger_id", "idempotency_key"],
+            &["trigger_payload"],
+            "409 carries a stable reason",
+        ),
+        (
+            "trigger-fire-and-wait",
+            &["trigger_id", "idempotency_key"],
+            &["trigger_payload", "poll_interval"],
+            "",
+        ),
+        (
+            "trigger-dry-run",
+            &["trigger_id"],
+            &["window_days", "sample_limit", "apply_guards"],
+            "",
+        ),
+        (
+            "obligation-list",
+            &["workflow_id"],
+            &["status", "assigned_user_id", "limit", "offset"],
+            "workflow_id is the required authz anchor",
+        ),
+        ("obligation-get", &["obligation_id"], &[], ""),
+        ("obligation-claim", &["obligation_id"], &[], ""),
+        ("obligation-release", &["obligation_id"], &[], ""),
+        (
+            "obligation-resolve",
+            &["obligation_id"],
+            &["resolution_payload"],
+            "",
+        ),
+        ("inbox-me", &[], &[], ""),
+        ("inbox-workspace", &["workspace_id"], &[], ""),
+        ("inbox-pool", &["workspace_id", "pool_key"], &[], ""),
+        ("schema-get", &["workflow_id"], &[], ""),
+        (
+            "audit-events",
+            &["workflow_id"],
+            &["include_payload", "limit", "offset"],
+            "",
+        ),
+        (
+            "audit-export-start",
+            &["workflow_id"],
+            &["scope", "include_overlays", "redaction_pin_strategy"],
+            "",
+        ),
+        (
+            "audit-export-list",
+            &["workspace_id"],
+            &["limit", "offset"],
+            "",
+        ),
+        ("audit-export-get", &["job_id"], &[], ""),
+        (
+            "audit-export-and-download",
+            &["workflow_id"],
+            &[
+                "scope",
+                "include_overlays",
+                "redaction_pin_strategy",
+                "output_path",
+                "poll_interval",
+            ],
+            "starts the export, polls to completed, streams manifest + all chunks to output_path",
+        ),
+        (
+            "subject-workflows",
+            &["workspace_id", "subject_id"],
+            &[],
+            "",
+        ),
+    ];
+
+    let mut action_map = serde_json::Map::new();
+    for (name, required, optional, note) in actions {
+        let mut spec = serde_json::Map::new();
+        spec.insert(
+            "required".to_owned(),
+            Value::Array(
+                required
+                    .iter()
+                    .map(|s| Value::String((*s).to_owned()))
+                    .collect(),
+            ),
+        );
+        spec.insert(
+            "optional".to_owned(),
+            Value::Array(
+                optional
+                    .iter()
+                    .map(|s| Value::String((*s).to_owned()))
+                    .collect(),
+            ),
+        );
+        if !note.is_empty() {
+            spec.insert("note".to_owned(), Value::String((*note).to_owned()));
+        }
+        action_map.insert((*name).to_owned(), Value::Object(spec));
+    }
+
+    let cli_only: Vec<Value> = [
+        "cancel",
+        "create",
+        "update",
+        "delete",
+        "purge",
+        "transfer",
+        "rotate-inbound-key",
+        "grant add/revoke",
+        "step cancel",
+        "template create/publish/withdraw/deprecate",
+        "trigger create/update/delete/purge/dry-run-draft/rotate-inbound-key",
+        "trigger-alias get/set/remove",
+        "schema set/derive",
+        "audit redaction request/confirm/get",
+        "audit check-integrity",
+        "outbound create/update/delete/rotate-secret",
+        "pool create/delete",
+        "realtime token",
+        "review create/decision/admin-resolve",
+    ]
+    .iter()
+    .map(|s| Value::String((*s).to_owned()))
+    .collect();
+
+    let payload = serde_json::json!({
+        "tool": "workflow",
+        "summary": "Workflow Orchestration v3.2 — durable runtime, templates, triggers, \
+                    obligations, signed audit, pools. Offload-oriented: prefer the compound \
+                    *-and-wait / *-and-download actions over hand-driven poll loops.",
+        "destructive_actions": [],
+        "side_effects": "instantiate / trigger-fire (+ their *-and-wait variants) START runtime \
+                         work and consume the workflow's credit budget. step-output / step-advance \
+                         drive the runtime forward and are CAS-guarded (a 409 surfaces by default; \
+                         pass retry_on_conflict=true to re-read and retry once). instantiate / \
+                         trigger-fire REQUIRE an idempotency_key for replay safety — there is NO \
+                         MCP auto-generate. The terminal 'cancel' lifecycle mutation is CLI-only \
+                         (see cli_only_actions) and is NOT exposed over MCP.",
+        "guidance": {
+            "offload": "To run a workflow end-to-end, use instantiate-and-wait (or \
+                        trigger-fire-and-wait). To obtain a verifiable audit bundle, use \
+                        audit-export-and-download.",
+            "integrity": "After audit-export-and-download, run `fastio workflow audit \
+                          check-integrity` (CLI) — INTEGRITY only; HMAC authenticity is not \
+                          implemented (deferred).",
+            "cli_only_actions": cli_only,
+        },
+        "actions": Value::Object(action_map),
+    });
+    success_json(&payload)
+}
+
+/// Resolve the idempotency key for an MCP instantiate/fire action. The MCP
+/// surface has NO auto-generate (unlike the CLI's explicit opt-in): a missing
+/// key is a hard error so replay safety is never silently dropped.
+fn require_idempotency_key(args: &Map<String, Value>) -> Result<&str, CallToolResult> {
+    match optional_str(args, "idempotency_key").filter(|s| !s.trim().is_empty()) {
+        Some(k) => Ok(k),
+        None => Err(error_text(
+            "idempotency_key is required for replay-safe instantiation/firing. The MCP surface \
+             does not auto-generate one — supply a stable, caller-chosen key.",
+        )),
+    }
+}
+
+/// Workflow Orchestration tool handler (read + drive actions; offload-oriented
+/// compounds). Admin/destructive/crypto actions are CLI-binary-only and absent.
+// Justification: this is a single flat `match action { … }` dispatch over the
+// ~35 read+drive workflow actions. Each arm is a few lines of arg extraction +
+// one orchestration call; splitting it into sub-handlers would scatter the
+// action surface across many functions and obscure the one-place action list
+// that mirrors the tool's advertised `actions`. The length is inherent to the
+// dispatch breadth, not accidental complexity — same pattern as the other
+// per-tool handlers in this module.
+#[allow(clippy::too_many_lines)]
+async fn handle_workflow(
+    state: &McpState,
+    action: &str,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    use fastio_cli::api::orchestration as wf;
+
+    // `describe` needs no auth.
+    if action == "describe" {
+        return Ok(workflow_describe());
+    }
+    if let Err(e) = require_auth(state).await {
+        return Ok(e);
+    }
+    let client = state.client().read().await;
+
+    match action {
+        "get" => {
+            let id = match required_str(args, "workflow_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(wf::get_workflow(&client, id).await)
+        }
+        "list" => {
+            let ws = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(
+                wf::list_workflows(
+                    &client,
+                    ws,
+                    optional_u32(args, "limit"),
+                    optional_u32(args, "offset"),
+                )
+                .await,
+            )
+        }
+        "state" => {
+            let id = match required_str(args, "workflow_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(wf::get_workflow_state(&client, id).await)
+        }
+        "instantiate" => {
+            let id = match required_str(args, "workflow_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let key = match require_idempotency_key(args) {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let params = wf::InstantiateParams::new(key.to_owned())
+                .trigger_payload(optional_str(args, "trigger_payload").map(str::to_owned))
+                .external_subject_id(optional_str(args, "external_subject_id").map(str::to_owned))
+                .pool_key(optional_str(args, "pool_key").map(str::to_owned));
+            wf_render(wf::instantiate_workflow(&client, id, &params).await)
+        }
+        "instantiate-and-wait" => {
+            let id = match required_str(args, "workflow_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let key = match require_idempotency_key(args) {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let params = wf::InstantiateParams::new(key.to_owned())
+                .trigger_payload(optional_str(args, "trigger_payload").map(str::to_owned))
+                .external_subject_id(optional_str(args, "external_subject_id").map(str::to_owned))
+                .pool_key(optional_str(args, "pool_key").map(str::to_owned));
+            if let Err(e) = wf::instantiate_workflow(&client, id, &params).await {
+                return Ok(cli_err_to_result(&e));
+            }
+            Ok(workflow_wait_for_terminal(&client, id, optional_u64(args, "poll_interval")).await)
+        }
+        "pause" => {
+            let id = match required_str(args, "workflow_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(wf::pause_workflow(&client, id).await)
+        }
+        "resume" => {
+            let id = match required_str(args, "workflow_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(wf::resume_workflow(&client, id).await)
+        }
+        // `cancel` is intentionally ABSENT from MCP: it is a terminal lifecycle
+        // mutation (cascades to sync sub-children, irreversible). It falls
+        // through to the CLI-only fallback below — run `fastio workflow cancel`.
+        "grant-list" => {
+            let id = match required_str(args, "workflow_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(
+                wf::list_grants(
+                    &client,
+                    id,
+                    optional_u32(args, "limit"),
+                    optional_str(args, "cursor"),
+                )
+                .await,
+            )
+        }
+        "step-get" => {
+            let (wid, oid) = match (
+                required_str(args, "workflow_id"),
+                required_str(args, "step_occurrence_id"),
+            ) {
+                (Ok(w), Ok(o)) => (w, o),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            wf_render(wf::get_step_occurrence(&client, wid, oid).await)
+        }
+        "step-output" => {
+            let (wid, oid) = match (
+                required_str(args, "workflow_id"),
+                required_str(args, "step_occurrence_id"),
+            ) {
+                (Ok(w), Ok(o)) => (w, o),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            let output = match required_str(args, "output") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let retry = optional_bool(args, "retry_on_conflict") == Some(true);
+            Ok(wf_step_cas(&client, wid, oid, retry, || {
+                wf::submit_step_output(&client, wid, oid, output)
+            })
+            .await)
+        }
+        "step-advance" => {
+            let (wid, oid) = match (
+                required_str(args, "workflow_id"),
+                required_str(args, "step_occurrence_id"),
+            ) {
+                (Ok(w), Ok(o)) => (w, o),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            let output = optional_str(args, "output");
+            let retry = optional_bool(args, "retry_on_conflict") == Some(true);
+            Ok(wf_step_cas(&client, wid, oid, retry, || {
+                wf::advance_step(&client, wid, oid, output)
+            })
+            .await)
+        }
+        "step-occurrences" => {
+            let (wid, sid) = match (
+                required_str(args, "workflow_id"),
+                required_str(args, "step_id"),
+            ) {
+                (Ok(w), Ok(s)) => (w, s),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            wf_render(
+                wf::list_step_occurrences(
+                    &client,
+                    wid,
+                    sid,
+                    optional_u32(args, "limit"),
+                    optional_u32(args, "offset"),
+                )
+                .await,
+            )
+        }
+        "template-list" => {
+            let ws = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(
+                wf::list_templates(
+                    &client,
+                    ws,
+                    optional_u32(args, "limit"),
+                    optional_u32(args, "offset"),
+                )
+                .await,
+            )
+        }
+        "template-get" => {
+            let id = match required_str(args, "template_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(
+                wf::get_template(
+                    &client,
+                    id,
+                    optional_bool(args, "include_body") == Some(true),
+                )
+                .await,
+            )
+        }
+        "trigger-list" => {
+            let ws = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(wf::list_triggers(&client, ws, optional_str(args, "enabled_filter")).await)
+        }
+        "trigger-get" => {
+            let id = match required_str(args, "trigger_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(wf::get_trigger(&client, id).await)
+        }
+        "trigger-fire" => {
+            let id = match required_str(args, "trigger_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let key = match require_idempotency_key(args) {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(
+                wf::fire_trigger(&client, id, key, optional_str(args, "trigger_payload")).await,
+            )
+        }
+        "trigger-fire-and-wait" => {
+            let id = match required_str(args, "trigger_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let key = match require_idempotency_key(args) {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let fired =
+                match wf::fire_trigger(&client, id, key, optional_str(args, "trigger_payload"))
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => return Ok(cli_err_to_result(&e)),
+                };
+            // Resolve the instantiated workflow id from the fire response.
+            let payload = fired.get("response").unwrap_or(&fired);
+            let wid = payload
+                .get("trigger_fire")
+                .and_then(|t| t.get("instantiated_run").or_else(|| t.get("job_id")))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            match wid {
+                Some(w) => Ok(workflow_wait_for_terminal(
+                    &client,
+                    &w,
+                    optional_u64(args, "poll_interval"),
+                )
+                .await),
+                None => Ok(success_json(&fired)),
+            }
+        }
+        "trigger-dry-run" => {
+            let id = match required_str(args, "trigger_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(
+                wf::dry_run_trigger(
+                    &client,
+                    id,
+                    optional_u64(args, "window_days"),
+                    optional_u64(args, "sample_limit"),
+                    optional_bool(args, "apply_guards"),
+                )
+                .await,
+            )
+        }
+        "obligation-list" => {
+            let wid = match required_str(args, "workflow_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(
+                wf::list_obligations(
+                    &client,
+                    wid,
+                    optional_str(args, "status"),
+                    optional_str(args, "assigned_user_id"),
+                    optional_u32(args, "limit"),
+                    optional_u32(args, "offset"),
+                )
+                .await,
+            )
+        }
+        "obligation-get" => wf_render_oblig(&client, args, "get").await,
+        "obligation-claim" => wf_render_oblig(&client, args, "claim").await,
+        "obligation-release" => wf_render_oblig(&client, args, "release").await,
+        "obligation-resolve" => {
+            let id = match required_str(args, "obligation_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(
+                wf::resolve_obligation(&client, id, optional_str(args, "resolution_payload")).await,
+            )
+        }
+        "inbox-me" => wf_render(wf::inbox(&client).await),
+        "inbox-workspace" => {
+            let ws = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(wf::inbox_workspace(&client, ws).await)
+        }
+        "inbox-pool" => {
+            let (ws, pk) = match (
+                required_str(args, "workspace_id"),
+                required_str(args, "pool_key"),
+            ) {
+                (Ok(w), Ok(p)) => (w, p),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            wf_render(wf::inbox_pool(&client, ws, pk).await)
+        }
+        "schema-get" => {
+            let id = match required_str(args, "workflow_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(wf::get_extraction_schema(&client, id).await)
+        }
+        "audit-events" => {
+            let id = match required_str(args, "workflow_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(
+                wf::audit_events(
+                    &client,
+                    id,
+                    optional_bool(args, "include_payload") == Some(true),
+                    optional_u32(args, "limit"),
+                    optional_u32(args, "offset"),
+                )
+                .await,
+            )
+        }
+        "audit-export-start" => {
+            let id = match required_str(args, "workflow_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(
+                wf::start_audit_export(
+                    &client,
+                    id,
+                    optional_str(args, "scope"),
+                    optional_bool(args, "include_overlays"),
+                    optional_str(args, "redaction_pin_strategy"),
+                )
+                .await,
+            )
+        }
+        "audit-export-list" => {
+            let ws = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(
+                wf::list_audit_export_jobs(
+                    &client,
+                    ws,
+                    optional_u32(args, "limit"),
+                    optional_u32(args, "offset"),
+                )
+                .await,
+            )
+        }
+        "audit-export-get" => {
+            let id = match required_str(args, "job_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(wf::get_audit_export_job(&client, id).await)
+        }
+        "audit-export-and-download" => {
+            let id = match required_str(args, "workflow_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            Ok(workflow_export_and_download(&client, args, id).await)
+        }
+        "subject-workflows" => {
+            let (ws, sid) = match (
+                required_str(args, "workspace_id"),
+                required_str(args, "subject_id"),
+            ) {
+                (Ok(w), Ok(s)) => (w, s),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            wf_render(wf::subject_workflows(&client, ws, sid).await)
+        }
+        _ => Ok(error_text(&format!(
+            "Unknown or CLI-only workflow action: {action}. Admin/destructive operations \
+             (cancel, create/update/delete/purge, template/pool/trigger lifecycle, secret/key \
+             rotation, redaction, schema set/derive, realtime token) are CLI-binary-only — run \
+             them via `fastio workflow …` (e.g. `fastio workflow cancel <id>`). Call \
+             action='describe' for the full MCP action list."
+        ))),
+    }
+}
+
+/// Render an orchestration `Result<Value>` as an MCP result.
+///
+/// Returns `Result<CallToolResult, McpError>` (never `Err`) so the ~20
+/// `handle_workflow` match arms can return it directly as the handler's
+/// `Result`-typed value without wrapping each in `Ok(...)`. The `McpError`
+/// arm is structurally unreachable here — an API failure becomes a successful
+/// tool result carrying `is_error`, matching every other handler in this
+/// module.
+#[allow(clippy::unnecessary_wraps)]
+fn wf_render(
+    result: Result<Value, fastio_cli::error::CliError>,
+) -> Result<CallToolResult, McpError> {
+    match result {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// Run an obligation lifecycle action that takes only `obligation_id`.
+async fn wf_render_oblig(
+    client: &fastio_cli::client::ApiClient,
+    args: &Map<String, Value>,
+    op: &str,
+) -> Result<CallToolResult, McpError> {
+    use fastio_cli::api::orchestration as wf;
+    let id = match required_str(args, "obligation_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let result = match op {
+        "get" => wf::get_obligation(client, id).await,
+        "claim" => wf::claim_obligation(client, id).await,
+        "release" => wf::release_obligation(client, id).await,
+        _ => return Ok(error_text("internal: unknown obligation op")),
+    };
+    wf_render(result)
+}
+
+/// Run a CAS-guarded step mutation, surfacing a 409 by default and retrying
+/// once (after a re-read) only when `retry_on_conflict` is set.
+///
+/// On a 409 with `retry_on_conflict=true`, the re-read is load-bearing (mirrors
+/// the CLI `run_step_mutation_with_cas`): a failed re-read is surfaced rather
+/// than blind-retried, and a re-read showing a terminal/non-mutable `state`
+/// abandons the retry (it would only 409 again). The step endpoints take no
+/// client-supplied CAS version, so the fresh value is used as a mutability gate
+/// rather than threaded into the retry body.
+async fn wf_step_cas<F, Fut>(
+    client: &fastio_cli::client::ApiClient,
+    workflow_id: &str,
+    step_occurrence_id: &str,
+    retry_on_conflict: bool,
+    op: F,
+) -> CallToolResult
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<Value, fastio_cli::error::CliError>>,
+{
+    use fastio_cli::api::orchestration as wf;
+    match op().await {
+        Ok(v) => success_json(&v),
+        Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 409 => {
+            if !retry_on_conflict {
+                return error_text(
+                    "step mutation hit a CAS conflict (409): the occurrence was modified \
+                     concurrently. Re-read it (step-get) and retry, or pass retry_on_conflict=true \
+                     to re-read and retry once automatically.",
+                );
+            }
+            // The re-read must succeed before retrying; surface its failure.
+            let snapshot = match wf::get_step_occurrence(client, workflow_id, step_occurrence_id)
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    return error_text(&format!(
+                        "CAS conflict (409): re-reading the step occurrence failed, so the retry \
+                         was abandoned: {e}"
+                    ));
+                }
+            };
+            // A terminal/non-mutable state means the retry would just 409 again.
+            if let Some(state) = step_occurrence_state(&snapshot)
+                && matches!(
+                    state.as_str(),
+                    "completed" | "failed" | "skipped" | "cancelled"
+                )
+            {
+                return error_text(&format!(
+                    "CAS conflict (409): the step occurrence is now in terminal state '{state}' \
+                     and can no longer be mutated; not retrying."
+                ));
+            }
+            match op().await {
+                Ok(v) => success_json(&v),
+                Err(e) => error_text(&format!(
+                    "step mutation still conflicted after one retry (CAS 409): {e}"
+                )),
+            }
+        }
+        Err(e) => cli_err_to_result(&e),
+    }
+}
+
+/// Read a step occurrence's lifecycle `state` from a get-occurrence snapshot
+/// (enveloped or flat shape).
+fn step_occurrence_state(snapshot: &Value) -> Option<String> {
+    let payload = snapshot.get("response").unwrap_or(snapshot);
+    payload
+        .get("step_occurrence")
+        .and_then(|o| o.get("state"))
+        .or_else(|| payload.get("state"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// How an MCP poll loop should react to an error from one poll tick.
+///
+/// Replaces the old `Err(_) => {}` (which silently looped to timeout on a
+/// 404/403/500). The 401 re-auth short-circuit is handled by the caller before
+/// this is reached.
+enum WfPollAction {
+    /// Server asked us to wait this many seconds (0 = no explicit interval).
+    RateLimited { retry_after_secs: u64 },
+    /// A transient failure worth another poll on the regular cadence.
+    RetryTransient,
+    /// A persistent error rendered for return (loop must stop and surface it).
+    Fatal(CallToolResult),
+}
+
+/// Classify a poll-tick [`CliError`] for an MCP wait/export loop.
+///
+/// Mirrors the CLI `classify_poll_error`: rate limits sleep their advertised
+/// interval; all 5xx (`500..=599`) / 408 / transport / I/O are transient; other
+/// 4xx, parse, and config are fatal and surfaced via [`cli_err_to_result`].
+fn classify_wf_poll_error(err: &fastio_cli::error::CliError) -> WfPollAction {
+    use fastio_cli::error::CliError;
+    match err {
+        CliError::RateLimit { retry_after_secs } => WfPollAction::RateLimited {
+            retry_after_secs: *retry_after_secs,
+        },
+        CliError::Api(e) => match e.http_status {
+            429 | 408 => WfPollAction::RateLimited {
+                retry_after_secs: 0,
+            },
+            // All server errors are transient (matches the CLI classifier): a
+            // 500 during a long poll is a momentary backend blip, not permanent.
+            500..=599 => WfPollAction::RetryTransient,
+            _ => WfPollAction::Fatal(cli_err_to_result(err)),
+        },
+        CliError::Http(_) | CliError::Io(_) => WfPollAction::RetryTransient,
+        // Parse / config / auth(other) — and, conservatively, any future
+        // non-exhaustive variant — are surfaced rather than looped.
+        _ => WfPollAction::Fatal(cli_err_to_result(err)),
+    }
+}
+
+/// Poll runtime state to a terminal lifecycle and return the final snapshot.
+async fn workflow_wait_for_terminal(
+    client: &fastio_cli::client::ApiClient,
+    workflow_id: &str,
+    poll_interval: Option<u64>,
+) -> CallToolResult {
+    use fastio_cli::api::orchestration as wf;
+    let interval = poll_interval
+        .unwrap_or(WORKFLOW_WAIT_POLL_DEFAULT_SECS)
+        .clamp(WORKFLOW_WAIT_POLL_MIN_SECS, WORKFLOW_WAIT_POLL_MAX_SECS);
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(WORKFLOW_WAIT_MAX_SECS);
+    loop {
+        // Default cadence is the fixed interval; rate limits and transient
+        // errors override it below (transient errors use the SAME bounded
+        // jittered backoff as the CLI `wait`).
+        let mut next_sleep = std::time::Duration::from_secs(interval);
+        match wf::get_workflow_state(client, workflow_id).await {
+            Ok(snapshot) => {
+                let state = snapshot
+                    .get("response")
+                    .unwrap_or(&snapshot)
+                    .get("workflow")
+                    .and_then(|w| w.get("state"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if state.as_deref().is_some_and(|s| {
+                    matches!(s, "completed" | "cancelled" | "archived" | "deleted")
+                }) {
+                    return success_json(&snapshot);
+                }
+            }
+            Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 401 => {
+                return error_text(&format!(
+                    "authentication expired while waiting for workflow {workflow_id}; it may still \
+                     be running. Re-authenticate and use action='state'."
+                ));
+            }
+            Err(other) => match classify_wf_poll_error(&other) {
+                WfPollAction::RateLimited { retry_after_secs } => {
+                    if retry_after_secs > 0 {
+                        next_sleep = std::time::Duration::from_secs(
+                            retry_after_secs
+                                .clamp(WORKFLOW_WAIT_POLL_MIN_SECS, WORKFLOW_WAIT_POLL_MAX_SECS),
+                        );
+                    }
+                }
+                // Transient blip: back off with bounded CSPRNG jitter (shared
+                // CLI helper; jitter failure falls back to no jitter).
+                WfPollAction::RetryTransient => {
+                    next_sleep = crate::commands::workflow::jittered(interval);
+                }
+                // Persistent, non-transient: surface it rather than loop.
+                WfPollAction::Fatal(result) => return result,
+            },
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return error_text(&format!(
+                "timed out after ~{WORKFLOW_WAIT_MAX_SECS}s waiting for workflow {workflow_id} to \
+                 reach a terminal state; it may still be running. Use action='state' to poll."
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(remaining.min(next_sleep)).await;
+    }
+}
+
+/// Compound: start an audit export, poll the job to completed, then stream the
+/// manifest and every chunk to `output_path` via the streaming download helper.
+// Justification: this is one linear offload pipeline — start export → resolve
+// job_id → bounded/rate-limit-aware poll loop → resolve output dir → stream
+// manifest + N chunks. Splitting the poll loop or the streaming step into
+// helpers would fragment a single sequential flow whose stages share local
+// state (job_id, deadline, out_dir), so the modest overage is kept inline.
+#[allow(clippy::too_many_lines)]
+async fn workflow_export_and_download(
+    client: &fastio_cli::client::ApiClient,
+    args: &Map<String, Value>,
+    workflow_id: &str,
+) -> CallToolResult {
+    use fastio_cli::api::orchestration as wf;
+
+    let start = match wf::start_audit_export(
+        client,
+        workflow_id,
+        optional_str(args, "scope"),
+        optional_bool(args, "include_overlays"),
+        optional_str(args, "redaction_pin_strategy"),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return cli_err_to_result(&e),
+    };
+    let payload = start.get("response").unwrap_or(&start);
+    let Some(job_id) = payload
+        .get("job_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return error_text("audit export did not return a job_id");
+    };
+
+    let interval = optional_u64(args, "poll_interval")
+        .unwrap_or(WORKFLOW_WAIT_POLL_DEFAULT_SECS)
+        .clamp(WORKFLOW_WAIT_POLL_MIN_SECS, WORKFLOW_WAIT_POLL_MAX_SECS);
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(WORKFLOW_WAIT_MAX_SECS);
+
+    // Poll the job to completed (or terminal failure).
+    let job = loop {
+        // Default cadence is the fixed interval; rate limits and transient
+        // errors override it below (transient errors use the SAME bounded
+        // jittered backoff as the CLI `wait`).
+        let mut next_sleep = std::time::Duration::from_secs(interval);
+        match wf::get_audit_export_job(client, &job_id).await {
+            Ok(j) => {
+                let status = j
+                    .get("response")
+                    .unwrap_or(&j)
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if status == "completed" {
+                    break j;
+                }
+                if matches!(status, "failed" | "errored" | "cancelled") {
+                    return error_text(&format!("audit export job {job_id} ended in '{status}'"));
+                }
+            }
+            Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 401 => {
+                return error_text("authentication expired while waiting for the export job");
+            }
+            Err(other) => match classify_wf_poll_error(&other) {
+                WfPollAction::RateLimited { retry_after_secs } => {
+                    if retry_after_secs > 0 {
+                        next_sleep = std::time::Duration::from_secs(
+                            retry_after_secs
+                                .clamp(WORKFLOW_WAIT_POLL_MIN_SECS, WORKFLOW_WAIT_POLL_MAX_SECS),
+                        );
+                    }
+                }
+                // Transient blip: back off with bounded CSPRNG jitter (shared
+                // CLI helper; jitter failure falls back to no jitter).
+                WfPollAction::RetryTransient => {
+                    next_sleep = crate::commands::workflow::jittered(interval);
+                }
+                WfPollAction::Fatal(result) => return result,
+            },
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return error_text(&format!(
+                "timed out after ~{WORKFLOW_WAIT_MAX_SECS}s waiting for export job {job_id}"
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(remaining.min(next_sleep)).await;
+    };
+
+    let job_payload = job.get("response").unwrap_or(&job);
+    let total_chunks = job_payload
+        .get("total_chunks")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    // Resolve the output directory (default .fastio/downloads/).
+    let out_dir =
+        std::path::PathBuf::from(optional_str(args, "output_path").unwrap_or(".fastio/downloads"));
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        return error_text(&format!(
+            "failed to create output directory '{}': {e}",
+            out_dir.display()
+        ));
+    }
+
+    // Stream the manifest, then each chunk, to disk (NEVER buffer).
+    let mut written = Vec::new();
+    let manifest_path = out_dir.join("manifest.json");
+    let manifest_api_path = wf::audit_bundle_chunk_path(&job_id, "manifest");
+    if let Err(e) = client
+        .download_file_stream(&manifest_api_path, &manifest_path)
+        .await
+    {
+        return error_text(&format!("failed to download manifest: {e}"));
+    }
+    written.push(manifest_path.display().to_string());
+
+    for i in 0..total_chunks {
+        let chunk_path = out_dir.join(format!("chunk_{i:04}.jsonl"));
+        let api_path = wf::audit_bundle_chunk_path(&job_id, &i.to_string());
+        if let Err(e) = client.download_file_stream(&api_path, &chunk_path).await {
+            return error_text(&format!("failed to download chunk {i}: {e}"));
+        }
+        written.push(chunk_path.display().to_string());
+    }
+
+    let result = serde_json::json!({
+        "result": "yes",
+        "job_id": job_id,
+        "total_chunks": total_chunks,
+        "downloaded": written,
+        "next_step": "Run `fastio workflow audit check-integrity --manifest <manifest> --chunk <0> …` \
+                      to verify chunk hashes + the content-hash chain + completeness. (HMAC \
+                      authenticity verification is not implemented.)",
+    });
+    success_json(&result)
+}
+
 /// AI instructions tool handler.
 #[allow(clippy::too_many_lines)]
 async fn handle_instructions(
@@ -10774,5 +11960,212 @@ mod ripley_tool_tests {
 
         // Omitted → not sent.
         assert!(!super::build_workspace_update_fields(&Map::new()).contains_key("intelligence"));
+    }
+
+    // ─── Workflow Orchestration MCP tool ────────────────────────────────────
+
+    /// The set of action names the `workflow` tool advertises in its registry.
+    fn workflow_tool_actions() -> Vec<&'static str> {
+        super::TOOL_DEFS
+            .iter()
+            .find(|d| d.name == "workflow")
+            .expect("workflow tool registered")
+            .actions
+            .to_vec()
+    }
+
+    #[test]
+    fn workflow_tool_is_registered_and_offload_oriented() {
+        let tools = ToolRouter::list_tools().tools;
+        let wf = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "workflow")
+            .expect("workflow tool present");
+        let desc = wf.description.as_deref().unwrap_or_default();
+        // Offload framing + the integrity-vs-authenticity caveat must be present.
+        assert!(
+            desc.contains("OFFLOAD"),
+            "description should steer to offload: {desc}"
+        );
+        assert!(desc.contains("integrity-only") || desc.contains("integrity"));
+    }
+
+    #[test]
+    fn workflow_tool_advertises_read_and_drive_actions() {
+        let actions = workflow_tool_actions();
+        for expected in [
+            "describe",
+            "state",
+            "instantiate",
+            "instantiate-and-wait",
+            "trigger-fire-and-wait",
+            "audit-export-and-download",
+            "obligation-resolve",
+            "step-output",
+        ] {
+            assert!(
+                actions.contains(&expected),
+                "workflow tool must advertise '{expected}'"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_tool_omits_admin_destructive_and_crypto_actions() {
+        // These admin/destructive/crypto actions are CLI-binary-only and MUST
+        // NOT be reachable through the MCP tool.
+        let actions = workflow_tool_actions();
+        for forbidden in [
+            "cancel",
+            "create",
+            "update",
+            "delete",
+            "purge",
+            "transfer",
+            "rotate-inbound-key",
+            "grant-add",
+            "grant-revoke",
+            "step-cancel",
+            "template-create",
+            "template-publish",
+            "template-withdraw",
+            "template-deprecate",
+            "trigger-create",
+            "trigger-update",
+            "trigger-delete",
+            "trigger-purge",
+            "schema-set",
+            "schema-derive",
+            "redaction-request",
+            "redaction-confirm",
+            "outbound-create",
+            "outbound-rotate-secret",
+            "pool-create",
+            "pool-delete",
+            "realtime-token",
+            "review-decision",
+            "audit-check-integrity",
+        ] {
+            assert!(
+                !actions.contains(&forbidden),
+                "workflow MCP tool must NOT advertise admin/destructive/crypto action '{forbidden}'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_describe_needs_no_auth_and_lists_actions() {
+        // `describe` must work unauthenticated and enumerate every advertised
+        // action with required/optional params.
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("describe".to_owned()));
+        let res = router.call_tool("workflow", args).await.expect("ok");
+        let text = result_to_string(&res);
+        // The describe payload (rendered markdown) names key actions and the
+        // CLI-only carve-out.
+        assert!(
+            text.contains("instantiate-and-wait"),
+            "describe should list compounds: {text}"
+        );
+        assert!(
+            text.contains("cli_only_actions") || text.contains("cli only"),
+            "describe should name CLI-only ops"
+        );
+        // describe accuracy: every advertised action appears in the payload.
+        for action in workflow_tool_actions() {
+            assert!(
+                text.contains(action),
+                "describe payload must document advertised action '{action}'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_unknown_action_points_to_cli_for_admin_ops() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        // An admin action that is intentionally not handled here.
+        args.insert("action".to_owned(), Value::String("create".to_owned()));
+        let res = router.call_tool("workflow", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("CLI-only workflow action") && text.contains("CLI-binary-only"),
+            "admin actions must be rejected with a CLI pointer, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_cancel_is_cli_only() {
+        // `cancel` is a terminal lifecycle mutation: it must NOT be reachable
+        // over MCP and must route to the CLI-only fallback with a clear pointer.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("cancel".to_owned()));
+        args.insert(
+            "workflow_id".to_owned(),
+            Value::String("4011234567890123456".to_owned()),
+        );
+        let res = router.call_tool("workflow", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("CLI-only workflow action") && text.contains("fastio workflow cancel"),
+            "cancel must be rejected over MCP with a CLI pointer, got: {text}"
+        );
+        // And cancel must not be advertised as an MCP action.
+        assert!(
+            !workflow_tool_actions().contains(&"cancel"),
+            "cancel must not appear in the workflow MCP action list"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_instantiate_requires_idempotency_key() {
+        // The MCP surface has NO auto-generate; a missing key is a hard error
+        // before any network call.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("instantiate".to_owned()));
+        args.insert(
+            "workflow_id".to_owned(),
+            Value::String("4011234567890123456".to_owned()),
+        );
+        let res = router.call_tool("workflow", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("idempotency_key is required"),
+            "instantiate without a key must be rejected, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_trigger_fire_requires_idempotency_key() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("trigger-fire".to_owned()),
+        );
+        args.insert("trigger_id".to_owned(), Value::String("trabc-1".to_owned()));
+        let res = router.call_tool("workflow", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(text.contains("idempotency_key is required"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn workflow_obligation_list_requires_workflow_id_anchor() {
+        // workflow_id is the required authz anchor for obligation listing.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("obligation-list".to_owned()),
+        );
+        let res = router.call_tool("workflow", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("Missing required parameter: workflow_id"),
+            "obligation-list must require workflow_id, got: {text}"
+        );
     }
 }

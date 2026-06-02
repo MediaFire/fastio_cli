@@ -199,6 +199,13 @@ pub enum Commands {
     #[command(subcommand)]
     Metadata(MetadataCommands),
 
+    /// Workflow Orchestration (v3.2): durable multi-step runtime, templates,
+    /// triggers, human obligations, signed audit, webhooks, and pools. This is
+    /// the new orchestration surface — distinct from the `[legacy]` task /
+    /// approval / todo primitives.
+    #[command(subcommand, visible_alias = "wf")]
+    Workflow(WorkflowCommands),
+
     /// AI instructions for user / org / workspace / share profiles.
     #[command(subcommand)]
     Instructions(InstructionsCommands),
@@ -299,6 +306,907 @@ pub enum SearchCommands {
         /// Client-side filter only; the server still searches every bucket.
         #[arg(long)]
         only: Option<String>,
+    },
+}
+
+// ─── Workflow Orchestration ────────────────────────────────────────────────────
+
+/// Workflow Orchestration subcommands (`fastio workflow`, alias `wf`).
+///
+/// Owner-side REST surface for the durable v3.2 runtime. All identifiers are
+/// opaque strings: the workflow id is a 19-digit profile id, the obligation id
+/// a plain numeric sequence, and the rest hyphenated `OpaqueId`s.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowCommands {
+    /// Create a workflow profile in a workspace.
+    Create {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Human-readable description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Bind a published template revision at create time.
+        #[arg(long)]
+        template_id: Option<String>,
+        /// Credit budget cap for the runtime.
+        #[arg(long)]
+        agent_credit_cap: Option<u64>,
+        /// Visibility: workspace, private, or `participants_only`.
+        #[arg(long)]
+        visibility: Option<String>,
+    },
+    /// List workflow profiles in a workspace (offset-paginated).
+    List {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Pagination limit.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Pagination offset.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Get a single workflow profile.
+    Get {
+        /// Workflow ID (19-digit profile id).
+        workflow_id: String,
+    },
+    /// Update mutable fields / transition lifecycle (form-encoded PATCH).
+    Update {
+        /// Workflow ID.
+        workflow_id: String,
+        /// New name.
+        #[arg(long)]
+        name: Option<String>,
+        /// New description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Lifecycle state transition (e.g. active, paused, completed,
+        /// cancelled, archived) — must follow the documented DAG.
+        #[arg(long)]
+        state: Option<String>,
+        /// New credit budget cap.
+        #[arg(long)]
+        agent_credit_cap: Option<u64>,
+    },
+    /// Soft-archive a workflow (use `purge` for an owner-only hard delete).
+    Delete {
+        /// Workflow ID.
+        workflow_id: String,
+    },
+    /// Permanently hard-delete a workflow (owner-only, irreversible).
+    Purge {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Re-state the workflow ID to confirm the destructive purge.
+        #[arg(long)]
+        confirm: String,
+    },
+    /// Transfer a workflow to another workspace in the same organization.
+    Transfer {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Destination workspace ID (must be in the same org).
+        #[arg(long)]
+        to_workspace: String,
+    },
+    /// Instantiate the workflow runtime (idempotent on the idempotency key).
+    Instantiate {
+        /// Workflow ID.
+        workflow_id: String,
+        /// REQUIRED replay-safe idempotency key. Omit only with
+        /// `--generate-idempotency-key`.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Generate a random idempotency key (PRINTS A LOUD WARNING — this
+        /// breaks replay safety; prefer an explicit, caller-stable key).
+        #[arg(long)]
+        generate_idempotency_key: bool,
+        /// Resolved input bindings as a JSON string (or `@file.json`).
+        #[arg(long)]
+        trigger_payload: Option<String>,
+        /// Integrator correlation handle (1..255 chars).
+        #[arg(long)]
+        external_subject_id: Option<String>,
+        /// Concurrency pool key to admit this run under.
+        #[arg(long)]
+        pool_key: Option<String>,
+    },
+    /// Get the runtime state snapshot.
+    State {
+        /// Workflow ID.
+        workflow_id: String,
+    },
+    /// Poll runtime state until terminal (bounded backoff + jitter).
+    Wait {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Base seconds between polls (clamped 1..60; jitter is added).
+        #[arg(long)]
+        poll_interval: Option<u64>,
+    },
+    /// Pause an active workflow.
+    Pause {
+        /// Workflow ID.
+        workflow_id: String,
+    },
+    /// Resume a paused workflow.
+    Resume {
+        /// Workflow ID.
+        workflow_id: String,
+    },
+    /// Cancel a workflow (cascades to synchronous sub-children).
+    Cancel {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Optional cancellation reason.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Rotate the per-workflow inbound HMAC key (returns the version int only).
+    RotateInboundKey {
+        /// Workflow ID.
+        workflow_id: String,
+    },
+
+    /// Workflow grants (workflow-scoped roles).
+    #[command(subcommand)]
+    Grant(WorkflowGrantCommands),
+    /// Step occurrences.
+    #[command(subcommand)]
+    Step(WorkflowStepCommands),
+    /// Template revisions (immutable).
+    #[command(subcommand)]
+    Template(WorkflowTemplateCommands),
+    /// Event-driven triggers.
+    #[command(subcommand)]
+    Trigger(WorkflowTriggerCommands),
+    /// Workspace verb→template alias map.
+    #[command(subcommand)]
+    TriggerAlias(WorkflowTriggerAliasCommands),
+    /// Human obligations ("waiting on me").
+    #[command(subcommand)]
+    Obligation(WorkflowObligationCommands),
+    /// Cross-workspace / workspace / pool inbox.
+    #[command(subcommand)]
+    Inbox(WorkflowInboxCommands),
+    /// Per-workflow extraction schema.
+    #[command(subcommand)]
+    Schema(WorkflowSchemaCommands),
+    /// Audit log, signed export, integrity check, and dual-control redaction.
+    #[command(subcommand)]
+    Audit(WorkflowAuditCommands),
+    /// Outbound webhook subscriptions.
+    #[command(subcommand)]
+    Outbound(WorkflowOutboundCommands),
+    /// Concurrency pools.
+    #[command(subcommand)]
+    Pool(WorkflowPoolCommands),
+    /// External-subject correlation.
+    #[command(subcommand)]
+    Subject(WorkflowSubjectCommands),
+    /// Realtime channel token (mint only).
+    #[command(subcommand)]
+    Realtime(WorkflowRealtimeCommands),
+    /// Workflow Review surface (v3.5b; 404 when the workspace flag is off).
+    #[command(subcommand)]
+    Review(WorkflowReviewCommands),
+}
+
+/// Workflow grant subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowGrantCommands {
+    /// Grant a user a workflow-scoped role.
+    Add {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Grantee user ID.
+        user_id: String,
+        /// Role: viewer, participant, or admin.
+        role: String,
+        /// Optional expiry timestamp.
+        #[arg(long)]
+        expires_at: Option<String>,
+    },
+    /// List a workflow's grants (cursor-paginated).
+    List {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Page size (default 100, max 500).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Cursor from a prior response's `pagination.next_cursor`.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Revoke a user's grant (soft revoke).
+    Revoke {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Grantee user ID.
+        user_id: String,
+    },
+}
+
+/// Workflow step subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowStepCommands {
+    /// Get a single step occurrence.
+    Get {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Step occurrence ID.
+        step_occurrence_id: String,
+    },
+    /// Dispatch a step occurrence's handler.
+    Advance {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Step occurrence ID.
+        step_occurrence_id: String,
+        /// Optional output envelope as a JSON string (or `@file.json`).
+        #[arg(long)]
+        output: Option<String>,
+        /// Re-read the occurrence and retry once on a CAS 409 conflict
+        /// (default: surface the conflict).
+        #[arg(long)]
+        retry_on_conflict: bool,
+    },
+    /// Cancel a single step occurrence (CAS-guarded).
+    Cancel {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Step occurrence ID.
+        step_occurrence_id: String,
+    },
+    /// Submit a step's output envelope (CAS-guarded).
+    Output {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Step occurrence ID.
+        step_occurrence_id: String,
+        /// Output envelope as a JSON string (or `@file.json`).
+        output: String,
+        /// Re-read the occurrence and retry once on a CAS 409 conflict
+        /// (default: surface the conflict).
+        #[arg(long)]
+        retry_on_conflict: bool,
+    },
+    /// List occurrences for a step definition.
+    Occurrences {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Step definition ID.
+        step_id: String,
+        /// Pagination limit.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Pagination offset.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+}
+
+/// Workflow template subcommands (immutable revisions — no `update`).
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowTemplateCommands {
+    /// Create a template revision (validated; 422 carries `validation_report`).
+    Create {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Template body as a JSON string (or `@file.json`).
+        template_body: String,
+        /// Optional display name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List template revisions for a workspace.
+    List {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Pagination limit.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Pagination offset.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Get a single revision (`--include-body` inlines the body).
+    Get {
+        /// Template ID.
+        template_id: String,
+        /// Inline the full `template_body`.
+        #[arg(long)]
+        include_body: bool,
+    },
+    /// Publish a revision (legal only from `validated`).
+    Publish {
+        /// Template ID.
+        template_id: String,
+    },
+    /// Withdraw a revision (legal only from `published`).
+    Withdraw {
+        /// Template ID.
+        template_id: String,
+    },
+    /// Deprecate a revision (legal only from `published`).
+    Deprecate {
+        /// Template ID.
+        template_id: String,
+    },
+}
+
+/// Workflow trigger subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowTriggerCommands {
+    /// Create a trigger.
+    Create {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Kind: manual, scheduled, `event_match`, `inbound_webhook`, `ai_driven`.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Target template id (optionally `:vN`-versioned).
+        #[arg(long)]
+        target_template_id: Option<String>,
+        /// Event-match expression as a JSON string (or `@file.json`).
+        #[arg(long)]
+        event_match: Option<String>,
+        /// Parameter mapping as a JSON string (or `@file.json`).
+        #[arg(long)]
+        param_mapping: Option<String>,
+        /// Per-hour rate limit.
+        #[arg(long)]
+        rate_limit_per_hour: Option<u64>,
+        /// Concurrency cap.
+        #[arg(long)]
+        concurrency_cap: Option<u64>,
+        /// Dedup scope.
+        #[arg(long)]
+        dedup_scope: Option<String>,
+        /// Idempotency-key template.
+        #[arg(long)]
+        idempotency_key_template: Option<String>,
+    },
+    /// List triggers (`--enabled-filter true|false|all`).
+    List {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Filter by enabled state: true, false, or all.
+        #[arg(long)]
+        enabled_filter: Option<String>,
+    },
+    /// Get a single trigger.
+    Get {
+        /// Trigger ID.
+        trigger_id: String,
+    },
+    /// Update a trigger's mutable fields (form-encoded PATCH).
+    Update {
+        /// Trigger ID.
+        trigger_id: String,
+        /// Toggle enabled state.
+        #[arg(long)]
+        enabled: Option<bool>,
+        /// New per-hour rate limit.
+        #[arg(long)]
+        rate_limit_per_hour: Option<u64>,
+        /// New concurrency cap.
+        #[arg(long)]
+        concurrency_cap: Option<u64>,
+    },
+    /// Manually fire a trigger (integration testing / replay).
+    Fire {
+        /// Trigger ID.
+        trigger_id: String,
+        /// REQUIRED idempotency key (omit only with
+        /// `--generate-idempotency-key`).
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Generate a random idempotency key (LOUD WARNING — breaks replay
+        /// safety).
+        #[arg(long)]
+        generate_idempotency_key: bool,
+        /// Trigger payload as a JSON string (or `@file.json`).
+        #[arg(long)]
+        trigger_payload: Option<String>,
+    },
+    /// Dry-run (backtest) a saved trigger over a historical window.
+    DryRun {
+        /// Trigger ID.
+        trigger_id: String,
+        /// Backtest window in days (≤ 90).
+        #[arg(long)]
+        window_days: Option<u64>,
+        /// Sample-match cap.
+        #[arg(long)]
+        sample_limit: Option<u64>,
+        /// Apply guard checks during the backtest.
+        #[arg(long)]
+        apply_guards: Option<bool>,
+    },
+    /// Dry-run an unsaved trigger draft (nothing saved or fired).
+    DryRunDraft {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Inline event-match expression as a JSON string (or `@file.json`).
+        #[arg(long)]
+        event_match: Option<String>,
+        /// Inline parameter mapping as a JSON string (or `@file.json`).
+        #[arg(long)]
+        param_mapping: Option<String>,
+        /// Target template id.
+        #[arg(long)]
+        target_template_id: Option<String>,
+        /// Backtest window in days (≤ 90).
+        #[arg(long)]
+        window_days: Option<u64>,
+        /// Sample-match cap.
+        #[arg(long)]
+        sample_limit: Option<u64>,
+    },
+    /// Soft-delete a trigger (sets enabled=false).
+    Delete {
+        /// Trigger ID.
+        trigger_id: String,
+        /// Permanently hard-delete (requires prior soft-delete + zero
+        /// in-flight fires).
+        #[arg(long)]
+        hard: bool,
+    },
+    /// Permanently hard-delete a trigger (soft-delete-first required).
+    Purge {
+        /// Trigger ID.
+        trigger_id: String,
+        /// Re-state the trigger ID to confirm the destructive purge.
+        #[arg(long)]
+        confirm: String,
+    },
+    /// Rotate the workspace inbound trigger key (returns the version int only).
+    RotateInboundKey {
+        /// Trigger ID.
+        trigger_id: String,
+    },
+}
+
+/// Workspace verb→template alias map subcommands (read-modify-write PATCH).
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowTriggerAliasCommands {
+    /// Show the workspace's verb→template alias map.
+    Get {
+        /// Workspace ID.
+        workspace_id: String,
+    },
+    /// Set (add or overwrite) a verb→template alias.
+    Set {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Alias verb (e.g. `redact`).
+        verb: String,
+        /// Template name/id the verb maps to.
+        template: String,
+    },
+    /// Remove a verb from the alias map.
+    Remove {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Alias verb to remove.
+        verb: String,
+    },
+}
+
+/// Workflow obligation subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowObligationCommands {
+    /// List obligations for a workflow (workflow id is the required anchor).
+    List {
+        /// Workflow ID (required authz anchor).
+        workflow_id: String,
+        /// Filter by status.
+        #[arg(long)]
+        status: Option<String>,
+        /// Filter by assigned user id.
+        #[arg(long)]
+        assigned_user_id: Option<String>,
+        /// Pagination limit.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Pagination offset.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Get a single obligation.
+    Get {
+        /// Obligation ID (plain numeric sequence string).
+        obligation_id: String,
+    },
+    /// Atomically claim a role-addressed obligation.
+    Claim {
+        /// Obligation ID.
+        obligation_id: String,
+    },
+    /// Release a claimed obligation back into the pool (claimer-only).
+    Release {
+        /// Obligation ID.
+        obligation_id: String,
+    },
+    /// Resolve an obligation (optional resolution payload).
+    Resolve {
+        /// Obligation ID.
+        obligation_id: String,
+        /// Resolution payload as a JSON string (or `@file.json`).
+        #[arg(long)]
+        resolution_payload: Option<String>,
+    },
+}
+
+/// Workflow inbox subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowInboxCommands {
+    /// Cross-workspace top-K inbox.
+    Me,
+    /// Workspace-scoped inbox.
+    Workspace {
+        /// Workspace ID.
+        workspace_id: String,
+    },
+    /// Pool-scoped inbox.
+    Pool {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Pool key.
+        pool_key: String,
+    },
+}
+
+/// Workflow extraction-schema subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowSchemaCommands {
+    /// Get the workflow's current extraction schema.
+    Get {
+        /// Workflow ID.
+        workflow_id: String,
+    },
+    /// Replace the extraction schema (append-only; form-encoded PUT).
+    Set {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Extraction schema as a JSON string (or `@file.json`).
+        extraction_schema: String,
+    },
+    /// Auto-derive a proposed schema from sample files (SPENDS AI CREDITS).
+    Derive {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Sample node ids as a JSON-string array (or `@file.json`).
+        #[arg(long)]
+        node_ids: Option<String>,
+        /// Acknowledge the AI-credit spend non-interactively.
+        #[arg(long)]
+        confirm_ai_spend: bool,
+    },
+}
+
+/// Workflow audit subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowAuditCommands {
+    /// Paginated audit event log.
+    Events {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Inline the event payload.
+        #[arg(long)]
+        include_payload: bool,
+        /// Pagination limit.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Pagination offset.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Signed-export job management.
+    #[command(subcommand)]
+    Export(WorkflowAuditExportCommands),
+    /// Check the INTEGRITY (not authenticity) of a downloaded bundle.
+    ///
+    /// Verifies chunk SHA-256 hashes, the content-hash chain, and the
+    /// completeness proof. Does NOT verify the HMAC signature (that is the
+    /// deferred `verify` contract).
+    CheckIntegrity {
+        /// Path to the downloaded `manifest.json`.
+        #[arg(long)]
+        manifest: std::path::PathBuf,
+        /// Paths to the downloaded chunk files, in chunk order (`0..N-1`).
+        #[arg(long = "chunk", num_args = 1.., required = true)]
+        chunks: Vec<std::path::PathBuf>,
+    },
+    /// Dual-control redaction.
+    #[command(subcommand)]
+    Redaction(WorkflowRedactionCommands),
+}
+
+/// Workflow audit-export subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowAuditExportCommands {
+    /// Start an asynchronous signed export job.
+    Start {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Export scope (e.g. `full`).
+        #[arg(long)]
+        scope: Option<String>,
+        /// Include redaction overlay rows.
+        #[arg(long)]
+        include_overlays: Option<bool>,
+        /// Redaction pin strategy (e.g. `job_start`).
+        #[arg(long)]
+        redaction_pin_strategy: Option<String>,
+    },
+    /// List export jobs for a workspace.
+    List {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Pagination limit.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Pagination offset.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Get an export job's status.
+    Get {
+        /// Export job ID.
+        job_id: String,
+    },
+    /// Stream the manifest or a chunk to disk.
+    Download {
+        /// Export job ID.
+        job_id: String,
+        /// Chunk id: `manifest` or an integer in `[0, total_chunks)`.
+        #[arg(long, default_value = "manifest")]
+        chunk: String,
+        /// Output file path.
+        #[arg(long, short)]
+        output: std::path::PathBuf,
+    },
+}
+
+/// Workflow dual-control redaction subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowRedactionCommands {
+    /// Initiate a redaction (first admin).
+    Request {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Target audit event id.
+        #[arg(long)]
+        target_event_id: String,
+        /// Target workflow id.
+        #[arg(long)]
+        target_workflow_id: String,
+        /// Redaction paths as a JSON-string array (or `@file.json`).
+        #[arg(long)]
+        redaction_paths: String,
+        /// Reason for the redaction.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Confirm a pending redaction (a DIFFERENT admin).
+    Confirm {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Action id from the request phase.
+        #[arg(long)]
+        action_id: String,
+        /// Confirmer user id (must match the authenticated caller).
+        #[arg(long)]
+        confirmer_user_id: String,
+    },
+    /// Get a committed redaction batch summary.
+    Get {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Redaction batch id.
+        redaction_id: String,
+    },
+}
+
+/// Workflow outbound-webhook-subscription subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowOutboundCommands {
+    /// Create a subscription (the HMAC secret is returned ONE TIME).
+    Create {
+        /// Workspace ID.
+        workspace_id: String,
+        /// HTTPS delivery target.
+        #[arg(long)]
+        target_url: String,
+        /// Event types as a JSON-string array (or `@file.json`).
+        #[arg(long)]
+        event_type_subscriptions: String,
+        /// Human-readable label.
+        #[arg(long)]
+        description: Option<String>,
+        /// Per-hour delivery cap (0 = no cap).
+        #[arg(long)]
+        rate_limit_per_hour: Option<u64>,
+        /// CDN-family allowlist as a JSON-string array (or `@file.json`).
+        #[arg(long)]
+        family_allowlist: Option<String>,
+        /// Write the one-time secret to this file (0600); never echoed to
+        /// stdout.
+        #[arg(long)]
+        secret_file: Option<std::path::PathBuf>,
+    },
+    /// List subscriptions for a workspace.
+    List {
+        /// Workspace ID.
+        workspace_id: String,
+    },
+    /// Get a single subscription (secret not returned).
+    Get {
+        /// Subscription ID.
+        subscription_id: String,
+    },
+    /// Update a subscription (form-encoded PATCH).
+    Update {
+        /// Subscription ID.
+        subscription_id: String,
+        /// Toggle enabled state.
+        #[arg(long)]
+        enabled: Option<bool>,
+        /// New description.
+        #[arg(long)]
+        description: Option<String>,
+        /// New per-hour delivery cap.
+        #[arg(long)]
+        rate_limit_per_hour: Option<u64>,
+        /// New CDN-family allowlist as a JSON-string array (or `@file.json`).
+        #[arg(long)]
+        family_allowlist: Option<String>,
+    },
+    /// Hard-delete a subscription.
+    Delete {
+        /// Subscription ID.
+        subscription_id: String,
+    },
+    /// Rotate the HMAC secret (new secret returned ONE TIME).
+    RotateSecret {
+        /// Subscription ID.
+        subscription_id: String,
+        /// Write the one-time secret to this file (0600); never echoed to
+        /// stdout.
+        #[arg(long)]
+        secret_file: Option<std::path::PathBuf>,
+    },
+}
+
+/// Workflow pool subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowPoolCommands {
+    /// Create a concurrency pool.
+    Create {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Pool key (unique within the workspace).
+        pool_key: String,
+        /// Maximum concurrent in-flight workflows.
+        #[arg(long)]
+        max_concurrent: Option<u64>,
+        /// Pool source: tag, `template_id`, or freeform.
+        #[arg(long)]
+        pool_source: Option<String>,
+        /// Admission policy at the cap: reject or queue.
+        #[arg(long)]
+        pool_admission_policy: Option<String>,
+    },
+    /// List pools in a workspace.
+    List {
+        /// Workspace ID.
+        workspace_id: String,
+    },
+    /// Get a single pool.
+    Get {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Pool key.
+        pool_key: String,
+    },
+    /// Delete a pool (requires zero running and zero queued workflows).
+    Delete {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Pool key.
+        pool_key: String,
+    },
+}
+
+/// Workflow external-subject subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowSubjectCommands {
+    /// List workflows indexed by an integrator correlation handle.
+    Workflows {
+        /// Workspace ID.
+        workspace_id: String,
+        /// External subject id (correlation handle).
+        subject_id: String,
+    },
+}
+
+/// Workflow realtime-channel subcommands (token mint only).
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowRealtimeCommands {
+    /// Mint a short-lived realtime-channel WebSocket token (no in-CLI client).
+    Token {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Write the minted token to this file (0600) instead of stdout.
+        #[arg(long)]
+        token_file: Option<std::path::PathBuf>,
+    },
+}
+
+/// Workflow Review (v3.5b) subcommands — flag-gated; 404 when off.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowReviewCommands {
+    /// Get-or-create a review surface for a step occurrence (idempotent).
+    Create {
+        /// Step occurrence ID.
+        step_occurrence_id: String,
+    },
+    /// Fetch a review surface (assets + reviewers + decision matrix).
+    Get {
+        /// Surface ID.
+        surface_id: String,
+    },
+    /// Fetch a single review asset and its current round.
+    Asset {
+        /// Surface ID.
+        surface_id: String,
+        /// Asset ID.
+        asset_id: String,
+    },
+    /// Record a review decision (approve / reject / `request_changes`).
+    Decision {
+        /// Surface ID.
+        surface_id: String,
+        /// Asset ID.
+        asset_id: String,
+        /// Decision: approve, reject, or `request_changes`.
+        decision: String,
+        /// Pinned current version id (CAS guard).
+        #[arg(long)]
+        version_id_pinned: String,
+        /// Optional reviewer comment.
+        #[arg(long)]
+        comment: Option<String>,
+    },
+    /// Workspace admin force-resolves a stuck surface.
+    AdminResolve {
+        /// Surface ID.
+        surface_id: String,
+        /// Resolution: approved, rejected, or cancelled.
+        resolution: String,
     },
 }
 

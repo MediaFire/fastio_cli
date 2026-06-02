@@ -80,6 +80,114 @@ const OUTPUT_INJECT_DENY_SUBSTRINGS: &[&str] = &[
     "/oauth/",
 ];
 
+/// JSON object / form keys whose VALUE is a credential and must be redacted
+/// before any request or response body is trace-logged.
+///
+/// Compared case-insensitively against each object/form key. Some API responses
+/// return one-time secrets (outbound-subscription create/rotate, realtime-token
+/// mint, the OAuth token exchange/refresh) in the body; `RUST_LOG=trace` would
+/// otherwise leak them via a shared trace line that runs BEFORE any
+/// command-level redaction. Request forms (OAuth refresh, password grants)
+/// carry credentials in their values too. The placeholder substituted for a
+/// matched value is [`REDACTED_PLACEHOLDER`].
+const SECRET_LOG_KEYS: &[&str] = &[
+    "secret",
+    "token",
+    "auth_token",
+    "access_token",
+    "refresh_token",
+    "signing_secret",
+    "inbound_signing_key",
+    "outbound_secret",
+    "api_key",
+    "apikey",
+    "password",
+    // Password-change/reset forms use numbered fields.
+    "password1",
+    "password2",
+    "private_key",
+    "client_secret",
+    // OAuth PKCE token-exchange form fields (one-time, but still credentials).
+    "code",
+    "code_verifier",
+    // Storage/file lock ownership token (form field).
+    "lock_token",
+];
+
+/// Placeholder written in place of a redacted secret value when trace-logging
+/// a response body.
+const REDACTED_PLACEHOLDER: &str = "[redacted]";
+
+/// Deep-walk a JSON value and return a clone in which the VALUE of any object
+/// key named like a credential (case-insensitive match against
+/// [`SECRET_LOG_KEYS`]) is replaced with [`REDACTED_PLACEHOLDER`], preserving
+/// the surrounding structure.
+///
+/// Used to sanitize a request or response body BEFORE it is trace-logged. The
+/// match is on the KEY name (not the value shape), so a redacted secret is
+/// replaced regardless of whether it was a string, number, array, or object.
+/// Non-secret keys — and the structure of objects and arrays — are preserved
+/// verbatim so the trace remains useful.
+fn redact_secret_values_for_log(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    if is_secret_log_key(k) {
+                        (k.clone(), Value::String(REDACTED_PLACEHOLDER.to_owned()))
+                    } else {
+                        (k.clone(), redact_secret_values_for_log(v))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(redact_secret_values_for_log).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Whether a (case-insensitive) object/form key names a credential per
+/// [`SECRET_LOG_KEYS`].
+fn is_secret_log_key(key: &str) -> bool {
+    SECRET_LOG_KEYS
+        .iter()
+        .any(|name| key.eq_ignore_ascii_case(name))
+}
+
+/// Redact a form-field map for trace logging.
+///
+/// Form-encoded request bodies (OAuth token exchange/refresh, password grants,
+/// secret rotations) carry credentials in their VALUES. Returns an ordered map
+/// (so the trace line is stable) in which any secret-named field's value is the
+/// [`REDACTED_PLACEHOLDER`]. Used before any `?form` request is trace-logged.
+fn redact_form_for_log(form: &HashMap<String, String>) -> std::collections::BTreeMap<&str, &str> {
+    form.iter()
+        .map(|(k, v)| {
+            let v = if is_secret_log_key(k) {
+                REDACTED_PLACEHOLDER
+            } else {
+                v.as_str()
+            };
+            (k.as_str(), v)
+        })
+        .collect()
+}
+
+/// Redact a JSON request/response body presented as text for trace logging.
+///
+/// Parses the text and applies [`redact_secret_values_for_log`]; if the text is
+/// not valid JSON (e.g. a proxy HTML error page) it cannot contain a structured
+/// secret field, so it is returned as-is. Callers should already be inside a
+/// `tracing::enabled!(Level::TRACE)` guard so the parse only runs when needed.
+fn redact_text_body_for_log(text: &str) -> String {
+    serde_json::from_str::<Value>(text).map_or_else(
+        |_| text.to_owned(),
+        |v| redact_secret_values_for_log(&v).to_string(),
+    )
+}
+
 /// HTTP client that wraps `reqwest` with Fast.io-specific conventions.
 pub struct ApiClient {
     /// The underlying HTTP client.
@@ -448,7 +556,7 @@ impl ApiClient {
         path: &str,
         form: &HashMap<String, String>,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "POST", path, ?form, "api request");
+        tracing::trace!(method = "POST", path, form = ?redact_form_for_log(form), "api request");
         self.send_with_retry(|| {
             let mut req = self.inner.post(self.url(path)).form(form);
             if let Some(auth) = self.auth_header() {
@@ -465,7 +573,7 @@ impl ApiClient {
         path: &str,
         form: &HashMap<String, String>,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "POST", path, ?form, "api request (no auth)");
+        tracing::trace!(method = "POST", path, form = ?redact_form_for_log(form), "api request (no auth)");
         self.send_with_retry(|| self.inner.post(self.url(path)).form(form))
             .await
     }
@@ -480,7 +588,7 @@ impl ApiClient {
         path: &str,
         form: &HashMap<String, String>,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "POST", path, ?form, "api request (no auth, raw)");
+        tracing::trace!(method = "POST", path, form = ?redact_form_for_log(form), "api request (no auth, raw)");
         self.send_with_retry_raw(|| self.inner.post(self.url(path)).form(form))
             .await
     }
@@ -492,7 +600,7 @@ impl ApiClient {
         path: &str,
         body: &Value,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "POST", path, body = %body, "api request (json)");
+        tracing::trace!(method = "POST", path, body = %redact_secret_values_for_log(body), "api request (json)");
         self.send_with_retry(|| {
             let mut req = self.inner.post(self.url(path)).json(body);
             if let Some(auth) = self.auth_header() {
@@ -520,7 +628,7 @@ impl ApiClient {
         path: &str,
         body: &Value,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "POST", path, body = %body, "api request (json, raw)");
+        tracing::trace!(method = "POST", path, body = %redact_secret_values_for_log(body), "api request (json, raw)");
         self.send_with_retry_raw(|| {
             let mut req = self.inner.post(self.url(path)).json(body);
             if let Some(auth) = self.auth_header() {
@@ -571,7 +679,7 @@ impl ApiClient {
         path: &str,
         body: &Value,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "PATCH", path, body = %body, "api request (json)");
+        tracing::trace!(method = "PATCH", path, body = %redact_secret_values_for_log(body), "api request (json)");
         self.send_with_retry(|| {
             let mut req = self.inner.patch(self.url(path)).json(body);
             if let Some(auth) = self.auth_header() {
@@ -592,7 +700,7 @@ impl ApiClient {
         path: &str,
         body: &Value,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "PUT", path, body = %body, "api request (json)");
+        tracing::trace!(method = "PUT", path, body = %redact_secret_values_for_log(body), "api request (json)");
         self.send_with_retry(|| {
             let mut req = self.inner.put(self.url(path)).json(body);
             if let Some(auth) = self.auth_header() {
@@ -615,7 +723,7 @@ impl ApiClient {
         path: &str,
         form: &HashMap<String, String>,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "PATCH", path, ?form, "api request");
+        tracing::trace!(method = "PATCH", path, form = ?redact_form_for_log(form), "api request");
         self.send_with_retry(|| {
             let mut req = self.inner.patch(self.url(path)).form(form);
             if let Some(auth) = self.auth_header() {
@@ -637,7 +745,7 @@ impl ApiClient {
         path: &str,
         form: &HashMap<String, String>,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "PUT", path, ?form, "api request");
+        tracing::trace!(method = "PUT", path, form = ?redact_form_for_log(form), "api request");
         self.send_with_retry(|| {
             let mut req = self.inner.put(self.url(path)).form(form);
             if let Some(auth) = self.auth_header() {
@@ -707,7 +815,7 @@ impl ApiClient {
         path: &str,
         form: &HashMap<String, String>,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "DELETE", path, ?form, "api request");
+        tracing::trace!(method = "DELETE", path, form = ?redact_form_for_log(form), "api request");
         self.send_with_retry(|| {
             let mut req = self.inner.delete(self.url(path)).form(form);
             if let Some(auth) = self.auth_header() {
@@ -787,7 +895,12 @@ impl ApiClient {
             // stream is not yet consumed). Fall back to a generic message if
             // the body is missing or not JSON.
             let body: Value = resp.json().await.unwrap_or_default();
-            tracing::trace!(body = %body, "stream download error body");
+            if tracing::enabled!(tracing::Level::TRACE) {
+                tracing::trace!(
+                    body = %redact_secret_values_for_log(&body),
+                    "stream download error body"
+                );
+            }
             return Err(Self::extract_error(&body, http_status).into());
         }
 
@@ -1151,7 +1264,14 @@ impl ApiClient {
             .json()
             .await
             .map_err(|e| CliError::Parse(format!("failed to parse API response: {e}")))?;
-        tracing::trace!(body = %body, "api response body");
+        // Redact one-time secrets (subscription create/rotate, realtime token,
+        // etc.) BEFORE tracing — the raw body must never reach the log even at
+        // `RUST_LOG=trace`. Only build the redacted clone when the trace level
+        // is actually enabled so the common (untraced) path stays allocation-free.
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let redacted = redact_secret_values_for_log(&body);
+            tracing::trace!(body = %redacted, "api response body");
+        }
 
         // The Fast.io envelope uses "yes"/"no" strings (or bool true/false in some endpoints).
         let result_ok = match body.get("result") {
@@ -1198,7 +1318,12 @@ impl ApiClient {
 
         if !status.is_success() {
             let body: Value = resp.json().await.unwrap_or_default();
-            tracing::trace!(body = %body, "api error response body (raw)");
+            if tracing::enabled!(tracing::Level::TRACE) {
+                tracing::trace!(
+                    body = %redact_secret_values_for_log(&body),
+                    "api error response body (raw)"
+                );
+            }
             return Err(Self::extract_error(&body, status.as_u16()).into());
         }
 
@@ -1206,7 +1331,16 @@ impl ApiClient {
             .text()
             .await
             .map_err(|e| CliError::Parse(format!("failed to read response body: {e}")))?;
-        tracing::trace!(body = %body_text, "api response body (raw)");
+        // The raw path serves non-envelope endpoints — notably the OAuth token
+        // exchange/refresh, whose success body carries `access_token` /
+        // `refresh_token`. Redact before tracing so `RUST_LOG=trace` cannot leak
+        // them (only parse for redaction when trace is actually enabled).
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(
+                body = %redact_text_body_for_log(&body_text),
+                "api response body (raw)"
+            );
+        }
 
         serde_json::from_str(&body_text)
             .map_err(|e| CliError::Parse(format!("failed to deserialize response: {e}")))
@@ -1235,7 +1369,12 @@ impl ApiClient {
         } else {
             resp.json().await.unwrap_or_default()
         };
-        tracing::trace!(body = %body, "api response body (partial envelope)");
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(
+                body = %redact_secret_values_for_log(&body),
+                "api response body (partial envelope)"
+            );
+        }
 
         if matches!(status.as_u16(), 200 | 404) {
             // The bulk-details contract uses the HTTP status and
@@ -1488,6 +1627,94 @@ mod tests {
     fn short_body_returned_verbatim() {
         let body = "short error";
         assert_eq!(ApiClient::truncate_for_error_message(body), body);
+    }
+
+    #[test]
+    fn redact_secret_values_masks_credential_keys_and_keeps_structure() {
+        let body = serde_json::json!({
+            "result": "yes",
+            "response": {
+                "id": "sub_123",
+                "token": "tok_LIVE_should_never_log",
+                "secret": "shh",
+                "auth_token": "bearer_xyz",
+                "nested": {
+                    "access_token": "at_abc",
+                    "description": "keep me",
+                },
+                "items": [
+                    {"api_key": "k_1", "label": "first"},
+                    {"refresh_token": "r_1", "label": "second"},
+                ],
+            },
+        });
+        let redacted = redact_secret_values_for_log(&body);
+        let rendered = redacted.to_string();
+
+        // Every secret value is masked, regardless of nesting / arrays.
+        assert!(
+            !rendered.contains("tok_LIVE_should_never_log"),
+            "top-level token leaked: {rendered}"
+        );
+        assert!(!rendered.contains("shh"), "secret leaked: {rendered}");
+        assert!(!rendered.contains("bearer_xyz"), "auth_token leaked");
+        assert!(!rendered.contains("at_abc"), "nested access_token leaked");
+        assert!(!rendered.contains("k_1"), "array api_key leaked");
+        assert!(!rendered.contains("r_1"), "array refresh_token leaked");
+
+        // The placeholder is present and non-secret fields are untouched.
+        assert_eq!(redacted["response"]["token"], REDACTED_PLACEHOLDER);
+        assert_eq!(redacted["response"]["secret"], REDACTED_PLACEHOLDER);
+        assert_eq!(redacted["response"]["auth_token"], REDACTED_PLACEHOLDER);
+        assert_eq!(
+            redacted["response"]["nested"]["access_token"],
+            REDACTED_PLACEHOLDER
+        );
+        assert_eq!(redacted["result"], "yes");
+        assert_eq!(redacted["response"]["id"], "sub_123");
+        assert_eq!(redacted["response"]["nested"]["description"], "keep me");
+        assert_eq!(redacted["response"]["items"][0]["label"], "first");
+        assert_eq!(redacted["response"]["items"][1]["label"], "second");
+        // Case-insensitive: the original (unredacted) body is unchanged.
+        assert_eq!(body["response"]["token"], "tok_LIVE_should_never_log");
+    }
+
+    #[test]
+    fn redact_form_masks_secret_valued_fields() {
+        let mut form = HashMap::new();
+        form.insert("grant_type".to_owned(), "refresh_token".to_owned());
+        form.insert("refresh_token".to_owned(), "rt_LIVE_secret".to_owned());
+        form.insert("client_id".to_owned(), "cid_123".to_owned());
+        form.insert("client_secret".to_owned(), "cs_should_hide".to_owned());
+        let redacted = redact_form_for_log(&form);
+        assert_eq!(redacted.get("refresh_token"), Some(&REDACTED_PLACEHOLDER));
+        // `client_secret` is a secret key and is masked; `client_id` is not.
+        assert_eq!(redacted.get("client_secret"), Some(&REDACTED_PLACEHOLDER));
+        assert_eq!(redacted.get("client_id"), Some(&"cid_123"));
+        // `grant_type` carries the literal string "refresh_token" as a VALUE but
+        // its KEY is not secret, so the value is preserved (we redact by key).
+        assert_eq!(redacted.get("grant_type"), Some(&"refresh_token"));
+    }
+
+    #[test]
+    fn redact_text_body_masks_oauth_tokens_and_passes_non_json() {
+        let oauth = r#"{"access_token":"at_live","refresh_token":"rt_live","token_type":"Bearer"}"#;
+        let redacted = redact_text_body_for_log(oauth);
+        assert!(
+            !redacted.contains("at_live"),
+            "access_token leaked: {redacted}"
+        );
+        assert!(
+            !redacted.contains("rt_live"),
+            "refresh_token leaked: {redacted}"
+        );
+        assert!(redacted.contains("[redacted]"));
+        // token_type is not a secret key.
+        assert!(redacted.contains("Bearer"));
+        // Non-JSON text (proxy HTML) cannot carry a structured secret field;
+        // returned as-is.
+        let html = "<html>Bad Gateway</html>";
+        assert_eq!(redact_text_body_for_log(html), html);
     }
 
     #[test]
