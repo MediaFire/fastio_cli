@@ -10613,6 +10613,18 @@ async fn workflow_wait_for_terminal(
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(WORKFLOW_WAIT_MAX_SECS);
     loop {
+        // Re-check the deadline at the TOP of every iteration, before issuing
+        // the next state GET. The sleep below is clamped to the remaining wait
+        // (and a 429 clamp can land exactly on the deadline); without this check
+        // a woken iteration would issue one more request that could add the
+        // client's request timeout and overrun WORKFLOW_WAIT_MAX_SECS. Mirrors
+        // the `mcp_ask_wait` top-of-loop check.
+        if tokio::time::Instant::now() >= deadline {
+            return error_text(&format!(
+                "timed out after ~{WORKFLOW_WAIT_MAX_SECS}s waiting for workflow {workflow_id} to \
+                 reach a terminal state; it may still be running. Use action='state' to poll."
+            ));
+        }
         // Default cadence is the fixed interval; rate limits and transient
         // errors override it below (transient errors use the SAME bounded
         // jittered backoff as the CLI `wait`).
@@ -10711,6 +10723,17 @@ async fn workflow_export_and_download(
 
     // Poll the job to completed (or terminal failure).
     let job = loop {
+        // Re-check the deadline at the TOP of every iteration, before issuing
+        // the next job-status GET. The sleep below is clamped to the remaining
+        // wait (and a 429 clamp can land exactly on the deadline); without this
+        // check a woken iteration would issue one more request that could add
+        // the client's request timeout and overrun WORKFLOW_WAIT_MAX_SECS.
+        // Mirrors the `mcp_ask_wait` top-of-loop check.
+        if tokio::time::Instant::now() >= deadline {
+            return error_text(&format!(
+                "timed out after ~{WORKFLOW_WAIT_MAX_SECS}s waiting for export job {job_id}"
+            ));
+        }
         // Default cadence is the fixed interval; rate limits and transient
         // errors override it below (transient errors use the SAME bounded
         // jittered backoff as the CLI `wait`).

@@ -647,6 +647,19 @@ async fn wait_for_workflow(
         eprintln!("waiting for workflow {workflow_id} (polling ~every {interval}s)...");
     }
     loop {
+        // Re-check the deadline at the TOP of every iteration, before issuing
+        // the next state GET. The sleep at the bottom is clamped to the
+        // remaining wait (and a 429 clamp can land exactly on the deadline);
+        // without this check a woken iteration would issue one more request
+        // that could add the client's request timeout and overrun WAIT_MAX_SECS.
+        // Mirrors the MCP `workflow_wait_for_terminal` top-of-loop check.
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out after ~{WAIT_MAX_SECS}s waiting for workflow {workflow_id} to reach a \
+                 terminal state. It may still be running; poll \
+                 'fastio workflow state {workflow_id}'."
+            );
+        }
         // The sleep applied at the bottom of this tick; rate-limit responses
         // override the default jittered cadence.
         let mut next_sleep = jittered(interval);
