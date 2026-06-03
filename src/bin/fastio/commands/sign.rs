@@ -294,8 +294,8 @@ enum SignOp {
     /// An audit-certificate fetch — a `404`/`1609`/`128301`/`146422` means the
     /// certificate is not ready yet, not that the row is missing. The audit
     /// certificate becomes available once the envelope reaches **any terminal
-    /// state** (completed OR voided), so the not-ready guidance steers to "poll
-    /// until it reaches a terminal state".
+    /// state** (completed/declined/voided/expired/failed), so the not-ready
+    /// guidance steers to "poll until it reaches a terminal state".
     AuditFetch,
 }
 
@@ -327,7 +327,8 @@ impl SignOp {
 ///   generic-404 "verify the id" (the ids are fine). The poll target is
 ///   artifact-appropriate: the signed PDF becomes available once the envelope
 ///   **completes**, the audit certificate once the envelope reaches **any
-///   terminal state** (completed OR voided). The router-level `9992` ("no such
+///   terminal state** (completed/declined/voided/expired/failed). The
+///   router-level `9992` ("no such
 ///   route", also HTTP 404) is the one exclusion, so it falls through to the
 ///   removed/renamed-route framing instead of "poll a dead route forever". For
 ///   [`SignOp::General`] the error is left to the shared generic not-found
@@ -384,12 +385,14 @@ fn map_signing_error(err: CliError, ctx: &'static str, op: SignOp) -> anyhow::Er
         //
         // The poll target is artifact-appropriate: the signed PDF is
         // available once the envelope COMPLETES; the audit certificate once
-        // the envelope reaches any TERMINAL state (completed OR voided).
+        // the envelope reaches any TERMINAL state
+        // (completed/declined/voided/expired/failed).
         let stage = match op {
             SignOp::AuditFetch => {
                 "the audit certificate is not generated until the envelope reaches a terminal \
                  state. Poll the envelope (`fastio sign envelope get --workspace <workspace-id> \
-                 <envelope-id>`) and retry once it reaches a terminal state (completed or voided)."
+                 <envelope-id>`) and retry once it reaches any terminal state (e.g. completed, \
+                 declined, voided, expired, or failed)."
             }
             // SignedFetch (General never reaches here — guarded by is_artifact_fetch()).
             _ => {
@@ -1196,7 +1199,8 @@ mod tests {
         // the audit-certificate guidance steers to "terminal state". The
         // signed message must NOT promise a terminal state (signed PDFs exist
         // only on completion, never on a void), and the audit message must NOT
-        // narrow to "completes" (audit certs exist on any terminal state).
+        // narrow to "completes" (audit certs exist on any terminal state —
+        // completed/declined/voided/expired/failed).
         let signed =
             map_signing_error(api_err(0, 404), "download", SignOp::SignedFetch).to_string();
         assert!(

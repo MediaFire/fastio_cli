@@ -10872,8 +10872,8 @@ enum SignOp {
     /// not-ready guidance steers to "poll until it completes".
     SignedFetch,
     /// An audit-certificate fetch — available once the envelope reaches **any
-    /// terminal state** (completed OR voided), so the not-ready guidance steers
-    /// to "poll until it reaches a terminal state".
+    /// terminal state** (completed/declined/voided/expired/failed), so the
+    /// not-ready guidance steers to "poll until it reaches a terminal state".
     AuditFetch,
 }
 
@@ -10899,7 +10899,8 @@ impl SignOp {
 ///   its OWN predicate arm so a non-404 `146422` still reframes. The poll target
 ///   is artifact-appropriate: the signed PDF is available once the envelope
 ///   **completes**, the audit certificate once the envelope reaches **any
-///   terminal state** (completed OR voided). For [`SignOp::General`] a
+///   terminal state** (completed/declined/voided/expired/failed). For
+///   [`SignOp::General`] a
 ///   `404`/`1609` is a genuine not-found and is NOT reframed (`signing.txt:591`).
 /// - `10545` (workspace membership) / `115069` (envelope access) override the
 ///   generic 401 hint; `1680` (workspace permission, kept generic), `1670`
@@ -10921,11 +10922,11 @@ fn sign_err_to_result(err: &fastio_cli::error::CliError, ctx: &str, op: SignOp) 
         {
             // Artifact-appropriate poll target: the signed PDF is available once
             // the envelope COMPLETES; the audit certificate once the envelope
-            // reaches any TERMINAL state (completed OR voided).
+            // reaches any TERMINAL state (completed/declined/voided/expired/failed).
             let stage = if op == SignOp::AuditFetch {
                 "the audit certificate is not generated until the envelope reaches a terminal \
-                 state; poll envelope-get and retry once it reaches a terminal state (completed \
-                 or voided)."
+                 state; poll envelope-get and retry once it reaches any terminal state (e.g. \
+                 completed, declined, voided, expired, or failed)."
             } else {
                 "the signed document is not generated until the envelope completes; poll \
                  envelope-get and retry once it completes."
@@ -13843,8 +13844,8 @@ mod ripley_tool_tests {
     #[test]
     fn sign_err_artifact_not_ready_wording_is_artifact_appropriate() {
         // Item 2: the signed-PDF not-ready guidance steers to "completes"; the
-        // audit-certificate guidance steers to "terminal state" (completed OR
-        // voided), mirroring the CLI surface.
+        // audit-certificate guidance steers to "terminal state"
+        // (completed/declined/voided/expired/failed), mirroring the CLI surface.
         use super::{SignOp, sign_err_to_result};
         let signed = result_to_string(&sign_err_to_result(
             &sign_api_err(0, 404),

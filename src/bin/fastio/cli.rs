@@ -1355,7 +1355,7 @@ pub enum SignEnvelopeCommands {
         workspace: String,
         /// Envelope ID.
         envelope_id: String,
-        /// New display name.
+        /// New display name. Omit to keep the current name; a name cannot be cleared via update.
         #[arg(long)]
         name: Option<String>,
         /// New UTC expiry timestamp.

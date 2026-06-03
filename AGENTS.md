@@ -251,7 +251,7 @@ name) and a workflow `wait_for_signing` step parks on an envelope until it
 reaches a terminal state. The CLI itself has no realtime watch; agents poll
 `fastio sign envelope get --workspace WS_ID ENVELOPE_ID` for artifact readiness:
 the signed PDF 404s until the envelope **completes**, and the audit certificate
-404s until the envelope reaches **any terminal state** (completed or voided).
+404s until the envelope reaches **any terminal state** (completed, declined, voided, expired, or failed).
 
 ### Over MCP
 
