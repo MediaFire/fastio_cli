@@ -286,9 +286,26 @@ enum SignOp {
     /// A CRUD / list / get / update / send call, or a source/preview document
     /// download — a `404`/`1609` is a genuine not-found here.
     General,
-    /// A signed-PDF or audit-certificate fetch — a `404`/`1609`/`128301`/`146422`
-    /// means the artifact is not ready yet, not that the row is missing.
-    ArtifactFetch,
+    /// A signed-PDF fetch — a `404`/`1609`/`128301`/`146422` means the signed
+    /// document is not ready yet, not that the row is missing. The signed PDF
+    /// becomes available once the envelope **completes**, so the not-ready
+    /// guidance steers to "poll until it completes".
+    SignedFetch,
+    /// An audit-certificate fetch — a `404`/`1609`/`128301`/`146422` means the
+    /// certificate is not ready yet, not that the row is missing. The audit
+    /// certificate becomes available once the envelope reaches **any terminal
+    /// state** (completed OR voided), so the not-ready guidance steers to "poll
+    /// until it reaches a terminal state".
+    AuditFetch,
+}
+
+impl SignOp {
+    /// `true` for an async signed/audit artifact fetch (where a
+    /// `404`/`1609`/`128301`/`146422` means "not ready yet" rather than a
+    /// genuine not-found). `false` for [`SignOp::General`].
+    fn is_artifact_fetch(self) -> bool {
+        matches!(self, SignOp::SignedFetch | SignOp::AuditFetch)
+    }
 }
 
 /// Map a signing API error to an actionable, signing-specific message.
@@ -299,17 +316,22 @@ enum SignOp {
 /// keys on the actual `error.code`, NOT a bare HTTP status, so an unrelated
 /// error with the same status is not mislabeled:
 ///
-/// - An error matching `http_status == 404 || code == 1609 || code == 128301`
-///   AND `code != 9992` (the OR-predicate the code evaluates; the live not-ready
-///   codes are `1609`/`128301`/`146422`, all served as HTTP 404) is reframed as
-///   "not ready yet — poll and retry" ONLY for an [`SignOp::ArtifactFetch`]
-///   (signed-download / audit-download); it is re-keyed onto
-///   [`CliError::ArtifactNotReady`] so the rendered `hint:` is the
-///   poll-and-retry guidance, not the generic-404 "verify the id" (the ids are
-///   fine). The router-level `9992` ("no such route", also HTTP 404) is the one
-///   exclusion, so it falls through to the removed/renamed-route framing instead
-///   of "poll a dead route forever". For [`SignOp::General`] the error is left
-///   to the shared generic not-found handling.
+/// - An error matching `http_status == 404 || code == 1609 || code == 128301
+///   || code == 146422` AND `code != 9992` (the OR-predicate the code
+///   evaluates; the live not-ready codes are `1609`/`128301`/`146422`, all also
+///   served as HTTP 404 — `146422` and the bare 404 arm are independent so a
+///   non-404 `146422` still matches) is reframed as "not ready yet — poll and
+///   retry" ONLY for a signed/audit artifact fetch ([`SignOp::SignedFetch`] /
+///   [`SignOp::AuditFetch`]); it is re-keyed onto [`CliError::ArtifactNotReady`]
+///   so the rendered `hint:` is the poll-and-retry guidance, not the
+///   generic-404 "verify the id" (the ids are fine). The poll target is
+///   artifact-appropriate: the signed PDF becomes available once the envelope
+///   **completes**, the audit certificate once the envelope reaches **any
+///   terminal state** (completed OR voided). The router-level `9992` ("no such
+///   route", also HTTP 404) is the one exclusion, so it falls through to the
+///   removed/renamed-route framing instead of "poll a dead route forever". For
+///   [`SignOp::General`] the error is left to the shared generic not-found
+///   handling.
 /// - `10545` (401) → not a member of this workspace. Overrides the generic 401
 ///   "run fastio auth login" suggestion (the failure is authorization, not a
 ///   missing login).
@@ -342,9 +364,12 @@ fn map_signing_error(err: CliError, ctx: &'static str, op: SignOp) -> anyhow::Er
     // 404; it must be EXCLUDED here so the code-specific match below frames it
     // as a removed/renamed route instead of "poll and retry" (otherwise an
     // agent would poll a dead route forever).
-    let is_artifact_not_ready = op == SignOp::ArtifactFetch
+    let is_artifact_not_ready = op.is_artifact_fetch()
         && api.code != 9992
-        && (api.http_status == 404 || api.code == 1609 || api.code == 128_301);
+        && (api.http_status == 404
+            || api.code == 1609
+            || api.code == 128_301
+            || api.code == 146_422);
     if is_artifact_not_ready {
         // Re-key onto the dedicated `ArtifactNotReady` variant rather than
         // wrapping `CliError::Api` so (a) the rendered `hint:` line is the
@@ -356,12 +381,25 @@ fn map_signing_error(err: CliError, ctx: &'static str, op: SignOp) -> anyhow::Er
         // rendered exactly ONCE — no duplicate source link, no doubling.
         // The signing-specific phrasing stays in this `.context(...)`. The
         // `ApiError` is MOVED into the variant, so nothing clones.
-        return anyhow::Error::from(CliError::ArtifactNotReady { api }).context(format!(
-            "{ctx}: not ready yet — the signed artifact / audit certificate is not generated \
-             until the envelope reaches the required (terminal) stage. Poll the envelope \
-             (`fastio sign envelope get --workspace <workspace-id> <envelope-id>`) and retry \
-             once it completes."
-        ));
+        //
+        // The poll target is artifact-appropriate: the signed PDF is
+        // available once the envelope COMPLETES; the audit certificate once
+        // the envelope reaches any TERMINAL state (completed OR voided).
+        let stage = match op {
+            SignOp::AuditFetch => {
+                "the audit certificate is not generated until the envelope reaches a terminal \
+                 state. Poll the envelope (`fastio sign envelope get --workspace <workspace-id> \
+                 <envelope-id>`) and retry once it reaches a terminal state (completed or voided)."
+            }
+            // SignedFetch (General never reaches here — guarded by is_artifact_fetch()).
+            _ => {
+                "the signed document is not generated until the envelope completes. Poll the \
+                 envelope (`fastio sign envelope get --workspace <workspace-id> <envelope-id>`) \
+                 and retry once it completes."
+            }
+        };
+        return anyhow::Error::from(CliError::ArtifactNotReady { api })
+            .context(format!("{ctx}: not ready yet — {stage}"));
     }
 
     // Code-specific signing framings (keyed on error.code, not bare status).
@@ -834,11 +872,14 @@ async fn stream_download(
 /// [`map_signing_error`] takes a `&'static str` context, so the per-artifact
 /// label is mapped to a fixed string rather than a formatted (non-`'static`)
 /// one. The discriminator decides whether a `404` (live not-ready codes
-/// `1609`/`128301`/`146422`) is reframed as "not ready yet": only the SIGNED PDF
-/// and the AUDIT certificate are generated asynchronously
-/// ([`SignOp::ArtifactFetch`]). A SOURCE-document download is a plain fetch
-/// ([`SignOp::General`]) — a `404` there is a genuine not-found (typo'd id /
-/// wrong workspace/envelope/document id, `signing.txt:591`), not "not ready".
+/// `1609`/`128301`/`146422`) is reframed as "not ready yet" and, if so, which
+/// poll target the guidance names: only the SIGNED PDF
+/// ([`SignOp::SignedFetch`] — available once the envelope completes) and the
+/// AUDIT certificate ([`SignOp::AuditFetch`] — available once the envelope
+/// reaches a terminal state) are generated asynchronously. A SOURCE-document
+/// download is a plain fetch ([`SignOp::General`]) — a `404` there is a genuine
+/// not-found (typo'd id / wrong workspace/envelope/document id,
+/// `signing.txt:591`), not "not ready".
 ///
 /// (Despite the historical name, this never `Box::leak`s — it returns a string
 /// literal, which is already `'static`.)
@@ -848,11 +889,8 @@ fn download_ctx(what: &str) -> (&'static str, SignOp) {
         // The preview returns the SAME source bytes as the download — a plain
         // fetch, so a 404 is a genuine not-found, not "not ready" (F25).
         "document preview" => ("failed to preview document", SignOp::General),
-        "signed document" => ("failed to download signed document", SignOp::ArtifactFetch),
-        "audit certificate" => (
-            "failed to download audit certificate",
-            SignOp::ArtifactFetch,
-        ),
+        "signed document" => ("failed to download signed document", SignOp::SignedFetch),
+        "audit certificate" => ("failed to download audit certificate", SignOp::AuditFetch),
         _ => ("failed to download", SignOp::General),
     }
 }
@@ -1143,11 +1181,41 @@ mod tests {
     #[test]
     fn map_artifact_fetch_404_and_1609_say_not_ready() {
         // Only a signed/audit ARTIFACT fetch reframes 404/1609 as "not ready".
-        let m = map_signing_error(api_err(0, 404), "download", SignOp::ArtifactFetch).to_string();
-        assert!(m.contains("not ready yet"), "got: {m}");
-        let m =
-            map_signing_error(api_err(1609, 200), "download", SignOp::ArtifactFetch).to_string();
-        assert!(m.contains("not ready yet"), "got: {m}");
+        for op in [SignOp::SignedFetch, SignOp::AuditFetch] {
+            let m = map_signing_error(api_err(0, 404), "download", op).to_string();
+            assert!(m.contains("not ready yet"), "got ({op:?}): {m}");
+            // 1609 with a non-404 status still reframes (keyed on code, not status).
+            let m = map_signing_error(api_err(1609, 200), "download", op).to_string();
+            assert!(m.contains("not ready yet"), "got ({op:?}): {m}");
+        }
+    }
+
+    #[test]
+    fn map_artifact_not_ready_wording_is_artifact_appropriate() {
+        // Item 2: the signed-PDF not-ready guidance steers to "completes";
+        // the audit-certificate guidance steers to "terminal state". The
+        // signed message must NOT promise a terminal state (signed PDFs exist
+        // only on completion, never on a void), and the audit message must NOT
+        // narrow to "completes" (audit certs exist on any terminal state).
+        let signed =
+            map_signing_error(api_err(0, 404), "download", SignOp::SignedFetch).to_string();
+        assert!(
+            signed.contains("completes") && signed.contains("signed document"),
+            "signed not-ready must steer to completion: {signed}"
+        );
+        assert!(
+            !signed.contains("terminal state"),
+            "signed not-ready must not promise a terminal state: {signed}"
+        );
+        let audit = map_signing_error(api_err(0, 404), "download", SignOp::AuditFetch).to_string();
+        assert!(
+            audit.contains("terminal state") && audit.contains("audit certificate"),
+            "audit not-ready must steer to a terminal state: {audit}"
+        );
+        assert!(
+            audit.contains("voided"),
+            "audit not-ready must mention voided as a valid terminal state: {audit}"
+        );
     }
 
     #[test]
@@ -1156,30 +1224,59 @@ mod tests {
         // `CliError::ArtifactNotReady` (no `ApiError` source link → no doubled
         // block) whose rendered hint is the poll-and-retry guidance, NOT the
         // generic-404 "Verify the ID or path is correct.". Covers the live
-        // signed-PDF code 146422 as well as 404/1609/128301.
-        for code in [0_u32, 1609, 128_301, 146_422] {
-            let mapped = map_signing_error(
-                api_err(code, 404),
-                "failed to download signed document",
-                SignOp::ArtifactFetch,
+        // signed-PDF code 146422 as well as 404/1609/128301, on BOTH artifact
+        // surfaces.
+        for op in [SignOp::SignedFetch, SignOp::AuditFetch] {
+            for code in [0_u32, 1609, 128_301, 146_422] {
+                let mapped = map_signing_error(api_err(code, 404), "failed to download", op);
+                let cli = mapped
+                    .downcast_ref::<CliError>()
+                    .expect("not-ready error must remain a CliError so main's pretty path fires");
+                assert!(
+                    matches!(cli, CliError::ArtifactNotReady { .. }),
+                    "not-ready must re-key onto ArtifactNotReady (code {code}, {op:?})"
+                );
+                let hint = cli.suggestion().unwrap_or_default();
+                assert!(
+                    !hint.contains("Verify the ID or path is correct"),
+                    "not-ready hint must not be the generic-404 hint (code {code}, {op:?}): {hint}"
+                );
+                assert!(
+                    hint.to_lowercase().contains("poll"),
+                    "not-ready hint must steer to poll-and-retry (code {code}, {op:?}): {hint}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn map_artifact_fetch_146422_non_404_status_says_not_ready() {
+        // Item 3: code 146422 (signed-PDF not-ready) with a NON-404 http_status
+        // must STILL map to not-ready, proving the explicit `code == 146422`
+        // predicate arm rather than relying on the bare-404 arm. Covers both
+        // artifact surfaces.
+        for op in [SignOp::SignedFetch, SignOp::AuditFetch] {
+            let mapped = map_signing_error(api_err(146_422, 200), "download", op);
+            let m = mapped.to_string();
+            assert!(
+                m.contains("not ready yet"),
+                "146422 with status 200 must say not ready ({op:?}): {m}"
             );
             let cli = mapped
                 .downcast_ref::<CliError>()
-                .expect("not-ready error must remain a CliError so main's pretty path fires");
+                .expect("not-ready must remain a CliError");
             assert!(
                 matches!(cli, CliError::ArtifactNotReady { .. }),
-                "not-ready must re-key onto ArtifactNotReady (code {code})"
-            );
-            let hint = cli.suggestion().unwrap_or_default();
-            assert!(
-                !hint.contains("Verify the ID or path is correct"),
-                "not-ready hint must not be the generic-404 hint (code {code}): {hint}"
-            );
-            assert!(
-                hint.to_lowercase().contains("poll"),
-                "not-ready hint must steer to poll-and-retry (code {code}): {hint}"
+                "146422/non-404 must re-key onto ArtifactNotReady ({op:?})"
             );
         }
+        // And on a General op, 146422 is NOT reframed (not the artifact surface).
+        let m =
+            map_signing_error(api_err(146_422, 200), "failed to get", SignOp::General).to_string();
+        assert!(
+            !m.contains("not ready"),
+            "general 146422 must not say ready: {m}"
+        );
     }
 
     #[test]
@@ -1217,10 +1314,11 @@ mod tests {
 
     #[test]
     fn map_artifact_fetch_128301_says_not_ready() {
-        // Live audit-not-ready code (P3): 128301 on an ArtifactFetch must read
-        // "not ready yet", same as 404/1609.
+        // Live audit-not-ready code (P3): 128301 on an artifact fetch must read
+        // "not ready yet", same as 404/1609. Tested on the AuditFetch surface
+        // (its native code) — SignedFetch coverage lives in the loop above.
         let m =
-            map_signing_error(api_err(128_301, 404), "download", SignOp::ArtifactFetch).to_string();
+            map_signing_error(api_err(128_301, 404), "download", SignOp::AuditFetch).to_string();
         assert!(m.contains("not ready yet"), "got: {m}");
         // But on a General op, 128301 is not reframed (it is not the artifact
         // surface), and falls through to the operation label.
@@ -1234,24 +1332,22 @@ mod tests {
 
     #[test]
     fn map_artifact_fetch_9992_404_is_removed_route_not_poll() {
-        // A router-level 9992 (also HTTP 404) on an ArtifactFetch must NOT be
+        // A router-level 9992 (also HTTP 404) on an artifact fetch must NOT be
         // reframed as "not ready — poll and retry" (an agent would poll a dead
         // route forever); it must surface the removed/renamed-route framing.
-        let m = map_signing_error(
-            api_err(9992, 404),
-            "download signed document",
-            SignOp::ArtifactFetch,
-        )
-        .to_string();
-        assert!(
-            !m.contains("not ready"),
-            "9992 on ArtifactFetch must not say not-ready/poll: {m}"
-        );
-        assert!(m.contains("9992"), "got: {m}");
-        assert!(
-            m.to_lowercase().contains("route") && m.to_lowercase().contains("recognize"),
-            "9992 on ArtifactFetch must flag an unrecognized/removed route: {m}"
-        );
+        for op in [SignOp::SignedFetch, SignOp::AuditFetch] {
+            let m =
+                map_signing_error(api_err(9992, 404), "download signed document", op).to_string();
+            assert!(
+                !m.contains("not ready"),
+                "9992 on {op:?} must not say not-ready/poll: {m}"
+            );
+            assert!(m.contains("9992"), "got ({op:?}): {m}");
+            assert!(
+                m.to_lowercase().contains("route") && m.to_lowercase().contains("recognize"),
+                "9992 on {op:?} must flag an unrecognized/removed route: {m}"
+            );
+        }
     }
 
     #[test]
@@ -1407,14 +1503,11 @@ mod tests {
         );
         assert_eq!(
             download_ctx("signed document"),
-            ("failed to download signed document", SignOp::ArtifactFetch)
+            ("failed to download signed document", SignOp::SignedFetch)
         );
         assert_eq!(
             download_ctx("audit certificate"),
-            (
-                "failed to download audit certificate",
-                SignOp::ArtifactFetch
-            )
+            ("failed to download audit certificate", SignOp::AuditFetch)
         );
     }
 

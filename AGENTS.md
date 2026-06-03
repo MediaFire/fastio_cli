@@ -249,8 +249,9 @@ Envelope transitions are observable via `fastio event list --workspace WS_ID
 viewed / recipient_signed / completed / voided / …; `--event` filters by event
 name) and a workflow `wait_for_signing` step parks on an envelope until it
 reaches a terminal state. The CLI itself has no realtime watch; agents poll
-`fastio sign envelope get --workspace WS_ID ENVELOPE_ID` for artifact readiness
-(the signed PDF and audit certificate 404 until the envelope completes).
+`fastio sign envelope get --workspace WS_ID ENVELOPE_ID` for artifact readiness:
+the signed PDF 404s until the envelope **completes**, and the audit certificate
+404s until the envelope reaches **any terminal state** (completed or voided).
 
 ### Over MCP
 

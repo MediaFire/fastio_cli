@@ -21,7 +21,7 @@ Both modes share a common API layer, ensuring zero code duplication.
 +----------------+   +------------------+     +------------------+
 |  cli.rs        |   |  commands/       |     |  mcp/            |
 |  Clap derive   |   |  30 command      |     |  MCP server      |
-|  definitions   |   |  modules         |     |  22 tools        |
+|  definitions   |   |  modules         |     |  27 tools        |
 +----------------+   +------------------+     +------------------+
                           |         |               |
                     +-----+         +--------+      |
@@ -185,7 +185,7 @@ Each module handles one command group, orchestrating API calls and output render
 - Tracing disabled to keep stdout clean for JSON-RPC
 
 #### `tools.rs`
-- 22 action-routed tools with 286 total actions
+- 27 action-routed tools (each multiplexes many actions via its `action` parameter)
 - Each tool has an `action` parameter for routing (mirrors the remote MCP server pattern)
 - All handlers call existing `src/api/` functions — zero duplicated API logic
 - Returns MCP text content blocks with markdown-formatted data,
@@ -307,7 +307,7 @@ The `ApiClient::handle_response()` method:
 
 1. **Direct REST API** — calls `api.fast.io` directly, not through the MCP server, for single-hop latency
 2. **Shared API layer** — both CLI and MCP modes use `src/api/`, ensuring feature parity
-3. **Action-based MCP tools** — mirrors the remote MCP server's consolidated tool pattern (22 tools with action routing vs 286 individual tools)
+3. **Action-based MCP tools** — mirrors the remote MCP server's consolidated tool pattern (27 action-routed tools rather than one tool per individual action)
 4. **Form-encoded POST bodies** — matches the Fast.io API convention (not JSON, unless specifically required)
 5. **Cursor-based pagination** — for storage endpoints; offset-based for other list endpoints
 6. **CSPRNG for PKCE** — `getrandom` crate, not `HashMap::RandomState`

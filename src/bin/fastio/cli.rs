@@ -1433,7 +1433,7 @@ pub enum SignDocumentCommands {
         #[arg(long, short)]
         output: String,
     },
-    /// Download a document's SIGNED PDF (not ready until the document completes).
+    /// Download a document's SIGNED PDF (not ready until the envelope completes).
     #[command(name = "signed-download")]
     SignedDownload {
         /// Workspace ID.

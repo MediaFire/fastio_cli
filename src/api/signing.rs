@@ -1071,7 +1071,7 @@ pub fn document_preview_path(
 ///
 /// `GET /workspace/{id}/sign_envelopes/{env}/documents/{doc}/signed/download/`.
 /// Returns HTTP 404 (live code `146422`, historically `1609`) until the
-/// document completes (`signing.txt:520`); `403` until the envelope is fully
+/// envelope completes (`signing.txt:520`); `403` until the envelope is fully
 /// completed.
 pub fn signed_document_download_path(
     workspace_id: &str,

@@ -491,7 +491,6 @@ impl ApiClient {
     }
 
     /// Perform a GET request with query parameters.
-    #[allow(dead_code)]
     pub async fn get_with_params<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -1491,14 +1490,26 @@ impl ApiClient {
             // (`"code": "400"` / `"405"`) while richer handler errors are
             // numeric. Accept either: a JSON number OR a string that parses as a
             // u64. An unparseable string falls back to 0 (the HTTP status still
-            // drives the suggestion) — never a panic.
-            let code = err
-                .get("code")
-                .and_then(|c| {
-                    c.as_u64()
-                        .or_else(|| c.as_str().and_then(|s| s.parse::<u64>().ok()))
-                })
-                .unwrap_or(0);
+            // drives the suggestion) — never a panic. Server codes may exceed
+            // u32; emit a trace warning when narrowing collapses a non-zero code
+            // to 0 so support can correlate to the raw body if needed (parity
+            // with the `error_id` branch below).
+            let raw_code = err.get("code").and_then(|c| {
+                c.as_u64()
+                    .or_else(|| c.as_str().and_then(|s| s.parse::<u64>().ok()))
+            });
+            let code = raw_code
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or_else(|| {
+                    if let Some(n) = raw_code {
+                        tracing::warn!(
+                            error_code = n,
+                            http_status,
+                            "API error code exceeds u32; truncating ApiError.code to 0"
+                        );
+                    }
+                    0
+                });
             let message = err
                 .get("text")
                 .or_else(|| err.get("message"))
@@ -1510,7 +1521,7 @@ impl ApiClient {
                 .and_then(Value::as_str)
                 .map(String::from);
             return ApiError {
-                code: u32::try_from(code).unwrap_or(0),
+                code,
                 error_code,
                 message,
                 http_status,
