@@ -218,30 +218,48 @@ realtime-token mint — are **CLI-binary-only** and are NOT routable over MCP.
 ## E-signature
 
 `fastio sign` drafts, sends, voids, and downloads `SignEnvelopes` (PDFs sent to
-recipients for electronic signature). Envelopes are parented to a workspace OR
-an org. Signing is a paid-plan feature.
+recipients for electronic signature). **Every envelope is parented to a
+workspace** — the former org-parented surface was removed (old org routes 404).
+Signing is a paid-plan feature, and access also requires workspace membership.
 
-Every `sign` subcommand requires the `--parent-type` / `--parent-id` pair that
-selects the owner (`workspace` or `org`). Destructive / outward-facing verbs
-(`send`, `void`, `delete`) prompt interactively; pass `--yes` to run them
-non-interactively.
+Every `sign` subcommand takes a required `--workspace WS_ID`. Outward-facing /
+terminal verbs (`send`, `void`) prompt interactively; pass `--yes` to run them
+non-interactively. There is no `delete` — envelopes are **voided**, not deleted.
 
 ```bash
-fastio sign envelope create --parent-type workspace --parent-id WS_ID ...
-fastio sign envelope send   --parent-type workspace --parent-id WS_ID ENVELOPE_ID --yes
-fastio sign envelope void   --parent-type workspace --parent-id WS_ID ENVELOPE_ID --reason "..." --yes
-fastio sign envelope delete --parent-type workspace --parent-id WS_ID ENVELOPE_ID --yes
-fastio sign document download --parent-type workspace --parent-id WS_ID ENVELOPE_ID DOCUMENT_ID -o ./doc.pdf
-fastio sign audit download    --parent-type workspace --parent-id WS_ID ENVELOPE_ID -o ./audit.json
+fastio sign envelope create --workspace WS_ID --source-node-id NODE_ID --recipient-email signer@example.com
+fastio sign envelope list   --workspace WS_ID --status draft,sent --created-after "2026-06-01 00:00:00 UTC"
+fastio sign envelope send   --workspace WS_ID ENVELOPE_ID --yes
+fastio sign envelope void   --workspace WS_ID ENVELOPE_ID --reason "..." --yes
+fastio sign document download --workspace WS_ID ENVELOPE_ID DOCUMENT_ID -o ./doc.pdf
+fastio sign document preview  --workspace WS_ID ENVELOPE_ID DOCUMENT_ID -o ./preview.pdf
+fastio sign audit download    --workspace WS_ID ENVELOPE_ID -o ./audit.json
 ```
+
+`envelope list` filters: `--status` (a single lifecycle status or a CSV of
+`draft,sent,in_progress,completed,declined,expired,voided,failed`),
+`--created-after` / `--created-before` (`Y-m-d H:i:s UTC`), `--limit`,
+`--offset`. An `envelope update` is a full recipient replacement —
+`--recipients-json` (≥1) is required.
+
+### Realtime / progress
+
+Envelope transitions are observable via `fastio event list --workspace WS_ID
+--event sign_envelope_completed` (event types `sign_envelope_*`: drafted / sent /
+viewed / recipient_signed / completed / voided / …; `--event` filters by event
+name) and a workflow `wait_for_signing` step parks on an envelope until it
+reaches a terminal state. The CLI itself has no realtime watch; agents poll
+`fastio sign envelope get --workspace WS_ID ENVELOPE_ID` for artifact readiness
+(the signed PDF and audit certificate 404 until the envelope completes).
 
 ### Over MCP
 
 The `sign` MCP tool exposes **read + reversible-draft-drive** actions only
 (envelope-create/update/list/get, document/signed/audit download). The
-outward-facing / destructive / terminal actions — **`send`** (emails real
-recipients), **`void`**, and **`delete`** — are **CLI-binary-only** and are NOT
-routable over MCP.
+outward-facing / terminal actions — **`send`** (emails real recipients) and
+**`void`** — are **CLI-binary-only** and are NOT routable over MCP. There is no
+delete (envelopes are voided). `document-download` covers preview needs — its
+bytes are the source/preview PDF, so there is no separate MCP preview action.
 
 ## Billing
 

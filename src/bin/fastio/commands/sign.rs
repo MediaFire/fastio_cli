@@ -1,24 +1,29 @@
 //! E-signature (`fastio sign`) command handlers.
 //!
-//! Owner/admin surface over [`fastio_cli::api::signing`]. These handlers
-//! enforce the binding signing disciplines:
+//! Owner/admin surface over [`fastio_cli::api::signing`]. Every command is
+//! workspace-scoped (a required `--workspace <id>`); the former org surface was
+//! removed. These handlers enforce the binding signing disciplines:
 //!
-//! - **Destructive confirmation.** `delete` and `void` are destructive, and
-//!   `send` emails REAL recipients — all three require `--yes` (or an
-//!   interactive y/N confirmation on a TTY) before proceeding.
+//! - **Destructive confirmation.** `void` is terminal, and `send` emails REAL
+//!   recipients — both require `--yes` (or an interactive y/N confirmation on a
+//!   TTY) before proceeding. (There is no `delete`: envelopes are voided, not
+//!   deleted.)
 //! - **`@file` JSON.** The ergonomic `--*-json` / `--body-json` arguments accept
 //!   `@path` to read JSON from a file and are validated as well-formed JSON
 //!   client-side before any state-changing call.
-//! - **Binary downloads stream to disk.** Document source/signed PDFs and the
-//!   audit certificate are streamed via
+//! - **Binary downloads stream to disk.** Document source/preview/signed PDFs
+//!   and the audit certificate are streamed via
 //!   [`fastio_cli::client::ApiClient::download_file_stream`] (direct-Bearer,
 //!   atomic temp write) — a signing node id is NEVER routed through
 //!   `/storage/{node}/read/` (`signing.txt:155`).
-//! - **Error mapping.** A `404`/`1609` is surfaced as "not ready yet" ONLY on a
-//!   signed/audit artifact fetch (a source-download / CRUD `404` is a genuine
-//!   not-found); a `1685` is "insufficient signing credits"; a `void` on a
-//!   terminal envelope (`1660`) is surfaced clearly; everything else (including
-//!   `1670` restricted) defers to the shared `CliError::suggestion()` hints.
+//! - **Error mapping.** Signing-specific wording lives HERE in
+//!   [`map_signing_error`] (never in the global `error.rs` hints). A
+//!   `404`/`1609`/`128301`/`146422` is surfaced as "not ready yet" ONLY on a
+//!   signed/audit artifact fetch (a source/preview-download or CRUD `404` is a
+//!   genuine not-found); `10545`/`115069` are workspace/envelope access denials;
+//!   `1680` is an insufficient-permission denial; `1670` is a plan restriction;
+//!   `9992` flags a removed/renamed route; `1685` is "insufficient signing
+//!   credits"; a `void` on a terminal envelope (`1660`) is surfaced clearly.
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
@@ -89,12 +94,32 @@ fn resolve_opt_json_object(raw: Option<&str>, label: &str) -> Result<Option<Valu
 
 // ─── Spec parsing (JSON array → typed builders) ─────────────────────────────
 
+/// Ensure a JSON array element is an OBJECT, naming the array and index on
+/// failure.
+///
+/// Each spec parser reads its fields via [`Value::get`], which returns `None`
+/// for a non-object (scalar / null / array) — so a malformed element like `[1]`
+/// or `[null]` would otherwise yield an all-`None` (EMPTY) spec that silently
+/// passes the recipients-required guard and ships garbage. Rejecting the
+/// non-object up front turns that into a clear client-side error (e.g.
+/// `recipients[0] must be a JSON object`). Field-level requirements are left to
+/// the server.
+fn ensure_object<'a>(v: &'a Value, label: &str, index: usize) -> Result<&'a Value> {
+    if v.is_object() {
+        Ok(v)
+    } else {
+        anyhow::bail!("{label}[{index}] must be a JSON object")
+    }
+}
+
 /// Parse a documents JSON array into [`DocumentSpec`] builders, matching the
 /// `signing.txt:298-304` / `:349-352` object shape.
 fn parse_documents(items: Vec<Value>) -> Result<Vec<DocumentSpec>> {
     items
         .into_iter()
-        .map(|v| {
+        .enumerate()
+        .map(|(i, v)| {
+            ensure_object(&v, "documents", i)?;
             Ok(DocumentSpec::new()
                 .id(str_field(&v, "id")?)
                 .source_node_id(str_field(&v, "source_node_id")?)
@@ -108,7 +133,9 @@ fn parse_documents(items: Vec<Value>) -> Result<Vec<DocumentSpec>> {
 fn parse_recipients(items: Vec<Value>) -> Result<Vec<RecipientSpec>> {
     items
         .into_iter()
-        .map(|v| {
+        .enumerate()
+        .map(|(i, v)| {
+            ensure_object(&v, "recipients", i)?;
             Ok(RecipientSpec::new()
                 .email(str_field(&v, "email")?)
                 .display_name(str_field(&v, "display_name")?)
@@ -126,7 +153,9 @@ fn parse_recipients(items: Vec<Value>) -> Result<Vec<RecipientSpec>> {
 fn parse_fields(items: Vec<Value>) -> Result<Vec<signing::FieldSpec>> {
     items
         .into_iter()
-        .map(|v| {
+        .enumerate()
+        .map(|(i, v)| {
+            ensure_object(&v, "fields", i)?;
             // `value_json` is a JSON STRING; re-serialize a non-string value so
             // an object literal in the input is preserved as a string.
             let value_json = v.get("value_json").and_then(|vj| match vj {
@@ -214,8 +243,8 @@ fn bool_field(v: &Value, key: &str) -> Result<Option<bool>> {
 ///
 /// `--yes` proceeds unconditionally. Without it, an interactive TTY is prompted
 /// y/N; a non-interactive caller that omitted `--yes` is blocked
-/// deterministically (so an unattended script never silently sends, voids, or
-/// deletes). Mirrors the metadata/workflow `confirm_spend` shape.
+/// deterministically (so an unattended script never silently sends or voids).
+/// Mirrors the metadata/workflow `confirm_spend` shape.
 fn confirm_destructive(action: &str, detail: &str, yes: bool) -> Result<()> {
     if yes {
         return Ok(());
@@ -245,77 +274,146 @@ fn confirm_destructive(action: &str, detail: &str, yes: bool) -> Result<()> {
 /// certificate) from every other signing call.
 ///
 /// Only these two artifacts are generated asynchronously and return
-/// `404`/`1609` ("not ready yet") until the envelope reaches the required
-/// (terminal) stage (`signing.txt:520`, `:531`). For CRUD / list / get /
-/// update / delete / send AND the SOURCE-document download, a `404`/`1609`
-/// instead means a genuine not-found (typo'd id / wrong parent,
+/// `404`/`1609`/`128301`/`146422` ("not ready yet") until the envelope reaches
+/// the required (terminal) stage (`signing.txt:520`, `:531`; live signed-PDF
+/// not-ready is code `146422`, live audit-not-ready is code `128301`). For CRUD
+/// / list / get / update / send AND the source / preview document downloads, a
+/// `404`/`1609` instead means a genuine not-found (typo'd id / wrong workspace,
 /// `signing.txt:591`), so the "poll and retry" framing would be misleading —
 /// those callers fall through to the shared generic not-found handling.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SignOp {
-    /// A CRUD / list / get / update / delete / send call, or a source-document
+    /// A CRUD / list / get / update / send call, or a source/preview document
     /// download — a `404`/`1609` is a genuine not-found here.
     General,
-    /// A signed-PDF or audit-certificate fetch — a `404`/`1609` means the
-    /// artifact is not ready yet, not that the row is missing.
+    /// A signed-PDF or audit-certificate fetch — a `404`/`1609`/`128301`/`146422`
+    /// means the artifact is not ready yet, not that the row is missing.
     ArtifactFetch,
 }
 
 /// Map a signing API error to an actionable, signing-specific message.
 ///
-/// This layer adds ONLY the signing *context* that is genuinely correct for the
-/// operation; everything else defers to the shared `CliError::suggestion()`
-/// hints (`error.rs`):
+/// All signing-specific wording lives HERE (and in the MCP `sign_err_to_result`
+/// mirror) — never in the global `error.rs` hints, which stay resource-agnostic
+/// (guard test `error.rs`: `HINT_RESTRICTED` etc. contain no "sign"). This layer
+/// keys on the actual `error.code`, NOT a bare HTTP status, so an unrelated
+/// error with the same status is not mislabeled:
 ///
-/// - `404`/`1609` is reframed as "not ready yet — poll and retry" ONLY for an
-///   [`SignOp::ArtifactFetch`] (signed-download / audit-download). For
-///   [`SignOp::General`] (CRUD / list / get / update / delete / send and the
-///   source-document download) it is left to the shared generic not-found
-///   handling — saying "not ready" there would be wrong (`signing.txt:591`).
-/// - `1660` (terminal-state conflict) and `1685` (insufficient credits) are
-///   keyed on the actual `error.code`, NOT on a bare `409`/`412` HTTP status,
-///   so an unrelated conflict / precondition isn't mislabeled.
-/// - For every unmatched code (and every non-signing error) ONLY the operation
-///   label is attached as anyhow context. The render layer (`cli_error_render`
-///   in `main.rs`) walks the chain and appends the shared `CliError::suggestion()`
-///   (which already covers `1670` → restricted and `1685` → feature-limit) on
-///   its own `hint:` line, so the hint reaches the user exactly once — this layer
-///   no longer re-derives or doubles it.
+/// - An error matching `http_status == 404 || code == 1609 || code == 128301`
+///   AND `code != 9992` (the OR-predicate the code evaluates; the live not-ready
+///   codes are `1609`/`128301`/`146422`, all served as HTTP 404) is reframed as
+///   "not ready yet — poll and retry" ONLY for an [`SignOp::ArtifactFetch`]
+///   (signed-download / audit-download); it is re-keyed onto
+///   [`CliError::ArtifactNotReady`] so the rendered `hint:` is the
+///   poll-and-retry guidance, not the generic-404 "verify the id" (the ids are
+///   fine). The router-level `9992` ("no such route", also HTTP 404) is the one
+///   exclusion, so it falls through to the removed/renamed-route framing instead
+///   of "poll a dead route forever". For [`SignOp::General`] the error is left
+///   to the shared generic not-found handling.
+/// - `10545` (401) → not a member of this workspace. Overrides the generic 401
+///   "run fastio auth login" suggestion (the failure is authorization, not a
+///   missing login).
+/// - `115069` (401) → no access to this specific envelope.
+/// - `1680` (403) → workspace permission insufficient for this action (kept
+///   generic — the docs disagree on the exact role required).
+/// - `1670` (403) → plan does not grant signing; points at `fastio org info`
+///   → `capabilities.signing`.
+/// - `9992` (404) → the server does not recognize this path (removed/renamed
+///   route — check for a CLI update).
+/// - `1685` (insufficient credits) / `1660` (terminal-state conflict) keyed on
+///   their codes.
+/// - Every unmatched code falls through to the shared `CliError::suggestion()`
+///   the render layer (`cli_error_render` in `main.rs`) appends on its own
+///   `hint:` line — this layer attaches only the operation label there.
 fn map_signing_error(err: CliError, ctx: &'static str, op: SignOp) -> anyhow::Error {
-    if let CliError::Api(api) = &err {
-        // Async-artifact "not ready yet" — only correct for a signed/audit fetch.
-        if op == SignOp::ArtifactFetch && (api.http_status == 404 || api.code == 1609) {
-            return anyhow::Error::from(err).context(format!(
-                "{ctx}: not ready yet — the signed artifact / audit certificate is not generated \
-                 until the envelope reaches the required (terminal) stage. Poll the envelope \
-                 (`fastio sign envelope get`) and retry once it completes."
-            ));
-        }
-        // Code-specific framings (keyed on error.code, not bare HTTP status).
-        match api.code {
-            // Insufficient signing credits on /send.
-            1685 => {
-                return anyhow::Error::from(err).context(format!(
-                    "{ctx}: insufficient signing credits to send this envelope (1685). \
-                     Check your plan's signing credit balance (`fastio org billing plans`)."
-                ));
-            }
-            // Void / transition not allowed from a terminal state.
-            1660 => {
-                return anyhow::Error::from(err).context(format!(
-                    "{ctx}: the envelope is already terminal (completed / declined / voided / \
-                     expired) and cannot be changed (1660)."
-                ));
-            }
-            _ => {}
-        }
+    // Take ownership of the inner `ApiError` up front. A non-`Api` `CliError`
+    // (auth / io / parse …) has no signing-specific framing — attach only the
+    // operation label and return. Matching by value (rather than the old
+    // `if let … = &err` + a second `let-else` to move `api` out) means there is
+    // no `unreachable!()` in this production path: the shape is proven by the
+    // arm we are inside, not re-asserted with a panic-capable macro.
+    let api = match err {
+        CliError::Api(api) => api,
+        other => return anyhow::Error::from(other).context(ctx),
+    };
+
+    // Async-artifact "not ready yet" — only correct for a signed/audit fetch.
+    // Code 9992 is a router-level "no such route" that also surfaces as HTTP
+    // 404; it must be EXCLUDED here so the code-specific match below frames it
+    // as a removed/renamed route instead of "poll and retry" (otherwise an
+    // agent would poll a dead route forever).
+    let is_artifact_not_ready = op == SignOp::ArtifactFetch
+        && api.code != 9992
+        && (api.http_status == 404 || api.code == 1609 || api.code == 128_301);
+    if is_artifact_not_ready {
+        // Re-key onto the dedicated `ArtifactNotReady` variant rather than
+        // wrapping `CliError::Api` so (a) the rendered `hint:` line is the
+        // poll-and-retry guidance, NOT the misleading generic-404 "Verify
+        // the ID or path is correct." (the ids are fine — the artifact just
+        // is not generated yet), and (b) the variant WRAPS the `ApiError`
+        // by value in a plain field (no `#[source]`), so its `Display` is
+        // the FULL server error (status / code / `see:` / `resource:`)
+        // rendered exactly ONCE — no duplicate source link, no doubling.
+        // The signing-specific phrasing stays in this `.context(...)`. The
+        // `ApiError` is MOVED into the variant, so nothing clones.
+        return anyhow::Error::from(CliError::ArtifactNotReady { api }).context(format!(
+            "{ctx}: not ready yet — the signed artifact / audit certificate is not generated \
+             until the envelope reaches the required (terminal) stage. Poll the envelope \
+             (`fastio sign envelope get --workspace <workspace-id> <envelope-id>`) and retry \
+             once it completes."
+        ));
     }
-    // Everything else: attach ONLY the operation label as context. The render
-    // layer (`cli_error_render` in `main.rs`) walks the anyhow chain AND appends
-    // the `CliError`'s own `suggestion()` on its own `hint:` line, so an
-    // unmatched code (e.g. 1670 → restricted, 1685 fallbacks) still surfaces its
-    // shared hint to the user without this layer re-deriving or doubling it.
-    anyhow::Error::from(err).context(ctx)
+
+    // Code-specific signing framings (keyed on error.code, not bare status).
+    // Each matched arm moves `api` back into `CliError::Api(api)` before
+    // attaching its context (the `_` arm falls through to the shared label).
+    let note = match api.code {
+        // Not a member of the workspace. MUST override the generic 401
+        // "run fastio auth login" suggestion — the caller IS authenticated.
+        10545 => Some(format!(
+            "{ctx}: you are not a member of this workspace (10545). Signing requires \
+             workspace membership — ask a workspace admin to add you, or check `--workspace`."
+        )),
+        // No access to this specific envelope.
+        115_069 => Some(format!(
+            "{ctx}: you do not have access to this envelope (115069). Confirm the \
+             envelope id and that you have permission on its workspace."
+        )),
+        // Insufficient workspace permission for this action. Kept generic —
+        // the docs disagree on the exact role required, so do not overclaim.
+        1680 => Some(format!(
+            "{ctx}: your workspace permission is insufficient for this signing action \
+             (1680). A higher workspace role may be required."
+        )),
+        // Org plan does not grant signing.
+        1670 => Some(format!(
+            "{ctx}: signing is not enabled for this workspace's organization (1670). \
+             Check the org's plan capability: `fastio org info <org-id>` → `capabilities.signing`."
+        )),
+        // Removed / renamed route (router-level "no such route").
+        9992 => Some(format!(
+            "{ctx}: the server does not recognize this API path (9992) — the route may \
+             have been removed or renamed. Check for a `fastio` CLI update."
+        )),
+        // Insufficient signing credits on /send.
+        1685 => Some(format!(
+            "{ctx}: insufficient signing credits to send this envelope (1685). \
+             Check your plan's signing credit balance (`fastio org billing plans`)."
+        )),
+        // Void / transition not allowed from a terminal state.
+        1660 => Some(format!(
+            "{ctx}: the envelope is already terminal (completed / declined / voided / \
+             expired) and cannot be changed (1660)."
+        )),
+        _ => None,
+    };
+    match note {
+        Some(note) => anyhow::Error::from(CliError::Api(api)).context(note),
+        // Everything else: attach ONLY the operation label as context. The
+        // render layer (`cli_error_render` in `main.rs`) walks the anyhow chain
+        // AND appends the `CliError`'s own `suggestion()` on its own `hint:` line.
+        None => anyhow::Error::from(CliError::Api(api)).context(ctx),
+    }
 }
 
 // ─── Dispatch ─────────────────────────────────────────────────────────────────
@@ -335,8 +433,7 @@ pub async fn execute(command: SignCommands, ctx: &CommandContext<'_>) -> Result<
 async fn execute_envelope(command: SignEnvelopeCommands, ctx: &CommandContext<'_>) -> Result<()> {
     match command {
         SignEnvelopeCommands::Create {
-            parent_type,
-            parent_id,
+            workspace,
             name,
             expires_at,
             body_json,
@@ -369,7 +466,7 @@ async fn execute_envelope(command: SignEnvelopeCommands, ctx: &CommandContext<'_
                 .validate()
                 .map_err(|e| anyhow::Error::from(e).context("invalid create request"))?;
             let client = ctx.build_client()?;
-            let v = signing::create_envelope(&client, &parent_type, &parent_id, &params)
+            let v = signing::create_envelope(&client, &workspace, &params)
                 .await
                 .map_err(|e| {
                     map_signing_error(e, "failed to create sign envelope", SignOp::General)
@@ -378,13 +475,23 @@ async fn execute_envelope(command: SignEnvelopeCommands, ctx: &CommandContext<'_
             Ok(())
         }
         SignEnvelopeCommands::List {
-            parent_type,
-            parent_id,
+            workspace,
+            status,
+            created_after,
+            created_before,
             limit,
             offset,
         } => {
+            // `--status` maps to the `envelope_status` query key; a single
+            // status or a CSV is passed through verbatim (server validates).
+            let params = signing::ListEnvelopesParams::new()
+                .envelope_status(status)
+                .created_after(created_after)
+                .created_before(created_before)
+                .limit(limit)
+                .offset(offset);
             let client = ctx.build_client()?;
-            let v = signing::list_envelopes(&client, &parent_type, &parent_id, limit, offset)
+            let v = signing::list_envelopes(&client, &workspace, &params)
                 .await
                 .map_err(|e| {
                     map_signing_error(e, "failed to list sign envelopes", SignOp::General)
@@ -393,12 +500,11 @@ async fn execute_envelope(command: SignEnvelopeCommands, ctx: &CommandContext<'_
             Ok(())
         }
         SignEnvelopeCommands::Get {
-            parent_type,
-            parent_id,
+            workspace,
             envelope_id,
         } => {
             let client = ctx.build_client()?;
-            let v = signing::get_envelope(&client, &parent_type, &parent_id, &envelope_id)
+            let v = signing::get_envelope(&client, &workspace, &envelope_id)
                 .await
                 .map_err(|e| {
                     map_signing_error(e, "failed to get sign envelope", SignOp::General)
@@ -407,8 +513,7 @@ async fn execute_envelope(command: SignEnvelopeCommands, ctx: &CommandContext<'_
             Ok(())
         }
         SignEnvelopeCommands::Update {
-            parent_type,
-            parent_id,
+            workspace,
             envelope_id,
             name,
             expires_at,
@@ -427,42 +532,32 @@ async fn execute_envelope(command: SignEnvelopeCommands, ctx: &CommandContext<'_
             )?;
             anyhow::ensure!(
                 !params.is_empty(),
-                "no fields to update were supplied (a draft-only PATCH needs at least one of \
-                 --name / --expires-at / --policy-json / --documents-json / --recipients-json / \
-                 --fields-json)"
+                "no fields to update were supplied: supply at least --recipients-json (recipients \
+                 are a full replacement); --name / --expires-at / --policy-json / --documents-json \
+                 / --fields-json are optional"
+            );
+            // An update is a FULL recipient replacement — recipients (>=1) are
+            // required (F5). Surface a clear, action-specific error before the
+            // network rather than relying on the generic validate() message.
+            anyhow::ensure!(
+                params.recipients.as_deref().is_some_and(|r| !r.is_empty()),
+                "an update is a full recipient replacement: supply --recipients-json with at \
+                 least one recipient (an update always replaces the recipient roster)"
             );
             params
                 .validate()
                 .map_err(|e| anyhow::Error::from(e).context("invalid update request"))?;
             let client = ctx.build_client()?;
-            let v =
-                signing::update_envelope(&client, &parent_type, &parent_id, &envelope_id, &params)
-                    .await
-                    .map_err(|e| {
-                        map_signing_error(e, "failed to update sign envelope", SignOp::General)
-                    })?;
-            ctx.output.render(&v)?;
-            Ok(())
-        }
-        SignEnvelopeCommands::Delete {
-            parent_type,
-            parent_id,
-            envelope_id,
-            yes,
-        } => {
-            confirm_destructive("sign envelope delete", "soft-deletes a draft envelope", yes)?;
-            let client = ctx.build_client()?;
-            let v = signing::delete_envelope(&client, &parent_type, &parent_id, &envelope_id)
+            let v = signing::update_envelope(&client, &workspace, &envelope_id, &params)
                 .await
                 .map_err(|e| {
-                    map_signing_error(e, "failed to delete sign envelope", SignOp::General)
+                    map_signing_error(e, "failed to update sign envelope", SignOp::General)
                 })?;
             ctx.output.render(&v)?;
             Ok(())
         }
         SignEnvelopeCommands::Send {
-            parent_type,
-            parent_id,
+            workspace,
             envelope_id,
             yes,
         } => {
@@ -473,7 +568,7 @@ async fn execute_envelope(command: SignEnvelopeCommands, ctx: &CommandContext<'_
                 yes,
             )?;
             let client = ctx.build_client()?;
-            let v = signing::send_envelope(&client, &parent_type, &parent_id, &envelope_id)
+            let v = signing::send_envelope(&client, &workspace, &envelope_id)
                 .await
                 .map_err(|e| {
                     map_signing_error(e, "failed to send sign envelope", SignOp::General)
@@ -482,8 +577,7 @@ async fn execute_envelope(command: SignEnvelopeCommands, ctx: &CommandContext<'_
             Ok(())
         }
         SignEnvelopeCommands::Void {
-            parent_type,
-            parent_id,
+            workspace,
             envelope_id,
             reason,
             yes,
@@ -495,16 +589,16 @@ async fn execute_envelope(command: SignEnvelopeCommands, ctx: &CommandContext<'_
                 .map_err(|e| anyhow::Error::from(e).context("invalid void request"))?;
             confirm_destructive(
                 "sign envelope void",
-                "permanently voids the envelope (credits are NOT refunded)",
+                "is IRREVERSIBLE — it permanently voids the envelope and signing credits are NOT \
+                 refunded",
                 yes,
             )?;
             let client = ctx.build_client()?;
-            let v =
-                signing::void_envelope(&client, &parent_type, &parent_id, &envelope_id, &reason)
-                    .await
-                    .map_err(|e| {
-                        map_signing_error(e, "failed to void sign envelope", SignOp::General)
-                    })?;
+            let v = signing::void_envelope(&client, &workspace, &envelope_id, &reason)
+                .await
+                .map_err(|e| {
+                    map_signing_error(e, "failed to void sign envelope", SignOp::General)
+                })?;
             ctx.output.render(&v)?;
             Ok(())
         }
@@ -622,8 +716,9 @@ fn create_params_from_body(body: &Value) -> Result<CreateEnvelopeParams> {
         .fields(fields))
 }
 
-/// Build [`UpdateEnvelopeParams`] from the update flags. A `None` documents/
-/// recipients/fields argument leaves that set unchanged.
+/// Build [`UpdateEnvelopeParams`] from the update flags. A `None` documents or
+/// fields argument leaves that set unchanged; `recipients` is a REQUIRED full
+/// replacement (validated downstream — a `None`/empty roster is rejected).
 fn build_update_params(
     name: Option<String>,
     expires_at: Option<String>,
@@ -658,35 +753,34 @@ fn build_update_params(
 async fn execute_document(command: SignDocumentCommands, ctx: &CommandContext<'_>) -> Result<()> {
     match command {
         SignDocumentCommands::Download {
-            parent_type,
-            parent_id,
+            workspace,
             envelope_id,
             document_id,
             output,
         } => {
-            let path = signing::document_download_path(
-                &parent_type,
-                &parent_id,
-                &envelope_id,
-                &document_id,
-            )
-            .map_err(|e| anyhow::Error::from(e).context("invalid download request"))?;
+            let path = signing::document_download_path(&workspace, &envelope_id, &document_id)
+                .map_err(|e| anyhow::Error::from(e).context("invalid download request"))?;
             stream_download(ctx, &path, &output, "source document").await
         }
-        SignDocumentCommands::SignedDownload {
-            parent_type,
-            parent_id,
+        SignDocumentCommands::Preview {
+            workspace,
             envelope_id,
             document_id,
             output,
         } => {
-            let path = signing::signed_document_download_path(
-                &parent_type,
-                &parent_id,
-                &envelope_id,
-                &document_id,
-            )
-            .map_err(|e| anyhow::Error::from(e).context("invalid download request"))?;
+            let path = signing::document_preview_path(&workspace, &envelope_id, &document_id)
+                .map_err(|e| anyhow::Error::from(e).context("invalid download request"))?;
+            stream_download(ctx, &path, &output, "document preview").await
+        }
+        SignDocumentCommands::SignedDownload {
+            workspace,
+            envelope_id,
+            document_id,
+            output,
+        } => {
+            let path =
+                signing::signed_document_download_path(&workspace, &envelope_id, &document_id)
+                    .map_err(|e| anyhow::Error::from(e).context("invalid download request"))?;
             stream_download(ctx, &path, &output, "signed document").await
         }
     }
@@ -697,12 +791,11 @@ async fn execute_document(command: SignDocumentCommands, ctx: &CommandContext<'_
 async fn execute_audit(command: SignAuditCommands, ctx: &CommandContext<'_>) -> Result<()> {
     match command {
         SignAuditCommands::Download {
-            parent_type,
-            parent_id,
+            workspace,
             envelope_id,
             output,
         } => {
-            let path = signing::audit_download_path(&parent_type, &parent_id, &envelope_id)
+            let path = signing::audit_download_path(&workspace, &envelope_id)
                 .map_err(|e| anyhow::Error::from(e).context("invalid download request"))?;
             stream_download(ctx, &path, &output, "audit certificate").await
         }
@@ -711,10 +804,11 @@ async fn execute_audit(command: SignAuditCommands, ctx: &CommandContext<'_>) -> 
 
 /// Stream a signing binary/JSON artifact to `output` via the Phase-0 streaming
 /// helper, mapping the error through [`map_signing_error`] with the per-artifact
-/// [`SignOp`] (see [`download_ctx`]) so a `404`/`1609` is only reframed as "not
-/// ready yet" for the async signed/audit artifacts. NEVER buffers (signed PDFs
-/// and audit certs can be large) and NEVER routes a signing node id through
-/// `/storage/{node}/read/` (`signing.txt:155`).
+/// [`SignOp`] (see [`download_ctx`]) so a `404` (live not-ready codes
+/// `1609`/`128301`/`146422`) is only reframed as "not ready yet" for the async
+/// signed/audit artifacts. NEVER buffers (signed PDFs and audit certs can be
+/// large) and NEVER routes a signing node id through `/storage/{node}/read/`
+/// (`signing.txt:155`).
 async fn stream_download(
     ctx: &CommandContext<'_>,
     api_path: &str,
@@ -739,17 +833,21 @@ async fn stream_download(
 ///
 /// [`map_signing_error`] takes a `&'static str` context, so the per-artifact
 /// label is mapped to a fixed string rather than a formatted (non-`'static`)
-/// one. The discriminator decides whether a `404`/`1609` is reframed as "not
-/// ready yet": only the SIGNED PDF and the AUDIT certificate are generated
-/// asynchronously ([`SignOp::ArtifactFetch`]). A SOURCE-document download is a
-/// plain fetch ([`SignOp::General`]) — a `404` there is a genuine not-found
-/// (typo'd id / wrong parent, `signing.txt:591`), not "not ready".
+/// one. The discriminator decides whether a `404` (live not-ready codes
+/// `1609`/`128301`/`146422`) is reframed as "not ready yet": only the SIGNED PDF
+/// and the AUDIT certificate are generated asynchronously
+/// ([`SignOp::ArtifactFetch`]). A SOURCE-document download is a plain fetch
+/// ([`SignOp::General`]) — a `404` there is a genuine not-found (typo'd id /
+/// wrong workspace/envelope/document id, `signing.txt:591`), not "not ready".
 ///
 /// (Despite the historical name, this never `Box::leak`s — it returns a string
 /// literal, which is already `'static`.)
 fn download_ctx(what: &str) -> (&'static str, SignOp) {
     match what {
         "source document" => ("failed to download source document", SignOp::General),
+        // The preview returns the SAME source bytes as the download — a plain
+        // fetch, so a 404 is a genuine not-found, not "not ready" (F25).
+        "document preview" => ("failed to preview document", SignOp::General),
         "signed document" => ("failed to download signed document", SignOp::ArtifactFetch),
         "audit certificate" => (
             "failed to download audit certificate",
@@ -903,7 +1001,8 @@ mod tests {
     #[test]
     fn build_update_empty_recipients_rejected_by_validate() {
         // `--recipients-json []` builds a Some(empty) recipient replace; the
-        // validate() guard must reject it before any PATCH (signing.txt:358).
+        // validate() guard must reject it before any update is sent
+        // (signing.txt:358).
         let p = build_update_params(None, None, None, None, Some("[]"), None).unwrap();
         assert!(
             p.recipients.as_deref().is_some_and(<[_]>::is_empty),
@@ -952,6 +1051,39 @@ mod tests {
     fn parse_documents_rejects_non_numeric_display_order() {
         let items = vec![json!({"source_node_id": "n1", "display_order": "two"})];
         assert!(parse_documents(items).is_err());
+    }
+
+    /// A non-object array element (`[1]`, `[null]`, `["x"]`, `[{},1]`) must be
+    /// rejected by each parser, naming the array + index — never accepted as an
+    /// EMPTY spec that would silently pass the recipients-required guard and ship
+    /// garbage to the server (MEDIUM A).
+    #[test]
+    fn parsers_reject_non_object_array_elements() {
+        for bad in [json!(1), json!(null), json!("x"), json!([1, 2])] {
+            let err = parse_recipients(vec![bad.clone()]).unwrap_err().to_string();
+            assert!(
+                err.contains("recipients[0] must be a JSON object"),
+                "recipients should reject {bad}: {err}"
+            );
+            let err = parse_documents(vec![bad.clone()]).unwrap_err().to_string();
+            assert!(
+                err.contains("documents[0] must be a JSON object"),
+                "documents should reject {bad}: {err}"
+            );
+            let err = parse_fields(vec![bad.clone()]).unwrap_err().to_string();
+            assert!(
+                err.contains("fields[0] must be a JSON object"),
+                "fields should reject {bad}: {err}"
+            );
+        }
+        // A valid first element followed by a malformed one is rejected at the
+        // offending index, not silently truncated.
+        let mixed = vec![json!({"email": "a@b.com"}), json!(1)];
+        let err = parse_recipients(mixed).unwrap_err().to_string();
+        assert!(
+            err.contains("recipients[1] must be a JSON object"),
+            "mixed array should name index 1: {err}"
+        );
     }
 
     #[test]
@@ -1019,8 +1151,40 @@ mod tests {
     }
 
     #[test]
+    fn map_artifact_fetch_not_ready_uses_artifact_variant_and_poll_hint() {
+        // LV-1/LV-2: a not-ready artifact fetch must re-key onto
+        // `CliError::ArtifactNotReady` (no `ApiError` source link → no doubled
+        // block) whose rendered hint is the poll-and-retry guidance, NOT the
+        // generic-404 "Verify the ID or path is correct.". Covers the live
+        // signed-PDF code 146422 as well as 404/1609/128301.
+        for code in [0_u32, 1609, 128_301, 146_422] {
+            let mapped = map_signing_error(
+                api_err(code, 404),
+                "failed to download signed document",
+                SignOp::ArtifactFetch,
+            );
+            let cli = mapped
+                .downcast_ref::<CliError>()
+                .expect("not-ready error must remain a CliError so main's pretty path fires");
+            assert!(
+                matches!(cli, CliError::ArtifactNotReady { .. }),
+                "not-ready must re-key onto ArtifactNotReady (code {code})"
+            );
+            let hint = cli.suggestion().unwrap_or_default();
+            assert!(
+                !hint.contains("Verify the ID or path is correct"),
+                "not-ready hint must not be the generic-404 hint (code {code}): {hint}"
+            );
+            assert!(
+                hint.to_lowercase().contains("poll"),
+                "not-ready hint must steer to poll-and-retry (code {code}): {hint}"
+            );
+        }
+    }
+
+    #[test]
     fn map_general_404_does_not_say_not_ready() {
-        // A 404 on get/list/delete/source-download is a genuine not-found, so it
+        // A 404 on get/list/source-download is a genuine not-found, so it
         // must NOT be reframed as "not ready" (signing.txt:591). It defers to
         // the shared 404 suggestion (surfaced by the render layer) instead.
         let mapped = map_signing_error(api_err(0, 404), "failed to get", SignOp::General);
@@ -1052,25 +1216,134 @@ mod tests {
     }
 
     #[test]
-    fn map_restricted_1670_defers_hint_to_render_layer() {
-        // 1670 has no signing-specific framing, so map_signing_error attaches
-        // ONLY the operation label as context — it must NOT fold the hint into
-        // the chain (the render layer in main.rs emits it on a `hint:` line).
-        let mapped = map_signing_error(api_err(1670, 403), "create", SignOp::General);
-        let m = mapped.to_string();
+    fn map_artifact_fetch_128301_says_not_ready() {
+        // Live audit-not-ready code (P3): 128301 on an ArtifactFetch must read
+        // "not ready yet", same as 404/1609.
+        let m =
+            map_signing_error(api_err(128_301, 404), "download", SignOp::ArtifactFetch).to_string();
+        assert!(m.contains("not ready yet"), "got: {m}");
+        // But on a General op, 128301 is not reframed (it is not the artifact
+        // surface), and falls through to the operation label.
+        let m =
+            map_signing_error(api_err(128_301, 404), "failed to get", SignOp::General).to_string();
         assert!(
-            !m.contains(fastio_cli::error::HINT_RESTRICTED),
-            "1670 hint must NOT be folded into the chain (render layer owns it): {m}"
+            !m.contains("not ready"),
+            "general 128301 must not say ready: {m}"
         );
-        // The error still downcasts to the original CliError, whose own
-        // suggestion() is the shared restricted hint the render layer will print.
+    }
+
+    #[test]
+    fn map_artifact_fetch_9992_404_is_removed_route_not_poll() {
+        // A router-level 9992 (also HTTP 404) on an ArtifactFetch must NOT be
+        // reframed as "not ready — poll and retry" (an agent would poll a dead
+        // route forever); it must surface the removed/renamed-route framing.
+        let m = map_signing_error(
+            api_err(9992, 404),
+            "download signed document",
+            SignOp::ArtifactFetch,
+        )
+        .to_string();
+        assert!(
+            !m.contains("not ready"),
+            "9992 on ArtifactFetch must not say not-ready/poll: {m}"
+        );
+        assert!(m.contains("9992"), "got: {m}");
+        assert!(
+            m.to_lowercase().contains("route") && m.to_lowercase().contains("recognize"),
+            "9992 on ArtifactFetch must flag an unrecognized/removed route: {m}"
+        );
+    }
+
+    #[test]
+    fn map_workspace_membership_10545_overrides_generic_401() {
+        // 10545 (401) is workspace-membership denied; it must override the
+        // generic 401 "run fastio auth login" suggestion (the caller IS authed).
+        let mapped = map_signing_error(api_err(10545, 401), "failed to list", SignOp::General);
+        let m = mapped.to_string();
+        assert!(m.contains("10545"), "got: {m}");
+        assert!(m.to_lowercase().contains("member"), "got: {m}");
+        assert!(
+            !m.to_lowercase().contains("auth login"),
+            "10545 must not steer to auth login: {m}"
+        );
+        // RENDER-LEVEL: the actual `hint:` line comes from the underlying
+        // CliError's suggestion() (cli_error_render in main.rs), NOT the chain.
+        // It must NOT be the misleading auth-login hint, and must carry
+        // workspace-access wording.
+        let hint = mapped
+            .downcast_ref::<CliError>()
+            .and_then(CliError::suggestion)
+            .unwrap_or_default();
+        assert!(
+            !hint.to_lowercase().contains("auth login"),
+            "10545 rendered hint must not steer to auth login: {hint}"
+        );
+        assert!(
+            hint.to_lowercase().contains("workspace"),
+            "10545 rendered hint must carry workspace-access wording: {hint}"
+        );
+    }
+
+    #[test]
+    fn map_envelope_access_115069() {
+        let mapped = map_signing_error(api_err(115_069, 401), "failed to get", SignOp::General);
+        let m = mapped.to_string();
+        assert!(m.contains("115069"), "got: {m}");
+        assert!(m.to_lowercase().contains("access"), "got: {m}");
+        // RENDER-LEVEL: the rendered `hint:` line (CliError::suggestion) must NOT
+        // be the auth-login hint and must carry resource-access wording.
+        let hint = mapped
+            .downcast_ref::<CliError>()
+            .and_then(CliError::suggestion)
+            .unwrap_or_default();
+        assert!(
+            !hint.to_lowercase().contains("auth login"),
+            "115069 rendered hint must not steer to auth login: {hint}"
+        );
+        assert!(
+            hint.to_lowercase().contains("access"),
+            "115069 rendered hint must carry resource-access wording: {hint}"
+        );
+    }
+
+    #[test]
+    fn map_workspace_permission_1680_generic() {
+        // 1680 (403) is a generic permission denial; it must NOT overclaim a
+        // specific role (the docs disagree on which role is required).
+        let m =
+            map_signing_error(api_err(1680, 403), "failed to update", SignOp::General).to_string();
+        assert!(m.contains("1680"), "got: {m}");
+        assert!(m.to_lowercase().contains("permission"), "got: {m}");
+    }
+
+    #[test]
+    fn map_plan_restricted_1670_signing_scoped() {
+        // 1670 carries a signing-scoped framing pointing at org capabilities.
+        let mapped = map_signing_error(api_err(1670, 403), "failed to create", SignOp::General);
+        let m = mapped.to_string();
+        assert!(m.contains("1670"), "got: {m}");
+        assert!(
+            m.contains("capabilities.signing"),
+            "1670 must point at org capabilities.signing: {m}"
+        );
+        // The underlying CliError still resolves to the shared restricted hint
+        // for the render layer.
         let cli_err = mapped
             .downcast_ref::<CliError>()
             .expect("mapped signing error must remain a CliError");
         assert_eq!(
             cli_err.suggestion(),
-            Some(fastio_cli::error::HINT_RESTRICTED),
-            "1670 must still resolve to the shared restricted hint via suggestion()"
+            Some(fastio_cli::error::HINT_RESTRICTED)
+        );
+    }
+
+    #[test]
+    fn map_unknown_route_9992_flags_removed_route() {
+        let m = map_signing_error(api_err(9992, 404), "failed to get", SignOp::General).to_string();
+        assert!(m.contains("9992"), "got: {m}");
+        assert!(
+            m.to_lowercase().contains("route") && m.to_lowercase().contains("recognize"),
+            "9992 must flag an unrecognized/removed route: {m}"
         );
     }
 
@@ -1126,6 +1399,11 @@ mod tests {
         assert_eq!(
             download_ctx("source document"),
             ("failed to download source document", SignOp::General)
+        );
+        // The preview is a plain source fetch → General (a 404 is genuine).
+        assert_eq!(
+            download_ctx("document preview"),
+            ("failed to preview document", SignOp::General)
         );
         assert_eq!(
             download_ctx("signed document"),

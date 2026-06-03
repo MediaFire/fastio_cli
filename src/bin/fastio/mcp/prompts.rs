@@ -83,8 +83,8 @@ or skip the manual browse and let `ripley` `ask` answer over the content.
   `instantiate-and-wait` / `trigger-fire-and-wait` actions over tight poll loops.
   (Read + drive only; `cancel` and other admin/destructive actions are
   CLI-binary-only.)
-- `sign` — e-signature envelopes (read + draft-drive only; `send`/`void`/`delete`
-  are CLI-binary-only).
+- `sign` — e-signature envelopes (workspace-scoped; read + draft-drive only;
+  `send`/`void` are CLI-binary-only — envelopes are voided, not deleted).
 - The `task`/`worklog`/`approval`/`todo` tools are `[legacy]` — superseded by
   `workflow`.
 

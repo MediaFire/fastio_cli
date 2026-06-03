@@ -40,6 +40,38 @@ pub enum CliError {
         /// Seconds until the rate limit resets.
         retry_after_secs: u64,
     },
+
+    /// An asynchronously-generated artifact (e.g. a signed PDF or audit
+    /// certificate) is not ready yet.
+    ///
+    /// Surfaced as an HTTP 404 by the server, but it is NOT a genuine
+    /// not-found: the resource ids are correct, the artifact simply has not
+    /// been rendered yet. This variant exists so the rendered `hint:` line is
+    /// the poll-and-retry guidance (see [`CliError::suggestion`]) instead of
+    /// the misleading generic-404 "Verify the ID or path is correct" — the ids
+    /// are fine.
+    ///
+    /// It WRAPS the original [`ApiError`] BY VALUE in a plain `api` field — NOT
+    /// `#[source]` / `#[from]` — so:
+    /// - its `Display` is the FULL server error verbatim (`[HTTP …] … (code …)`
+    ///   plus any `see:` / `resource:` details), rendered EXACTLY ONCE because
+    ///   no `source()` link is generated for a plain field, so the `anyhow`
+    ///   chain carries no duplicate (LV-1); and
+    /// - `suggestion()` can return the poll hint instead of the inner
+    ///   `ApiError`'s generic-404 hint (LV-2).
+    ///
+    /// Command handlers construct it via the signing error-mapping layer; the
+    /// shared hint is deliberately generic (no resource wording) so the variant
+    /// stays usable for any async artifact and the signing-specific phrasing
+    /// lives in the mapping layer's `.context(...)`, not here.
+    #[error("{api}")]
+    ArtifactNotReady {
+        /// The original server error, preserved verbatim for `Display` (carries
+        /// the HTTP status, code, and any `documentation_url` / `resource`
+        /// details). Intentionally a plain field, NOT `#[source]`, so it adds
+        /// no duplicate link to the rendered `anyhow` chain.
+        api: ApiError,
+    },
 }
 
 impl CliError {
@@ -55,6 +87,7 @@ impl CliError {
                 Some("Wait for the rate limit window to reset, then retry your request.")
             }
             Self::Api(api_err) => api_err.suggestion(),
+            Self::ArtifactNotReady { .. } => Some(HINT_ARTIFACT_NOT_READY),
             Self::Http(_) => {
                 Some("Check your network connection and verify the API base URL is correct.")
             }
@@ -107,6 +140,47 @@ pub const HINT_RESTRICTED: &str =
 /// etc.), so this hint is deliberately resource-agnostic.
 pub const HINT_FEATURE_LIMIT: &str =
     "A plan or feature limit was reached for this operation; a higher plan tier may be required.";
+
+/// Shared generic "router does not recognize this path" hint (code `9992`).
+///
+/// Code `9992` is a ROUTER-level "no such route" error — NOT specific to any
+/// resource. It commonly means the path was removed or renamed; this hint is
+/// deliberately resource-agnostic (it must NOT mention signing — that wording
+/// lives in `map_signing_error` / the MCP `sign_err_to_result`).
+pub const HINT_UNKNOWN_ROUTE: &str = "The server does not recognize this API path — the route may have been removed or renamed. \
+     Check for a `fastio` CLI update.";
+
+/// Shared "not a member of this workspace" hint (code `10545`).
+///
+/// Code `10545` is a GENERIC workspace-access code (the caller is authenticated
+/// but lacks membership of the target workspace), not specific to signing — so
+/// this hint is resource-agnostic and must NOT mention signing. It exists so the
+/// rendered `hint:` line steers to the access problem instead of the misleading
+/// generic-401 "run `fastio auth login`" suggestion (the caller IS authenticated).
+pub const HINT_WORKSPACE_MEMBERSHIP: &str = "You are not a member of this workspace. \
+     Ask a workspace admin to add you, or verify the workspace ID.";
+
+/// Shared "resource access not granted" hint (code `115069`).
+///
+/// Code `115069` is an access-denied code (the caller is authenticated but the
+/// specific resource is not shared with their account). This hint is
+/// deliberately resource-agnostic and must NOT mention signing; it replaces the
+/// misleading generic-401 "run `fastio auth login`" suggestion.
+pub const HINT_RESOURCE_ACCESS: &str = "Access to this resource is not granted to your account. \
+     Verify the resource ID and that you have permission on it.";
+
+/// Shared "asynchronously-generated artifact not ready" hint
+/// ([`CliError::ArtifactNotReady`]).
+///
+/// The server returns HTTP 404 until the artifact (a signed PDF, audit
+/// certificate, etc.) is rendered, but it is NOT a genuine not-found — the ids
+/// are correct. This hint therefore must NOT steer the user to re-check the id
+/// (the generic-404 "Verify the ID or path is correct."): the recovery is to
+/// poll and retry. Kept resource-agnostic (no "sign" wording) so it stays a
+/// generic hint; the signing-specific phrasing lives in the mapping layer's
+/// added `.context(...)`.
+pub const HINT_ARTIFACT_NOT_READY: &str = "The requested artifact is generated asynchronously and is not ready yet. \
+     Poll the resource and retry once it reaches the required (terminal) stage.";
 
 /// An error returned by the Fast.io REST API.
 ///
@@ -173,6 +247,13 @@ impl ApiError {
             1696 => return Some(HINT_CREDIT_LIMIT),
             1670 => return Some(HINT_RESTRICTED),
             1685 => return Some(HINT_FEATURE_LIMIT),
+            9992 => return Some(HINT_UNKNOWN_ROUTE),
+            // Access-denied codes that surface as HTTP 401 but are NOT a missing
+            // login (the caller IS authenticated). Without these arms the bare
+            // 401 fallback below would emit the misleading "run `fastio auth
+            // login`" hint.
+            10545 => return Some(HINT_WORKSPACE_MEMBERSHIP),
+            115_069 => return Some(HINT_RESOURCE_ACCESS),
             _ => {}
         }
         match self.http_status {
@@ -333,6 +414,48 @@ mod tests {
         assert_eq!(api_err(1685, 402).suggestion(), Some(HINT_FEATURE_LIMIT));
         assert!(!HINT_RESTRICTED.to_lowercase().contains("sign"));
         assert!(!HINT_FEATURE_LIMIT.to_lowercase().contains("sign"));
+    }
+
+    #[test]
+    fn suggestion_unknown_route_9992_is_generic_non_signing() {
+        // 9992 is a router-level "no such route" code; its hint must be
+        // resource-agnostic and must NOT mention signing (that wording lives in
+        // map_signing_error / the MCP sign_err_to_result, never here).
+        assert_eq!(api_err(9992, 404).suggestion(), Some(HINT_UNKNOWN_ROUTE));
+        assert!(!HINT_UNKNOWN_ROUTE.to_lowercase().contains("sign"));
+    }
+
+    #[test]
+    fn suggestion_access_codes_override_generic_401_hint() {
+        // 10545 (workspace membership) and 115069 (resource access) surface as
+        // HTTP 401 but are NOT a missing login — the caller IS authenticated. The
+        // rendered hint must steer to the access problem, never to `auth login`.
+        // Both hints must also stay resource-agnostic (no "sign" wording — that
+        // lives in map_signing_error / the MCP sign_err_to_result, never here).
+        let m = api_err(10545, 401).suggestion().unwrap_or_default();
+        assert_eq!(
+            api_err(10545, 401).suggestion(),
+            Some(HINT_WORKSPACE_MEMBERSHIP)
+        );
+        assert!(
+            !m.to_lowercase().contains("auth login"),
+            "10545 hint must not steer to auth login: {m}"
+        );
+        assert!(m.to_lowercase().contains("workspace"));
+
+        let r = api_err(115_069, 401).suggestion().unwrap_or_default();
+        assert_eq!(
+            api_err(115_069, 401).suggestion(),
+            Some(HINT_RESOURCE_ACCESS)
+        );
+        assert!(
+            !r.to_lowercase().contains("auth login"),
+            "115069 hint must not steer to auth login: {r}"
+        );
+        assert!(r.to_lowercase().contains("access"));
+
+        assert!(!HINT_WORKSPACE_MEMBERSHIP.to_lowercase().contains("sign"));
+        assert!(!HINT_RESOURCE_ACCESS.to_lowercase().contains("sign"));
     }
 
     #[test]

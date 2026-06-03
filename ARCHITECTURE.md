@@ -20,7 +20,7 @@ Both modes share a common API layer, ensuring zero code duplication.
         v                    v                         v
 +----------------+   +------------------+     +------------------+
 |  cli.rs        |   |  commands/       |     |  mcp/            |
-|  Clap derive   |   |  25 command      |     |  MCP server      |
+|  Clap derive   |   |  30 command      |     |  MCP server      |
 |  definitions   |   |  modules         |     |  22 tools        |
 +----------------+   +------------------+     +------------------+
                           |         |               |
@@ -28,7 +28,7 @@ Both modes share a common API layer, ensuring zero code duplication.
                     v                        v      |
             +-------------+          +------+------+
             |  api/       |          |  output/    |
-            |  16 endpoint|          |  JSON,Table,|
+            |  26 endpoint|          |  JSON,Table,|
             |  modules    |          |  CSV render |
             +-------------+          +-------------+
                     |
@@ -61,19 +61,19 @@ Both modes share a common API layer, ensuring zero code duplication.
 - Tokio async entry point
 - MCP mode detection — routes to MCP server before tracing init (to avoid corrupting stdio)
 - CLI mode: parses args via clap, initializes tracing (stderr), loads config, dispatches to commands
-- Error interception with colored output and suggestions via `CliError::render_stderr()`
+- Error interception with colored output and suggestions via `cli_error_render()`, which renders the anyhow chain through `render_chain_dedup()` (collapsing the `#[from]` forward-to-source duplicate `thiserror` generates for `CliError::Api`) and appends the `CliError`'s own `suggestion()` as a `hint:` line
 
 ### `cli.rs`
 - Defines `Cli` struct with `#[derive(Parser)]`
 - Global flags: `--format`, `--fields`, `--no-color`, `--quiet`, `--verbose`, `--profile`, `--token`, `--api-base`
-- `Commands` enum with 25 top-level subcommands
+- `Commands` enum with 33 top-level subcommands (incl. hidden legacy aliases)
 - Nested subcommand enums for complex groups (org billing, org members, share files, task lists, etc.)
 
 ### `error.rs`
-- `CliError` enum using `thiserror` with variants: `Api`, `Auth`, `Config`, `Io`, `Http`, `Parse`, `RateLimit`
+- `CliError` enum using `thiserror` with variants: `Api`, `Auth`, `Config`, `Io`, `Http`, `Parse`, `RateLimit`, `ArtifactNotReady`
 - `ApiError` struct: `code`, `error_code`, `message`, `http_status`
-- `suggestion()` methods providing actionable hints based on error codes and HTTP status
-- `render_stderr()` for colored error display
+- `suggestion()` methods providing actionable hints based on error codes and HTTP status (`ArtifactNotReady` returns the poll-and-retry hint instead of the generic-404 wording)
+- `render_stderr()` for colored error display of a bare `CliError`; the `main.rs` interception now renders through `cli_error_render()` + `render_chain_dedup()` (chain-aware, byte-identical to `render_stderr` for a bare `CliError`)
 
 ### `config.rs`
 - Manages `~/.fastio/config.json`
@@ -113,7 +113,9 @@ Both modes share a common API layer, ensuring zero code duplication.
 - Local TCP server on port 19836 for OAuth callback
 - Authorization code + state extraction and CSRF validation
 
-### `api/` — 16 Modules
+### `api/` — 26 Modules
+
+Count convention: **26 endpoint modules** = `src/api/*.rs` excluding `mod.rs` (declarations) and `types.rs` (shared structs; the `—` table row). The table below lists representative modules, not all 26.
 
 Each module contains typed functions mapping to Fast.io REST endpoints:
 
@@ -135,9 +137,12 @@ Each module contains typed functions mapping to Fast.io REST endpoints:
 | `apps.rs` | 4 functions | List, details, launch, tool-apps |
 | `import.rs` | 22 functions | Providers, identities, sources, jobs, writebacks |
 | `locking.rs` | 3 functions | Acquire, status, release |
+| `signing.rs` | 14 functions | E-signature (SignEnvelope) — workspace-only CRUD/lifecycle, document/preview/signed/audit download paths |
 | `types.rs` | — | Shared response structs |
 
-### `commands/` — 25 Modules
+### `commands/` — 30 Modules
+
+Count convention: **30 command modules** = `src/bin/fastio/commands/*.rs` excluding `mod.rs` (declarations); there is no `types.rs` here. The table below lists representative modules, not all 30.
 
 Each module handles one command group, orchestrating API calls and output rendering:
 
@@ -165,6 +170,7 @@ Each module handles one command group, orchestrating API calls and output render
 | `apps.rs` | 4 | App integration |
 | `import.rs` | 22 | Cloud import/sync |
 | `lock.rs` | 3 | File locking |
+| `sign.rs` | 10 | E-signature (workspace-only): envelope create/list/get/update/send/void, document download/preview/signed, audit download |
 | `configure.rs` | 4 | CLI configuration |
 | `mod.rs` | — | Module declarations |
 

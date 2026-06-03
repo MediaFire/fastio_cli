@@ -207,8 +207,9 @@ pub enum Commands {
     Workflow(WorkflowCommands),
 
     /// E-signature: draft, send, void, and download `SignEnvelopes` (PDFs sent
-    /// to recipients for electronic signature). Parented to a workspace OR an
-    /// org. Signing is a paid-plan feature.
+    /// to recipients for electronic signature). Every envelope is parented to a
+    /// workspace (each subcommand takes a required `--workspace <id>`). Signing
+    /// is a paid-plan feature.
     #[command(subcommand)]
     Sign(SignCommands),
 
@@ -1233,10 +1234,11 @@ pub enum WorkflowReviewCommands {
 
 /// E-signature subcommands (`fastio sign`).
 ///
-/// `SignEnvelopes` are parented to a Workspace OR an Organization; the
-/// `--parent-type` / `--parent-id` pair selects the owner. Drafts are created
-/// and edited via these commands, then `send` emails real recipients. Signing
-/// is a paid-plan feature (a non-entitled org returns `1670`).
+/// `SignEnvelopes` are parented to a Workspace; every subcommand takes a
+/// required `--workspace <id>` flag. Drafts are created and edited via these
+/// commands, then `send` emails real recipients. Signing is a paid-plan feature
+/// (a non-entitled org returns `1670`; access also requires workspace
+/// membership).
 // Justification: the envelope-lifecycle variant carries the create/update
 // flag set and is larger than the download variants. This is a clap subcommand
 // enum constructed once at parse time and immediately dispatched (never stored
@@ -1246,10 +1248,10 @@ pub enum WorkflowReviewCommands {
 #[derive(Subcommand, Debug)]
 #[non_exhaustive]
 pub enum SignCommands {
-    /// Envelope lifecycle (create / list / get / update / delete / send / void).
+    /// Envelope lifecycle (create / list / get / update / send / void).
     #[command(subcommand)]
     Envelope(SignEnvelopeCommands),
-    /// Document byte downloads (source PDF, signed PDF).
+    /// Document byte downloads (source PDF, preview, signed PDF).
     #[command(subcommand)]
     Document(SignDocumentCommands),
     /// Audit certificate download.
@@ -1269,12 +1271,9 @@ pub enum SignEnvelopeCommands {
     /// single-signer single-document draft, the simple flags
     /// `--source-node-id` + `--recipient-email` suffice.
     Create {
-        /// Parent type: `workspace` or `org`.
+        /// Workspace ID.
         #[arg(long)]
-        parent_type: String,
-        /// Parent ID (workspace or org, 19-digit).
-        #[arg(long)]
-        parent_id: String,
+        workspace: String,
         /// Display name.
         #[arg(long)]
         name: Option<String>,
@@ -1314,14 +1313,21 @@ pub enum SignEnvelopeCommands {
         #[arg(long)]
         auth_method: Option<String>,
     },
-    /// List envelopes for the parent (offset-paginated).
+    /// List envelopes for the workspace (offset-paginated, newest first).
     List {
-        /// Parent type: `workspace` or `org`.
+        /// Workspace ID.
         #[arg(long)]
-        parent_type: String,
-        /// Parent ID.
+        workspace: String,
+        /// Lifecycle status filter: a single status or a CSV of
+        /// `draft,sent,in_progress,completed,declined,expired,voided,failed`.
         #[arg(long)]
-        parent_id: String,
+        status: Option<String>,
+        /// Only envelopes created after this time (format `Y-m-d H:i:s UTC`).
+        #[arg(long)]
+        created_after: Option<String>,
+        /// Only envelopes created before this time (format `Y-m-d H:i:s UTC`).
+        #[arg(long)]
+        created_before: Option<String>,
         /// Pagination limit.
         #[arg(long)]
         limit: Option<u32>,
@@ -1331,27 +1337,22 @@ pub enum SignEnvelopeCommands {
     },
     /// Get a single envelope (documents/recipients/fields inlined).
     Get {
-        /// Parent type: `workspace` or `org`.
+        /// Workspace ID.
         #[arg(long)]
-        parent_type: String,
-        /// Parent ID.
-        #[arg(long)]
-        parent_id: String,
+        workspace: String,
         /// Envelope ID.
         envelope_id: String,
     },
     /// Update mutable fields on a DRAFT envelope (a non-draft returns 403).
     ///
-    /// `--recipients-json` / `--fields-json` are FULL replacements;
-    /// `--documents-json` is a declarative replacement (omit to leave the
-    /// document set unchanged). Each accepts `@file.json`.
+    /// An update is a FULL recipient replacement — `--recipients-json` (≥1) is
+    /// REQUIRED. `--fields-json` is a full replacement; `--documents-json` is a
+    /// declarative replacement (omit to leave the document set unchanged). Each
+    /// accepts `@file.json`.
     Update {
-        /// Parent type: `workspace` or `org`.
+        /// Workspace ID.
         #[arg(long)]
-        parent_type: String,
-        /// Parent ID.
-        #[arg(long)]
-        parent_id: String,
+        workspace: String,
         /// Envelope ID.
         envelope_id: String,
         /// New display name.
@@ -1367,34 +1368,18 @@ pub enum SignEnvelopeCommands {
         #[arg(long)]
         documents_json: Option<String>,
         /// Full recipient replacement as a JSON array (or `@file.json`).
+        /// REQUIRED — an update always replaces the recipient roster (≥1).
         #[arg(long)]
         recipients_json: Option<String>,
         /// Full field replacement as a JSON array (or `@file.json`).
         #[arg(long)]
         fields_json: Option<String>,
     },
-    /// Soft-delete a DRAFT envelope (terminal envelopes refuse). Destructive.
-    Delete {
-        /// Parent type: `workspace` or `org`.
-        #[arg(long)]
-        parent_type: String,
-        /// Parent ID.
-        #[arg(long)]
-        parent_id: String,
-        /// Envelope ID.
-        envelope_id: String,
-        /// Skip the interactive confirmation prompt.
-        #[arg(long)]
-        yes: bool,
-    },
     /// Send a draft envelope (draft → sent). EMAILS REAL RECIPIENTS; idempotent.
     Send {
-        /// Parent type: `workspace` or `org`.
+        /// Workspace ID.
         #[arg(long)]
-        parent_type: String,
-        /// Parent ID.
-        #[arg(long)]
-        parent_id: String,
+        workspace: String,
         /// Envelope ID.
         envelope_id: String,
         /// Skip the interactive confirmation prompt (send notifies recipients).
@@ -1403,12 +1388,9 @@ pub enum SignEnvelopeCommands {
     },
     /// Void a non-terminal envelope (cascades to Voided). Credits NOT refunded.
     Void {
-        /// Parent type: `workspace` or `org`.
+        /// Workspace ID.
         #[arg(long)]
-        parent_type: String,
-        /// Parent ID.
-        #[arg(long)]
-        parent_id: String,
+        workspace: String,
         /// Envelope ID.
         envelope_id: String,
         /// Reason for voiding (REQUIRED, max 1024 bytes).
@@ -1426,12 +1408,23 @@ pub enum SignEnvelopeCommands {
 pub enum SignDocumentCommands {
     /// Download a document's SOURCE PDF (the file uploaded at create time).
     Download {
-        /// Parent type: `workspace` or `org`.
+        /// Workspace ID.
         #[arg(long)]
-        parent_type: String,
-        /// Parent ID.
+        workspace: String,
+        /// Envelope ID.
+        envelope_id: String,
+        /// Document ID.
+        document_id: String,
+        /// Output file path.
+        #[arg(long, short)]
+        output: String,
+    },
+    /// Preview a document's SOURCE PDF (same bytes as `download`, served for
+    /// in-app rendering).
+    Preview {
+        /// Workspace ID.
         #[arg(long)]
-        parent_id: String,
+        workspace: String,
         /// Envelope ID.
         envelope_id: String,
         /// Document ID.
@@ -1443,12 +1436,9 @@ pub enum SignDocumentCommands {
     /// Download a document's SIGNED PDF (not ready until the document completes).
     #[command(name = "signed-download")]
     SignedDownload {
-        /// Parent type: `workspace` or `org`.
+        /// Workspace ID.
         #[arg(long)]
-        parent_type: String,
-        /// Parent ID.
-        #[arg(long)]
-        parent_id: String,
+        workspace: String,
         /// Envelope ID.
         envelope_id: String,
         /// Document ID.
@@ -1466,12 +1456,9 @@ pub enum SignAuditCommands {
     /// Download the envelope's audit certificate (JSON; not ready until the
     /// envelope reaches a terminal state).
     Download {
-        /// Parent type: `workspace` or `org`.
+        /// Workspace ID.
         #[arg(long)]
-        parent_type: String,
-        /// Parent ID.
-        #[arg(long)]
-        parent_id: String,
+        workspace: String,
         /// Envelope ID.
         envelope_id: String,
         /// Output file path.
@@ -5365,7 +5352,8 @@ impl fmt::Debug for AuthCommands {
 mod ripley_alias_tests {
     use super::{
         ApprovalCommands, Cli, Commands, OrgBillingCommands, OrgCommands, RipleyCommands,
-        SearchCommands, TaskCommands, TodoCommands, WorklogCommands,
+        SearchCommands, SignCommands, SignDocumentCommands, SignEnvelopeCommands, TaskCommands,
+        TodoCommands, WorklogCommands,
     };
     use clap::{CommandFactory, Parser};
 
@@ -6128,6 +6116,151 @@ mod ripley_alias_tests {
         match cli.command {
             Commands::Org(OrgCommands::Limits { org_id }) => assert_eq!(org_id, "org123"),
             other => panic!("expected Org Limits, got {other:?}"),
+        }
+    }
+
+    // ── Sign workspace-only migration parse guards ───────────────────────
+
+    #[test]
+    fn sign_envelope_get_requires_workspace() {
+        // The workspace-only migration made `--workspace` mandatory everywhere.
+        // `get` without it must be rejected; with it, it parses.
+        let missing = Cli::try_parse_from(["fastio", "sign", "envelope", "get", "env1"]);
+        assert!(
+            missing.is_err(),
+            "`sign envelope get` must require --workspace"
+        );
+
+        let cli = Cli::try_parse_from([
+            "fastio",
+            "sign",
+            "envelope",
+            "get",
+            "--workspace",
+            "ws1",
+            "env1",
+        ])
+        .expect("`sign envelope get --workspace ws1 env1` should parse");
+        match cli.command {
+            Commands::Sign(SignCommands::Envelope(SignEnvelopeCommands::Get {
+                workspace,
+                envelope_id,
+            })) => {
+                assert_eq!(workspace, "ws1");
+                assert_eq!(envelope_id, "env1");
+            }
+            other => panic!("expected Sign Envelope Get, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sign_rejects_legacy_parent_type_and_parent_id_flags() {
+        // The old org/workspace dual-parent surface (--parent-type/--parent-id)
+        // was removed; both flags must now be unknown args.
+        let parent_type = Cli::try_parse_from([
+            "fastio",
+            "sign",
+            "envelope",
+            "list",
+            "--parent-type",
+            "workspace",
+            "--parent-id",
+            "ws1",
+        ]);
+        assert!(
+            parent_type.is_err(),
+            "legacy --parent-type/--parent-id must be rejected"
+        );
+    }
+
+    #[test]
+    fn sign_document_preview_parses() {
+        let cli = Cli::try_parse_from([
+            "fastio",
+            "sign",
+            "document",
+            "preview",
+            "--workspace",
+            "ws1",
+            "env1",
+            "doc1",
+            "-o",
+            "./preview.pdf",
+        ])
+        .expect("`sign document preview` should parse");
+        match cli.command {
+            Commands::Sign(SignCommands::Document(SignDocumentCommands::Preview {
+                workspace,
+                envelope_id,
+                document_id,
+                output,
+            })) => {
+                assert_eq!(workspace, "ws1");
+                assert_eq!(envelope_id, "env1");
+                assert_eq!(document_id, "doc1");
+                assert_eq!(output, "./preview.pdf");
+            }
+            other => panic!("expected Sign Document Preview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sign_envelope_delete_no_longer_parses() {
+        // Envelopes are voided, never deleted — the `delete` subcommand was
+        // removed and must not parse.
+        let res = Cli::try_parse_from([
+            "fastio",
+            "sign",
+            "envelope",
+            "delete",
+            "--workspace",
+            "ws1",
+            "env1",
+        ]);
+        assert!(
+            res.is_err(),
+            "`sign envelope delete` must not parse (use `void`)"
+        );
+    }
+
+    #[test]
+    fn sign_envelope_list_filter_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "fastio",
+            "sign",
+            "envelope",
+            "list",
+            "--workspace",
+            "ws1",
+            "--status",
+            "draft,sent",
+            "--created-after",
+            "2026-06-01 00:00:00 UTC",
+            "--created-before",
+            "2026-06-30 23:59:59 UTC",
+            "--limit",
+            "50",
+            "--offset",
+            "10",
+        ])
+        .expect("`sign envelope list` filter flags should parse");
+        match cli.command {
+            Commands::Sign(SignCommands::Envelope(SignEnvelopeCommands::List {
+                workspace,
+                status,
+                created_after,
+                created_before,
+                limit,
+                offset,
+            })) => {
+                assert_eq!(workspace, "ws1");
+                assert_eq!(status.as_deref(), Some("draft,sent"));
+                assert_eq!(created_after.as_deref(), Some("2026-06-01 00:00:00 UTC"));
+                assert_eq!(created_before.as_deref(), Some("2026-06-30 23:59:59 UTC"));
+                assert_eq!(limit, Some(50));
+                assert_eq!(offset, Some(10));
+            }
+            other => panic!("expected Sign Envelope List, got {other:?}"),
         }
     }
 }

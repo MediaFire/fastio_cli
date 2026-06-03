@@ -93,10 +93,61 @@ fn cli_error_render(
         // Bare CliError — preserve the legacy headline exactly.
         cli_err.to_string()
     } else {
-        // Context was layered on; render the full chain so it isn't dropped.
-        format!("{err:#}")
+        // Context was layered on; render the full chain so it isn't dropped,
+        // de-doubling the consecutive identical links that `thiserror`'s
+        // `#[from]`-generated `source()` produces (see `render_chain_dedup`).
+        render_chain_dedup(err)
     };
     (headline, cli_err.suggestion())
+}
+
+/// Render an `anyhow` error chain as `outer: …: root cause`, collapsing ONLY the
+/// duplicate-link artifact that `thiserror`'s `#[from]` introduces on a
+/// [`CliError::Api`].
+///
+/// This is `format!("{err:#}")` MINUS that one artifact. [`CliError::Api`] is
+/// `#[error("{0}")]` with `#[from] ApiError`: the `#[from]` ALSO generates a
+/// `source()` returning the inner [`ApiError`], so the chain carries the
+/// `ApiError`'s `Display` TWICE in a row — once as `CliError::Api`'s own
+/// `Display` (which just forwards to it) and once as the `ApiError` source link
+/// directly behind it. anyhow's `{:#}` joins every link with `": "`, so the full
+/// `[HTTP …] … see: … resource: …` block printed twice in a row (observed on
+/// the signing not-ready path, but inherent to ANY command that layers
+/// `.context()` onto a [`CliError::Api`]).
+///
+/// The dedup is **type-aware**, not text-only: a link is skipped ONLY when the
+/// immediately-preceding link downcasts to [`CliError::Api`] AND the current
+/// link's `Display` is byte-identical to it (the forwarded `ApiError` source).
+/// This targets exactly the `#[from]` forward-to-source adjacency and nothing
+/// else — a hand-written same-text context/cause pair (e.g. an anyhow `.context("x")`
+/// over a plain error whose `Display` is `"x"`) renders in full as `"x: x"`,
+/// because the preceding link is not a `CliError::Api`.
+fn render_chain_dedup(err: &anyhow::Error) -> String {
+    use fastio_cli::error::CliError;
+
+    let mut out = String::new();
+    // Track the previously-appended link's rendered text and whether it was a
+    // `CliError::Api` — the only pairing whose forwarded source we collapse.
+    let mut prev: Option<(String, bool)> = None;
+    for link in err.chain() {
+        let rendered = link.to_string();
+        if let Some((prev_text, prev_is_api)) = &prev
+            && *prev_is_api
+            && *prev_text == rendered
+        {
+            // The `#[from]` forward-to-source duplicate of a `CliError::Api`
+            // link. Skip it (do not advance `prev`: the appended link is
+            // still the `CliError::Api` we are collapsing onto).
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(": ");
+        }
+        out.push_str(&rendered);
+        let is_api = matches!(link.downcast_ref::<CliError>(), Some(CliError::Api(_)));
+        prev = Some((rendered, is_api));
+    }
+    out
 }
 
 /// Core logic extracted so we can intercept errors in `main()`.
@@ -2754,5 +2805,149 @@ mod tests {
         // The hint is the CliError suggestion, unchanged and not folded into the headline.
         assert_eq!(got_hint, hint, "hint must be the CliError suggestion");
         assert!(got_hint.is_some(), "a 404 CliError has a suggestion");
+    }
+
+    /// LV-1 regression: when `.context()` is layered onto a `CliError::Api`,
+    /// the underlying `ApiError` `Display` block must appear EXACTLY ONCE in the
+    /// headline — not twice. `thiserror`'s `#[from]` makes `CliError::Api`'s
+    /// own `Display` AND its `ApiError` source link render identically, so a
+    /// naive `{:#}` printed the `[HTTP …] … see: … resource: …` block twice in
+    /// a row. `render_chain_dedup` collapses the consecutive duplicate.
+    #[test]
+    fn cli_error_render_dedups_doubled_api_block() {
+        use fastio_cli::error::ApiError;
+        // Same shape a command handler builds: `.context(...)` layered on a
+        // `CliError::Api`. `thiserror`'s `#[from]` makes the chain carry the
+        // `ApiError` Display twice in a row (once as `CliError::Api`'s own
+        // forwarded Display, once as the source link), which the naive `{:#}`
+        // rendered as a doubled block. The dedup must collapse it.
+        let api = ApiError::new(
+            146_422,
+            None,
+            "Signed PDF is not yet available for this document.".to_owned(),
+            404,
+        );
+        let block = api.to_string();
+        let cli_err = CliError::Api(api);
+        let err = anyhow::Error::from(CliError::Api(ApiError::new(
+            146_422,
+            None,
+            "Signed PDF is not yet available for this document.".to_owned(),
+            404,
+        )))
+        .context("failed to download signed document");
+        let (headline, _hint) = cli_error_render(&err, &cli_err);
+        // The block (which itself contains "code 146422") must occur ONCE.
+        assert_eq!(
+            headline.matches("code 146422").count(),
+            1,
+            "the ApiError block must render exactly once, not doubled: {headline}"
+        );
+        // And it is still present (the context is also surfaced).
+        assert!(
+            headline.contains(&block),
+            "block must be present: {headline}"
+        );
+        assert!(
+            headline.contains("failed to download signed document"),
+            "context must be present: {headline}"
+        );
+    }
+
+    /// LV-1 + LV-2 regression for the signing not-ready path as the user sees it:
+    /// the `ArtifactNotReady` variant carries no `ApiError` source link, so the
+    /// `[HTTP 404] … (code …)` block renders exactly once even with context
+    /// layered on, AND its hint is the poll-and-retry guidance — NOT the generic
+    /// 404 "Verify the ID or path is correct.".
+    #[test]
+    fn cli_error_render_artifact_not_ready_single_block_and_poll_hint() {
+        use fastio_cli::error::ApiError;
+        let cli_err = CliError::ArtifactNotReady {
+            api: ApiError::new(
+                146_422,
+                None,
+                "Signed PDF is not yet available for this document.".to_owned(),
+                404,
+            ),
+        };
+        let err = anyhow::Error::from(CliError::ArtifactNotReady {
+            api: ApiError::new(
+                146_422,
+                None,
+                "Signed PDF is not yet available for this document.".to_owned(),
+                404,
+            ),
+        })
+        .context(
+            "failed to download signed document: not ready yet — Poll the envelope and retry once \
+             it completes.",
+        );
+        let (headline, hint) = cli_error_render(&err, &cli_err);
+        // Exact rendered headline: context, then the server block ONCE.
+        assert_eq!(
+            headline,
+            "failed to download signed document: not ready yet — Poll the envelope and retry once \
+             it completes.: [HTTP 404] Signed PDF is not yet available for this document. \
+             (code 146422)",
+            "unexpected headline: {headline}"
+        );
+        // The code appears exactly once (no doubling — no ApiError source link).
+        assert_eq!(
+            headline.matches("code 146422").count(),
+            1,
+            "not-ready block must render exactly once: {headline}"
+        );
+        // The server code is carried through.
+        assert!(
+            headline.contains("146422"),
+            "server code must surface: {headline}"
+        );
+        // The poll guidance is in the headline.
+        assert!(
+            headline.to_lowercase().contains("poll"),
+            "poll guidance must surface: {headline}"
+        );
+        // The hint is the poll-appropriate one, NOT the generic-404 wording.
+        let hint = hint.unwrap_or_default();
+        assert!(
+            !hint.contains("Verify the ID or path is correct"),
+            "not-ready hint must NOT be the generic-404 hint: {hint}"
+        );
+        assert!(
+            hint.to_lowercase().contains("poll") || hint.to_lowercase().contains("not ready"),
+            "not-ready hint must steer to poll-and-retry: {hint}"
+        );
+    }
+
+    /// MEDIUM B regression: the dedup is TYPE-AWARE — it collapses ONLY the
+    /// `#[from]` forward-to-source adjacency on a `CliError::Api`, never an
+    /// arbitrary same-text context/cause pair. A chain of two distinct,
+    /// same-text links NOT involving `CliError::Api` (anyhow `.context("x")`
+    /// over a plain error whose `Display` is `"x"`) must render BOTH links:
+    /// `"x: x"`.
+    #[test]
+    fn render_chain_dedup_preserves_non_api_same_text_links() {
+        use super::render_chain_dedup;
+        use std::fmt;
+
+        // A plain (non-CliError) error whose Display is exactly "x".
+        #[derive(Debug)]
+        struct PlainX;
+        impl fmt::Display for PlainX {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("x")
+            }
+        }
+        impl std::error::Error for PlainX {}
+
+        // `.context("x")` over PlainX → chain is ["x" (context), "x" (PlainX)],
+        // two distinct links that happen to render identically. Neither is a
+        // `CliError::Api`, so BOTH must survive.
+        let err = anyhow::Error::from(PlainX).context("x");
+        assert_eq!(
+            render_chain_dedup(&err),
+            "x: x",
+            "a same-text context/cause pair not involving CliError::Api must render in full"
+        );
     }
 }

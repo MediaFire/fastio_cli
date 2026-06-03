@@ -130,8 +130,9 @@ impl ServerHandler for FastioMcpServer {
                  do a task over hand-driving many primitives, and prefer the `workflow` \
                  tool's compound `*-and-wait` actions over tight detail-poll loops. \
                  `workflow` and `sign` expose READ + DRIVE actions only -- destructive / \
-                 terminal mutations (workflow `cancel`; sign `send`/`void`/`delete`) are \
-                 CLI-binary-only. The `task`/`worklog`/`approval`/`todo` tools are \
+                 terminal mutations (workflow `cancel`; sign `send`/`void` -- envelopes are \
+                 voided, not deleted) are CLI-binary-only. The `task`/`worklog`/`approval`/`todo` \
+                 tools are \
                  `[legacy]` and superseded by `workflow`. Tool results are rendered as \
                  GitHub-flavored Markdown (shape-compatible with the server-side \
                  `?output=markdown` contract) for compact, high-signal consumption. Run \

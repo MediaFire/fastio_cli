@@ -678,17 +678,22 @@ impl ApiClient {
         .await
     }
 
-    /// Perform an authenticated POST with **no request body at all** and
-    /// unwrap the standard `{"result": …, "response": …}` envelope.
+    /// Perform an authenticated POST with **no request body at all** and apply
+    /// the shared envelope handling.
     ///
-    /// The envelope-unwrapping counterpart to [`Self::post_empty_raw`]: like
+    /// The envelope-handling counterpart to [`Self::post_empty_raw`]: like
     /// [`Self::post_json`] it routes through the shared retry / rate-limit /
-    /// envelope-unwrap path, but the wire request carries neither a body nor a
-    /// `Content-Type` header. Use it for endpoints whose contract is literally
-    /// "Body: Empty" yet still return the standard envelope (e.g. the
-    /// `sign_envelopes/{id}/send/` action, `signing.txt:364-371`), where sending
-    /// `{}` with `Content-Type: application/json` would diverge from the
-    /// documented bodyless contract.
+    /// envelope path, but the wire request carries neither a body nor a
+    /// `Content-Type` header. The shared handler unwraps a nested `response`
+    /// sub-object when present; otherwise it returns the full envelope verbatim
+    /// (minus server bookkeeping) — so a named-key boolean envelope such as the
+    /// signing `/send/` response (`{"result": true, …}`, NO `response` key) is
+    /// preserved intact rather than collapsed. Use it for endpoints whose
+    /// contract is literally "Body: Empty" yet still return an envelope (e.g. the
+    /// verified workspace-suffixed `/workspace/{ws}/sign_envelopes/{env}/send/`
+    /// action; `signing.txt`'s send body shape is authoritative, its route table
+    /// is stale), where sending `{}` with `Content-Type: application/json` would
+    /// diverge from the documented bodyless contract.
     pub async fn post_empty<T: DeserializeOwned>(&self, path: &str) -> Result<T, CliError> {
         tracing::trace!(method = "POST", path, "api request (empty body)");
         self.send_with_retry(|| {
@@ -867,7 +872,7 @@ impl ApiClient {
     /// Returns `true` only when the status is **not** a success (non-2xx). A
     /// 2xx response is always streamed, regardless of `Content-Type` — the
     /// signing audit-certificate endpoint
-    /// (`/sign_envelopes/{id}/audit/download/`) returns a 2xx
+    /// (`/workspace/{ws}/sign_envelopes/{env}/audit/download/`) returns a 2xx
     /// `application/json` body that is the *success* payload, not an error
     /// envelope, so content-type sniffing here would wrongly reject it. Error
     /// detection therefore keys on status alone. Pure function so the branch
@@ -1482,7 +1487,18 @@ impl ApiClient {
     ///   `"API request failed with HTTP {status}"` placeholder.
     fn extract_error(body: &Value, http_status: u16) -> ApiError {
         if let Some(err) = body.get("error") {
-            let code = err.get("code").and_then(Value::as_u64).unwrap_or(0);
+            // The live framework returns string-encoded codes for some errors
+            // (`"code": "400"` / `"405"`) while richer handler errors are
+            // numeric. Accept either: a JSON number OR a string that parses as a
+            // u64. An unparseable string falls back to 0 (the HTTP status still
+            // drives the suggestion) — never a panic.
+            let code = err
+                .get("code")
+                .and_then(|c| {
+                    c.as_u64()
+                        .or_else(|| c.as_str().and_then(|s| s.parse::<u64>().ok()))
+                })
+                .unwrap_or(0);
             let message = err
                 .get("text")
                 .or_else(|| err.get("message"))
@@ -1847,6 +1863,33 @@ mod tests {
         assert_eq!(err.message, "bad hash");
         assert_eq!(err.error_code.as_deref(), Some("APP_BAD_HASH"));
         assert_eq!(err.http_status, 403);
+    }
+
+    #[test]
+    fn extract_error_accepts_string_encoded_code() {
+        // Live framework validation errors carry STRING codes (`"code": "400"`
+        // / `"405"`) while richer handler errors are numeric. Both must parse.
+        let body = serde_json::json!({
+            "result": false,
+            "error": {"code": "400", "text": "bad request"},
+        });
+        let err = ApiClient::extract_error(&body, 400);
+        assert_eq!(err.code, 400, "string-encoded code must parse to 400");
+        assert_eq!(err.http_status, 400);
+
+        let m405 = serde_json::json!({"error": {"code": "405", "text": "method"}});
+        assert_eq!(ApiClient::extract_error(&m405, 405).code, 405);
+
+        // A numeric code still parses unchanged.
+        let numeric = serde_json::json!({"error": {"code": 9992, "text": "no route"}});
+        assert_eq!(ApiClient::extract_error(&numeric, 404).code, 9992);
+
+        // An unparseable string code falls back to 0 (no panic); the HTTP
+        // status still drives the suggestion.
+        let junk = serde_json::json!({"error": {"code": "not-a-number", "text": "x"}});
+        let err = ApiClient::extract_error(&junk, 500);
+        assert_eq!(err.code, 0);
+        assert_eq!(err.http_status, 500);
     }
 
     #[test]
@@ -2892,5 +2935,61 @@ mod tests {
             after_headers.is_empty(),
             "bodyless send must send no payload, got body: {after_headers:?}"
         );
+    }
+
+    /// End-to-end: a signing-style named-key BOOLEAN envelope
+    /// (`{"result": true, "sign_envelope": {...}}`, with no `response` key) is
+    /// preserved VERBATIM by `post_empty` — the shared handler only unwraps a
+    /// `response` sub-object when present, otherwise it returns the full
+    /// envelope (so the named `sign_envelope` payload and `result: true` survive
+    /// intact, mirroring the documented signing send/details/list shapes).
+    #[tokio::test]
+    async fn post_empty_preserves_named_key_boolean_envelope() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await.unwrap_or(0);
+                // Boolean `result`, NO `response` key, named `sign_envelope` payload.
+                let body = br#"{"result":true,"sign_envelope":{"id":"env1","status":"sent"}}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+                let _ = tx.send(());
+            }
+        });
+        let client = ApiClient::new(&format!("http://{addr}"), Some("tok".to_owned()))
+            .expect("client builds");
+        let resp: Value = client
+            .post_empty("/workspace/ws1/sign_envelopes/env1/send/")
+            .await
+            .expect("bodyless send succeeds");
+        // No `response` key → the full envelope is preserved verbatim, including
+        // the boolean `result` and the named-key `sign_envelope` payload.
+        assert_eq!(resp["result"], Value::Bool(true));
+        assert_eq!(
+            resp["sign_envelope"]["id"],
+            Value::String("env1".to_owned())
+        );
+        assert_eq!(
+            resp["sign_envelope"]["status"],
+            Value::String("sent".to_owned())
+        );
+        // The payload was NOT mistakenly unwrapped to a missing `response`.
+        assert!(
+            resp.get("response").is_none(),
+            "named-key envelope must not gain a synthetic `response` key"
+        );
+        let () = rx.await.expect("server captured request");
     }
 }
