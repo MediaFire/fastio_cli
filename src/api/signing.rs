@@ -30,7 +30,7 @@
 //! | Create | `POST .../create/` (JSON) | `sign_envelope` |
 //! | List | `GET .../list/` | `envelopes` |
 //! | Details | `GET .../{env}/details/` | `sign_envelope` |
-//! | Update | `POST .../{env}/update/` (JSON; PATCH 405) | `sign_envelope` |
+//! | Update | `POST .../{env}/update/` (JSON; PATCH also accepted) | `sign_envelope` |
 //! | Send | `POST .../{env}/send/` (bodyless) | `sign_envelope` |
 //! | Void | `POST .../{env}/void/` (JSON `{"reason"}`) | `sign_envelope` |
 //! | Doc download/preview | `GET .../{env}/documents/{doc}/download|preview/` | bytes |
@@ -47,8 +47,10 @@
 //! Unlike most of the Fast.io API (form-encoded), the signing surface takes
 //! **`application/json`** request bodies. CRUD/lifecycle therefore route
 //! through [`ApiClient::post_json`] (create / update / void) or
-//! [`ApiClient::post_empty`] (bodyless send) — NOT the form helpers, and NOT
-//! `patch_json` (the `/update/` route is POST-only; PATCH returns 405).
+//! [`ApiClient::post_empty`] (bodyless send) — NOT the form helpers. The
+//! `/update/` route accepts both POST and PATCH server-side; the CLI uses POST
+//! (the portable default — some CDNs/proxies block PATCH), so `post_json`, not
+//! `patch_json`.
 //!
 //! ## Response envelope shape
 //!
@@ -940,7 +942,8 @@ pub async fn get_envelope(
 /// Update mutable fields on a draft envelope (draft-only; non-draft → 403).
 ///
 /// `POST /workspace/{id}/sign_envelopes/{envelope_id}/update/` (JSON body,
-/// `signing.txt:344-362`). The route is **POST-only** — a PATCH returns 405.
+/// `signing.txt:344-362`). The endpoint accepts both POST and PATCH; the CLI
+/// uses POST as the portable default (some CDNs/proxies block PATCH).
 pub async fn update_envelope(
     client: &ApiClient,
     workspace_id: &str,
