@@ -247,6 +247,12 @@ Filter which tools are available:
 fastio mcp --tools auth,org,workspace,files,upload,download
 ```
 
+Authentication and backend follow the standard CLI rules: the server honors the
+global `--api-base`, `--token`, and `--profile` flags (and the `FASTIO_TOKEN` /
+`FASTIO_API_KEY` env vars), so you can point it at a non-default backend or
+profile — e.g. `fastio --profile staging mcp` or
+`fastio --api-base https://api.example/current mcp`.
+
 ## Shell Completions
 
 Generate shell completions for your shell:

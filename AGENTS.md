@@ -346,3 +346,8 @@ It speaks MCP over stdio and exposes the CLI's operations as action-routed tools
 rendered as GitHub-flavored Markdown for compact, high-signal consumption. This
 same guide is available as the `skill://guide` MCP resource and via
 `fastio skill`.
+
+Auth and backend follow the standard CLI precedence: the server honors the
+global `--token` / `--profile` / `--api-base` flags (and `FASTIO_TOKEN` /
+`FASTIO_API_KEY` env), so `fastio --profile staging mcp` or
+`fastio --api-base <url> mcp` point it at a non-default backend.

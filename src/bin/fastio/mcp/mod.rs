@@ -90,8 +90,15 @@ pub struct FastioMcpServer {
 
 impl FastioMcpServer {
     /// Create a new MCP server, resolving credentials from the standard chain.
-    fn new(api_base: &str, config_dir: &std::path::Path) -> Result<Self> {
-        let token = resolve_token(None, "default", config_dir).ok().flatten();
+    fn new(
+        api_base: &str,
+        token_override: Option<&str>,
+        profile_name: &str,
+        config_dir: &std::path::Path,
+    ) -> Result<Self> {
+        let token = resolve_token(token_override, profile_name, config_dir)
+            .ok()
+            .flatten();
         let authenticated = token.is_some();
         let client = ApiClient::new(api_base, token).context("failed to create API client")?;
 
@@ -196,22 +203,73 @@ impl ServerHandler for FastioMcpServer {
 /// Start the MCP server over stdio transport.
 ///
 /// This is the main entry point called from `main.rs` when `fastio mcp` runs.
-pub async fn serve(tools_filter: Option<Vec<String>>) -> Result<()> {
+pub async fn serve(
+    tools_filter: Option<Vec<String>>,
+    api_base_override: Option<&str>,
+    token_override: Option<&str>,
+    profile_override: Option<&str>,
+) -> Result<()> {
     let _ = tools_filter; // reserved for future --tools filter
 
     let config = Config::load().unwrap_or_default();
-    let api_base = config.api_base(None, Some(&config.default_profile));
-    let api_base_str = if api_base.is_empty() {
+    // Honor the global --profile / --api-base / --token overrides, mirroring the
+    // non-MCP path in main.rs. Without this, `fastio mcp` resolves its backend
+    // and token from stored config only and silently ignores those flags.
+    let profile_name = profile_override.unwrap_or(&config.default_profile);
+    let api_base = config.api_base(api_base_override, Some(profile_name));
+    // Substitute the production default ONLY when nothing was explicitly
+    // requested and the resolved base is somehow empty. An explicit
+    // `--api-base ""` (e.g. an unset env var in a wrapper) must NOT silently
+    // fall back to production — pass it through so the client fails loudly,
+    // matching the non-MCP path.
+    let api_base_str = if api_base.is_empty() && api_base_override.is_none() {
         DEFAULT_API_BASE.to_owned()
     } else {
         api_base
     };
 
-    let server = FastioMcpServer::new(&api_base_str, &config.config_dir)?;
+    let server = FastioMcpServer::new(
+        &api_base_str,
+        token_override,
+        profile_name,
+        &config.config_dir,
+    )?;
     let service = server
         .serve(stdio())
         .await
         .context("failed to start MCP server on stdio")?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// A `--token` override authenticates the MCP server with no credentials
+    /// file, and the `api_base` passed through reaches the state — i.e. the
+    /// global overrides are honored. Regression guard for the bug where
+    /// `fastio mcp` ignored --api-base / --token / --profile (it resolved the
+    /// backend and token from stored config only).
+    #[tokio::test]
+    async fn new_honors_token_override_and_api_base() {
+        let server = FastioMcpServer::new(
+            "http://example.test/api/current",
+            Some("override-token"),
+            "default",
+            Path::new("/nonexistent-config-dir-for-test"),
+        )
+        .expect("server constructs with a token override");
+        assert_eq!(server.state.api_base(), "http://example.test/api/current");
+        // Assert the RESOLVED token is the override itself — not merely that the
+        // server is authenticated. This proves the `--token` precedence path and
+        // is NOT satisfied by an ambient FASTIO_TOKEN (which would pass a bare
+        // `authenticated == true` check even on the pre-fix env-first code).
+        assert_eq!(
+            server.state.client().read().await.get_token(),
+            Some("override-token")
+        );
+        assert!(*server.state.authenticated.read().await);
+    }
 }

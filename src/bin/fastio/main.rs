@@ -161,7 +161,15 @@ async fn run() -> Result<()> {
                 .map(|s| s.trim().to_owned())
                 .collect::<Vec<_>>()
         });
-        return mcp::serve(tools_filter).await;
+        // Thread the global --api-base / --token / --profile overrides into the
+        // MCP server; this branch returns before the non-MCP path resolves them.
+        return mcp::serve(
+            tools_filter,
+            cli.api_base.as_deref(),
+            cli.token.as_deref(),
+            cli.profile.as_deref(),
+        )
+        .await;
     }
 
     // Initialize tracing (only for non-MCP modes)
