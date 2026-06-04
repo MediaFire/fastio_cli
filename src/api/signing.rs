@@ -633,15 +633,23 @@ impl CreateEnvelopeParams {
 /// (`None`) to leave the set unchanged, or supply it for a full declarative
 /// replacement (1..=20 must remain).
 ///
+/// **`expires_at` and `policy_json` are declarative**: the server rewrites them
+/// on every update, so omitting one (`None`) CLEARS it server-side (resets to
+/// `null`) — re-send the current value to retain it (`signing.txt:344`). This is
+/// the OPPOSITE of `name` / `documents` / `fields`, which are preserved when
+/// omitted; the command layer warns when an update would clear them.
+///
 /// [`validate`]: UpdateEnvelopeParams::validate
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct UpdateEnvelopeParams {
-    /// New display name (optional).
+    /// New display name. Omitting keeps the current name (it cannot be cleared).
     pub name: Option<String>,
-    /// New expiry (optional).
+    /// New expiry. **Declarative**: `None` CLEARS the envelope's expiry
+    /// server-side (resets to `null`) — re-send the current value to retain it.
     pub expires_at: Option<String>,
-    /// New policy bag (optional).
+    /// New policy bag. **Declarative**: `None` CLEARS the policy server-side
+    /// (resets to `null`) — re-send the current value to retain it.
     pub policy_json: Option<Value>,
     /// `None` leaves documents unchanged; `Some(list)` is a declarative replace.
     pub documents: Option<Vec<DocumentSpec>>,
@@ -669,6 +677,9 @@ impl UpdateEnvelopeParams {
     }
 
     /// Set the new expiry timestamp.
+    ///
+    /// Declarative on update: `None` CLEARS the envelope's expiry (resets to
+    /// `null`); pass the current value to retain it.
     #[must_use]
     pub fn expires_at(mut self, expires_at: Option<String>) -> Self {
         self.expires_at = expires_at;
@@ -676,6 +687,9 @@ impl UpdateEnvelopeParams {
     }
 
     /// Set the new policy bag JSON value.
+    ///
+    /// Declarative on update: `None` CLEARS the policy (resets to `null`); pass
+    /// the current value to retain it.
     #[must_use]
     pub fn policy_json(mut self, policy: Option<Value>) -> Self {
         self.policy_json = policy;
@@ -772,6 +786,10 @@ impl UpdateEnvelopeParams {
         if let Some(name) = &self.name {
             obj.insert("name".to_owned(), Value::String(name.clone()));
         }
+        // `expires_at` / `policy_json` are DECLARATIVE on update: an absent key
+        // clears the field server-side (resets to `null`, `signing.txt:344`). We
+        // emit them only when supplied — omission IS the caller's intent to clear
+        // (do not "helpfully" always-insert them).
         if let Some(exp) = &self.expires_at {
             obj.insert("expires_at".to_owned(), Value::String(exp.clone()));
         }
@@ -900,6 +918,12 @@ impl ListEnvelopesParams {
 /// `POST /workspace/{id}/sign_envelopes/create/` (JSON body,
 /// `signing.txt:288-340`). The caller-side caps are validated first via
 /// [`CreateEnvelopeParams::validate`].
+///
+/// The response is the **flat** envelope object: it does NOT inline the
+/// `documents` / `recipients` / `fields` sub-collections, and `provider` /
+/// `provider_envelope_id` are `null` until the envelope is sent. Read the
+/// server-generated sub-resource ids from the envelope `details/` read
+/// (`fastio sign envelope get`).
 pub async fn create_envelope(
     client: &ApiClient,
     workspace_id: &str,
@@ -944,6 +968,11 @@ pub async fn get_envelope(
 /// `POST /workspace/{id}/sign_envelopes/{envelope_id}/update/` (JSON body,
 /// `signing.txt:344-362`). The endpoint accepts both POST and PATCH; the CLI
 /// uses POST as the portable default (some CDNs/proxies block PATCH).
+///
+/// Per `signing.txt:344`, `expires_at` and `policy_json` are **declarative**: an
+/// update that omits them CLEARS them server-side (`name` / `documents` /
+/// `fields` are preserved when omitted). The command layer warns before sending
+/// an update that would clear them.
 pub async fn update_envelope(
     client: &ApiClient,
     workspace_id: &str,

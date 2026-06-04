@@ -1655,7 +1655,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "sign",
-        description: "E-signature (SignEnvelope): draft and drive electronic-signature envelopes (PDFs sent to recipients). Every envelope is parented to a workspace (workspace_id; the former org surface was removed). This tool exposes READ + reversible-DRAFT-drive actions ONLY: envelope-create (creates a DRAFT — reversible), envelope-update (draft-only; recipients are a full replacement), envelope-list (filter via envelope_status / created_after / created_before), envelope-get, document-download (covers preview needs — the download bytes ARE the source/preview PDF, so there is no separate MCP preview action), signed-download, audit-download, describe. The OUTWARD-FACING / TERMINAL actions — send (EMAILS REAL RECIPIENTS) and void (terminal) — are intentionally CLI-binary-only (`fastio sign envelope send|void …`) and are NOT routable over MCP (mirrors how the workflow tool keeps cancel CLI-only). Envelopes are voided, not deleted — there is no delete action. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Signing is a paid-plan feature (a non-entitled org returns 1670; access also requires workspace membership). Call action='describe' for the authoritative per-action reference.",
+        description: "E-signature (SignEnvelope): draft and drive electronic-signature envelopes (PDFs sent to recipients). Every envelope is parented to a workspace (workspace_id; the former org surface was removed). This tool exposes READ + reversible-DRAFT-drive actions ONLY: envelope-create (creates a DRAFT — reversible), envelope-update (draft-only; recipients are a full replacement; expires_at/policy_json are DECLARATIVE — omitting them CLEARS those fields, re-send to retain), envelope-list (filter via envelope_status / created_after / created_before), envelope-get, document-download (covers preview needs — the download bytes ARE the source/preview PDF, so there is no separate MCP preview action), signed-download, audit-download, describe. The OUTWARD-FACING / TERMINAL actions — send (EMAILS REAL RECIPIENTS) and void (terminal) — are intentionally CLI-binary-only (`fastio sign envelope send|void …`) and are NOT routable over MCP (mirrors how the workflow tool keeps cancel CLI-only). Envelopes are voided, not deleted — there is no delete action. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Signing is a paid-plan feature (a non-entitled org returns 1670; access also requires workspace membership). Call action='describe' for the authoritative per-action reference.",
         actions: &[
             "describe",
             "envelope-create",
@@ -1689,7 +1689,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("name", "Display name (envelope-create / -update)", false),
             (
                 "expires_at",
-                "UTC auto-expiry timestamp (envelope-create / -update)",
+                "UTC auto-expiry timestamp. envelope-create: optional. envelope-update: DECLARATIVE — omitting it CLEARS the expiry (resets to null); re-send the current value to keep it.",
                 false,
             ),
             (
@@ -1699,7 +1699,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             (
                 "policy_json",
-                "Policy bag as a JSON object STRING (envelope-create / -update)",
+                "Policy bag as a JSON object STRING. envelope-create: optional. envelope-update: DECLARATIVE — omitting it CLEARS the policy (resets to null); re-send the current value to keep it.",
                 false,
             ),
             (
@@ -11212,7 +11212,9 @@ fn sign_describe() -> CallToolResult {
                 "auth_method",
             ],
             "creates a DRAFT (reversible). Supply documents/recipients via the *_json arrays \
-             (or body_json), or the simple source_node_id + recipient_email path.",
+             (or body_json), or the simple source_node_id + recipient_email path. The response is \
+             the FLAT envelope (no inlined documents/recipients/fields; provider is null until \
+             sent) — call envelope-get to read the server-generated sub-resource ids.",
         ),
         (
             "envelope-update",
@@ -11226,7 +11228,9 @@ fn sign_describe() -> CallToolResult {
             ],
             "DRAFT-only (a non-draft returns 403). recipients_json is REQUIRED — an update is a \
              full recipient replacement (>=1). fields_json is a full replacement; documents_json \
-             is a declarative replace (omit to leave unchanged).",
+             is a declarative replace (omit to leave unchanged). expires_at and policy_json are \
+             DECLARATIVE: omitting one CLEARS it (resets to null) — re-send the current value to \
+             keep it (name/documents/fields are preserved when omitted).",
         ),
         (
             "envelope-list",
@@ -11405,8 +11409,9 @@ async fn handle_sign(
             if params.is_empty() {
                 return Ok(error_text(
                     "no fields to update were supplied: supply at least recipients_json \
-                     (recipients are a full replacement); name / expires_at / policy_json / \
-                     documents_json / fields_json are optional",
+                     (recipients are a full replacement). name / documents_json / fields_json \
+                     are kept when omitted; expires_at / policy_json are DECLARATIVE — omitting \
+                     them clears the envelope's expiry / policy",
                 ));
             }
             // An update is a FULL recipient replacement — recipients_json (>=1)

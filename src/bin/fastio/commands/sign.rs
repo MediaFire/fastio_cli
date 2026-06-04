@@ -446,6 +446,14 @@ fn map_signing_error(err: CliError, ctx: &'static str, op: SignOp) -> anyhow::Er
             "{ctx}: the envelope is already terminal (completed / declined / voided / \
              expired) and cannot be changed (1660)."
         )),
+        // Send precondition not met (checked only at send time, signing.txt:360).
+        201_134 => Some(format!(
+            "{ctx}: the envelope is not ready to send (201134) — a send precondition \
+             failed. The server message names the specific gap (e.g. \"signer but has no \
+             fields to complete\"); a sendable draft needs ≥1 document, ≥1 signing \
+             recipient, and every signer-role recipient must have ≥1 field. Fix that \
+             recipient/field and retry. Branch on the code (201134), not the message text."
+        )),
         _ => None,
     };
     match note {
@@ -574,8 +582,9 @@ async fn execute_envelope(command: SignEnvelopeCommands, ctx: &CommandContext<'_
             anyhow::ensure!(
                 !params.is_empty(),
                 "no fields to update were supplied: supply at least --recipients-json (recipients \
-                 are a full replacement); --name / --expires-at / --policy-json / --documents-json \
-                 / --fields-json are optional"
+                 are a full replacement). --name / --documents-json / --fields-json are kept when \
+                 omitted; --expires-at / --policy-json are DECLARATIVE — omitting them clears the \
+                 envelope's expiry / policy"
             );
             // An update is a FULL recipient replacement — recipients (>=1) are
             // required (F5). Surface a clear, action-specific error before the
@@ -588,6 +597,17 @@ async fn execute_envelope(command: SignEnvelopeCommands, ctx: &CommandContext<'_
             params
                 .validate()
                 .map_err(|e| anyhow::Error::from(e).context("invalid update request"))?;
+            // `expires_at` / `policy_json` are declarative (signing.txt:344):
+            // omitting one CLEARS it server-side. Warn before sending so a
+            // rename-only update doesn't silently drop the expiry/policy.
+            if !ctx.output.quiet
+                && let Some(note) = update_declarative_clear_note(
+                    params.expires_at.is_some(),
+                    params.policy_json.is_some(),
+                )
+            {
+                eprintln!("{note}");
+            }
             let client = ctx.build_client()?;
             let v = signing::update_envelope(&client, &workspace, &envelope_id, &params)
                 .await
@@ -755,6 +775,36 @@ fn create_params_from_body(body: &Value) -> Result<CreateEnvelopeParams> {
         .documents(documents)
         .recipients(recipients)
         .fields(fields))
+}
+
+/// Build the declarative-clear warning for `sign envelope update`.
+///
+/// `expires_at` and `policy_json` are declarative (`signing.txt:344`): the server
+/// rewrites them on every update, so omitting one CLEARS it (resets to `null`).
+/// Returns a one-line note naming whichever field is being cleared, or `None`
+/// when both were supplied (nothing is cleared). `name` / `documents` / `fields`
+/// are preserved when omitted and are intentionally not mentioned.
+fn update_declarative_clear_note(expires_at_set: bool, policy_json_set: bool) -> Option<String> {
+    let mut cleared = Vec::new();
+    if !expires_at_set {
+        cleared.push("expiry (--expires-at)");
+    }
+    if !policy_json_set {
+        cleared.push("policy (--policy-json)");
+    }
+    if cleared.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "note: an update is declarative — this clears the envelope's {} (reset to null), since {} \
+         not supplied. Re-send the current value(s) — see `sign envelope get` — to keep them.",
+        cleared.join(" and "),
+        if cleared.len() == 1 {
+            "it was"
+        } else {
+            "they were"
+        },
+    ))
 }
 
 /// Build [`UpdateEnvelopeParams`] from the update flags. A `None` documents or
@@ -1191,6 +1241,54 @@ mod tests {
             let m = map_signing_error(api_err(1609, 200), "download", op).to_string();
             assert!(m.contains("not ready yet"), "got ({op:?}): {m}");
         }
+    }
+
+    #[test]
+    fn map_send_precondition_201134_names_the_gap_and_keys_on_code() {
+        // F8: a /send precondition failure (201134) gets a hint that names the
+        // likely gap (a signer with no field) and steers callers to branch on the
+        // numeric code, not the (server-reworded) message text.
+        let m = map_signing_error(
+            api_err(201_134, 422),
+            "failed to send sign envelope",
+            SignOp::General,
+        )
+        .to_string();
+        assert!(m.contains("201134"), "must cite the code: {m}");
+        assert!(
+            m.contains("not ready to send") && m.contains("field"),
+            "must name the send-precondition gap: {m}"
+        );
+        assert!(
+            m.contains("Branch on the code"),
+            "must steer callers off the message text: {m}"
+        );
+    }
+
+    #[test]
+    fn update_declarative_clear_note_fires_only_for_omitted_fields() {
+        // F5: expires_at / policy_json are declarative — omitting one clears it.
+        // The note names exactly the omitted field(s); None when both supplied.
+        assert!(update_declarative_clear_note(true, true).is_none());
+        let exp = update_declarative_clear_note(false, true).expect("expiry omitted → note");
+        assert!(
+            exp.contains("--expires-at") && !exp.contains("--policy-json"),
+            "{exp}"
+        );
+        let pol = update_declarative_clear_note(true, false).expect("policy omitted → note");
+        assert!(
+            pol.contains("--policy-json") && !pol.contains("--expires-at"),
+            "{pol}"
+        );
+        let both = update_declarative_clear_note(false, false).expect("both omitted → note");
+        assert!(
+            both.contains("--expires-at") && both.contains("--policy-json"),
+            "{both}"
+        );
+        assert!(
+            both.contains("declarative") && both.contains("sign envelope get"),
+            "must be actionable: {both}"
+        );
     }
 
     #[test]

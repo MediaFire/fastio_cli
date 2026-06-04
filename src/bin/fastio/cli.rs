@@ -1290,6 +1290,10 @@ pub enum SignEnvelopeCommands {
     /// accepts `@file.json`) for non-trivial envelopes. For a trivial
     /// single-signer single-document draft, the simple flags
     /// `--source-node-id` + `--recipient-email` suffice.
+    ///
+    /// The response is the flat envelope (no inlined documents / recipients /
+    /// fields; `provider` is null until sent). Run `sign envelope get <id>` to
+    /// read the server-generated document/recipient/field ids.
     Create {
         /// Workspace ID.
         #[arg(long)]
@@ -1369,6 +1373,11 @@ pub enum SignEnvelopeCommands {
     /// REQUIRED. `--fields-json` is a full replacement; `--documents-json` is a
     /// declarative replacement (omit to leave the document set unchanged). Each
     /// accepts `@file.json`.
+    ///
+    /// DECLARATIVE — `--expires-at` and `--policy-json` are rewritten on every
+    /// update: OMITTING one CLEARS it (resets to null). Re-send the current value
+    /// (from `sign envelope get`) to keep it. `--name` / `--documents-json` /
+    /// `--fields-json` are preserved when omitted.
     Update {
         /// Workspace ID.
         #[arg(long)]
@@ -1378,10 +1387,12 @@ pub enum SignEnvelopeCommands {
         /// New display name. Omit to keep the current name; a name cannot be cleared via update.
         #[arg(long)]
         name: Option<String>,
-        /// New UTC expiry timestamp.
+        /// New UTC expiry timestamp. DECLARATIVE: omitting CLEARS the expiry
+        /// (resets to null) — re-send the current value to keep it.
         #[arg(long)]
         expires_at: Option<String>,
-        /// New policy bag as a JSON object (or `@file.json`).
+        /// New policy bag as a JSON object (or `@file.json`). DECLARATIVE:
+        /// omitting CLEARS the policy (resets to null) — re-send to keep it.
         #[arg(long)]
         policy_json: Option<String>,
         /// Declarative document replacement as a JSON array (or `@file.json`).
