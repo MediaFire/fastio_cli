@@ -6,7 +6,6 @@
 /// response envelope unwrapping, rate-limit detection, and automatic
 /// retry with exponential backoff for transient network failures.
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -124,7 +123,18 @@ const SECRET_LOG_KEYS: &[&str] = &[
     "downloadtoken",
     // Invitation bearer capability (org/workspace/share invite acceptance).
     "invitation_key",
+    // File Share recipient link password (sent in the `x-ve-password` request
+    // header; defense-in-depth in case it ever lands in a logged body/form).
+    PASSWORD_HEADER,
 ];
+
+/// Name of the request header carrying a File Share recipient's link password.
+///
+/// The password travels ONLY in this header — never in a URL or query string.
+/// The built [`HeaderValue`] is marked sensitive (see [`build_password_header`])
+/// so reqwest's own debug logging redacts it, and the header name is registered
+/// in [`SECRET_LOG_KEYS`] for defense-in-depth.
+const PASSWORD_HEADER: &str = "x-ve-password";
 
 /// Placeholder written in place of a redacted secret value when trace-logging
 /// a response body.
@@ -200,6 +210,36 @@ fn redact_text_body_for_log(text: &str) -> String {
     )
 }
 
+/// Parse a recipient link password into a sensitive [`HeaderValue`] for the
+/// `x-ve-password` header.
+///
+/// Built from the password's raw UTF-8 BYTES via [`HeaderValue::from_bytes`]
+/// rather than [`HeaderValue::from_str`]: the link password contract allows any
+/// 1-255 character (UTF-8) value, but `from_str` rejects every non-ASCII byte,
+/// which would make a perfectly valid password (e.g. `"pässwört→"`, settable via
+/// the management form) unsendable from the CLI. `from_bytes` accepts the
+/// non-ASCII bytes while STILL rejecting control bytes / newlines (the bytes
+/// HTTP headers genuinely cannot carry), so it fails (no panic) with
+/// [`CliError::InvalidHeaderValue`] only on a truly un-encodable value. The
+/// error names only the header, NEVER the value — the value is a secret. On
+/// success the header is marked sensitive ([`HeaderValue::set_sensitive`]) so
+/// reqwest's own debug logging redacts it.
+///
+/// Defined as a free function (not a method) so it can be parsed ONCE, before
+/// the non-fallible retry closure that [`ApiClient::send_request_with_retry`]
+/// re-runs per attempt, then cheaply cloned inside the closure. Exposed
+/// `pub(crate)` so the raw-reqwest upload paths (which cannot reach a private
+/// method) reuse this single builder instead of duplicating it.
+pub(crate) fn build_password_header(password: &SecretString) -> Result<HeaderValue, CliError> {
+    let mut value = HeaderValue::from_bytes(password.expose_secret().as_bytes()).map_err(|_| {
+        CliError::InvalidHeaderValue {
+            header: PASSWORD_HEADER,
+        }
+    })?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
 /// HTTP client that wraps `reqwest` with Fast.io-specific conventions.
 pub struct ApiClient {
     /// The underlying HTTP client.
@@ -213,14 +253,48 @@ pub struct ApiClient {
     /// construction) because handlers hold `&self` async and interior
     /// mutability would be unidiomatic here.
     detail: Option<OutputDetail>,
-    /// Lazily-built client used only by [`Self::download_file_stream`].
+    /// Eagerly-built client used only by [`Self::download_file_stream`].
     ///
     /// Unlike [`Self::inner`], it carries a connect timeout but **no** overall
     /// request timeout, so large signed-PDF / audit-bundle downloads are not
-    /// killed by [`DEFAULT_TIMEOUT_SECS`] mid-stream. Built on first use via
-    /// [`OnceLock`] and reused thereafter (connection pooling) so a download
-    /// burst does not rebuild the client per call.
-    streaming_client: OnceLock<reqwest::Client>,
+    /// killed by [`DEFAULT_TIMEOUT_SECS`] mid-stream. Built once at construction
+    /// (the only builder failure mode is a TLS-backend init issue that would
+    /// already have failed [`Self::inner`]) and reused thereafter (connection
+    /// pooling) so a download burst does not rebuild the client per call.
+    streaming_client: reqwest::Client,
+    /// Eagerly-built no-redirect ENVELOPE client for the leak-safe File Share
+    /// JSON/form consumption + write-back paths that carry an optional
+    /// `x-ve-password` (`get_with_password` / `post_with_password` — details,
+    /// versions, grants, complete, status).
+    ///
+    /// Like [`Self::no_redirect_streaming_client`] it sets
+    /// [`reqwest::redirect::Policy::none`] (the load-bearing leak-safety
+    /// property — see that field), but UNLIKE the streaming client it carries the
+    /// ordinary [`DEFAULT_TIMEOUT_SECS`] overall request timeout. These calls
+    /// return a bounded JSON/form envelope, not a multi-MB stream, so a stalled
+    /// response must time out exactly as it would on [`Self::inner`] rather than
+    /// hang indefinitely. Built once at construction so a builder failure is a
+    /// hard error, NEVER a silent fall-back to the redirect-following
+    /// [`Self::inner`] (which would re-introduce the credential-forwarding leak).
+    no_redirect_envelope_client: reqwest::Client,
+    /// Eagerly-built no-redirect STREAMING client for the leak-safe File Share
+    /// binary consumption paths that carry an optional `x-ve-password`
+    /// (`download_file_stream_with_password` /
+    /// `download_preview_following_redirect`, including the token-bearing follow).
+    ///
+    /// Same timeout profile as [`Self::streaming_client`] (connect timeout only,
+    /// **no** overall body timeout, so a large download is not killed mid-stream)
+    /// PLUS [`reqwest::redirect::Policy::none`] so a 3xx is NEVER auto-followed.
+    /// That no-redirect policy is the load-bearing safety property for
+    /// password-bearing requests: reqwest follows up to 10 redirects by default
+    /// and does NOT strip custom headers on a cross-origin redirect, so
+    /// auto-following would forward the `x-ve-password` (and bearer) header to
+    /// the `Location` target — a CDN. Routing every password-bearing stream onto
+    /// this client and treating any 3xx as a terminal (or manually-followed,
+    /// header-stripped) case fails closed instead. Built once at construction so
+    /// a builder failure is a hard error, NEVER a silent fall-back to the
+    /// redirect-following [`Self::inner`].
+    no_redirect_streaming_client: reqwest::Client,
 }
 
 impl ApiClient {
@@ -254,35 +328,94 @@ impl ApiClient {
             .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
             .build()?;
 
+        // The streaming and both no-redirect clients are built EAGERLY here so a
+        // builder failure is a hard error at construction, NEVER a silent
+        // fall-back to the redirect-following `inner` (which for the no-redirect
+        // clients would defeat the entire leak-safety design). The no-redirect
+        // ENVELOPE client carries the ordinary request timeout (bounded JSON/form
+        // responses); the no-redirect STREAMING client omits the body timeout
+        // (multi-MB downloads).
+        let streaming_client = Self::build_streaming_client()?;
+        let no_redirect_envelope_client = Self::build_no_redirect_envelope_client()?;
+        let no_redirect_streaming_client = Self::build_no_redirect_streaming_client()?;
+
         Ok(Self {
             inner,
             base_url: base_url.trim_end_matches('/').to_owned(),
             token: token.map(SecretString::from),
             detail,
-            streaming_client: OnceLock::new(),
+            streaming_client,
+            no_redirect_envelope_client,
+            no_redirect_streaming_client,
         })
     }
 
-    /// Return the dedicated streaming-download client, building it on first use.
+    /// Build the dedicated streaming-download client.
     ///
     /// Carries [`STREAM_CONNECT_TIMEOUT_SECS`] connect timeout but no overall
-    /// request timeout (see [`Self::streaming_client`]). If the builder ever
-    /// fails, falls back to [`Self::inner`] rather than erroring — the only
-    /// documented failure modes for `reqwest::Client::builder().build()` are
-    /// TLS-backend init issues that would already have failed `inner`, so the
-    /// fallback is purely defensive.
-    fn streaming_client(&self) -> &reqwest::Client {
-        self.streaming_client.get_or_init(|| {
-            let mut headers = HeaderMap::new();
-            headers.insert(USER_AGENT, HeaderValue::from_static(CLIENT_USER_AGENT));
-            reqwest::Client::builder()
-                .default_headers(headers)
-                .connect_timeout(Duration::from_secs(STREAM_CONNECT_TIMEOUT_SECS))
-                .pool_idle_timeout(Duration::from_secs(POOL_IDLE_TIMEOUT_SECS))
-                .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
-                .build()
-                .unwrap_or_else(|_| self.inner.clone())
-        })
+    /// request timeout (see [`Self::streaming_client`]). Returns the builder
+    /// error verbatim — there is NO fall-back to [`Self::inner`]; the only
+    /// documented failure mode is a TLS-backend init issue that would already
+    /// have failed `inner`, so surfacing it is correct rather than substituting
+    /// a differently-configured client.
+    fn build_streaming_client() -> Result<reqwest::Client, CliError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_static(CLIENT_USER_AGENT));
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .connect_timeout(Duration::from_secs(STREAM_CONNECT_TIMEOUT_SECS))
+            .pool_idle_timeout(Duration::from_secs(POOL_IDLE_TIMEOUT_SECS))
+            .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+            .build()
+            .map_err(CliError::Http)
+    }
+
+    /// Build the dedicated no-redirect ENVELOPE client.
+    ///
+    /// [`reqwest::redirect::Policy::none`] (so a 3xx is surfaced rather than
+    /// auto-followed — the leak-safety property) PLUS the ordinary
+    /// [`DEFAULT_TIMEOUT_SECS`] overall request timeout, because the callers
+    /// (`get_with_password` / `post_with_password`) exchange a bounded JSON/form
+    /// envelope and must not hang indefinitely on a stalled response (F2-2). The
+    /// connect timeout matches [`Self::inner`] (30s). Returns the builder error
+    /// verbatim and NEVER falls back to a redirect-following client —
+    /// substituting one would re-introduce the exact leak this client exists to
+    /// prevent (forwarding `x-ve-password` to a `Location` target).
+    fn build_no_redirect_envelope_client() -> Result<reqwest::Client, CliError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_static(CLIENT_USER_AGENT));
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(POOL_IDLE_TIMEOUT_SECS))
+            .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+            .build()
+            .map_err(CliError::Http)
+    }
+
+    /// Build the dedicated no-redirect STREAMING client.
+    ///
+    /// Same connect-timeout / NO-body-timeout profile as
+    /// [`Self::build_streaming_client`] (so a multi-MB download is not killed
+    /// mid-stream) but with [`reqwest::redirect::Policy::none`] so a 3xx is
+    /// surfaced rather than auto-followed (see
+    /// [`Self::no_redirect_streaming_client`]). Returns the builder error
+    /// verbatim and NEVER falls back to a redirect-following client —
+    /// substituting one here would re-introduce the exact leak this client
+    /// exists to prevent (forwarding `x-ve-password` to a `Location` target).
+    fn build_no_redirect_streaming_client() -> Result<reqwest::Client, CliError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_static(CLIENT_USER_AGENT));
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(STREAM_CONNECT_TIMEOUT_SECS))
+            .pool_idle_timeout(Duration::from_secs(POOL_IDLE_TIMEOUT_SECS))
+            .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+            .build()
+            .map_err(CliError::Http)
     }
 
     /// Whether `?output=<detail>` may be injected on `path`.
@@ -831,7 +964,6 @@ impl ApiClient {
     }
 
     /// Perform a DELETE request with query parameters.
-    #[allow(dead_code)]
     pub async fn delete_with_params<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -919,7 +1051,7 @@ impl ApiClient {
         output_path: &std::path::Path,
     ) -> Result<u64, CliError> {
         tracing::trace!(method = "GET", path, "api request (stream download)");
-        let mut req = self.streaming_client().get(self.url(path));
+        let mut req = self.streaming_client.get(self.url(path));
         if let Some(auth) = self.auth_header() {
             req = req.header(AUTHORIZATION, auth);
         }
@@ -956,6 +1088,450 @@ impl ApiClient {
         let temp_path = Self::partial_path(output_path);
         let file = Self::create_temp(&temp_path).await?;
         let written = Self::stream_to_temp(resp, file).await;
+        Self::finalize_download(written, &temp_path, output_path).await
+    }
+
+    // ─── File Share consumption (optional `x-ve-password`) ──────────────────
+    //
+    // These helpers thread an OPTIONAL recipient link password through the
+    // `x-ve-password` header. They serve BOTH authenticated and anonymous
+    // consumers: the bearer token is attached only when the client holds one,
+    // so the same method works for `anyone_with_link` (anonymous), the
+    // registered tiers, and named-people grants. The password (when present) is
+    // parsed to a sensitive `HeaderValue` ONCE — before the non-fallible retry
+    // closure — and cheaply cloned inside it.
+
+    /// Perform a GET that may carry an optional `x-ve-password` header, and
+    /// unwrap the API envelope.
+    ///
+    /// The `Authorization: Bearer` header is attached ONLY when the client
+    /// holds a token, so this single method serves both authenticated and
+    /// anonymous File Share consumption (details / versions). When `password`
+    /// is `Some`, it is parsed to a sensitive [`HeaderValue`] before the retry
+    /// closure (so a bad value fails fast, without a panic, via
+    /// [`CliError::InvalidHeaderValue`]) and cloned per attempt.
+    ///
+    /// **Redirect safety:** when a password is present the request goes out on
+    /// the no-redirect [`Self::no_redirect_envelope_client`] and an unexpected
+    /// 3xx is a terminal error (see [`Self::send_no_redirect`]) — reqwest does
+    /// NOT strip custom headers across a redirect, so auto-following one would
+    /// forward the `x-ve-password` header to the `Location` target. When
+    /// `password` is `None` the behavior is unchanged: the request rides the
+    /// ordinary redirect-following [`Self::inner`] path via [`Self::build_get`].
+    ///
+    /// **`--detail` injection:** the password branch routes the no-redirect GET
+    /// through [`Self::inject_output_query`] (F2-7) so a configured `--detail`
+    /// appends `?output=<detail>` on password-protected details / versions
+    /// exactly as it does on the unauthenticated/authed paths — preserving the
+    /// [`OUTPUT_INJECT_DENY_SUBSTRINGS`] deny-substring behavior. Previously the
+    /// branch built directly on the client and silently dropped `--detail`.
+    pub async fn get_with_password<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        password: Option<&SecretString>,
+    ) -> Result<T, CliError> {
+        tracing::trace!(method = "GET", path, "api request (optional password)");
+        let Some(password) = password else {
+            // No password → preserve the existing redirect-following behavior
+            // exactly.
+            return self.send_with_retry(|| self.build_get(path)).await;
+        };
+        // Password present → parse once (fail fast on a bad value) and send on
+        // the no-redirect ENVELOPE client (it carries the ordinary request
+        // timeout — F2-2), failing closed on any 3xx.
+        let password_header = build_password_header(password)?;
+        let url = self.url(path);
+        self.send_no_redirect(|| {
+            // Apply `?output=<detail>` injection on the no-redirect GET BEFORE
+            // attaching auth/password headers (F2-7), honoring the deny-substring
+            // guard inside `inject_output_query`.
+            let req = self.no_redirect_envelope_client.get(&url);
+            let mut req = self.inject_output_query(req, path, false);
+            if let Some(auth) = self.auth_header() {
+                req = req.header(AUTHORIZATION, auth);
+            }
+            req.header(PASSWORD_HEADER, password_header.clone())
+        })
+        .await
+    }
+
+    /// Perform a form-encoded POST that may carry an optional `x-ve-password`
+    /// header, and unwrap the API envelope.
+    ///
+    /// Like [`Self::post`] but with the optional recipient link password. The
+    /// bearer token is attached only when the client holds one. The existing
+    /// form trace-redaction applies (secret-named form values are masked before
+    /// logging); the password header itself is sensitive and never logged.
+    ///
+    /// **Redirect safety:** mirrors [`Self::get_with_password`] — a present
+    /// password routes the POST onto the no-redirect client and fails closed on
+    /// any 3xx; a `None` password preserves the ordinary redirect-following
+    /// [`Self::inner`] behavior exactly.
+    pub async fn post_with_password<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        form: &HashMap<String, String>,
+        password: Option<&SecretString>,
+    ) -> Result<T, CliError> {
+        tracing::trace!(method = "POST", path, form = ?redact_form_for_log(form), "api request (optional password)");
+        let Some(password) = password else {
+            // No password → preserve the existing redirect-following behavior
+            // exactly (identical to `post`).
+            return self
+                .send_with_retry(|| {
+                    let mut req = self.inner.post(self.url(path)).form(form);
+                    if let Some(auth) = self.auth_header() {
+                        req = req.header(AUTHORIZATION, auth);
+                    }
+                    req
+                })
+                .await;
+        };
+        let password_header = build_password_header(password)?;
+        let url = self.url(path);
+        // Send on the no-redirect ENVELOPE client (it carries the ordinary
+        // request timeout — F2-2), failing closed on any 3xx.
+        self.send_no_redirect(|| {
+            let mut req = self.no_redirect_envelope_client.post(&url).form(form);
+            if let Some(auth) = self.auth_header() {
+                req = req.header(AUTHORIZATION, auth);
+            }
+            req.header(PASSWORD_HEADER, password_header.clone())
+        })
+        .await
+    }
+
+    /// Perform a form-encoded POST whose form body may carry a sensitive value
+    /// (e.g. a link `password` form field), failing closed on any 3xx so the body
+    /// is never replayed to a redirect `Location` target, then unwrap the API
+    /// envelope.
+    ///
+    /// Unlike [`Self::post`] (which rides the redirect-FOLLOWING [`Self::inner`]
+    /// client, so a 307/308 would replay the ENTIRE form body — including any
+    /// `password=…` field — to the untrusted `Location`), this routes onto the
+    /// no-redirect [`Self::no_redirect_envelope_client`] and treats an unexpected
+    /// 3xx as a TERMINAL [`CliError::Parse`] that names neither the URL nor any
+    /// form value (see [`Self::send_no_redirect`] /
+    /// [`Self::send_request_with_retry_inner`]). The bearer token is attached only
+    /// when the client holds one. Use this for management writes whose form may
+    /// contain a credential (File Share create / update). This is distinct from
+    /// [`Self::post_with_password`], whose secret travels in the `x-ve-password`
+    /// HEADER; here the sensitive value is a FORM FIELD.
+    pub async fn post_sensitive_form<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        form: &HashMap<String, String>,
+    ) -> Result<T, CliError> {
+        tracing::trace!(method = "POST", path, form = ?redact_form_for_log(form), "api request (sensitive form, fail-closed)");
+        let url = self.url(path);
+        self.send_no_redirect(|| {
+            let mut req = self.no_redirect_envelope_client.post(&url).form(form);
+            if let Some(auth) = self.auth_header() {
+                req = req.header(AUTHORIZATION, auth);
+            }
+            req
+        })
+        .await
+    }
+
+    /// Stream a binary GET to disk with an optional `x-ve-password` header,
+    /// returning the bytes written.
+    ///
+    /// Mirrors [`Self::download_file_stream`] (status-based error sniff, unique
+    /// temp file, atomic finalize) but also attaches the optional recipient link
+    /// password. The bearer token is added only when present, so the same method
+    /// serves authenticated and anonymous File Share downloads
+    /// (`/storage/read/`, `/storage/versions/{v}/read/`).
+    ///
+    /// **Redirect safety:** when a password is present the request rides the
+    /// no-redirect [`Self::no_redirect_streaming_client`] and any 3xx fails
+    /// closed (it is NOT followed) — reqwest does not strip the `x-ve-password`
+    /// header across a redirect, so auto-following one would leak it to the
+    /// `Location` target. When `password` is `None` the request uses the
+    /// redirect-following [`Self::streaming_client`] exactly as
+    /// [`Self::download_file_stream`] does, preserving existing behavior.
+    pub async fn download_file_stream_with_password(
+        &self,
+        path: &str,
+        output_path: &std::path::Path,
+        password: Option<&SecretString>,
+    ) -> Result<u64, CliError> {
+        tracing::trace!(
+            method = "GET",
+            path,
+            "api request (stream download, optional password)"
+        );
+        // Password present → no-redirect STREAMING client (fail closed on a 3xx,
+        // no body timeout); absent → the ordinary redirect-following streaming
+        // client (unchanged behavior).
+        let (client, password_header) = match password {
+            Some(password) => (
+                &self.no_redirect_streaming_client,
+                Some(build_password_header(password)?),
+            ),
+            None => (&self.streaming_client, None),
+        };
+        let url = self.url(path);
+        // Route the initial response through the shared 429 → RateLimit +
+        // 502-504-retry seam BEFORE streaming the body (F2-3). The body is not
+        // consumed on any error path, so re-issuing the GET per retry is safe.
+        let resp = self
+            .send_streaming_with_retry(
+                || {
+                    let mut req = client.get(&url);
+                    if let Some(auth) = self.auth_header() {
+                        req = req.header(AUTHORIZATION, auth);
+                    }
+                    if let Some(value) = &password_header {
+                        req = req.header(PASSWORD_HEADER, value.clone());
+                    }
+                    req
+                },
+                false,
+            )
+            .await?;
+        let status = resp.status();
+
+        // A password-bearing download is on the no-redirect client; a 3xx here
+        // means the server redirected and we must NOT chase it (it would forward
+        // the credential header). Fail closed with a resource-agnostic, secret-
+        // and URL-free error rather than streaming the redirect body.
+        if password.is_some() && status.is_redirection() {
+            return Err(CliError::Parse(
+                "the server returned an unexpected redirect for a \
+                 password-protected download; refusing to follow it"
+                    .to_owned(),
+            ));
+        }
+
+        if Self::stream_response_is_error(status.is_success()) {
+            let http_status = status.as_u16();
+            let body: Value = resp.json().await.unwrap_or_default();
+            if tracing::enabled!(tracing::Level::TRACE) {
+                tracing::trace!(
+                    body = %redact_secret_values_for_log(&body),
+                    "stream download error body"
+                );
+            }
+            return Err(Self::extract_error(&body, http_status).into());
+        }
+
+        let temp_path = Self::partial_path(output_path);
+        let file = Self::create_temp(&temp_path).await?;
+        let written = Self::stream_to_temp(resp, file).await;
+        Self::finalize_download(written, &temp_path, output_path).await
+    }
+
+    /// Stream a File Share preview to disk, manually following at most one
+    /// `307`/3xx redirect in a leak-safe way.
+    ///
+    /// The primary preview GET carries the bearer token (when present) plus the
+    /// optional `x-ve-password` header. On ANY 3xx response
+    /// ([`reqwest::StatusCode::is_redirection`]) the `Location` header is read,
+    /// resolved against the request URL (relative references are joined via
+    /// [`reqwest::Url::join`]), validated to be `http`/`https`, and the follow
+    /// GET is re-issued on the SAME no-redirect client WITHOUT `Authorization`
+    /// and WITHOUT `x-ve-password`. Dropping both headers on the follow is the
+    /// key safety property: reqwest does NOT strip custom headers on a
+    /// cross-origin redirect, so leaving them on would leak the link password
+    /// (and bearer) to a CDN — the redirect URL embeds its own short-lived
+    /// `download_token` that authorizes the follow, so neither header is needed.
+    /// A SECOND redirect (or a 3xx on the follow) fails closed with a clear
+    /// error; the client NEVER falls back to a redirect-following client. A
+    /// `2xx` primary streams directly (single-file previews do not redirect).
+    ///
+    /// **Transient handling:** both the primary request and the follow GET run
+    /// through [`Self::send_streaming_with_retry`], so a 429 surfaces as
+    /// [`CliError::RateLimit`] and a transient HTTP 502-504 is retried before the
+    /// redirect / stream decision (F2-4). The body is not consumed on any error
+    /// path, so re-issuing the GET per retry is safe.
+    pub async fn download_preview_following_redirect(
+        &self,
+        path: &str,
+        output_path: &std::path::Path,
+        password: Option<&SecretString>,
+    ) -> Result<u64, CliError> {
+        tracing::trace!(
+            method = "GET",
+            path,
+            "api request (preview, manual redirect)"
+        );
+        let request_url = self.url(path);
+        // Parse the password ONCE (fail fast, no panic) so the retry closure is
+        // non-fallible and just clones the sensitive header per attempt.
+        let password_header = password.map(build_password_header).transpose()?;
+        // The primary send carries the bearer + `x-ve-password`; its URL holds
+        // no secret in path/query, so transport errors are left intact
+        // (`scrub_url=false`). The FOLLOW URL (which embeds a short-lived
+        // download_token) IS scrubbed via `scrub_url=true` below.
+        let resp = self
+            .send_streaming_with_retry(
+                || {
+                    let mut req = self.no_redirect_streaming_client.get(&request_url);
+                    if let Some(auth) = self.auth_header() {
+                        req = req.header(AUTHORIZATION, auth);
+                    }
+                    if let Some(value) = &password_header {
+                        req = req.header(PASSWORD_HEADER, value.clone());
+                    }
+                    req
+                },
+                false,
+            )
+            .await?;
+        let status = resp.status();
+
+        // 3xx primary: follow exactly once, header-stripped, to the resolved
+        // (validated) target. Anything else (2xx success or a non-redirect
+        // error status) is handled by the shared streaming sink below.
+        if status.is_redirection() {
+            let follow_url = Self::resolve_redirect_location(resp.headers(), &request_url)?;
+            // The follow rides the same 429/502-504 retry seam, with
+            // `scrub_url=true` so a transport failure cannot leak the embedded
+            // download_token via `reqwest::Error`'s Display (addendum F23 / H3 /
+            // F2-4).
+            let follow_resp = self
+                .send_streaming_with_retry(|| self.build_follow_request(follow_url.clone()), true)
+                .await?;
+            return self
+                .finalize_streamed_response(follow_resp, output_path, true)
+                .await;
+        }
+
+        self.finalize_streamed_response(resp, output_path, false)
+            .await
+    }
+
+    /// Build the leak-safe preview FOLLOW request on the no-redirect streaming
+    /// client.
+    ///
+    /// The redirect target's URL embeds a short-lived `download_token` that
+    /// authorizes the read, so the follow GET deliberately carries NEITHER an
+    /// `Authorization` header NOR an `x-ve-password` header — reqwest does not
+    /// strip custom headers across a (cross-origin) redirect, so re-attaching
+    /// either would leak a credential to the CDN. Built on the no-redirect
+    /// streaming client so the follow itself cannot chase a further redirect.
+    /// Extracted as a small helper (addendum F23 / H4) so a unit test can assert
+    /// the built request carries no credential headers without a live server.
+    fn build_follow_request(&self, url: reqwest::Url) -> reqwest::RequestBuilder {
+        // No Authorization, no x-ve-password — the embedded download_token is the
+        // sole authorizer for the follow.
+        self.no_redirect_streaming_client.get(url)
+    }
+
+    /// Resolve and validate a redirect `Location` for the leak-safe preview
+    /// follow.
+    ///
+    /// Pure helper (no I/O) so the relative-resolution and scheme-validation
+    /// logic is unit-testable without a live server. Reads the `Location`
+    /// header, resolves a relative reference against `request_url` via
+    /// [`reqwest::Url::join`] (an absolute `Location` replaces it wholesale),
+    /// and rejects any scheme other than `http`/`https`. Returns
+    /// [`CliError::Parse`] when the header is missing, unreadable, unparseable,
+    /// or carries a disallowed scheme.
+    fn resolve_redirect_location(
+        headers: &HeaderMap,
+        request_url: &str,
+    ) -> Result<reqwest::Url, CliError> {
+        let location = headers
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| {
+                CliError::Parse("preview redirect is missing a Location header".to_owned())
+            })?
+            .to_str()
+            .map_err(|_| {
+                CliError::Parse("preview redirect Location header is not valid text".to_owned())
+            })?;
+        let base = reqwest::Url::parse(request_url).map_err(|e| {
+            CliError::Parse(format!("could not parse the preview request URL: {e}"))
+        })?;
+        // `Url::join` resolves a relative reference against the base and, for an
+        // absolute `Location`, returns it wholesale.
+        let resolved = base.join(location).map_err(|e| {
+            CliError::Parse(format!(
+                "could not resolve the preview redirect target: {e}"
+            ))
+        })?;
+        if !matches!(resolved.scheme(), "http" | "https") {
+            return Err(CliError::Parse(format!(
+                "preview redirect target uses an unsupported scheme: {}",
+                resolved.scheme()
+            )));
+        }
+        Ok(resolved)
+    }
+
+    /// Stream an (already-sent) response to `output_path`, treating any further
+    /// redirect as a fail-closed error.
+    ///
+    /// Shared sink for [`Self::download_preview_following_redirect`]: a non-2xx
+    /// status is surfaced as a structured [`CliError`] (a 3xx becomes an
+    /// explicit "second redirect" error when `is_follow` — we never chase a
+    /// chain), and a 2xx body streams to a unique temp file that is atomically
+    /// finalized.
+    async fn finalize_streamed_response(
+        &self,
+        resp: reqwest::Response,
+        output_path: &std::path::Path,
+        is_follow: bool,
+    ) -> Result<u64, CliError> {
+        let status = resp.status();
+        if status.is_redirection() {
+            // A redirect on the follow (or a second redirect) is a fail-closed
+            // error — we never chase a redirect chain for a preview.
+            return Err(CliError::Parse(if is_follow {
+                "preview redirect chained to a second redirect; refusing to follow further"
+                    .to_owned()
+            } else {
+                "preview returned an unexpected redirect".to_owned()
+            }));
+        }
+        if Self::stream_response_is_error(status.is_success()) {
+            let http_status = status.as_u16();
+            // On the FOLLOW response the body comes from the redirect target (a
+            // CDN) reached via the tokenized download URL. A CDN error page can
+            // reflect the request URL — including the embedded `download_token` —
+            // in its body text, so we must NOT mine that body into an error
+            // message that reaches stderr / logs. Surface a generic, status-only
+            // error (no body-derived text, no URL) for the follow (F2-8). The
+            // PRIMARY response is the Fast.io API envelope (no token in the body)
+            // and is mined as usual so the server's real error message shows.
+            if is_follow {
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    tracing::trace!(
+                        http_status,
+                        "preview follow returned a non-success status (body suppressed)"
+                    );
+                }
+                return Err(CliError::Api(ApiError {
+                    code: 0,
+                    error_code: None,
+                    message: format!("the preview redirect target returned HTTP {http_status}"),
+                    http_status,
+                    details: None,
+                }));
+            }
+            let body: Value = resp.json().await.unwrap_or_default();
+            if tracing::enabled!(tracing::Level::TRACE) {
+                tracing::trace!(
+                    body = %redact_secret_values_for_log(&body),
+                    "preview download error body"
+                );
+            }
+            return Err(Self::extract_error(&body, http_status).into());
+        }
+        let temp_path = Self::partial_path(output_path);
+        let file = Self::create_temp(&temp_path).await?;
+        let mut written = Self::stream_to_temp(resp, file).await;
+        // On the FOLLOW response the body streams from the redirect target,
+        // whose URL embeds a short-lived download_token. A mid-stream
+        // `reqwest::Error` carries that URL in its Display, so scrub it before it
+        // can reach stderr / logs (H3 streaming-path audit). The primary
+        // (non-follow) response streams from the API path, which carries no
+        // secret in its URL, so it is left intact.
+        if is_follow && let Err(CliError::Http(e)) = written {
+            written = Err(CliError::Http(e.without_url()));
+        }
         Self::finalize_download(written, &temp_path, output_path).await
     }
 
@@ -1144,16 +1720,133 @@ impl ApiClient {
         Ok(written)
     }
 
+    /// Send a streaming-download request with the SAME 429 / 502-504 / network
+    /// retry semantics as [`Self::send_request_with_retry`], returning the final
+    /// [`reqwest::Response`] WITHOUT consuming its body.
+    ///
+    /// This is the retry seam for the binary File Share consumption paths
+    /// (`download_file_stream_with_password`, `download_preview_following_redirect`),
+    /// which previously sent exactly once and so failed on a transient 502-504
+    /// and surfaced a 429 as a generic error instead of [`CliError::RateLimit`]
+    /// (F2-3 / F2-4). It re-issues `build_request` per attempt — safe because the
+    /// body is NOT yet consumed on any of these error paths (the request bytes
+    /// are simply re-sent). A 429 becomes [`CliError::RateLimit`]; HTTP 502-504
+    /// is retried with exponential backoff; a pre-send / mid-handshake
+    /// `reqwest::Error` is retried per [`Self::is_retryable_error`]. Any other
+    /// status (2xx, a non-retryable 4xx/5xx, or a 3xx) is returned to the caller
+    /// to handle — the redirect / error-body / streaming decisions stay in the
+    /// caller, exactly as before.
+    ///
+    /// `scrub_url` strips the request URL from a transport error
+    /// ([`reqwest::Error::without_url`]) before it is wrapped — set it `true` on
+    /// the token-bearing preview FOLLOW so a network failure cannot leak the
+    /// embedded `download_token` to stderr / logs (H3 / F2-4). The
+    /// rate-limit-header check on a non-retried success mirrors the envelope
+    /// path.
+    async fn send_streaming_with_retry<F>(
+        &self,
+        build_request: F,
+        scrub_url: bool,
+    ) -> Result<reqwest::Response, CliError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let mut last_error: Option<CliError> = None;
+
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let backoff = INITIAL_BACKOFF * 2u32.saturating_pow(attempt - 1);
+                tracing::warn!(
+                    attempt,
+                    backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+                    "retrying streaming request after transient failure"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+
+            match build_request().send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    tracing::trace!(status = status.as_u16(), "streaming api response");
+
+                    if matches!(status.as_u16(), 502..=504) && attempt < MAX_RETRIES {
+                        tracing::warn!(
+                            status = status.as_u16(),
+                            "received transient server error on streaming request, will retry"
+                        );
+                        last_error = Some(CliError::Api(ApiError {
+                            code: 0,
+                            error_code: None,
+                            message: format!("transient server error (HTTP {})", status.as_u16()),
+                            http_status: status.as_u16(),
+                            details: None,
+                        }));
+                        continue;
+                    }
+
+                    if status.as_u16() == 429 {
+                        let retry_secs = Self::parse_rate_limit_expiry(&resp);
+                        Self::emit_rate_limit_error(retry_secs);
+                        return Err(CliError::RateLimit {
+                            retry_after_secs: retry_secs,
+                        });
+                    }
+
+                    Self::check_rate_limit(&resp);
+                    return Ok(resp);
+                }
+                Err(e) if Self::is_retryable_error(&e) && attempt < MAX_RETRIES => {
+                    let scrubbed = if scrub_url { e.without_url() } else { e };
+                    tracing::warn!(error = %scrubbed, "transient streaming network error, will retry");
+                    last_error = Some(CliError::Http(scrubbed));
+                }
+                Err(e) => {
+                    let scrubbed = if scrub_url { e.without_url() } else { e };
+                    return Err(CliError::Http(scrubbed));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            CliError::Parse("streaming request failed: all retries exhausted".to_owned())
+        }))
+    }
+
     /// Send a request with automatic retry and exponential backoff,
     /// returning the unprocessed [`reqwest::Response`] for body-shape-specific
     /// handlers to parse.
     ///
     /// Retries on connection errors, timeouts, and HTTP 502/503/504. A 429
     /// response is converted to [`CliError::RateLimit`] without retrying.
-    /// Rate-limit headers are checked on every successful return.
+    /// Rate-limit headers are checked on every successful return. The request is
+    /// built on the redirect-FOLLOWING [`Self::inner`] client (the closure picks
+    /// the client), so a 3xx is transparently chased — appropriate for ordinary
+    /// authenticated/anonymous traffic but NOT for password-bearing requests
+    /// (see [`Self::send_no_redirect`]).
     async fn send_request_with_retry<F>(
         &self,
         build_request: F,
+    ) -> Result<reqwest::Response, CliError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        self.send_request_with_retry_inner(build_request, false)
+            .await
+    }
+
+    /// Core retry/rate-limit send loop shared by the redirect-following and
+    /// fail-closed-on-redirect paths.
+    ///
+    /// When `fail_closed_on_redirect` is `true`, a 3xx response is a TERMINAL
+    /// error ([`CliError::Parse`], resource-agnostic, embedding no secret or
+    /// URL) rather than something to retry or follow — the caller is on the
+    /// no-redirect client precisely so an unexpected redirect cannot forward a
+    /// credential header to the `Location` target. The 429 / 502-504 / network
+    /// retry semantics are identical in both modes.
+    async fn send_request_with_retry_inner<F>(
+        &self,
+        build_request: F,
+        fail_closed_on_redirect: bool,
     ) -> Result<reqwest::Response, CliError>
     where
         F: Fn() -> reqwest::RequestBuilder,
@@ -1196,6 +1889,19 @@ impl ApiClient {
                         });
                     }
 
+                    // Fail closed on an unexpected redirect for password-bearing
+                    // sends: the no-redirect client never followed it, and we
+                    // must NOT chase it ourselves (the `Location` target is
+                    // untrusted for a credential header). The error names no
+                    // resource and embeds neither the secret nor any URL.
+                    if fail_closed_on_redirect && status.is_redirection() {
+                        return Err(CliError::Parse(
+                            "the server returned an unexpected redirect for a \
+                             password-protected request; refusing to follow it"
+                                .to_owned(),
+                        ));
+                    }
+
                     Self::check_rate_limit(&resp);
                     return Ok(resp);
                 }
@@ -1211,6 +1917,27 @@ impl ApiClient {
         // on every retryable failure, but we handle `None` defensively.
         Err(last_error
             .unwrap_or_else(|| CliError::Parse("request failed: all retries exhausted".to_owned())))
+    }
+
+    /// Send a password-bearing request on the no-redirect client, with the same
+    /// retry / rate-limit semantics as [`Self::send_with_retry`] but failing
+    /// closed on any 3xx, then unwrap the API envelope.
+    ///
+    /// This is the sole send path for the password-bearing ENVELOPE requests
+    /// (`get_with_password` / `post_with_password`). The `build_request` closure
+    /// MUST build on [`Self::no_redirect_envelope_client`] (those helpers do) so
+    /// reqwest never auto-follows a redirect and forwards the credential header
+    /// to the `Location` target; an unexpected 3xx becomes a terminal
+    /// [`CliError::Parse`] (see [`Self::send_request_with_retry_inner`]).
+    async fn send_no_redirect<T, F>(&self, build_request: F) -> Result<T, CliError>
+    where
+        T: DeserializeOwned,
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let resp = self
+            .send_request_with_retry_inner(build_request, true)
+            .await?;
+        self.handle_response(resp).await
     }
 
     /// Send a request with retry; deserialize the unwrapped envelope payload.
@@ -3002,5 +3729,301 @@ mod tests {
             "named-key envelope must not gain a synthetic `response` key"
         );
         let () = rx.await.expect("server captured request");
+    }
+
+    #[test]
+    fn password_header_name_is_in_secret_log_keys() {
+        // Defense-in-depth: if the password ever lands in a logged body/form,
+        // the redaction layer must mask it by key name.
+        assert!(
+            SECRET_LOG_KEYS
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(PASSWORD_HEADER)),
+            "x-ve-password must be registered in SECRET_LOG_KEYS"
+        );
+    }
+
+    #[test]
+    fn build_password_header_marks_value_sensitive() {
+        let pw = SecretString::from("hunter2".to_owned());
+        let value = build_password_header(&pw).expect("valid password header");
+        assert!(
+            value.is_sensitive(),
+            "the password header value must be marked sensitive"
+        );
+        // A well-formed value round-trips to the same bytes.
+        assert_eq!(value.to_str().ok(), Some("hunter2"));
+    }
+
+    #[test]
+    fn build_password_header_accepts_non_ascii_utf8_password() {
+        // F2-5: the link-password contract allows any 1-255 char UTF-8 value.
+        // `HeaderValue::from_bytes` accepts the non-ASCII bytes (which
+        // `from_str` would reject), so a password the user could set via the
+        // management form is sendable from the CLI. It is still marked sensitive
+        // and round-trips to the original BYTES.
+        let secret = "pässwört→";
+        let pw = SecretString::from(secret.to_owned());
+        let value = build_password_header(&pw).expect("utf-8 password must be accepted");
+        assert!(
+            value.is_sensitive(),
+            "the password header value must be marked sensitive"
+        );
+        assert_eq!(value.as_bytes(), secret.as_bytes());
+    }
+
+    #[test]
+    fn build_password_header_rejects_control_chars_without_leaking_secret() {
+        // A newline cannot be carried in a header value. The error must be the
+        // dedicated InvalidHeaderValue variant, name only the header, and NEVER
+        // echo the offending secret.
+        let secret = "abc\ndef-SUPER-SECRET";
+        let pw = SecretString::from(secret.to_owned());
+        let err = build_password_header(&pw).expect_err("control char must be rejected");
+        match &err {
+            CliError::InvalidHeaderValue { header } => {
+                assert_eq!(*header, PASSWORD_HEADER);
+            }
+            other => panic!("expected InvalidHeaderValue, got {other:?}"),
+        }
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("SUPER-SECRET"),
+            "the secret must never appear in the error message: {rendered}"
+        );
+        assert!(
+            !rendered.contains("def"),
+            "no fragment of the secret may appear in the error message: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_with_password_fails_closed_on_redirect() {
+        // H1: a password-bearing GET that receives a 3xx must FAIL CLOSED (the
+        // no-redirect client never follows it, so the x-ve-password header can
+        // never be forwarded to the Location target). The error names no
+        // resource and embeds neither the secret nor the redirect URL.
+        let addr = spawn_one_shot_redirect(
+            "302 Found",
+            "https://cdn.example.com/leak-target".to_owned(),
+        )
+        .await;
+        let client = ApiClient::new(&format!("http://{addr}"), Some("tok".to_owned()))
+            .expect("client builds");
+        let pw = SecretString::from("hunter2-SECRET".to_owned());
+        let err = client
+            .get_with_password::<Value>("/fileshare/1/details/", Some(&pw))
+            .await
+            .expect_err("a redirect on a password-bearing GET must fail closed");
+        match &err {
+            CliError::Parse(msg) => {
+                assert!(
+                    msg.contains("unexpected redirect"),
+                    "expected a fail-closed redirect error, got: {msg}"
+                );
+                assert!(
+                    !msg.contains("hunter2-SECRET"),
+                    "the secret must never appear in the error: {msg}"
+                );
+                assert!(
+                    !msg.contains("cdn.example.com"),
+                    "the redirect target URL must not appear in the error: {msg}"
+                );
+            }
+            other => panic!("expected CliError::Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_redirect_location_resolves_relative_against_request_url() {
+        // A relative Location resolves against the request URL's origin + path.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::LOCATION,
+            HeaderValue::from_static("/cdn/token/abc/file/clip.ts"),
+        );
+        let resolved = ApiClient::resolve_redirect_location(
+            &headers,
+            "https://api.fast.io/current/fileshare/1/storage/preview/hls_stream/read/",
+        )
+        .expect("relative Location resolves");
+        assert_eq!(
+            resolved.as_str(),
+            "https://api.fast.io/cdn/token/abc/file/clip.ts"
+        );
+    }
+
+    #[test]
+    fn resolve_redirect_location_accepts_absolute_cross_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::LOCATION,
+            HeaderValue::from_static("https://cdn.example.com/dl/token123/file/clip.ts?x=1"),
+        );
+        let resolved = ApiClient::resolve_redirect_location(
+            &headers,
+            "https://api.fast.io/current/fileshare/1/storage/preview/hls_stream/read/",
+        )
+        .expect("absolute Location is taken wholesale");
+        assert_eq!(
+            resolved.as_str(),
+            "https://cdn.example.com/dl/token123/file/clip.ts?x=1"
+        );
+    }
+
+    #[test]
+    fn resolve_redirect_location_rejects_non_http_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::LOCATION,
+            HeaderValue::from_static("file:///etc/passwd"),
+        );
+        let err = ApiClient::resolve_redirect_location(
+            &headers,
+            "https://api.fast.io/current/fileshare/1/storage/preview/pdf/read/",
+        )
+        .expect_err("non-http scheme must be rejected");
+        assert!(matches!(err, CliError::Parse(_)));
+
+        // A missing Location header is also a clear error, not a panic.
+        let empty = HeaderMap::new();
+        let err = ApiClient::resolve_redirect_location(
+            &empty,
+            "https://api.fast.io/current/fileshare/1/storage/preview/pdf/read/",
+        )
+        .expect_err("missing Location must be rejected");
+        assert!(matches!(err, CliError::Parse(_)));
+    }
+
+    #[test]
+    fn build_follow_request_strips_authorization_and_password_headers() {
+        // H4 (addendum F23): the leak-safe preview FOLLOW request must carry
+        // NEITHER an Authorization header NOR an x-ve-password header — reqwest
+        // does not strip custom headers across a redirect, so re-attaching
+        // either would leak a credential to the CDN. The embedded download_token
+        // in the URL is the sole authorizer.
+        let client = ApiClient::new(
+            "https://api.fast.io/current",
+            Some("super-secret-bearer".to_owned()),
+        )
+        .expect("client builds");
+        let follow_url = reqwest::Url::parse("https://cdn.example.com/dl/token123/file/clip.ts")
+            .expect("valid url");
+        let req = client
+            .build_follow_request(follow_url)
+            .build()
+            .expect("request builds");
+
+        assert_eq!(req.method(), reqwest::Method::GET);
+        assert!(
+            req.headers().get(AUTHORIZATION).is_none(),
+            "the follow request must NOT carry an Authorization header"
+        );
+        assert!(
+            req.headers().get(PASSWORD_HEADER).is_none(),
+            "the follow request must NOT carry an x-ve-password header"
+        );
+        // Sanity: the bearer never appears anywhere in the built request.
+        let serialized = format!("{:?}", req.headers());
+        assert!(
+            !serialized.contains("super-secret-bearer"),
+            "the bearer token must not appear on the follow request: {serialized}"
+        );
+    }
+
+    /// Serve a single HTTP/1.1 redirect (`status_line` + `Location: location`)
+    /// then close. Returns the bound `127.0.0.1:<port>` address. Used to drive
+    /// the manual preview-redirect follow without a live API.
+    async fn spawn_one_shot_redirect(status_line: &'static str, location: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let header = format!(
+                    "HTTP/1.1 {status_line}\r\nLocation: {location}\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn preview_follows_one_redirect_then_streams_body() {
+        // The primary preview GET 307s to a CDN URL (the embedded download_token
+        // authorizes the follow); the follow streams the body to disk.
+        let body = b"PREVIEW-BYTES";
+        let cdn_addr = spawn_one_shot_server("200 OK", "video/mp2t", body).await;
+        let primary_addr = spawn_one_shot_redirect(
+            "307 Temporary Redirect",
+            format!("http://{cdn_addr}/clip.ts"),
+        )
+        .await;
+        let client = ApiClient::new(&format!("http://{primary_addr}"), Some("tok".to_owned()))
+            .expect("client builds");
+
+        let dir = std::env::temp_dir().join(format!("fastio-preview-ok-{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let output = dir.join("clip.ts");
+
+        let written = client
+            .download_preview_following_redirect("/preview/", &output, None)
+            .await
+            .expect("preview follow streams to disk");
+        assert_eq!(written, body.len() as u64);
+        assert_eq!(
+            tokio::fs::read(&output).await.expect("read output"),
+            body,
+            "the followed body must be written verbatim"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn preview_second_redirect_fails_closed() {
+        // H4 / addendum F23: a redirect ON THE FOLLOW response (a second
+        // redirect) must fail closed — never be chased, never written to disk.
+        // Primary 307 → server B; server B 307s AGAIN → the follow sink rejects.
+        let second_addr = spawn_one_shot_redirect(
+            "307 Temporary Redirect",
+            "http://example.invalid/x".to_owned(),
+        )
+        .await;
+        let primary_addr = spawn_one_shot_redirect(
+            "307 Temporary Redirect",
+            format!("http://{second_addr}/again"),
+        )
+        .await;
+        let client = ApiClient::new(&format!("http://{primary_addr}"), Some("tok".to_owned()))
+            .expect("client builds");
+
+        let dir =
+            std::env::temp_dir().join(format!("fastio-preview-2redir-{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let output = dir.join("preview.ts");
+
+        let err = client
+            .download_preview_following_redirect("/preview/", &output, None)
+            .await
+            .expect_err("a second redirect must fail closed");
+        match &err {
+            CliError::Parse(msg) => assert!(
+                msg.contains("second redirect"),
+                "expected a clear second-redirect error, got: {msg}"
+            ),
+            other => panic!("expected CliError::Parse, got {other:?}"),
+        }
+        assert!(
+            tokio::fs::metadata(&output).await.is_err(),
+            "a fail-closed redirect must not write an output file"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

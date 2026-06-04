@@ -19,6 +19,8 @@ pub mod comment;
 pub mod download;
 /// Audit and activity event endpoints.
 pub mod event;
+/// File Share (durable single-file link) management + consumption endpoints.
+pub mod fileshare;
 /// External storage import endpoints.
 pub mod import;
 /// AI instructions endpoints (user / org / workspace / share).

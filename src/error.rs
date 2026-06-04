@@ -72,6 +72,52 @@ pub enum CliError {
         /// no duplicate link to the rendered `anyhow` chain.
         api: ApiError,
     },
+
+    /// A user-supplied secret (e.g. a link password) cannot be carried in an
+    /// HTTP header value.
+    ///
+    /// The header value is built from the secret's raw bytes via
+    /// [`reqwest::header::HeaderValue::from_bytes`], which accepts any byte
+    /// EXCEPT control characters (including CR/LF) and a few disallowed header
+    /// bytes — so a non-ASCII UTF-8 value (e.g. `"pässwört→"`) is fine, but a
+    /// value containing a newline or other control byte cannot be turned into a
+    /// [`reqwest::header::HeaderValue`]. This variant is raised at the seam that
+    /// builds such a header so the failure is a clear client-side validation
+    /// error rather than a panic or a confusing transport error.
+    ///
+    /// `header` names ONLY the header that could not be built — the offending
+    /// VALUE is NEVER embedded, because it is a secret (this is the whole point
+    /// of failing here). The wording is deliberately resource-agnostic so the
+    /// variant stays reusable for any header-bound secret; the `suggestion()`
+    /// hint explains the likely cause (the value contains characters HTTP
+    /// headers cannot carry) without naming any specific feature.
+    #[error("invalid value for {header} header")]
+    InvalidHeaderValue {
+        /// The name of the header that could not be constructed (e.g.
+        /// `x-ve-password`). The disallowed value is intentionally NOT carried
+        /// here — it is a secret.
+        header: &'static str,
+    },
+
+    /// A compare-and-swap (optimistic-concurrency) write was rejected because
+    /// the target moved on since the version the caller based their change on.
+    ///
+    /// Surfaced when a server returns a version-mismatch on a conditional write
+    /// (the caller passed an "if the current version is X" precondition and the
+    /// current version is no longer X). The wording is deliberately
+    /// resource-AGNOSTIC — "the target file changed" rather than naming any one
+    /// feature — so the variant is reusable for any CAS write; feature-specific
+    /// phrasing belongs in the command layer's `.context(...)`, never here. The
+    /// `suggestion()` hint is the rebase recipe: re-fetch the latest, re-apply
+    /// the change, and retry with the current version id.
+    #[error(
+        "the target file changed since the version you supplied (current version: {current_version})"
+    )]
+    VersionConflict {
+        /// The version id that is now current on the server — the value the
+        /// caller should rebase onto and retry with. Not a secret.
+        current_version: String,
+    },
 }
 
 impl CliError {
@@ -88,6 +134,8 @@ impl CliError {
             }
             Self::Api(api_err) => api_err.suggestion(),
             Self::ArtifactNotReady { .. } => Some(HINT_ARTIFACT_NOT_READY),
+            Self::InvalidHeaderValue { .. } => Some(HINT_INVALID_HEADER_VALUE),
+            Self::VersionConflict { .. } => Some(HINT_VERSION_CONFLICT),
             Self::Http(_) => {
                 Some("Check your network connection and verify the API base URL is correct.")
             }
@@ -181,6 +229,28 @@ pub const HINT_RESOURCE_ACCESS: &str = "Access to this resource is not granted t
 /// added `.context(...)`.
 pub const HINT_ARTIFACT_NOT_READY: &str = "The requested artifact is generated asynchronously and is not ready yet. \
      Poll the resource and retry once it reaches the required (terminal) stage.";
+
+/// Shared "secret cannot be carried in an HTTP header" hint
+/// ([`CliError::InvalidHeaderValue`]).
+///
+/// The value is sent via `HeaderValue::from_bytes`, which accepts non-ASCII
+/// UTF-8 but rejects control characters (including newlines) and a few
+/// disallowed header bytes — so only such bytes can trip this error. The hint
+/// stays resource-agnostic — it names no specific feature — and NEVER echoes the
+/// offending value (it is a secret).
+pub const HINT_INVALID_HEADER_VALUE: &str = "The supplied value contains a control character or newline, which cannot be \
+     carried in an HTTP header. Non-ASCII letters are fine; re-check the value and remove any control characters or line breaks.";
+
+/// Shared compare-and-swap (optimistic-concurrency) conflict hint
+/// ([`CliError::VersionConflict`]).
+///
+/// The conditional write was rejected because the target advanced past the
+/// version the caller based their change on. The recovery is the rebase recipe:
+/// re-fetch the latest, re-apply the change, and retry with the now-current
+/// version id. Kept resource-agnostic (no feature wording) so the variant stays
+/// reusable; the conflict error's `Display` carries the current version id.
+pub const HINT_VERSION_CONFLICT: &str = "The target changed since the version you supplied. \
+     Re-fetch the latest, re-apply your changes, then retry using the current version id shown above.";
 
 /// An error returned by the Fast.io REST API.
 ///
@@ -474,6 +544,68 @@ mod tests {
                 "hint references the removed `--plan-id` flag (use `--plan`): {hint}"
             );
         }
+    }
+
+    #[test]
+    fn invalid_header_value_display_and_hint_are_resource_agnostic() {
+        // The variant names ONLY the header (its whole purpose) and NEVER the
+        // offending value (it is a secret). The Display deliberately carries the
+        // header name `x-ve-password`, but neither the Display nor the hint may
+        // carry FEATURE wording (fileshare / file share / sign) — so the variant
+        // stays reusable for any header-bound secret. The hint additionally must
+        // never name a concrete header or secret kind.
+        let err = CliError::InvalidHeaderValue {
+            header: "x-ve-password",
+        };
+        let rendered = err.to_string();
+        assert_eq!(rendered, "invalid value for x-ve-password header");
+        let hint = err.suggestion().unwrap_or_default();
+        assert_eq!(hint, HINT_INVALID_HEADER_VALUE);
+        // No FEATURE wording in either the Display or the hint.
+        for needle in ["fileshare", "file share", "sign", "envelope"] {
+            assert!(
+                !rendered.to_lowercase().contains(needle),
+                "InvalidHeaderValue Display must not carry resource wording ({needle}): {rendered}"
+            );
+            assert!(
+                !hint.to_lowercase().contains(needle),
+                "InvalidHeaderValue hint must not carry resource wording ({needle}): {hint}"
+            );
+        }
+        // The hint stays generic: it names no specific header or secret kind.
+        assert!(!hint.to_lowercase().contains("x-ve-password"));
+        assert!(!hint.to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn version_conflict_display_and_hint_are_resource_agnostic() {
+        // The conflict wording must be resource-AGNOSTIC ("the target file
+        // changed") — never naming a feature — so the variant stays reusable for
+        // any compare-and-swap write; the current version id is carried for the
+        // rebase, but no fileshare/share/sign wording may appear.
+        let err = CliError::VersionConflict {
+            current_version: "v9xQ2-abc12".to_owned(),
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("v9xQ2-abc12"),
+            "current version id must surface for the rebase: {rendered}"
+        );
+        let hint = err.suggestion().unwrap_or_default();
+        assert_eq!(hint, HINT_VERSION_CONFLICT);
+        for needle in ["fileshare", "file share", "share", "sign", "envelope"] {
+            assert!(
+                !rendered.to_lowercase().contains(needle),
+                "VersionConflict Display must not carry resource wording ({needle}): {rendered}"
+            );
+            assert!(
+                !hint.to_lowercase().contains(needle),
+                "VersionConflict hint must not carry resource wording ({needle}): {hint}"
+            );
+        }
+        // The CAS conflict hint must NOT collide with the Config hint (which
+        // wrongly says "run fastio configure init" for this case).
+        assert!(!hint.to_lowercase().contains("configure init"));
     }
 
     #[test]
