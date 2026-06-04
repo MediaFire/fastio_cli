@@ -198,7 +198,22 @@ fastio workflow wait WF_ID                       # bounded poll to a terminal st
 fastio workflow trigger fire TRIGGER_ID --idempotency-key KEY
 fastio workflow audit export start WF_ID
 fastio workflow audit check-integrity ...        # local integrity verification
+fastio workflow review active WS_ID              # hydrate in-flight reviews (badge files under review)
 ```
+
+The `review` group is the v3.5b native content-approval surface attached to a
+workflow's approval steps. Its mutating / by-id endpoints (`create`, `get`,
+`asset`, `decision`, `admin-resolve`) are **CLI-binary-only** (not over MCP); the
+sole exception is the `active` hydration read, which is also exposed over MCP as
+the `workflow` tool's `review-active` action.
+`review active WS_ID` is a workspace hydration read — it returns the active
+(`arming` / `open`) reviews with their asset `node_id`s so files can be badged
+"under review" without per-file fetches. It accepts `--limit` (default 25, max
+100) and `--offset`, ordered oldest-first; active reviews per workspace are
+typically few, so one page usually covers it (otherwise page with `--offset`
+while `pagination.has_more` is true). Unlike the other review reads it is
+**not** flag-gated: a workspace member always gets a result (an empty list when
+nothing is in review); a non-member or unknown workspace id gets a `404`.
 
 `instantiate` and `trigger fire` **require** an `--idempotency-key` for replay
 safety (no silent auto-generation). Audit `check-integrity` verifies bundle

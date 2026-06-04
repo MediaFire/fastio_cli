@@ -1562,13 +1562,16 @@ pub async fn realtime_token(client: &ApiClient, workflow_id: &str) -> Result<Val
 }
 
 // ════════════════════════════════════════════════════════════════════════
-//  Workflow Review (v3.5b — member-only MVS, flag-gated; 404 when off)
+//  Workflow Review (v3.5b — member-only MVS; flag-gated 404 when off, except
+//  the not-flag-gated `review_workspace_active` hydration read at the end)
 // ════════════════════════════════════════════════════════════════════════
 
 /// Get-or-create a review surface for a step occurrence (idempotent).
 ///
-/// `POST /workflow-review/surface/create/` (form-encoded). Endpoints in this
-/// section 404 when the workspace's native-review rollout flag is off.
+/// `POST /workflow-review/surface/create/` (form-encoded). The create / get /
+/// asset / decision / admin-resolve endpoints in this section 404 when the
+/// workspace's native-review rollout flag is off; the `review_workspace_active`
+/// hydration read below is the exception (never flag-gated).
 pub async fn review_surface_create(
     client: &ApiClient,
     step_occurrence_id: &str,
@@ -1650,6 +1653,46 @@ pub async fn review_admin_resolve(
         urlencoding::encode(surface_id)
     );
     client.post(&path, &form).await
+}
+
+/// List the ACTIVE (`arming` / `open`) review surfaces in a workspace, each
+/// with its asset rows.
+///
+/// `GET /workflow-review/workspace/{workspace_id}/active/`. A workspace
+/// hydration read: returns the in-flight reviews with their asset `node_id`s,
+/// so a client can badge files as "under review" without per-file fetches.
+/// Accepts `limit` (default 25, max 100) and `offset`; rows are ordered
+/// oldest-created first (stable id tiebreak). Active reviews per workspace are
+/// typically few, so the default page usually covers them — for exhaustive
+/// hydration, page with `offset` while `pagination.has_more` is true. The
+/// response is `{ reviews: [ { surface, assets } ], pagination }` — it
+/// intentionally omits each surface's reviewer roster and per-asset decision
+/// matrix (fetch [`review_surface_get`] for those).
+///
+/// Unlike the other endpoints in this section, this read is **not** gated on
+/// the workspace's native-review rollout flag: in-flight reviews keep blocking
+/// file writes even if the feature is later disabled, so the list always
+/// reports them. For a workspace member it returns `result: true` with an
+/// empty `reviews` list when nothing is under review (never an error); a
+/// non-member or unknown workspace id gets a uniform `404` (no existence leak).
+pub async fn review_workspace_active(
+    client: &ApiClient,
+    workspace_id: &str,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Value, CliError> {
+    let mut params = HashMap::new();
+    if let Some(l) = limit {
+        params.insert("limit".to_owned(), l.to_string());
+    }
+    if let Some(o) = offset {
+        params.insert("offset".to_owned(), o.to_string());
+    }
+    let path = format!(
+        "/workflow-review/workspace/{}/active/",
+        urlencoding::encode(workspace_id)
+    );
+    client.get_with_params(&path, &params).await
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -2132,6 +2175,28 @@ mod tests {
             urlencoding::encode("user/1")
         );
         assert_eq!(path, "/workflows/4011234567890123456/grants/user%2F1/");
+    }
+
+    #[test]
+    fn review_workspace_active_path_and_pagination_params() {
+        // Workspace id is path-encoded.
+        let path = format!(
+            "/workflow-review/workspace/{}/active/",
+            urlencoding::encode("ws/9")
+        );
+        assert_eq!(path, "/workflow-review/workspace/ws%2F9/active/");
+        // Pagination params are inserted only when present (mirrors the fn body).
+        let limit: Option<u32> = Some(25);
+        let offset: Option<u32> = None;
+        let mut params = HashMap::new();
+        if let Some(l) = limit {
+            params.insert("limit".to_owned(), l.to_string());
+        }
+        if let Some(o) = offset {
+            params.insert("offset".to_owned(), o.to_string());
+        }
+        assert_eq!(params.get("limit").map(String::as_str), Some("25"));
+        assert!(!params.contains_key("offset"));
     }
 
     // ---- sha256 / integrity ----

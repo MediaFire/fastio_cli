@@ -499,7 +499,7 @@ pub enum WorkflowCommands {
     /// Realtime channel token (mint only).
     #[command(subcommand)]
     Realtime(WorkflowRealtimeCommands),
-    /// Workflow Review surface (v3.5b; 404 when the workspace flag is off).
+    /// Workflow Review surface (v3.5b; flag-gated 404 when off — except `active`).
     #[command(subcommand)]
     Review(WorkflowReviewCommands),
 }
@@ -1185,7 +1185,10 @@ pub enum WorkflowRealtimeCommands {
     },
 }
 
-/// Workflow Review (v3.5b) subcommands — flag-gated; 404 when off.
+/// Workflow Review (v3.5b) subcommands. The `create` / `get` / `asset` /
+/// `decision` / `admin-resolve` endpoints are flag-gated (404 when the
+/// workspace's native-review flag is off); `active` is the exception — it is
+/// never flag-gated and always works for a workspace member.
 #[derive(Subcommand, Debug)]
 #[non_exhaustive]
 pub enum WorkflowReviewCommands {
@@ -1227,6 +1230,23 @@ pub enum WorkflowReviewCommands {
         surface_id: String,
         /// Resolution: approved, rejected, or cancelled.
         resolution: String,
+    },
+    /// List the active (arming / open) review surfaces in a workspace.
+    ///
+    /// A workspace hydration read: returns the in-flight reviews (paginated via
+    /// `--limit` / `--offset`) with their asset node ids, so files can be
+    /// badged "under review" without per-file fetches. Unlike the other review
+    /// reads this is not flag-gated — a member always gets a result (an empty
+    /// list when nothing is under review).
+    Active {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Pagination limit (default 25, max 100).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Pagination offset.
+        #[arg(long)]
+        offset: Option<u32>,
     },
 }
 

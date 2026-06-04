@@ -1502,7 +1502,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "workflow",
-        description: "Workflow Orchestration (v3.2): the durable multi-step runtime — distinct from the legacy task/approval/todo primitives. OFFLOAD multi-step orchestration here instead of hand-driving primitives: the compound actions 'instantiate-and-wait', 'trigger-fire-and-wait', and 'audit-export-and-download' do the full fire→poll→download loop for you. This tool exposes READ + DRIVE actions only; admin/destructive/crypto operations (workflow cancel + purge, template/pool/trigger create+lifecycle, outbound subscription management, secret/key rotation, dual-control redaction, schema set/derive, realtime token mint) are intentionally CLI-binary-only (`fastio workflow …`) — including the terminal 'cancel' lifecycle mutation, which is NOT available over MCP. Call action='describe' for the authoritative action/param reference. Idempotency keys for instantiate/fire are REQUIRED for replay safety and have no MCP auto-generate. CAS step output/advance surfaces 409 conflicts by default. The audit 'check-integrity' is integrity-only (chunk SHA-256 + content-hash chain + completeness), NOT HMAC authenticity.",
+        description: "Workflow Orchestration (v3.2): the durable multi-step runtime — distinct from the legacy task/approval/todo primitives. OFFLOAD multi-step orchestration here instead of hand-driving primitives: the compound actions 'instantiate-and-wait', 'trigger-fire-and-wait', and 'audit-export-and-download' do the full fire→poll→download loop for you. This tool exposes READ + DRIVE actions only; admin/destructive/crypto operations (workflow cancel + purge, template/pool/trigger create+lifecycle, outbound subscription management, secret/key rotation, dual-control redaction, schema set/derive, realtime token mint) are intentionally CLI-binary-only (`fastio workflow …`) — including the terminal 'cancel' lifecycle mutation, which is NOT available over MCP. Call action='describe' for the authoritative action/param reference. Idempotency keys for instantiate/fire are REQUIRED for replay safety and have no MCP auto-generate. CAS step output/advance surfaces 409 conflicts by default. The audit 'check-integrity' is integrity-only (chunk SHA-256 + content-hash chain + completeness), NOT HMAC authenticity. The v3.5b review surface is otherwise CLI-binary-only, but its workspace hydration READ is exposed here as 'review-active' (lists active arming/open review surfaces + their asset node_ids so you can badge files as under review without per-file fetches; not flag-gated). The mutating review actions (create/decision/admin-resolve) and the by-id review reads remain CLI-only.",
         actions: &[
             "describe",
             "get",
@@ -1539,6 +1539,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             "audit-export-get",
             "audit-export-and-download",
             "subject-workflows",
+            "review-active",
         ],
         params: &[
             ("workspace_id", "Workspace ID (19-digit)", false),
@@ -9948,6 +9949,16 @@ fn workflow_describe() -> CallToolResult {
             &[],
             "",
         ),
+        (
+            "review-active",
+            &["workspace_id"],
+            &["limit", "offset"],
+            "v3.5b workspace hydration read: lists active (arming/open) review \
+             surfaces + their asset node_ids so files can be badged under review; \
+             NOT flag-gated (always returns for a workspace member). The other \
+             review actions (create/get/asset/decision/admin-resolve) are \
+             CLI-binary-only.",
+        ),
     ];
 
     let mut action_map = serde_json::Map::new();
@@ -9996,7 +10007,7 @@ fn workflow_describe() -> CallToolResult {
         "outbound create/update/delete/rotate-secret",
         "pool create/delete",
         "realtime token",
-        "review create/decision/admin-resolve",
+        "review create/get/asset/decision/admin-resolve (review-active read IS on MCP)",
     ]
     .iter()
     .map(|s| Value::String((*s).to_owned()))
@@ -10097,6 +10108,26 @@ async fn handle_workflow(
                 Err(e) => return Ok(e),
             };
             wf_render(wf::get_workflow_state(&client, id).await)
+        }
+        // The one review action exposed over MCP: a read-only workspace
+        // hydration list (active review surfaces + asset node_ids for
+        // under-review file badging). The mutating / by-id review endpoints
+        // (create / get / asset / decision / admin-resolve) stay CLI-only and
+        // fall through to the CLI-only fallback below.
+        "review-active" => {
+            let ws = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(
+                wf::review_workspace_active(
+                    &client,
+                    ws,
+                    optional_u32(args, "limit"),
+                    optional_u32(args, "offset"),
+                )
+                .await,
+            )
         }
         "instantiate" => {
             let id = match required_str(args, "workflow_id") {
@@ -13298,6 +13329,46 @@ mod ripley_tool_tests {
         assert!(
             text.contains("CLI-only workflow action") && text.contains("CLI-binary-only"),
             "admin actions must be rejected with a CLI pointer, got: {text}"
+        );
+    }
+
+    #[test]
+    fn workflow_review_active_advertised_but_mutating_review_stays_cli_only() {
+        // review-active (the workspace hydration READ) is the one review action
+        // exposed over MCP; the mutating / by-id review actions are not.
+        let actions = workflow_tool_actions();
+        assert!(
+            actions.contains(&"review-active"),
+            "review-active read must be advertised over MCP"
+        );
+        for cli_only in ["review-create", "review-decision", "review-admin-resolve"] {
+            assert!(
+                !actions.contains(&cli_only),
+                "mutating/by-id review action '{cli_only}' must stay CLI-only"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_review_active_routes_to_handler_not_cli_only() {
+        // Calling review-active without workspace_id must surface the handler's
+        // missing-param error, proving it routes to the handler rather than the
+        // CLI-only fallback the other review actions hit.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("review-active".to_owned()),
+        );
+        let res = router.call_tool("workflow", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("CLI-only workflow action"),
+            "review-active must route to the handler, not the CLI-only fallback: {text}"
+        );
+        assert!(
+            text.contains("workspace_id"),
+            "review-active without workspace_id must report the missing param: {text}"
         );
     }
 

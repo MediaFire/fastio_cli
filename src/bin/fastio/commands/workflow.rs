@@ -1840,6 +1840,13 @@ async fn execute_review(command: WorkflowReviewCommands, ctx: &CommandContext<'_
         } => orchestration::review_admin_resolve(&client, &surface_id, &resolution)
             .await
             .context("failed to admin-resolve review surface")?,
+        WorkflowReviewCommands::Active {
+            workspace_id,
+            limit,
+            offset,
+        } => orchestration::review_workspace_active(&client, &workspace_id, limit, offset)
+            .await
+            .context("failed to list active reviews")?,
     };
     ctx.output.render(&v)?;
     Ok(())
