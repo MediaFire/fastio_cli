@@ -5,8 +5,6 @@
 
 /// AI chat and prompt endpoints.
 pub mod ai;
-/// AI-memory endpoints (org + workspace, self-only, revision CAS).
-pub mod ai_memory;
 /// Connected-app management endpoints.
 pub mod apps;
 /// Asset metadata and transformation endpoints.

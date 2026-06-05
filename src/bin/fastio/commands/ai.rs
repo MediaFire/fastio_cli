@@ -28,35 +28,6 @@ pub struct AskScopeFlags {
     pub files_attach: Option<String>,
 }
 
-/// AI-memory scope, resolved from the clap `--org` XOR `--workspace` flags.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum MemoryTarget {
-    /// Organization-scoped memory.
-    Org(String),
-    /// Workspace-scoped memory.
-    Workspace(String),
-}
-
-/// AI-memory subcommand variants.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum MemoryCommand {
-    /// Read the caller's memory row.
-    Get(MemoryTarget),
-    /// Write the caller's memory row (optional revision CAS).
-    Set {
-        /// Org- or workspace-scoped target.
-        target: MemoryTarget,
-        /// New content (≤64KB).
-        content: String,
-        /// Optimistic-concurrency revision.
-        revision: Option<u64>,
-    },
-    /// Hard-delete the caller's memory row.
-    Delete(MemoryTarget),
-}
-
 /// AI subcommand variants.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -167,8 +138,6 @@ pub enum AiCommand {
         /// Optional context to guide generation.
         user_context: Option<String>,
     },
-    /// Manage the caller's AI memory (org or workspace; self-only).
-    Memory(MemoryCommand),
     /// Hand work to Ripley to run on the caller's behalf. The server
     /// delegation contract is not finalized, so this is a guarded stub —
     /// the payload is retained for the forthcoming wiring but unread today
@@ -368,7 +337,6 @@ pub async fn execute(command: &AiCommand, ctx: &CommandContext<'_>) -> Result<()
             share,
             user_context,
         } => autotitle(ctx, share, user_context.as_deref()).await,
-        AiCommand::Memory(mem) => memory(ctx, mem).await,
         // All four delegated-job stubs share the same guarded "pending"
         // response and call no endpoint (the server delegation contract is
         // not finalized — see phase2.log "Delegated-job contract").
@@ -1308,45 +1276,6 @@ async fn autotitle(
     Ok(())
 }
 
-/// Dispatch a memory subcommand to the `ai_memory` API.
-async fn memory(ctx: &CommandContext<'_>, cmd: &MemoryCommand) -> Result<()> {
-    let client = ctx.build_client()?;
-    let value = match cmd {
-        MemoryCommand::Get(target) => {
-            let (scope, id) = memory_scope(target);
-            api::ai_memory::get(&client, scope, id)
-                .await
-                .context("failed to read AI memory")?
-        }
-        MemoryCommand::Set {
-            target,
-            content,
-            revision,
-        } => {
-            let (scope, id) = memory_scope(target);
-            api::ai_memory::set(&client, scope, id, content, *revision)
-                .await
-                .context("failed to write AI memory")?
-        }
-        MemoryCommand::Delete(target) => {
-            let (scope, id) = memory_scope(target);
-            api::ai_memory::delete(&client, scope, id)
-                .await
-                .context("failed to delete AI memory")?
-        }
-    };
-    ctx.output.render(&value)?;
-    Ok(())
-}
-
-/// Map an internal [`MemoryTarget`] to the `ai_memory` scope + id.
-fn memory_scope(target: &MemoryTarget) -> (api::ai_memory::MemoryScope, &str) {
-    match target {
-        MemoryTarget::Org(id) => (api::ai_memory::MemoryScope::Org, id),
-        MemoryTarget::Workspace(id) => (api::ai_memory::MemoryScope::Workspace, id),
-    }
-}
-
 /// The shared "delegation not yet available" message emitted by every hidden
 /// delegated-job stub. Returns an `Err` so a caller/script sees a non-success
 /// exit, but with a clear, non-alarming message rather than a guessed endpoint
@@ -1363,10 +1292,9 @@ fn delegated_jobs_unavailable() -> Result<()> {
 #[cfg(test)]
 mod phase2_tests {
     use super::{
-        MemoryTarget, PollAction, classify_poll_error, delegated_jobs_unavailable, extract_chat_id,
-        extract_message_id, memory_scope,
+        PollAction, classify_poll_error, delegated_jobs_unavailable, extract_chat_id,
+        extract_message_id,
     };
-    use fastio_cli::api::ai_memory::MemoryScope;
     use fastio_cli::error::{ApiError, CliError};
     use serde_json::json;
 
@@ -1405,18 +1333,6 @@ mod phase2_tests {
             msg.contains("delegation contract"),
             "expected the contract-pending wording, got: {msg}"
         );
-    }
-
-    #[test]
-    fn memory_scope_maps_org_and_workspace() {
-        let org = MemoryTarget::Org("o1".to_owned());
-        let (scope, id) = memory_scope(&org);
-        assert_eq!(scope, MemoryScope::Org);
-        assert_eq!(id, "o1");
-        let ws = MemoryTarget::Workspace("ws1".to_owned());
-        let (scope, id) = memory_scope(&ws);
-        assert_eq!(scope, MemoryScope::Workspace);
-        assert_eq!(id, "ws1");
     }
 
     #[test]

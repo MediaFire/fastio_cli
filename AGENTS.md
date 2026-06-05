@@ -30,9 +30,6 @@ Heuristics for agents:
   endpoint with a bounded wait — do **not** tight-loop a `--detail full` read.
   The `ask`, `workflow wait`, `workflow instantiate-and-wait`, and
   `metadata extract --wait` paths already do bounded activity-polling for you.
-- Ripley also keeps **self-only AI memory** per org/workspace
-  (`fastio ripley memory get|set|delete`), useful for carrying context across
-  invocations.
 
 `ripley` is the former `ai` group — **`ai` still works as a hidden alias** (CLI
 and MCP) for backward compatibility, but new code should use `ripley`.
@@ -157,7 +154,6 @@ fastio ripley list --workspace WS_ID --kind all          # chats
 fastio ripley details CHAT_ID --workspace WS_ID
 fastio ripley messages CHAT_ID --workspace WS_ID
 fastio ripley summary --workspace WS_ID NODE_ID1 NODE_ID2     # AI share
-fastio ripley memory get --workspace WS_ID
 ```
 
 ### Unified search
