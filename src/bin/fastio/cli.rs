@@ -1676,9 +1676,11 @@ pub enum FileshareCommands {
         fileshare_id: String,
         /// Path to the local file whose content replaces the bound file.
         file: String,
-        /// Compare-and-swap precondition: apply the replace ONLY if the bound
-        /// file's current version equals this id (avoids clobbering a concurrent
-        /// edit). On mismatch the command reports the current version id.
+        /// Compare-and-swap precondition (server-enforced): the bound file's
+        /// current version id, sent so the server can reject the replace on a
+        /// version conflict. When the server detects a mismatch it reports
+        /// `CONFLICT_VERSION_MISMATCH` and the command surfaces it as a
+        /// version-conflict error carrying the current version id.
         #[arg(long)]
         if_version: Option<String>,
         /// Link password (visible in `ps`/history — prefer

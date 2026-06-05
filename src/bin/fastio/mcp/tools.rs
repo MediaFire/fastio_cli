@@ -12217,8 +12217,10 @@ fn fileshare_describe() -> CallToolResult {
             "quickshare": "QuickShare creation is deprecated (10756) — use this tool's `create` \
                            action. Legacy QuickShare reads/revokes still work.",
             "write_back": "To replace the bound file's bytes with a new version, run the CLI: \
-                           `fastio fileshare upload <id> <file> [--if-version <vid>]`. A stale \
-                           --if-version surfaces CONFLICT_VERSION_MISMATCH with the current \
+                           `fastio fileshare upload <id> <file> [--if-version <vid>]`. \
+                           --if-version is a server-enforced CAS precondition: when the server \
+                           detects a version conflict it reports CONFLICT_VERSION_MISMATCH and \
+                           the CLI surfaces it as a version-conflict error with the current \
                            version id — re-download, re-apply, retry with that id. This is NOT \
                            available over MCP (it needs local file bytes and is destructive).",
             "ws_token": "To mint a realtime WebSocket token, run the CLI: `fastio fileshare \
@@ -12258,9 +12260,10 @@ async fn handle_fileshare(
         return Ok(error_text(
             "fileshare upload (write-back) is CLI-binary-only: it pushes a NEW VERSION of the \
              bound file and needs the local file bytes. Run it via the CLI — `fastio fileshare \
-             upload <id> <file> [--if-version <vid>] [--password …]`. A stale --if-version \
-             surfaces CONFLICT_VERSION_MISMATCH with the current version id. Call \
-             action='describe' for the MCP action list.",
+             upload <id> <file> [--if-version <vid>] [--password …]`. --if-version is a \
+             server-enforced CAS precondition: when the server detects a version conflict it \
+             reports CONFLICT_VERSION_MISMATCH and the CLI surfaces it as a version-conflict \
+             error with the current version id. Call action='describe' for the MCP action list.",
         ));
     }
     // `ws-token` (realtime WebSocket-token mint) is CLI-binary-only: the token is
@@ -12371,7 +12374,7 @@ async fn handle_fileshare(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            if let Err(e) = fileshare_validate_password_arg(args) {
+            if let Err(e) = fileshare_validate_consumption_password_arg(args) {
                 return Ok(e);
             }
             let password = fileshare_mcp_password(args);
@@ -12529,7 +12532,7 @@ async fn handle_fileshare(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            if let Err(e) = fileshare_validate_password_arg(args) {
+            if let Err(e) = fileshare_validate_consumption_password_arg(args) {
                 return Ok(e);
             }
             let password = fileshare_mcp_password(args);
@@ -12549,6 +12552,14 @@ async fn handle_fileshare(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
+            // `required_str` accepts a present-but-empty `""`; `poll_activity`
+            // does NOT guard the entity id, so an empty id would build
+            // `/activity/poll//`. Reject it explicitly here.
+            if fileshare_id.is_empty() {
+                return Ok(error_text(
+                    "invalid request: `fileshare_id` must not be empty for the activity action.",
+                ));
+            }
             // A SINGLE poll — pass wait / lastactivity / updated through; no loop.
             match event::poll_activity(
                 &client,
@@ -12586,14 +12597,6 @@ const FILESHARE_DELETE_CONFIRM: &str = "fileshare delete permanently revokes the
 const FILESHARE_REVOKE_CONFIRM: &str = "fileshare grants-remove revokes this user's access to the \
      File Share; pass confirm_revoke=true to proceed (mirrors the CLI --yes gate).";
 
-/// Resolve the optional link `password` arg, wrapping it in a [`SecretString`]
-/// immediately so the plaintext lifetime is minimal and it is never echoed.
-///
-/// Flag PRESENCE is preserved: a PRESENT-but-empty `password` (`""`) flows
-/// through as `Some("")` so the Wave-1 library validator rejects it with its
-/// clear message, rather than being silently downgraded to "absent" (which on
-/// create would produce an UNPROTECTED share). The password travels ONLY in the
-/// `x-ve-password` header (threaded by the Wave-1 client helpers).
 /// Strictly parse the File-Share expiry inputs, distinguishing ABSENT (→ `None`)
 /// from PRESENT-but-invalid (→ a clear error).
 ///
@@ -12648,6 +12651,14 @@ fn fileshare_strict_expiry(
     Ok((expires, expires_at))
 }
 
+/// Resolve the optional link `password` arg, wrapping it in a [`SecretString`]
+/// immediately so the plaintext lifetime is minimal and it is never echoed.
+///
+/// Flag PRESENCE is preserved: a PRESENT-but-empty `password` (`""`) flows
+/// through as `Some("")` so the Wave-1 library validator rejects it with its
+/// clear message, rather than being silently downgraded to "absent" (which on
+/// create would produce an UNPROTECTED share). The password travels ONLY in the
+/// `x-ve-password` header (threaded by the Wave-1 client helpers).
 fn fileshare_mcp_password(args: &Map<String, Value>) -> Option<SecretString> {
     // `Value::as_str` returns `Some("")` for a present empty string, preserving
     // PRESENCE — exactly the semantics the validator depends on.
@@ -12676,6 +12687,54 @@ fn fileshare_validate_password_arg(args: &Map<String, Value>) -> Result<(), Call
     }
 }
 
+/// Validate the `password` arg on a CONSUMPTION / WRITE-BACK path (info /
+/// download / versions / preview / upload): reject a non-string type AND a
+/// present-but-EMPTY string.
+///
+/// On these paths the resolved password is applied DIRECTLY as the
+/// `x-ve-password` header — the library `validate()` (which rejects an empty
+/// password on management create/update) never runs. A link password is
+/// contractually 1-255 chars, so a present `""` is invalid: sending an empty
+/// header is meaningless and only masks an unprotected-share mistake. An ABSENT
+/// password (`None`) is the correct way to consume an UNPROTECTED share, so only
+/// a PRESENT empty string is rejected. The value is NEVER echoed in the error.
+fn fileshare_validate_consumption_password_arg(
+    args: &Map<String, Value>,
+) -> Result<(), CallToolResult> {
+    fileshare_validate_password_arg(args)?;
+    if args.get("password").and_then(Value::as_str) == Some("") {
+        return Err(error_text(
+            "invalid request: link password cannot be empty — omit `password` for an \
+             unprotected share.",
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a PRESENT-but-non-string TARGET-SELECTING arg with a clear type error.
+///
+/// `optional_str` resolves via `Value::as_str`, which returns `None` for a
+/// non-string JSON value (e.g. a number or boolean) — so a present-but-non-string
+/// `version` or `output_path` would be SILENTLY DROPPED and the action would
+/// proceed against the WRONG target: a non-string `version` falls back to the
+/// CURRENT file (wrong bytes, no error), and a non-string `output_path` falls
+/// back to the DEFAULT path (the file is written somewhere the caller did not
+/// ask for). Both are target-selecting, so the silent drop is a correctness bug,
+/// not a benign convenience. An ABSENT arg is fine; a present string is fine.
+/// `note` is appended to clarify the consequence of the wrong type.
+fn fileshare_validate_string_arg(
+    args: &Map<String, Value>,
+    key: &str,
+    note: &str,
+) -> Result<(), CallToolResult> {
+    match args.get(key) {
+        Some(v) if !v.is_string() => Err(error_text(&format!(
+            "invalid request: `{key}` must be a string ({note})."
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Stream a File Share's bound file (or a historical version) to the local
 /// filesystem and return a path + byte count. ANONYMOUS-capable; the optional
 /// `password` authorizes a protected link (x-ve-password). The default output
@@ -12689,7 +12748,26 @@ async fn fileshare_download(
         Ok(v) => v,
         Err(e) => return e,
     };
-    if let Err(e) = fileshare_validate_password_arg(args) {
+    if let Err(e) = fileshare_validate_consumption_password_arg(args) {
+        return e;
+    }
+    // `version` and `output_path` are TARGET-SELECTING: a present-but-non-string
+    // `version` would be silently dropped → the CURRENT file downloads instead of
+    // the requested one (wrong bytes, no error); a present-but-non-string
+    // `output_path` would be dropped → the file is written to the DEFAULT path.
+    // Reject either before resolving them.
+    if let Err(e) = fileshare_validate_string_arg(
+        args,
+        "version",
+        "a version id; a non-string would silently download the current file instead",
+    ) {
+        return e;
+    }
+    if let Err(e) = fileshare_validate_string_arg(
+        args,
+        "output_path",
+        "a destination path; a non-string would silently write to the default download path",
+    ) {
         return e;
     }
     let password = fileshare_mcp_password(args);
@@ -12769,7 +12847,16 @@ async fn fileshare_preview(
         Ok(v) => v,
         Err(e) => return e,
     };
-    if let Err(e) = fileshare_validate_password_arg(args) {
+    if let Err(e) = fileshare_validate_consumption_password_arg(args) {
+        return e;
+    }
+    // `output_path` is target-selecting: a present-but-non-string value would be
+    // silently dropped → the preview is written to the DEFAULT path. Reject it.
+    if let Err(e) = fileshare_validate_string_arg(
+        args,
+        "output_path",
+        "a destination path; a non-string would silently write to the default download path",
+    ) {
         return e;
     }
     let password = fileshare_mcp_password(args);
@@ -15750,6 +15837,234 @@ mod ripley_tool_tests {
         );
     }
 
+    // ─── FR-1: download target-selecting args must not be silently dropped ───
+
+    #[tokio::test]
+    async fn fileshare_download_rejects_non_string_version() {
+        // A present-but-non-string `version` (e.g. a JSON number) would be
+        // silently dropped by `optional_str` → the CURRENT file downloads instead
+        // of the requested version (wrong bytes, no error). It must be rejected
+        // pre-network with a clear type error. Run anonymously so reaching the
+        // type error (and NOT the network "failed to download" error) proves the
+        // check fires BEFORE any request.
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("download".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert(
+            "version".to_owned(),
+            Value::Number(serde_json::Number::from(42)),
+        );
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("`version` must be a string"),
+            "a non-string version must be rejected with a type error, got: {text}"
+        );
+        assert!(
+            !text.contains("failed to download"),
+            "the version type check must fire BEFORE the network call, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_download_rejects_non_string_output_path() {
+        // A present-but-non-string `output_path` would be silently dropped →
+        // the file is written to the DEFAULT path instead of where the caller
+        // asked. Reject it pre-network.
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("download".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert("output_path".to_owned(), Value::Bool(true));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("`output_path` must be a string"),
+            "a non-string output_path must be rejected with a type error, got: {text}"
+        );
+        assert!(
+            !text.contains("failed to download"),
+            "the output_path type check must fire BEFORE the network call, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_preview_rejects_non_string_output_path() {
+        // Same target-selecting guard on the preview path's `output_path`.
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("preview".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert(
+            "preview_type".to_owned(),
+            Value::String("thumbnail".to_owned()),
+        );
+        args.insert(
+            "output_path".to_owned(),
+            Value::Number(serde_json::Number::from(7)),
+        );
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("`output_path` must be a string"),
+            "a non-string output_path must be rejected with a type error, got: {text}"
+        );
+        assert!(
+            !text.contains("failed to download"),
+            "the output_path type check must fire BEFORE the network call, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_download_accepts_string_version() {
+        // A valid string `version` must NOT be rejected — it proceeds into the
+        // download path (here failing on the unroutable base, NOT the type check).
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("download".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert("version".to_owned(), Value::String("v-123".to_owned()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("`version` must be a string"),
+            "a valid string version must be accepted, got: {text}"
+        );
+    }
+
+    // ─── FR-2: empty link password rejected on consumption paths (MCP) ──────
+
+    #[tokio::test]
+    async fn fileshare_info_rejects_empty_password() {
+        // An empty `password` ("") on a CONSUMPTION path would be applied as an
+        // empty `x-ve-password` header (the library validator never runs here).
+        // A link password is 1-255 chars, so it must be rejected pre-network.
+        // Run anonymously so reaching the empty-password error (NOT the network
+        // error) proves it fires before any request.
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("info".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert("password".to_owned(), Value::String(String::new()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("link password cannot be empty"),
+            "an empty consumption password must be rejected, got: {text}"
+        );
+        assert!(
+            !text.contains("failed to get File Share details"),
+            "the empty-password check must fire BEFORE the network call, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_versions_rejects_empty_password() {
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("versions".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert("password".to_owned(), Value::String(String::new()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("link password cannot be empty"),
+            "an empty consumption password must be rejected, got: {text}"
+        );
+        assert!(
+            !text.contains("failed to list File Share versions"),
+            "the empty-password check must fire BEFORE the network call, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_download_rejects_empty_password() {
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("download".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert("password".to_owned(), Value::String(String::new()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("link password cannot be empty"),
+            "an empty consumption password must be rejected, got: {text}"
+        );
+        assert!(
+            !text.contains("failed to download"),
+            "the empty-password check must fire BEFORE the network call, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_preview_rejects_empty_password() {
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("preview".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert(
+            "preview_type".to_owned(),
+            Value::String("thumbnail".to_owned()),
+        );
+        args.insert("password".to_owned(), Value::String(String::new()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("link password cannot be empty"),
+            "an empty consumption password must be rejected, got: {text}"
+        );
+        assert!(
+            !text.contains("failed to download"),
+            "the empty-password check must fire BEFORE the network call, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_info_absent_password_is_not_rejected() {
+        // An ABSENT password is the correct way to consume an UNPROTECTED share;
+        // it must NOT trigger the empty-password rejection and must reach the
+        // network path (here failing on the unroutable base).
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("info".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("link password cannot be empty"),
+            "an absent password must not be rejected, got: {text}"
+        );
+        assert!(
+            text.contains("failed to get File Share details"),
+            "an absent password must reach the consumption path, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_create_empty_password_still_uses_library_validator() {
+        // FR-2 must NOT change management behavior: an empty `password` on
+        // `create` is still handled by the library validator (not the new
+        // consumption-path rejection). The error text must be the library's
+        // "must not be empty" message, NOT the consumption-path wording.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("create".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("node_id".to_owned(), Value::String("node-1".to_owned()));
+        args.insert("password".to_owned(), Value::String(String::new()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("link password cannot be empty — omit"),
+            "create must NOT use the consumption-path wording, got: {text}"
+        );
+        assert!(
+            text.contains("invalid create request"),
+            "create with an empty password must surface the library validator, got: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn fileshare_create_password_never_echoed_on_validation_error() {
         // An explicit empty password ("") must reach the library validator
@@ -15993,6 +16308,26 @@ mod ripley_tool_tests {
         assert!(
             text.contains("invalid create request"),
             "a valid numeric `expires` should reach the library validator, got: {text}"
+        );
+    }
+
+    // ─── R-2: activity empty fileshare_id guard ────────────────────────────
+
+    #[tokio::test]
+    async fn fileshare_activity_rejects_empty_id() {
+        // `required_str` accepts a present-but-empty `""`; the activity handler
+        // must reject it explicitly BEFORE calling `event::poll_activity`, so the
+        // malformed `/activity/poll//` path is never built (and no network call
+        // is made — the rejection fires synchronously, so this is hermetic).
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("activity".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String(String::new()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("`fileshare_id` must not be empty"),
+            "an empty fileshare_id must be rejected before poll_activity, got: {text}"
         );
     }
 

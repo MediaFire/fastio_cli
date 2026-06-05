@@ -24,9 +24,10 @@
 //!   [`map_fileshare_error`] (never in the global `error.rs` hints, which stay
 //!   resource-agnostic). A `1609`/`404` is surfaced UNIFORMLY ("unavailable")
 //!   so an expired/revoked/never-existed share is never distinguished.
-//! - **Write-back CAS.** A stale `--if-version` ends the session terminally
-//!   (`assembly_failed` + `CONFLICT_VERSION_MISMATCH:{vid}`); that is parsed
-//!   into [`CliError::VersionConflict`] with the current version id.
+//! - **Write-back CAS.** `--if-version` is a SERVER-ENFORCED precondition: when
+//!   the server detects a version conflict it ends the session terminally
+//!   (`assembly_failed` + `CONFLICT_VERSION_MISMATCH:{vid}`), which the CLI
+//!   parses into [`CliError::VersionConflict`] with the current version id.
 //! - **Secret tokens.** `ws-token` mints a realtime token that is REDACTED from
 //!   stdout and written 0600 to `--token-file`, reusing the shared
 //!   [`super::secret_output`] helpers (identical to the workflow command).
@@ -35,7 +36,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 
 use fastio_cli::api::{event, fileshare, upload};
@@ -106,6 +107,30 @@ fn resolve_update_password(flag: Option<&str>, clear_password: bool) -> Option<S
     resolve_password(flag)
 }
 
+/// Resolve the link password for a CONSUMPTION / WRITE-BACK path
+/// (`info` / `download` / `versions` / `preview` / `upload`), rejecting a
+/// PRESENT-but-EMPTY value.
+///
+/// On these paths the resolved password is applied DIRECTLY as the
+/// `x-ve-password` header — the library `validate()` (which rejects an empty
+/// password on management create/update) never runs. A link password is
+/// contractually 1-255 chars, so a present `""` (an explicit `--password ""`)
+/// is invalid: sending an empty header is meaningless and only masks an
+/// unprotected-share mistake. An ABSENT password (`None`) is the correct way to
+/// consume an UNPROTECTED share, so only a PRESENT empty string is rejected.
+/// `resolve_password` already treats an empty ENV value as absent, so the only
+/// way to reach `Some("")` here is an explicit empty flag. The value is NEVER
+/// echoed in the error.
+fn resolve_consumption_password(flag: Option<&str>) -> Result<Option<SecretString>> {
+    let resolved = resolve_password(flag);
+    if let Some(pw) = resolved.as_ref()
+        && pw.expose_secret().is_empty()
+    {
+        anyhow::bail!("link password cannot be empty — omit --password for an unprotected share");
+    }
+    Ok(resolved)
+}
+
 // ─── Confirmation ───────────────────────────────────────────────────────────
 
 /// Gate a destructive / outward-facing action behind explicit confirmation.
@@ -135,6 +160,21 @@ fn confirm_destructive(action: &str, detail: &str, yes: bool) -> Result<()> {
     } else {
         anyhow::bail!("aborted: '{action}' not confirmed");
     }
+}
+
+/// Reject an empty File Share id client-side.
+///
+/// The `activity` arm calls the generic `event::poll_activity`, which does NOT
+/// guard its entity id — an empty id would build the malformed path
+/// `/activity/poll//`. Mirrors the library's `require_id` wording / `Parse`
+/// style so the surfaced message is consistent with the rest of the domain.
+fn require_fileshare_id(fileshare_id: &str) -> Result<()> {
+    if fileshare_id.is_empty() {
+        return Err(anyhow::Error::from(CliError::Parse(
+            "a File Share id is required for File Share operations".to_owned(),
+        )));
+    }
+    Ok(())
 }
 
 // ─── Error mapping ──────────────────────────────────────────────────────────
@@ -510,7 +550,7 @@ pub async fn execute(command: FileshareCommands, ctx: &CommandContext<'_>) -> Re
             fileshare_id,
             password,
         } => {
-            let password = resolve_password(password.as_deref());
+            let password = resolve_consumption_password(password.as_deref())?;
             let client = ctx.build_client_allow_anonymous()?;
             let v = fileshare::get_details(&client, &fileshare_id, password.as_ref())
                 .await
@@ -592,7 +632,7 @@ pub async fn execute(command: FileshareCommands, ctx: &CommandContext<'_>) -> Re
             fileshare_id,
             password,
         } => {
-            let password = resolve_password(password.as_deref());
+            let password = resolve_consumption_password(password.as_deref())?;
             let client = ctx.build_client_allow_anonymous()?;
             let v = fileshare::list_versions(&client, &fileshare_id, password.as_ref())
                 .await
@@ -642,6 +682,10 @@ pub async fn execute(command: FileshareCommands, ctx: &CommandContext<'_>) -> Re
             wait,
             updated,
         } => {
+            // `event::poll_activity` is a generic helper that does NOT guard the
+            // entity id; an empty fileshare_id would build `/activity/poll//`.
+            // Reject it client-side (mirrors the library's `require_id` wording).
+            require_fileshare_id(&fileshare_id)?;
             // Activity is members-only per spec → always-authed client.
             let client = ctx.build_client()?;
             let v = event::poll_activity(
@@ -758,7 +802,7 @@ async fn download(
     version: Option<&str>,
     password: Option<&str>,
 ) -> Result<()> {
-    let password = resolve_password(password);
+    let password = resolve_consumption_password(password)?;
     let client = ctx.build_client_allow_anonymous()?;
 
     let output_path =
@@ -841,7 +885,7 @@ async fn preview(
     output: Option<&str>,
     password: Option<&str>,
 ) -> Result<()> {
-    let password = resolve_password(password);
+    let password = resolve_consumption_password(password)?;
     let client = ctx.build_client_allow_anonymous()?;
 
     let api_path = fileshare::storage_preview_path(fileshare_id, preview_type)
@@ -901,11 +945,37 @@ fn validate_writeback_source(path: &Path, display: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the write-back `name` (explicit `--name` or the local file's base
+/// name) and validate it against the SAME rules the normal upload path applies
+/// (`upload::validate_filename`: empty, path separators, CR/LF, NUL, controls,
+/// bidi/zero-width, `.`/`..`, trailing whitespace/dot, length).
+///
+/// The resolved name flows into the write-back `name` field and the multipart
+/// `file_name`, so an invalid `--name ""` or a CR/LF name must be rejected
+/// HERE — before the destructive confirm gate and any network call — exactly as
+/// `validate_writeback_source` guards the source path. Factored into a pure
+/// helper so the rejection is unit-testable.
+fn resolve_writeback_name(path: &Path, file: &str, name: Option<&str>) -> Result<String> {
+    let upload_name = match name {
+        Some(n) => n.to_owned(),
+        None => path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow::anyhow!("invalid filename for '{file}'"))?
+            .to_owned(),
+    };
+    upload::validate_filename(&upload_name)
+        .map_err(|e| anyhow::anyhow!("invalid upload name: {e}"))?;
+    Ok(upload_name)
+}
+
 /// Replace the bound file's content with a local file (write-back). Requires an
 /// `edit` grant (always-authed). Resolves the bound node id from `details`
 /// (`fileshare.file.id`), then takes the single-shot path for files ≤ 4 MB or
-/// the chunked path (session → chunks → complete → poll) for larger ones. A
-/// stale `--if-version` ends terminally with a [`CliError::VersionConflict`].
+/// the chunked path (session → chunks → complete → poll) for larger ones.
+/// `--if-version` is a server-enforced precondition: when the server detects a
+/// version conflict the session ends terminally and the CLI surfaces a
+/// [`CliError::VersionConflict`] with the current version id.
 async fn upload_writeback(
     ctx: &CommandContext<'_>,
     fileshare_id: &str,
@@ -922,14 +992,10 @@ async fn upload_writeback(
     validate_writeback_source(path, file)?;
     let metadata = std::fs::metadata(path).context("failed to read file metadata")?;
     let file_size = metadata.len();
-    let upload_name = match name {
-        Some(n) => n.to_owned(),
-        None => path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| anyhow::anyhow!("invalid filename for '{file}'"))?
-            .to_owned(),
-    };
+    // Resolve AND validate the write-back name BEFORE the confirm gate and any
+    // network call. Factored into a pure helper so the rejection is
+    // unit-testable (mirrors the P2F-6 `validate_writeback_source` pattern).
+    let upload_name = resolve_writeback_name(path, file, name)?;
 
     confirm_destructive(
         "fileshare upload",
@@ -938,7 +1004,7 @@ async fn upload_writeback(
         yes,
     )?;
 
-    let password = resolve_password(password);
+    let password = resolve_consumption_password(password)?;
 
     // Resolve the bound node id (fileshare.file.id) via details. The write-back
     // requires it as `file_id`; supplying any other node 404s.
@@ -1309,7 +1375,6 @@ mod tests {
     /// silently fall back to the env value or create an unprotected share).
     #[test]
     fn resolve_password_precedence_and_empty_handling() {
-        use secrecy::ExposeSecret;
         // SAFETY: single test fn, mutations are sequential within it.
         // 1. Flag wins over env.
         unsafe { std::env::set_var(PASSWORD_ENV, "env-pw") };
@@ -1375,6 +1440,69 @@ mod tests {
             "password=Some(env)+clear must be rejected (the bug P2F-4 fixes)"
         );
         unsafe { std::env::remove_var(PASSWORD_ENV) };
+
+        // 8. FR-2: resolve_consumption_password env interplay. Kept HERE (not a
+        //    separate test) to share this test's sequential PASSWORD_ENV
+        //    serialization — a parallel env-mutating test would race.
+        //    8a. No flag + no env → Ok(None) (a valid unprotected-share read).
+        assert!(
+            resolve_consumption_password(None)
+                .expect("no flag + no env is not an error")
+                .is_none(),
+            "consumption: no flag + no env → Ok(None)"
+        );
+        //    8b. An empty env is treated as ABSENT upstream → Ok(None), NOT an
+        //        empty-password error.
+        unsafe { std::env::set_var(PASSWORD_ENV, "") };
+        assert!(
+            resolve_consumption_password(None)
+                .expect("an empty env is absent, not an empty password")
+                .is_none(),
+            "consumption: empty env → Ok(None)"
+        );
+        //    8c. A non-empty env resolves to Ok(Some(env)).
+        unsafe { std::env::set_var(PASSWORD_ENV, "env-pw") };
+        let pw = resolve_consumption_password(None)
+            .expect("a non-empty env is accepted")
+            .expect("a non-empty env resolves to Some");
+        assert_eq!(
+            pw.expose_secret(),
+            "env-pw",
+            "consumption: non-empty env → Some"
+        );
+        unsafe { std::env::remove_var(PASSWORD_ENV) };
+    }
+
+    // ─── resolve_consumption_password (FR-2) ────────────────────────────────
+
+    /// FR-2: on consumption / write-back paths an EMPTY link password must be
+    /// rejected (the library validator never runs there, so an empty
+    /// `x-ve-password` header would otherwise be sent). A present non-empty flag
+    /// is accepted; a present empty flag is an error. The flag PRESENT cases read
+    /// no env var, so this test is race-free against the env-mutating sequential
+    /// test above.
+    #[test]
+    fn resolve_consumption_password_flag_cases() {
+        // A present non-empty flag → Ok(Some(value)).
+        let pw = resolve_consumption_password(Some("flag-pw"))
+            .expect("a non-empty flag must be accepted")
+            .expect("a present flag resolves to Some");
+        assert_eq!(pw.expose_secret(), "flag-pw");
+
+        // A present EMPTY flag (--password "") → Err on the consumption path
+        // (unlike create/update, which defer the empty-string rejection to the
+        // library validator). The error must steer the user to omit --password.
+        let err = resolve_consumption_password(Some(""))
+            .expect_err("an empty flag must be rejected on the consumption path");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("link password cannot be empty"),
+            "the empty-password error must explain the fix, got: {msg}"
+        );
+        assert!(
+            msg.contains("omit --password"),
+            "the error must steer to omitting --password, got: {msg}"
+        );
     }
 
     // ─── confirm_destructive ────────────────────────────────────────────────
@@ -1809,6 +1937,75 @@ mod tests {
         let ok = validate_writeback_source(&file, &file.display().to_string());
         let _ = std::fs::remove_file(&file);
         assert!(ok.is_ok(), "a regular file must be accepted: {ok:?}");
+    }
+
+    // ─── R-1: write-back name validation ────────────────────────────────────
+
+    /// The write-back name MUST pass the same filename validation the normal
+    /// upload path applies, BEFORE the confirm gate. An explicit empty `--name`,
+    /// a path-separator name, or a CR/LF name must all be rejected; a normal
+    /// name passes. `resolve_writeback_name` is the pure gate the destructive
+    /// `upload_writeback` calls immediately after deriving the name.
+    #[test]
+    fn resolve_writeback_name_validates_before_confirm() {
+        let path = Path::new("/tmp/local-source.bin");
+
+        // An explicit empty --name is rejected (would otherwise reach the
+        // destructive write-back as an empty `file_name`).
+        let err = resolve_writeback_name(path, "/tmp/local-source.bin", Some(""))
+            .expect_err("an empty --name must be rejected");
+        assert!(
+            err.to_string().contains("invalid upload name")
+                && err.to_string().contains("must not be empty"),
+            "empty-name rejection must be the validate_filename message: {err}"
+        );
+
+        // A path-separator name is rejected.
+        let err = resolve_writeback_name(path, "/tmp/local-source.bin", Some("a/b.txt"))
+            .expect_err("a separator name must be rejected");
+        assert!(
+            err.to_string().contains("path separators"),
+            "separator rejection must mention path separators: {err}"
+        );
+
+        // A CR/LF name is rejected (would corrupt the multipart envelope).
+        let err = resolve_writeback_name(path, "/tmp/local-source.bin", Some("a\r\nb.txt"))
+            .expect_err("a CRLF name must be rejected");
+        assert!(
+            err.to_string().contains("CR or LF"),
+            "CRLF rejection must mention CR or LF: {err}"
+        );
+
+        // A normal explicit name passes and is returned verbatim.
+        let ok =
+            resolve_writeback_name(path, "/tmp/local-source.bin", Some("report.pdf")).expect("ok");
+        assert_eq!(ok, "report.pdf", "a valid --name passes through verbatim");
+
+        // With no --name, the local file's base name is derived and validated.
+        let ok = resolve_writeback_name(path, "/tmp/local-source.bin", None)
+            .expect("a valid derived name passes");
+        assert_eq!(ok, "local-source.bin", "derived from the source base name");
+    }
+
+    // ─── R-2: activity empty-id guard ───────────────────────────────────────
+
+    /// An empty `fileshare_id` must be rejected BEFORE `event::poll_activity` is
+    /// reached, so the malformed `/activity/poll//` path is never built. A
+    /// non-empty id passes the guard.
+    #[test]
+    fn require_fileshare_id_rejects_empty() {
+        let err = require_fileshare_id("").expect_err("an empty id must be rejected");
+        let cli = err
+            .downcast_ref::<CliError>()
+            .expect("the rejection must be rooted at a CliError::Parse");
+        assert!(
+            matches!(cli, CliError::Parse(m) if m.contains("File Share id is required")),
+            "must be a Parse error mirroring the library require_id wording: {cli:?}"
+        );
+        assert!(
+            require_fileshare_id("9xQ2-abc12").is_ok(),
+            "a non-empty id must pass the guard"
+        );
     }
 
     // ─── write-back session inspection ──────────────────────────────────────

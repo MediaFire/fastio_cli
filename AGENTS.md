@@ -318,10 +318,12 @@ fastio fileshare delete   FS_ID --yes
   account-login problem).
 - **Write-back (CAS).** `fileshare upload` pushes a **new version** of the bound
   file (the previous version is retained in history) and needs an `edit` grant.
-  Pass `--if-version VID` for optimistic concurrency: if the file changed, the
-  session ends with `CONFLICT_VERSION_MISMATCH:{vid}` — re-download the current
-  bytes, re-apply your change, and retry with `--if-version {vid}`. Files ≤ 4 MB
-  go single-shot; larger files chunk + complete + poll.
+  Pass `--if-version VID` for optimistic concurrency: the precondition is
+  **server-enforced** — when the server detects a version conflict it reports
+  `CONFLICT_VERSION_MISMATCH:{vid}` and the CLI surfaces it as a version-conflict
+  error. On that conflict, re-download the current bytes, re-apply your change,
+  and retry with `--if-version {vid}`. Files ≤ 4 MB go single-shot; larger files
+  chunk + complete + poll.
 - **`ws-token`** mints a realtime WebSocket token; it is **redacted from stdout**
   and only written (0600) to `--token-file <path>`. There is no in-CLI WebSocket
   client (token mint only).

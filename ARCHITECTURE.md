@@ -91,7 +91,7 @@ Both modes share a common API layer, ensuring zero code duplication.
 - User-Agent: `fastio-cli/<version>`
 - 120-second request timeout (supports event long-polling)
 - `get_token()` accessor for MCP mode token forwarding
-- **Link-password header seam (File Shares).** `get_with_password` / `post_with_password` / `post_sensitive_form` / `download_file_stream_with_password` attach the link password in the `x-ve-password` header (set sensitive, added to `SECRET_LOG_KEYS` so it is redacted from traces) and route through a **no-redirect** client whenever a password is present — reqwest 0.12 does NOT strip custom headers on a cross-origin 3xx, so a redirect-following client would replay the password to the `Location` target. The preview path (`download_preview_following_redirect`) follows at most ONE redirect MANUALLY, re-issuing the follow GET WITHOUT `Authorization` or `x-ve-password` (the embedded download token authorizes it) and failing closed on a second redirect
+- **Link-password header seam (File Shares).** `get_with_password` / `post_with_password` / `download_file_stream_with_password` attach the link password in the `x-ve-password` header (set sensitive, added to `SECRET_LOG_KEYS` so it is redacted from traces) and route through a **no-redirect** client whenever a password is present — reqwest 0.12 does NOT strip custom headers on a cross-origin 3xx, so a redirect-following client would replay the password to the `Location` target. `post_sensitive_form` is the FORM-FIELD sibling: it protects a sensitive FORM value (the password sent as a `password=…` form field on management create/update), failing closed on any 3xx so the body is never replayed — NOT a header-password path. The preview path (`download_preview_following_redirect`) follows at most ONE redirect MANUALLY, re-issuing the follow GET WITHOUT `Authorization` or `x-ve-password` (the embedded download token authorizes it) and failing closed on a second redirect
 
 ### `auth/`
 
@@ -139,7 +139,7 @@ Each module contains typed functions mapping to Fast.io REST endpoints:
 | `import.rs` | 22 functions | Providers, identities, sources, jobs, writebacks |
 | `locking.rs` | 3 functions | Acquire, status, release |
 | `signing.rs` | 14 functions | E-signature (SignEnvelope) — workspace-only CRUD/lifecycle, document/preview/signed/audit download paths |
-| `fileshare.rs` | 11 functions | File Shares — durable single-file link shares (replacing QuickShare): management create/list/update/delete + grants, password-capable anonymous consumption (details/versions), write-back path builders, websocket-auth token, named-key extractors |
+| `fileshare.rs` | 10 functions | File Shares — durable single-file link shares (replacing QuickShare): management create/list/update/delete + grants, password-capable anonymous consumption (details/versions), write-back path builders, websocket-auth token, named-key extractors |
 | `types.rs` | — | Shared response structs |
 
 ### `commands/` — 32 Modules
