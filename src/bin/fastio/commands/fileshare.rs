@@ -163,6 +163,14 @@ const HINT_FS_UNAVAILABLE: Option<&str> = None;
 const HINT_FS_NOT_SERVEABLE: &str = "The bound file cannot be served — it may be locked, taken down (DMCA), or flagged as infected. \
      This is a property of the file, not your permissions.";
 
+/// Override hint for a preview-specific miss (`143705`, or a bare 404 on the
+/// `preview` op). Steers to `--type` / retry — NOT the uniform "share gone"
+/// wording, because the SHARE exists; only the requested preview asset does not.
+/// The TEXT lives here (a command-module `const`) so `error.rs` stays
+/// resource-agnostic; the render layer fires it via [`CliError::MappedApi`].
+const HINT_FS_PREVIEW_UNAVAILABLE: &str = "No preview of this type is available for the bound file — it may still be generating, \
+     or this file type may not support it. Retry shortly, or try another --type.";
+
 /// Override hint for the QuickShare-deprecation failure (`10756`/403). Replaces
 /// the generic-403 role guidance with the migration path.
 const HINT_FS_QUICKSHARE_DEPRECATED: &str =
@@ -245,6 +253,20 @@ fn map_fileshare_error(err: CliError, ctx: &'static str, op: FsOp) -> anyhow::Er
             ),
             FsHint::Override(Some(HINT_FS_CAPABILITY)),
         )),
+        // Preview-specific miss (143705 / "Unable to retrieve preview"). This
+        // code is emitted ONLY by the storage preview-read path's default arm
+        // (server `storage/Io.php`), so keying on the code alone is op-independent
+        // and safe — the SHARE exists; only the requested preview asset does not
+        // (still generating, or the file type does not support it). Distinct from
+        // the uniform-unavailable 1609 below, which means the share itself is gone.
+        143_705 => Some((
+            format!(
+                "{ctx}: no preview of this type is available for the bound file (143705) — it may \
+                 still be generating, or this file type may not support it. Retry shortly, or try \
+                 another --type."
+            ),
+            FsHint::Override(Some(HINT_FS_PREVIEW_UNAVAILABLE)),
+        )),
         // Uniform unavailable — NEVER distinguish not-found / expired / revoked.
         // The generic-404 "Verify the ID …" hint is SUPPRESSED (would imply a
         // fixable id typo and re-introduce an enumeration oracle).
@@ -283,7 +305,7 @@ fn map_fileshare_error(err: CliError, ctx: &'static str, op: FsOp) -> anyhow::Er
                      folder or note).",
                     api.message
                 ),
-                FsOp::ManagementOther | FsOp::LinkAccess => {
+                FsOp::ManagementOther | FsOp::LinkAccess | FsOp::Preview => {
                     format!("{ctx}: invalid request (1605): {}", api.message)
                 }
             },
@@ -303,6 +325,19 @@ fn map_fileshare_error(err: CliError, ctx: &'static str, op: FsOp) -> anyhow::Er
                  Pass --password, or set the {PASSWORD_ENV} environment variable (preferred)."
             ),
             FsHint::Override(Some(HINT_FS_LINK_PASSWORD)),
+        )),
+        // A bare 404 on the PREVIEW op (no 1609, no 143705) is a preview miss, not
+        // a share-gone — the consumption call reached the share but the requested
+        // preview asset does not exist. Use the preview-specific wording. A bare
+        // 404 on any NON-preview op keeps the uniform-unavailable discipline below
+        // (that genuinely means the share is gone — do NOT weaken it).
+        404 if op.is_preview() => Some((
+            format!(
+                "{ctx}: no preview of this type is available for the bound file — it may still be \
+                 generating, or this file type may not support it. Retry shortly, or try another \
+                 --type."
+            ),
+            FsHint::Override(Some(HINT_FS_PREVIEW_UNAVAILABLE)),
         )),
         404 => Some((
             format!(
@@ -360,18 +395,32 @@ enum FsOp {
     /// activity / ws-token). Authenticates with the ACCOUNT token, so a
     /// `1650`/401 is an account-auth failure, not a link password.
     ManagementOther,
-    /// A link-access call (consumption: info / download / versions / preview;
-    /// and write-back). `x-ve-password` applies, so a `1650`/401 is a
-    /// link-password failure.
+    /// A link-access call (consumption: info / download / versions; and
+    /// write-back). `x-ve-password` applies, so a `1650`/401 is a link-password
+    /// failure.
     LinkAccess,
+    /// The `preview` consumption call. Like [`Self::LinkAccess`] for auth
+    /// purposes (`x-ve-password` applies, so a `1650`/401 is a link-password
+    /// failure), but a `404` WITHOUT a share-gone code (`1609`) — or the
+    /// preview-specific `143705` — is a PREVIEW miss (the share exists; the
+    /// requested preview asset does not), NOT a share-gone, so it gets the
+    /// preview-specific wording instead of the uniform "unavailable".
+    Preview,
 }
 
 impl FsOp {
     /// Whether this op authenticates against the share's LINK gate
     /// (`x-ve-password`), so a `1650`/401 means a link-password failure rather
-    /// than an account-auth failure.
+    /// than an account-auth failure. Both consumption classes (`LinkAccess` and
+    /// `Preview`) gate on the link.
     fn is_link_access(self) -> bool {
-        matches!(self, Self::LinkAccess)
+        matches!(self, Self::LinkAccess | Self::Preview)
+    }
+
+    /// Whether this is the `preview` op, so a bare `404` is a preview miss rather
+    /// than a share-gone (the SHARE exists; the requested preview asset does not).
+    fn is_preview(self) -> bool {
+        matches!(self, Self::Preview)
     }
 }
 
@@ -815,7 +864,7 @@ async fn preview(
         .download_preview_following_redirect(&api_path, &output_path, password.as_ref())
         .await
         .map_err(|e| {
-            map_fileshare_error(e, "failed to download File Share preview", FsOp::LinkAccess)
+            map_fileshare_error(e, "failed to download File Share preview", FsOp::Preview)
         })?;
 
     let value = json!({
@@ -1409,6 +1458,102 @@ mod tests {
         assert!(
             m.contains("unavailable"),
             "bare 404 must be unavailable: {m}"
+        );
+    }
+
+    // ─── LV CLI-1: preview-specific 404 / 143705 ────────────────────────────
+
+    #[test]
+    fn map_preview_143705_is_preview_not_uniform_unavailable() {
+        // A 143705 ("Unable to retrieve preview") is a PREVIEW miss — the share
+        // exists, the requested preview asset does not. It must NOT collapse into
+        // the uniform "share unavailable" wording, and must steer to --type/retry.
+        // Op-independent: the code alone keys it (it only ever arises on preview).
+        let m = map_fileshare_error(api_err(143_705, 404), "failed to preview", FsOp::Preview)
+            .to_string();
+        assert!(
+            m.contains("no preview of this type"),
+            "143705 must use the preview-specific wording: {m}"
+        );
+        assert!(m.contains("--type"), "143705 must steer to --type: {m}");
+        assert!(
+            !m.contains("may have expired") && !m.contains("may have been revoked"),
+            "143705 must NOT use the uniform share-gone wording: {m}"
+        );
+    }
+
+    #[test]
+    fn map_preview_bare_404_is_preview_not_uniform_unavailable() {
+        // A bare 404 (no 1609, no 143705) on the PREVIEW op is a preview miss, not
+        // a share-gone — the share was reached but the preview asset is absent.
+        let m =
+            map_fileshare_error(api_err(0, 404), "failed to preview", FsOp::Preview).to_string();
+        assert!(
+            m.contains("no preview of this type"),
+            "a bare 404 on the preview op must be preview-specific: {m}"
+        );
+        assert!(
+            !m.contains("may have been revoked"),
+            "a bare 404 on the preview op must NOT be the uniform share-gone wording: {m}"
+        );
+    }
+
+    #[test]
+    fn map_preview_1609_stays_uniform_unavailable() {
+        // A 1609 on the preview op means the SHARE itself is gone — it must KEEP
+        // the uniform-unavailable discipline (do NOT weaken it to a preview miss).
+        let m =
+            map_fileshare_error(api_err(1609, 404), "failed to preview", FsOp::Preview).to_string();
+        assert!(
+            m.contains("unavailable") && m.contains("not exist") && m.contains("revoked"),
+            "a 1609 on the preview op must stay uniform-unavailable: {m}"
+        );
+        assert!(
+            !m.contains("no preview of this type"),
+            "a 1609 (share gone) must NOT be reframed as a preview miss: {m}"
+        );
+    }
+
+    #[test]
+    fn map_nonpreview_bare_404_stays_uniform_unavailable() {
+        // The uniform-404 discipline for NON-preview consumption ops (info /
+        // download / versions) must be untouched: a bare 404 there is share-gone.
+        let m = map_fileshare_error(api_err(0, 404), "failed to get", FsOp::LinkAccess).to_string();
+        assert!(
+            m.contains("unavailable") && m.contains("revoked"),
+            "a bare 404 on a non-preview op must stay uniform-unavailable: {m}"
+        );
+        assert!(
+            !m.contains("no preview of this type"),
+            "a non-preview 404 must NOT borrow the preview wording: {m}"
+        );
+    }
+
+    #[test]
+    fn render_mapped_preview_143705_shows_preview_hint_not_verify_id() {
+        // Driven through the REAL render path: a 143705 must print OUR preview
+        // hint (retry / another --type), NOT the generic-404 "Verify the ID …"
+        // line and NOT a suppressed (None) hint.
+        let err = map_fileshare_error(
+            api_err(143_705, 404),
+            "failed to download File Share preview",
+            FsOp::Preview,
+        );
+        let (headline, hint) = render_mapped(&err);
+        assert!(
+            headline.to_lowercase().contains("no preview of this type"),
+            "headline must carry the preview miss: {headline}"
+        );
+        let hint = hint
+            .expect("a mapped 143705 must carry a preview hint")
+            .to_lowercase();
+        assert!(
+            hint.contains("--type") && hint.contains("retry"),
+            "rendered hint must steer to --type / retry: {hint}"
+        );
+        assert!(
+            !hint.contains("verify the id"),
+            "rendered hint must NOT be the generic-404 verify-id line: {hint}"
         );
     }
 

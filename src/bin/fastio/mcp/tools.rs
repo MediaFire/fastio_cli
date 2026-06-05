@@ -11883,17 +11883,30 @@ enum FsMcpOp {
     /// activity). Authenticates with the ACCOUNT token, so a `1650`/`401` is an
     /// account-auth failure, not a link password.
     ManagementOther,
-    /// A link-access call (consumption: info / download / versions / preview).
+    /// A link-access call (consumption: info / download / versions).
     /// `x-ve-password` applies, so a `1650`/`401` is a link-password failure.
     LinkAccess,
+    /// The `preview` consumption call. Like [`Self::LinkAccess`] for auth
+    /// purposes (`x-ve-password` applies, so a `1650`/`401` is a link-password
+    /// failure), but a `404` WITHOUT a share-gone code (`1609`) — or the
+    /// preview-specific `143705` — is a PREVIEW miss (the share exists; the
+    /// requested preview asset does not), NOT a share-gone.
+    Preview,
 }
 
 impl FsMcpOp {
     /// Whether this op authenticates against the share's LINK gate
     /// (`x-ve-password`), so a `1650`/`401` means a link-password failure rather
-    /// than an account-auth failure.
+    /// than an account-auth failure. Both consumption classes (`LinkAccess` and
+    /// `Preview`) gate on the link.
     fn is_link_access(self) -> bool {
-        matches!(self, Self::LinkAccess)
+        matches!(self, Self::LinkAccess | Self::Preview)
+    }
+
+    /// Whether this is the `preview` op, so a bare `404` is a preview miss rather
+    /// than a share-gone (the SHARE exists; the requested preview asset does not).
+    fn is_preview(self) -> bool {
+        matches!(self, Self::Preview)
     }
 }
 
@@ -11958,6 +11971,17 @@ fn fileshare_err_to_result(
              CLI-only `fastio fileshare upload` and needs an explicit `edit` grant."
                 .to_owned(),
         ),
+        // Preview-specific miss (143705 / "Unable to retrieve preview"). Emitted
+        // ONLY by the storage preview-read path's default arm (server
+        // `storage/Io.php`), so keying on the code alone is op-independent and
+        // safe — the SHARE exists; only the requested preview asset does not.
+        // Distinct from the uniform-unavailable 1609 below (the share itself).
+        143_705 => Some(
+            "no preview of this type is available for the bound file (143705) — it may still be \
+             generating, or this file type may not support it. Retry shortly, or try another \
+             preview_type."
+                .to_owned(),
+        ),
         1609 => Some(
             "this File Share is unavailable (1609) — it may not exist, may have expired, or may \
              have been revoked."
@@ -11987,10 +12011,20 @@ fn fileshare_err_to_result(
 
     // Bare-status fallback for password / unavailable when the server returns the
     // status without the specific code (only after the code match misses).
-    let note = note.or_else(|| match api.http_status {
+    let note = note.or_else(|| {
+        match api.http_status {
         401 if op.is_link_access() => Some(
             "this File Share requires a link password (or the one supplied is wrong). Pass the \
              `password` arg (it travels only in the x-ve-password header and is never logged)."
+                .to_owned(),
+        ),
+        // A bare 404 on the PREVIEW op (no 1609, no 143705) is a preview miss, not
+        // a share-gone — the call reached the share but the requested preview
+        // asset does not exist. A bare 404 on any NON-preview op keeps the uniform
+        // "unavailable" below (that genuinely means the share is gone).
+        404 if op.is_preview() => Some(
+            "no preview of this type is available for the bound file — it may still be generating, \
+             or this file type may not support it. Retry shortly, or try another preview_type."
                 .to_owned(),
         ),
         404 => Some(
@@ -11999,6 +12033,7 @@ fn fileshare_err_to_result(
                 .to_owned(),
         ),
         _ => None,
+    }
     });
 
     if let Some(note) = note {
@@ -12761,7 +12796,7 @@ async fn fileshare_preview(
         Err(e) => fileshare_err_to_result(
             &e,
             "failed to download File Share preview",
-            FsMcpOp::LinkAccess,
+            FsMcpOp::Preview,
         ),
     }
 }
@@ -16064,6 +16099,89 @@ mod ripley_tool_tests {
         assert!(
             m.contains("view") && m.contains("download") && m.contains("edit"),
             "must describe capability order: {m}"
+        );
+    }
+
+    // ─── LV CLI-1: preview-specific 404 / 143705 (MCP mirror) ───────────────
+
+    #[test]
+    fn fileshare_err_preview_143705_is_preview_not_uniform_unavailable() {
+        use super::{FsMcpOp, fileshare_err_to_result};
+        // A 143705 is a PREVIEW miss — never the uniform share-gone wording.
+        // Keyed on the code alone (op-independent), so it holds on the preview op.
+        let m = result_to_string(&fileshare_err_to_result(
+            &fs_api_err(143_705, 404),
+            "failed to download File Share preview",
+            FsMcpOp::Preview,
+        ));
+        assert!(
+            m.contains("no preview of this type"),
+            "143705 must use the preview-specific wording: {m}"
+        );
+        assert!(
+            m.contains("preview_type"),
+            "143705 must steer to another preview_type: {m}"
+        );
+        assert!(
+            !m.contains("may have been revoked"),
+            "143705 must NOT use the uniform share-gone wording: {m}"
+        );
+    }
+
+    #[test]
+    fn fileshare_err_preview_bare_404_is_preview_not_uniform_unavailable() {
+        use super::{FsMcpOp, fileshare_err_to_result};
+        // A bare 404 on the PREVIEW op is a preview miss, not a share-gone.
+        let m = result_to_string(&fileshare_err_to_result(
+            &fs_api_err(0, 404),
+            "failed to download File Share preview",
+            FsMcpOp::Preview,
+        ));
+        assert!(
+            m.contains("no preview of this type"),
+            "a bare 404 on the preview op must be preview-specific: {m}"
+        );
+        assert!(
+            !m.contains("may have been revoked"),
+            "a bare 404 on the preview op must NOT be the uniform share-gone wording: {m}"
+        );
+    }
+
+    #[test]
+    fn fileshare_err_preview_1609_stays_uniform_unavailable() {
+        use super::{FsMcpOp, fileshare_err_to_result};
+        // A 1609 on the preview op means the SHARE is gone — keep uniform wording.
+        let m = result_to_string(&fileshare_err_to_result(
+            &fs_api_err(1609, 404),
+            "failed to download File Share preview",
+            FsMcpOp::Preview,
+        ));
+        assert!(
+            m.contains("unavailable") && m.contains("not exist") && m.contains("revoked"),
+            "a 1609 on the preview op must stay uniform-unavailable: {m}"
+        );
+        assert!(
+            !m.contains("no preview of this type"),
+            "a 1609 (share gone) must NOT be reframed as a preview miss: {m}"
+        );
+    }
+
+    #[test]
+    fn fileshare_err_nonpreview_bare_404_stays_uniform_unavailable() {
+        use super::{FsMcpOp, fileshare_err_to_result};
+        // The uniform-404 discipline for NON-preview ops must be untouched.
+        let m = result_to_string(&fileshare_err_to_result(
+            &fs_api_err(0, 404),
+            "failed to get",
+            FsMcpOp::LinkAccess,
+        ));
+        assert!(
+            m.contains("unavailable") && m.contains("revoked"),
+            "a bare 404 on a non-preview op must stay uniform-unavailable: {m}"
+        );
+        assert!(
+            !m.contains("no preview of this type"),
+            "a non-preview 404 must NOT borrow the preview wording: {m}"
         );
     }
 
