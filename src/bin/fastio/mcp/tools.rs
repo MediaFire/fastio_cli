@@ -857,7 +857,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "ripley",
-        description: "Offload multi-step work to Ripley, Fast.io's AI agent: ask a question and get the answer (ask — creates a chat and waits), lower-level chat create/list/details/update/delete/publish/cancel, message send/list/details/read, semantic search, generate AI shares (share-generate), transactions, autotitle, and self-only AI memory (memory-get/memory-set/memory-delete). (Formerly the `ai` tool; `ai` still works as a hidden alias.)",
+        description: "Offload multi-step work to Ripley, Fast.io's AI agent: ask a question and get the answer (ask — creates a chat and waits), lower-level chat create/list/details/update/delete/publish/cancel, message send/list/details/read, semantic search, generate AI shares (share-generate), transactions, and autotitle. (Formerly the `ai` tool; `ai` still works as a hidden alias.)",
         actions: &[
             "ask",
             "chat-create",
@@ -875,18 +875,14 @@ const TOOL_DEFS: &[ToolDef] = &[
             "transactions",
             "autotitle",
             "search",
-            "memory-get",
-            "memory-set",
-            "memory-delete",
         ],
         params: &[
             (
                 "context_type",
-                "Context: workspace or share (chat/message/share/transactions/autotitle); \
-                 org or workspace for memory-* actions",
+                "Context: workspace or share (chat/message/share/transactions/autotitle)",
                 false,
             ),
-            ("context_id", "Workspace, share, or org ID", false),
+            ("context_id", "Workspace or share ID", false),
             (
                 "query_text",
                 "Question or search query (ask, chat-create, message-send, search)",
@@ -914,12 +910,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             (
                 "no_wait",
                 "ask: return chat/message IDs immediately without waiting for the answer",
-                false,
-            ),
-            ("content", "Memory content, max 64KB (memory-set)", false),
-            (
-                "revision",
-                "Optimistic-concurrency revision; write only if it matches (memory-set)",
                 false,
             ),
             (
@@ -1500,6 +1490,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             "step-output",
             "step-advance",
             "step-occurrences",
+            "step-agent-activity",
             "template-list",
             "template-get",
             "trigger-list",
@@ -6010,9 +6001,6 @@ async fn handle_ai(
         "transactions" => handle_ai_transactions(state, args).await,
         "autotitle" => handle_ai_autotitle(state, args).await,
         "search" => handle_ai_search(state, args).await,
-        "memory-get" => handle_ai_memory_get(state, args).await,
-        "memory-set" => handle_ai_memory_set(state, args).await,
-        "memory-delete" => handle_ai_memory_delete(state, args).await,
         _ => Ok(error_text(&format!("Unknown ripley action: {action}"))),
     }
 }
@@ -6803,109 +6791,6 @@ fn json_value_id_to_string(v: &Value) -> Option<String> {
 /// numeric JSON value.
 fn json_value_field_to_string(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(json_value_id_to_string)
-}
-
-/// Resolve the AI-memory scope from the MCP `context_type` arg, which for
-/// memory actions accepts `org` or `workspace` (NOT `share` — memory has no
-/// share scope). Returns an error result for any other value.
-fn resolve_memory_scope(
-    args: &Map<String, Value>,
-) -> Result<fastio_cli::api::ai_memory::MemoryScope, CallToolResult> {
-    match optional_str(args, "context_type").unwrap_or("workspace") {
-        "org" => Ok(fastio_cli::api::ai_memory::MemoryScope::Org),
-        "workspace" => Ok(fastio_cli::api::ai_memory::MemoryScope::Workspace),
-        other => Err(error_text(&format!(
-            "memory context_type must be \"org\" or \"workspace\", got {other:?}"
-        ))),
-    }
-}
-
-async fn handle_ai_memory_get(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let scope = match resolve_memory_scope(args) {
-        Ok(s) => s,
-        Err(e) => return Ok(e),
-    };
-    let ctx_id = match required_str(args, "context_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::ai_memory::get(&client, scope, ctx_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_ai_memory_set(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let scope = match resolve_memory_scope(args) {
-        Ok(s) => s,
-        Err(e) => return Ok(e),
-    };
-    let ctx_id = match required_str(args, "context_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let content = match required_str(args, "content") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    // `revision` is optional. Distinguish three cases:
-    //   - key ABSENT              → unconditional (last-writer-wins) write
-    //   - present, valid u64       → conditional (optimistic-concurrency) write
-    //   - present, NOT a valid u64 → reject BEFORE the write. This includes an
-    //     explicit `null`. Only a truly absent key means "unconditional"; a
-    //     present-but-invalid value (null, bool, float, object, array,
-    //     non-numeric string) is rejected. Silently dropping such a value —
-    //     including treating `null` as absent — would downgrade an intended
-    //     conditional write to an unconditional one (lost-update risk;
-    //     orgs.txt:2265).
-    // Accept both a JSON number and a numeric string (mirrors other MCP args).
-    let revision = match args.get("revision") {
-        None => None,
-        Some(v) => {
-            let parsed = v
-                .as_u64()
-                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
-            match parsed {
-                Some(rev) => Some(rev),
-                None => {
-                    return Ok(error_text(
-                        "revision must be a non-negative integer (a number or numeric string)",
-                    ));
-                }
-            }
-        }
-    };
-    match api::ai_memory::set(&client, scope, ctx_id, content, revision).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_ai_memory_delete(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let scope = match resolve_memory_scope(args) {
-        Ok(s) => s,
-        Err(e) => return Ok(e),
-    };
-    let ctx_id = match required_str(args, "context_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::ai_memory::delete(&client, scope, ctx_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
 }
 
 /// Member tool handler.
@@ -9876,6 +9761,16 @@ fn workflow_describe() -> CallToolResult {
             &["limit", "offset"],
             "",
         ),
+        (
+            "step-agent-activity",
+            &["workflow_id", "step_occurrence_id"],
+            &[],
+            "read-only action feed of an AI-agent step (cards: seq, label, state, \
+             affected_refs, started_at, ended_at; ascending seq). Same shape live or \
+             finished — poll while the step runs. available:false + empty actions = \
+             no readable feed yet (neutral, NOT an error); a non-agent occurrence \
+             returns 404. Never contains tool ids, arguments, results, or reasoning.",
+        ),
         ("template-list", &["workspace_id"], &["limit", "offset"], ""),
         ("template-get", &["template_id"], &["include_body"], ""),
         ("trigger-list", &["workspace_id"], &["enabled_filter"], ""),
@@ -10260,6 +10155,16 @@ async fn handle_workflow(
                 )
                 .await,
             )
+        }
+        "step-agent-activity" => {
+            let (wid, oid) = match (
+                required_str(args, "workflow_id"),
+                required_str(args, "step_occurrence_id"),
+            ) {
+                (Ok(w), Ok(o)) => (w, o),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            wf_render(wf::get_step_agent_activity(&client, wid, oid).await)
         }
         "template-list" => {
             let ws = match required_str(args, "workspace_id") {
@@ -13275,10 +13180,18 @@ mod ripley_tool_tests {
             .find(|t| t.name.as_ref() == "ripley")
             .expect("ripley tool present");
         let schema = serde_json::to_string(&ripley.input_schema).unwrap_or_default();
-        for action in ["ask", "memory-get", "memory-set", "memory-delete"] {
+        for action in ["ask", "share-generate", "search"] {
             assert!(
                 schema.contains(action),
                 "ripley schema must advertise the `{action}` action, got: {schema}"
+            );
+        }
+        // The retired self-only AI-memory actions must NOT be advertised —
+        // agent memory was removed from public API access.
+        for retired in ["memory-get", "memory-set", "memory-delete"] {
+            assert!(
+                !schema.contains(retired),
+                "ripley schema must NOT advertise retired memory action `{retired}`"
             );
         }
     }
@@ -13446,206 +13359,26 @@ mod ripley_tool_tests {
     }
 
     #[tokio::test]
-    async fn memory_get_routes_to_handler() {
-        // Unauthenticated → short-circuits at the auth gate inside handle_ai,
-        // proving `memory-get` routed (vs the unknown-action arm).
-        let router = unauthed_router();
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("memory-get".to_owned()));
-        let res = router
-            .call_tool("ripley", args)
-            .await
-            .expect("call_tool ok");
-        let text = result_to_string(&res);
-        assert!(text.contains("Not authenticated"), "got: {text}");
-        assert!(!text.contains("Unknown ripley action"), "got: {text}");
-    }
-
-    #[tokio::test]
-    async fn memory_set_rejects_over_cap_content() {
-        // ai.txt: content is capped at 64KB; the api layer validates before
-        // the round-trip, so an over-cap write surfaces a Parse error.
+    async fn memory_actions_are_retired() {
+        // Agent memory was removed from public API access: the memory-* actions
+        // must no longer route to a handler — they hit the unknown-action arm
+        // even when authenticated.
         let router = authed_router().await;
-        let big = "a".repeat(65_537);
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("memory-set".to_owned()));
-        args.insert("context_type".to_owned(), Value::String("org".to_owned()));
-        args.insert("context_id".to_owned(), Value::String("o1".to_owned()));
-        args.insert("content".to_owned(), Value::String(big));
-        let res = router
-            .call_tool("ripley", args)
-            .await
-            .expect("call_tool ok");
-        let text = result_to_string(&res);
-        assert!(
-            text.contains("65536") || text.contains("at most"),
-            "over-cap memory content must be rejected, got: {text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn memory_set_rejects_non_numeric_revision() {
-        // A present-but-invalid revision must NOT be silently dropped (which
-        // would downgrade a conditional write to last-writer-wins). It must be
-        // rejected pre-network, BEFORE api::ai_memory::set runs. We pair it with
-        // an over-cap content so that, had the revision been silently dropped,
-        // the request would instead surface the 64KB content-cap error — proving
-        // the revision check fires first.
-        let router = authed_router().await;
-        let big = "a".repeat(65_537);
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("memory-set".to_owned()));
-        args.insert("context_type".to_owned(), Value::String("org".to_owned()));
-        args.insert("context_id".to_owned(), Value::String("o1".to_owned()));
-        args.insert("content".to_owned(), Value::String(big));
-        args.insert("revision".to_owned(), Value::String("abc".to_owned()));
-        let res = router
-            .call_tool("ripley", args)
-            .await
-            .expect("call_tool ok");
-        let text = result_to_string(&res);
-        assert!(
-            text.contains("revision must be a non-negative integer"),
-            "non-numeric revision must be rejected, got: {text}"
-        );
-        assert!(
-            !text.contains("65536") && !text.contains("at most"),
-            "revision check must fire before api::ai_memory::set, got: {text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn memory_set_rejects_null_revision() {
-        // An explicit `null` revision is PRESENT-but-invalid, not absent. Per the
-        // lost-update contract (orgs.txt:2265) only a truly absent key means an
-        // unconditional write; a present `null` must be rejected pre-network so a
-        // conditional write is never silently downgraded to last-writer-wins. As
-        // with the other rejection test we pair it with over-cap content: surfacing
-        // the revision error (and NOT the 64KB content-cap error) proves the
-        // revision check fires before api::ai_memory::set.
-        let router = authed_router().await;
-        let big = "a".repeat(65_537);
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("memory-set".to_owned()));
-        args.insert("context_type".to_owned(), Value::String("org".to_owned()));
-        args.insert("context_id".to_owned(), Value::String("o1".to_owned()));
-        args.insert("content".to_owned(), Value::String(big));
-        args.insert("revision".to_owned(), Value::Null);
-        let res = router
-            .call_tool("ripley", args)
-            .await
-            .expect("call_tool ok");
-        let text = result_to_string(&res);
-        assert!(
-            text.contains("revision must be a non-negative integer"),
-            "a null revision must be rejected, got: {text}"
-        );
-        assert!(
-            !text.contains("65536") && !text.contains("at most"),
-            "revision check must fire before api::ai_memory::set, got: {text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn memory_set_accepts_numeric_string_revision() {
-        // A valid numeric-string revision passes the MCP-handler check and
-        // proceeds into api::ai_memory::set as a CONDITIONAL write. With over-cap
-        // content, reaching the content-cap error (rather than the revision
-        // error) proves the revision was accepted and forwarded.
-        let router = authed_router().await;
-        let big = "a".repeat(65_537);
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("memory-set".to_owned()));
-        args.insert("context_type".to_owned(), Value::String("org".to_owned()));
-        args.insert("context_id".to_owned(), Value::String("o1".to_owned()));
-        args.insert("content".to_owned(), Value::String(big));
-        args.insert("revision".to_owned(), Value::String("5".to_owned()));
-        let res = router
-            .call_tool("ripley", args)
-            .await
-            .expect("call_tool ok");
-        let text = result_to_string(&res);
-        assert!(
-            !text.contains("revision must be a non-negative integer"),
-            "a valid numeric-string revision must be accepted, got: {text}"
-        );
-        assert!(
-            text.contains("65536") || text.contains("at most"),
-            "a valid revision should proceed into the write path, got: {text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn memory_set_accepts_number_revision() {
-        // Same as above but the revision arrives as a JSON number, not a string.
-        let router = authed_router().await;
-        let big = "a".repeat(65_537);
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("memory-set".to_owned()));
-        args.insert("context_type".to_owned(), Value::String("org".to_owned()));
-        args.insert("context_id".to_owned(), Value::String("o1".to_owned()));
-        args.insert("content".to_owned(), Value::String(big));
-        args.insert("revision".to_owned(), Value::Number(5.into()));
-        let res = router
-            .call_tool("ripley", args)
-            .await
-            .expect("call_tool ok");
-        let text = result_to_string(&res);
-        assert!(
-            !text.contains("revision must be a non-negative integer"),
-            "a valid JSON-number revision must be accepted, got: {text}"
-        );
-        assert!(
-            text.contains("65536") || text.contains("at most"),
-            "a valid revision should proceed into the write path, got: {text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn memory_set_omitted_revision_proceeds_unconditionally() {
-        // No revision key → unconditional write. The handler must NOT emit the
-        // revision-validation error and must proceed into the write path (here
-        // surfacing the over-cap content error, proving it got past the
-        // revision logic).
-        let router = authed_router().await;
-        let big = "a".repeat(65_537);
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("memory-set".to_owned()));
-        args.insert("context_type".to_owned(), Value::String("org".to_owned()));
-        args.insert("context_id".to_owned(), Value::String("o1".to_owned()));
-        args.insert("content".to_owned(), Value::String(big));
-        let res = router
-            .call_tool("ripley", args)
-            .await
-            .expect("call_tool ok");
-        let text = result_to_string(&res);
-        assert!(
-            !text.contains("revision must be a non-negative integer"),
-            "an omitted revision must not trigger the revision error, got: {text}"
-        );
-        assert!(
-            text.contains("65536") || text.contains("at most"),
-            "an omitted revision should proceed unconditionally, got: {text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn memory_rejects_share_context_type() {
-        // Memory has no share scope; context_type must be org or workspace.
-        let router = authed_router().await;
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("memory-get".to_owned()));
-        args.insert("context_type".to_owned(), Value::String("share".to_owned()));
-        args.insert("context_id".to_owned(), Value::String("s1".to_owned()));
-        let res = router
-            .call_tool("ripley", args)
-            .await
-            .expect("call_tool ok");
-        let text = result_to_string(&res);
-        assert!(
-            text.contains("org") && text.contains("workspace"),
-            "share context_type must be rejected for memory, got: {text}"
-        );
+        for action in ["memory-get", "memory-set", "memory-delete"] {
+            let mut args = Map::new();
+            args.insert("action".to_owned(), Value::String((*action).to_owned()));
+            args.insert("context_type".to_owned(), Value::String("org".to_owned()));
+            args.insert("context_id".to_owned(), Value::String("o1".to_owned()));
+            let res = router
+                .call_tool("ripley", args)
+                .await
+                .expect("call_tool ok");
+            let text = result_to_string(&res);
+            assert!(
+                text.contains("Unknown ripley action"),
+                "retired `{action}` must hit the unknown-action arm, got: {text}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -14301,6 +14034,7 @@ mod ripley_tool_tests {
             "audit-export-and-download",
             "obligation-resolve",
             "step-output",
+            "step-agent-activity",
         ] {
             assert!(
                 actions.contains(&expected),
@@ -14431,6 +14165,30 @@ mod ripley_tool_tests {
         assert!(
             text.contains("workspace_id"),
             "review-active without workspace_id must report the missing param: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_step_agent_activity_routes_to_handler_not_cli_only() {
+        // step-agent-activity (the AI-agent step's read-only action feed) is an
+        // MCP read action: calling it without its required params must surface
+        // the handler's missing-param error, proving it routes to the handler
+        // rather than the CLI-only fallback.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("step-agent-activity".to_owned()),
+        );
+        let res = router.call_tool("workflow", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("CLI-only workflow action"),
+            "step-agent-activity must route to the handler, not the CLI-only fallback: {text}"
+        );
+        assert!(
+            text.contains("workflow_id"),
+            "step-agent-activity without workflow_id must report the missing param: {text}"
         );
     }
 

@@ -609,6 +609,15 @@ pub enum WorkflowStepCommands {
         #[arg(long)]
         offset: Option<u32>,
     },
+    /// Read an AI-agent step occurrence's action feed (poll while the step
+    /// runs; durable once finished). `available: false` means no readable
+    /// feed yet — not an error. Non-agent occurrences return 404.
+    AgentActivity {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Step occurrence ID.
+        step_occurrence_id: String,
+    },
 }
 
 /// Workflow template subcommands (immutable revisions — no `update`).
@@ -4146,9 +4155,6 @@ pub enum RipleyCommands {
         #[arg(long)]
         user_context: Option<String>,
     },
-    /// Manage the caller's AI-memory blob (org or workspace; self-only).
-    #[command(subcommand)]
-    Memory(RipleyMemoryCommands),
     /// Hand work to Ripley to run on your behalf (not yet available).
     #[command(hide = true, alias = "run")]
     Delegate {
@@ -4178,45 +4184,6 @@ pub enum RipleyCommands {
     CancelJob {
         /// Delegated-job ID.
         id: String,
-    },
-}
-
-/// Ripley AI-memory subcommands (self-only; org or workspace scope).
-#[derive(Subcommand, Debug)]
-#[non_exhaustive]
-pub enum RipleyMemoryCommands {
-    /// Read the caller's AI-memory blob.
-    Get {
-        /// Organization ID.
-        #[arg(long, required_unless_present = "workspace")]
-        org: Option<String>,
-        /// Workspace ID (alternative to org).
-        #[arg(long, conflicts_with = "org")]
-        workspace: Option<String>,
-    },
-    /// Write the caller's AI-memory blob (≤64KB; optional revision CAS).
-    Set {
-        /// Organization ID.
-        #[arg(long, required_unless_present = "workspace")]
-        org: Option<String>,
-        /// Workspace ID (alternative to org).
-        #[arg(long, conflicts_with = "org")]
-        workspace: Option<String>,
-        /// New markdown content (max 64KB; empty string stores an empty row).
-        content: String,
-        /// Optimistic-concurrency revision: write only if the row's current
-        /// revision matches (409 on mismatch).
-        #[arg(long)]
-        revision: Option<u64>,
-    },
-    /// Hard-delete the caller's AI-memory blob.
-    Delete {
-        /// Organization ID.
-        #[arg(long, required_unless_present = "workspace")]
-        org: Option<String>,
-        /// Workspace ID (alternative to org).
-        #[arg(long, conflicts_with = "org")]
-        workspace: Option<String>,
     },
 }
 
@@ -6053,8 +6020,6 @@ mod ripley_alias_tests {
 
     // ── Phase 2 surface parse tests ──────────────────────────────────────
 
-    use super::RipleyMemoryCommands;
-
     #[test]
     fn ask_parses_with_workspace_and_no_wait() {
         let cli = Cli::try_parse_from([
@@ -6178,57 +6143,6 @@ mod ripley_alias_tests {
     }
 
     #[test]
-    fn memory_set_parses_org_content_revision() {
-        let cli = Cli::try_parse_from([
-            "fastio",
-            "ripley",
-            "memory",
-            "set",
-            "--org",
-            "o1",
-            "--revision",
-            "7",
-            "hello",
-        ])
-        .expect("memory set should parse");
-        match cli.command {
-            Commands::Ripley(RipleyCommands::Memory(RipleyMemoryCommands::Set {
-                org,
-                workspace,
-                content,
-                revision,
-            })) => {
-                assert_eq!(org.as_deref(), Some("o1"));
-                assert!(workspace.is_none());
-                assert_eq!(content, "hello");
-                assert_eq!(revision, Some(7));
-            }
-            other => panic!("expected Ripley(Memory(Set)), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn memory_get_requires_org_or_workspace() {
-        let res = Cli::try_parse_from(["fastio", "ripley", "memory", "get"]);
-        assert!(res.is_err(), "memory get must require --org or --workspace");
-    }
-
-    #[test]
-    fn memory_org_and_workspace_conflict() {
-        let res = Cli::try_parse_from([
-            "fastio",
-            "ripley",
-            "memory",
-            "get",
-            "--org",
-            "o1",
-            "--workspace",
-            "ws1",
-        ]);
-        assert!(res.is_err(), "memory --org + --workspace must conflict");
-    }
-
-    #[test]
     fn delegated_job_stubs_parse_but_are_hidden() {
         // The hidden stubs still parse (so the "pending" message can fire),
         // but must not be advertised in help.
@@ -6271,14 +6185,10 @@ mod ripley_alias_tests {
                 "hidden delegated-job verb `{hidden}` must not be listed in help"
             );
         }
-        // The headline `ask` and `memory` verbs ARE visible.
+        // The headline `ask` verb IS visible.
         assert!(
             help.contains("ask"),
             "`ask` should be visible in ripley help"
-        );
-        assert!(
-            help.contains("memory"),
-            "`memory` should be visible in ripley help"
         );
     }
 

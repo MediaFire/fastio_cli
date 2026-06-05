@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "fastio-cli"
-version = "2026.6.9"
+version = "2026.6.11"
 dependencies = [
  "anyhow",
  "base64",

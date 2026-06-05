@@ -654,6 +654,7 @@ async fn execute_grant(command: WorkflowGrantCommands, ctx: &CommandContext<'_>)
 
 // ─── Steps ─────────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)] // flat dispatch over the step-occurrence sub-surface
 async fn execute_step(command: WorkflowStepCommands, ctx: &CommandContext<'_>) -> Result<()> {
     let client = ctx.build_client()?;
     match command {
@@ -744,6 +745,17 @@ async fn execute_step(command: WorkflowStepCommands, ctx: &CommandContext<'_>) -
             )
             .await
             .context("failed to list step occurrences")?;
+            ctx.output.render(&v)?;
+            Ok(())
+        }
+        WorkflowStepCommands::AgentActivity {
+            workflow_id,
+            step_occurrence_id,
+        } => {
+            let v =
+                orchestration::get_step_agent_activity(&client, &workflow_id, &step_occurrence_id)
+                    .await
+                    .context("failed to read step agent activity")?;
             ctx.output.render(&v)?;
             Ok(())
         }
