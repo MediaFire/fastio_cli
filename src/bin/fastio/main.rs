@@ -289,6 +289,7 @@ async fn dispatch(
         Commands::Metadata(c) => commands::metadata::execute(&map_metadata_command(c), ctx).await,
         Commands::Workflow(c) => commands::workflow::execute(c, ctx).await,
         Commands::Sign(c) => commands::sign::execute(c, ctx).await,
+        Commands::Fileshare(c) => commands::fileshare::execute(c, ctx).await,
         Commands::Instructions(c) => {
             commands::instructions::execute(&map_instructions_command(c), ctx).await
         }

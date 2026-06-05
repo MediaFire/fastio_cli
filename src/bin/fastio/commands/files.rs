@@ -964,13 +964,17 @@ async fn read_content(ctx: &CommandContext<'_>, workspace: &str, node_id: &str) 
 }
 
 /// Get quickshare information for a file.
+///
+/// `QuickShare` is deprecated: creating a new one is rejected server-side with
+/// error `10756`, which is mapped here to the File-Share migration guidance.
+/// Reading/revoking existing `QuickShare`s still works.
 async fn quickshare(ctx: &CommandContext<'_>, workspace: &str, node_id: &str) -> Result<()> {
     validate_workspace_id(workspace)?;
     validate_node_id(node_id, "node ID")?;
     let client = ctx.build_client()?;
     let value = api::storage::quickshare_get(&client, workspace, node_id)
         .await
-        .context("failed to get quickshare")?;
+        .map_err(|e| super::fileshare::map_quickshare_deprecation(e, "failed to get quickshare"))?;
     ctx.output.render(&value)?;
     Ok(())
 }

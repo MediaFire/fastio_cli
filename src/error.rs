@@ -99,6 +99,48 @@ pub enum CliError {
         header: &'static str,
     },
 
+    /// An [`ApiError`] for which a command-layer error mapper has supplied an
+    /// OVERRIDE recovery hint (or chosen to SUPPRESS the generic one).
+    ///
+    /// Motivation: a command-scoped mapper (e.g. a File-Share or signing mapper)
+    /// re-frames a raw API error with a resource-specific `.context(...)` message
+    /// — but that context is layered ON TOP OF a `CliError::Api`, which the render
+    /// layer still downcasts to in order to fetch `suggestion()`. The inner
+    /// `ApiError`'s GENERIC status hint (e.g. "Run `fastio auth login`" for a 401,
+    /// "Verify the ID or path is correct." for a 404, the generic-403 line) then
+    /// gets appended UNDERNEATH the mapper's careful wording, contradicting it.
+    /// Wrapping the error in this variant lets the mapper own the rendered `hint:`
+    /// line: `suggestion()` returns the override (or `None` to print no hint at
+    /// all), instead of the inner `ApiError`'s status default.
+    ///
+    /// Like [`CliError::ArtifactNotReady`], `api` is a PLAIN field (NOT
+    /// `#[source]` / `#[from]`), so:
+    /// - its `Display` is the inner `ApiError`'s `Display` verbatim (`[HTTP …] …
+    ///   (code …)` plus any `see:` / `resource:` details), preserving the exit
+    ///   code and the full server message; and
+    /// - no `source()` link is generated, so the rendered `anyhow` chain carries
+    ///   no duplicate `ApiError` block (the dedup invariant in `main.rs`'s
+    ///   `render_chain_dedup` is untouched).
+    ///
+    /// `hint` is `Option<&'static str>` so the MAPPING LAYER owns the override
+    /// TEXT (passed in as a `const` from the command module) — keeping this
+    /// variant RESOURCE-AGNOSTIC: it embeds no feature-specific wording itself,
+    /// only relaying whatever static string the caller provided (or `None`).
+    #[error("{api}")]
+    MappedApi {
+        /// The original server error, preserved verbatim for `Display` and for
+        /// the HTTP status / code it carries. A plain field (NOT `#[source]`), so
+        /// it adds no duplicate link to the rendered `anyhow` chain — identical to
+        /// [`CliError::ArtifactNotReady`].
+        api: ApiError,
+        /// The override recovery hint the mapping layer chose. `Some(text)`
+        /// replaces the inner `ApiError`'s generic status hint with `text`;
+        /// `None` SUPPRESSES the hint entirely (no `hint:` line is printed). The
+        /// text is owned by the caller (a command-module `const`), so this variant
+        /// stays resource-agnostic.
+        hint: Option<&'static str>,
+    },
+
     /// A compare-and-swap (optimistic-concurrency) write was rejected because
     /// the target moved on since the version the caller based their change on.
     ///
@@ -133,6 +175,9 @@ impl CliError {
                 Some("Wait for the rate limit window to reset, then retry your request.")
             }
             Self::Api(api_err) => api_err.suggestion(),
+            // The mapping layer OWNS the rendered hint: `Some(text)` overrides the
+            // inner ApiError's generic status hint; `None` suppresses it entirely.
+            Self::MappedApi { hint, .. } => *hint,
             Self::ArtifactNotReady { .. } => Some(HINT_ARTIFACT_NOT_READY),
             Self::InvalidHeaderValue { .. } => Some(HINT_INVALID_HEADER_VALUE),
             Self::VersionConflict { .. } => Some(HINT_VERSION_CONFLICT),
@@ -575,6 +620,56 @@ mod tests {
         // The hint stays generic: it names no specific header or secret kind.
         assert!(!hint.to_lowercase().contains("x-ve-password"));
         assert!(!hint.to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn mapped_api_delegates_display_and_owns_hint() {
+        // Display delegates to the inner ApiError verbatim (preserving the server
+        // headline + code), so the exit-code-bearing message survives.
+        let api = ApiError::new(1650, None, "boom".to_owned(), 401);
+        let want_display = api.to_string();
+        let mapped = CliError::MappedApi {
+            api,
+            hint: Some("use --password"),
+        };
+        assert_eq!(
+            mapped.to_string(),
+            want_display,
+            "MappedApi Display must delegate to the inner ApiError"
+        );
+        // The hint is whatever the mapping layer supplied — NOT the inner
+        // ApiError's generic 401 "auth login" default.
+        assert_eq!(mapped.suggestion(), Some("use --password"));
+
+        // `hint: None` SUPPRESSES the hint entirely (no generic fallback).
+        let suppressed = CliError::MappedApi {
+            api: ApiError::new(0, None, "boom".to_owned(), 404),
+            hint: None,
+        };
+        assert_eq!(
+            suppressed.suggestion(),
+            None,
+            "MappedApi with hint None must print no hint (no generic-404 fallback)"
+        );
+    }
+
+    #[test]
+    fn mapped_api_variant_carries_no_resource_wording() {
+        // The variant itself must stay RESOURCE-AGNOSTIC: its Display delegates to
+        // the inner (server-supplied) ApiError and it relays only the caller's
+        // `hint`. With a plain server message and no hint, nothing fileshare /
+        // share / sign specific may appear from the variant's own structure.
+        let err = CliError::MappedApi {
+            api: ApiError::new(1609, None, "not available".to_owned(), 404),
+            hint: None,
+        };
+        let rendered = err.to_string();
+        for needle in ["fileshare", "file share", "sign", "envelope"] {
+            assert!(
+                !rendered.to_lowercase().contains(needle),
+                "MappedApi Display must not carry resource wording ({needle}): {rendered}"
+            );
+        }
     }
 
     #[test]
