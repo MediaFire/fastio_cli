@@ -3162,7 +3162,7 @@ pub enum FilesCommands {
         /// Node ID.
         node_id: String,
     },
-    /// Create or get a quickshare link. DEPRECATED: `QuickShare` is superseded
+    /// Get an existing `QuickShare` link. DEPRECATED: `QuickShare` is superseded
     /// by File Shares — use `fastio fileshare create --workspace <ws> --node
     /// <node>` instead. Creating a new `QuickShare` is rejected server-side;
     /// reading or revoking existing ones still works.

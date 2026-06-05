@@ -177,7 +177,7 @@ pub enum FilesCommand {
         /// Node ID.
         node_id: String,
     },
-    /// Create or get a quickshare link.
+    /// Get an existing `QuickShare` link.
     Quickshare {
         /// Workspace ID.
         workspace: String,
