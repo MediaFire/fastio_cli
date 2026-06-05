@@ -510,7 +510,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "workspace",
-        description: "Workspaces: list, create, view, update, delete, archive/unarchive, members, shares, notes, quickshares, metadata, import/export, workflow. SIDE EFFECTS — these metadata actions SPEND AI CREDITS: 'metadata-template-preview-match', 'metadata-template-suggest-fields', 'metadata-extract', 'metadata-extract-and-wait'. 'metadata-extract-and-wait' enqueues a single-file extraction and polls workspace jobs-status to a terminal state before returning.",
+        description: "Workspaces: list, create, view, update, delete, archive/unarchive, members, shares, notes, metadata, import/export, workflow. SIDE EFFECTS — these metadata actions SPEND AI CREDITS: 'metadata-template-preview-match', 'metadata-template-suggest-fields', 'metadata-extract', 'metadata-extract-and-wait'. 'metadata-extract-and-wait' enqueues a single-file extraction and polls workspace jobs-status to a terminal state before returning.",
         actions: &[
             "list",
             "create",
@@ -532,9 +532,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             "create-note",
             "update-note",
             "read-note",
-            "quickshare-get",
-            "quickshare-delete",
-            "quickshares-list",
             "enable-import",
             "disable-import",
             "metadata-template-categories",
@@ -569,7 +566,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("query", "Search query", false),
             ("confirm", "Confirmation string (delete)", false),
             ("share_id", "Share ID (import-share)", false),
-            ("node_id", "Node ID (notes, quickshare, metadata)", false),
+            ("node_id", "Node ID (notes, metadata)", false),
             ("parent_id", "Parent folder ID (create-note)", false),
             (
                 "content",
@@ -661,7 +658,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "files",
-        description: "File operations: list, details, create folders, move, copy, rename, delete, restore, purge, trash, versions, search, recent, lock, quickshare, transfer, read content.",
+        description: "File operations: list, details, create folders, move, copy, rename, delete, restore, purge, trash, versions, search, recent, lock, transfer, read content.",
         actions: &[
             "list",
             "info",
@@ -683,7 +680,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             "lock-status",
             "lock-release",
             "read",
-            "quickshare",
         ],
         params: &[
             ("workspace_id", "Workspace ID", false),
@@ -792,19 +788,18 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "download",
-        description: "Downloads: get file download URLs, folder ZIP URLs, quickshare details. file-url returns a secret-bearing URL (short-lived scoped read token) — do not log or share it.",
-        actions: &["file-url", "zip-url", "quickshare-details"],
+        description: "Downloads: get file download URLs, folder ZIP URLs. file-url returns a secret-bearing URL (short-lived scoped read token) — do not log or share it.",
+        actions: &["file-url", "zip-url"],
         params: &[
             ("context_type", "Context: workspace or share", false),
             ("context_id", "Workspace or share ID", false),
             ("node_id", "File/folder node ID", false),
             ("version_id", "Version ID (file-url)", false),
-            ("quickshare_id", "Quickshare ID (quickshare-details)", false),
         ],
     },
     ToolDef {
         name: "share",
-        description: "Shares (data rooms): list, create, view, update, delete, archive/unarchive, password-auth, guest-auth, quickshare, workflow, discovery.",
+        description: "Shares (data rooms): list, create, view, update, delete, archive/unarchive, password-auth, guest-auth, workflow, discovery.",
         actions: &[
             "list",
             "create",
@@ -819,7 +814,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             "unarchive",
             "password-auth",
             "guest-auth",
-            "quickshare-create",
             "available",
             "check-name",
             "enable-workflow",
@@ -827,11 +821,7 @@ const TOOL_DEFS: &[ToolDef] = &[
         ],
         params: &[
             ("share_id", "Share ID", false),
-            (
-                "workspace_id",
-                "Workspace ID (create, quickshare-create)",
-                false,
-            ),
+            ("workspace_id", "Workspace ID (create)", false),
             ("name", "Share name", false),
             ("description", "Description", false),
             ("access_options", "Access options", false),
@@ -857,13 +847,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("folder", "Folder ID (files-list)", false),
             ("email", "Member email (members-add)", false),
             ("role", "Member role", false),
-            ("node_id", "Node ID (quickshare-create)", false),
-            ("expires", "Expiration (quickshare-create)", false),
-            (
-                "expires_at",
-                "ISO datetime expiration (quickshare-create)",
-                false,
-            ),
             ("sort_by", "Sort field (files-list)", false),
             ("sort_dir", "Sort direction (files-list)", false),
             ("page_size", "Page size", false),
@@ -1767,6 +1750,130 @@ const TOOL_DEFS: &[ToolDef] = &[
         ],
     },
     ToolDef {
+        name: "fileshare",
+        description: "File Shares: durable, link-shareable views of a SINGLE workspace file — the replacement for the retired QuickShare (use this tool's 'create' action). A File Share binds one file node and serves it via a stable link with optional password protection, an access option (named_people / anyone_with_link / …), an expiry, and per-user grants (view < download < edit). This tool exposes READ + DRIVE actions: create, list, info (details + effective_capability), update, grants-list, grants-add, versions, download (streams the bound file to the agent's local fs), preview (streams a derived preview asset), activity (single poll), describe. CONFIRM-GATED destructive actions: 'delete' REQUIRES confirm_delete=true (revokes the link + cascades grants; the bound file is untouched); 'grants-remove' REQUIRES confirm_revoke=true. CLI-BINARY-ONLY actions (NOT routable over MCP): 'upload' — the write-back that pushes a NEW VERSION of the bound file — needs the local file bytes and is destructive, so run `fastio fileshare upload …`; and 'ws-token' — the realtime WebSocket-token mint — is CLI-only because the token is a long-lived secret that must NOT be parked in an MCP transcript (run `fastio fileshare ws-token --token-file <path>`; mirrors how the workflow tool keeps its realtime-token mint CLI-only). The 'password' arg protects/authorizes a link (travels only in the x-ve-password header; NEVER logged or echoed in results/errors). info/download/versions/preview may be ANONYMOUS on a public (anyone_with_link) share. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Call action='describe' for the authoritative per-action reference.",
+        actions: &[
+            "describe",
+            "create",
+            "list",
+            "info",
+            "update",
+            "grants-list",
+            "grants-add",
+            "grants-remove",
+            "delete",
+            "versions",
+            "download",
+            "preview",
+            "activity",
+        ],
+        params: &[
+            (
+                "workspace_id",
+                "Workspace ID (19-digit) — create / list",
+                false,
+            ),
+            (
+                "fileshare_id",
+                "File Share ID — info / update / delete / grants-* / versions / download / preview / activity",
+                false,
+            ),
+            (
+                "node_id",
+                "Bound file node id (create) — must be a FILE node (not a folder or note)",
+                false,
+            ),
+            ("title", "Display title (create / update)", false),
+            (
+                "access_option",
+                "Access option (create / update): e.g. named_people, anyone_with_link",
+                false,
+            ),
+            (
+                "password",
+                "Link password (create / update set; info / download / versions / preview supply it to authorize a protected link). Travels only in the x-ve-password header; NEVER logged. On update, pass clear_password=true to REMOVE it (do not also pass password).",
+                false,
+            ),
+            (
+                "expires",
+                "Relative expiry in seconds (create / update). Mutually exclusive with expires_at.",
+                false,
+            ),
+            (
+                "expires_at",
+                "Absolute expiry timestamp (create / update; naive = UTC). Mutually exclusive with expires.",
+                false,
+            ),
+            (
+                "clear_password",
+                "update only: true REMOVES the link password (do not also pass password).",
+                false,
+            ),
+            (
+                "clear_expires",
+                "update only: true CLEARS the expiry.",
+                false,
+            ),
+            (
+                "user",
+                "Grant target user id (grants-add / grants-remove). Supply exactly one of user / email.",
+                false,
+            ),
+            (
+                "email",
+                "Grant target email (grants-add / grants-remove). Supply exactly one of user / email. (Unregistered emails send a real invite.)",
+                false,
+            ),
+            (
+                "capability",
+                "Grant capability (grants-add): view / download / edit (ordered view < download < edit).",
+                false,
+            ),
+            (
+                "version",
+                "download only: a historical version id to fetch instead of the current bytes.",
+                false,
+            ),
+            (
+                "preview_type",
+                "preview only: the preview/derived-asset type to fetch (e.g. a thumbnail/format key).",
+                false,
+            ),
+            (
+                "output_path",
+                "Local destination FILE path for download / preview (defaults under .fastio/downloads/).",
+                false,
+            ),
+            (
+                "confirm_delete",
+                "REQUIRED to proceed (true) for delete; the action is rejected unless confirm_delete=true (mirrors the CLI --yes gate).",
+                false,
+            ),
+            (
+                "confirm_revoke",
+                "REQUIRED to proceed (true) for grants-remove; the action is rejected unless confirm_revoke=true (mirrors the CLI --yes gate).",
+                false,
+            ),
+            ("offset", "Pagination offset (list)", false),
+            ("limit", "Pagination limit (list)", false),
+            (
+                "lastactivity",
+                "activity only: cursor — return only events newer than this marker.",
+                false,
+            ),
+            (
+                "wait",
+                "activity only: long-poll wait seconds (single poll).",
+                false,
+            ),
+            (
+                "updated",
+                "activity only: true to return only events newer than lastactivity.",
+                false,
+            ),
+        ],
+    },
+    ToolDef {
         name: "instructions",
         description: "AI instructions (markdown blob, max 65,536 raw bytes) per profile. Scopes: user (self only), org/workspace/share (profile-wide admin slot + per-user override at /me/). User has no /me/ variant. clear-* maps to DELETE; setting empty content is equivalent.",
         actions: &[
@@ -1886,6 +1993,7 @@ impl ToolRouter {
             "metadata" => handle_metadata(&self.state, action, &args).await,
             "workflow" => handle_workflow(&self.state, action, &args).await,
             "sign" => handle_sign(&self.state, action, &args).await,
+            "fileshare" => handle_fileshare(&self.state, action, &args).await,
             "instructions" => handle_instructions(&self.state, action, &args).await,
             "system" => handle_system(&self.state, action, &args).await,
             _ => Ok(error_text(&format!("Unknown tool: {name}"))),
@@ -3879,51 +3987,6 @@ async fn handle_workspace(
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
-        "quickshare-get" => {
-            let ws_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let node_id = match required_str(args, "node_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workspace::quickshare_get(&client, ws_id, node_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "quickshare-delete" => {
-            let ws_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let node_id = match required_str(args, "node_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workspace::quickshare_delete(&client, ws_id, node_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "quickshares-list" => {
-            let ws_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workspace::quickshares_list(
-                &client,
-                ws_id,
-                optional_u32(args, "limit"),
-                optional_u32(args, "offset"),
-            )
-            .await
-            {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
         "disable-workflow" => {
             let ws_id = match required_str(args, "workspace_id") {
                 Ok(v) => v,
@@ -4640,7 +4703,6 @@ async fn handle_files(
         "lock-status" => handle_files_lock_status(state, args).await,
         "lock-release" => handle_files_lock_release(state, args).await,
         "read" => handle_files_read(state, args).await,
-        "quickshare" => handle_files_quickshare(state, args).await,
         _ => Ok(error_text(&format!("Unknown files action: {action}"))),
     }
 }
@@ -5071,25 +5133,6 @@ async fn handle_files_read(
         Err(e) => return Ok(e),
     };
     match api::storage::read_content(&client, ws_id, node_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_files_quickshare(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let ws_id = match required_str(args, "workspace_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let node_id = match required_str(args, "node_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::storage::quickshare_get(&client, ws_id, node_id).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5574,16 +5617,6 @@ async fn handle_download(
             let url = api::download::get_zip_url_ctx(state.api_base(), ctx_type, ctx_id, node_id);
             Ok(success_json(&json!({ "zip_url": url })))
         }
-        "quickshare-details" => {
-            let qs_id = match required_str(args, "quickshare_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::download::quickshare_details(&client, qs_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
         _ => Ok(error_text(&format!("Unknown download action: {action}"))),
     }
 }
@@ -5611,7 +5644,6 @@ async fn handle_share(
         "unarchive" => handle_share_unarchive(state, args).await,
         "password-auth" => handle_share_password_auth(state, args).await,
         "guest-auth" => handle_share_guest_auth(state, args).await,
-        "quickshare-create" => handle_share_quickshare_create(state, args).await,
         "available" => handle_share_available(state, args).await,
         "check-name" => handle_share_check_name(state, args).await,
         "enable-workflow" => handle_share_enable_workflow(state, args).await,
@@ -5892,33 +5924,6 @@ async fn handle_share_guest_auth(
         Err(e) => return Ok(e),
     };
     match api::share::guest_auth(&client, share_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_share_quickshare_create(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let ws_id = match required_str(args, "workspace_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let node_id = match required_str(args, "node_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::share::create_quickshare(
-        &client,
-        ws_id,
-        node_id,
-        optional_str(args, "expires"),
-        optional_str(args, "expires_at"),
-    )
-    .await
-    {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -11719,6 +11724,1058 @@ async fn sign_download(
     }
 }
 
+// ─── File Shares ────────────────────────────────────────────────────────────
+
+/// Discriminates a File Share call by its AUTH CLASS and `create`-ness, mirroring
+/// the CLI's `FsOp` so [`fileshare_err_to_result`] can reframe a `1650`/`401`
+/// correctly: a management call authenticates with the caller's ACCOUNT token (a
+/// `1650` there is account auth, not a link password), whereas a link-access call
+/// (consumption) authenticates against the share's LINK gate (`x-ve-password`, so
+/// a `1650` is a link-password failure). A `create` additionally hints
+/// node-must-be-a-file on a `1605`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FsMcpOp {
+    /// A `create` call — a `1605` invalid-input hints node-must-be-a-file.
+    Create,
+    /// A management call other than `create` (list / update / delete / grants /
+    /// activity). Authenticates with the ACCOUNT token, so a `1650`/`401` is an
+    /// account-auth failure, not a link password.
+    ManagementOther,
+    /// A link-access call (consumption: info / download / versions).
+    /// `x-ve-password` applies, so a `1650`/`401` is a link-password failure.
+    LinkAccess,
+    /// The `preview` consumption call. Like [`Self::LinkAccess`] for auth
+    /// purposes (`x-ve-password` applies, so a `1650`/`401` is a link-password
+    /// failure), but a `404` WITHOUT a share-gone code (`1609`) — or the
+    /// preview-specific `143705` — is a PREVIEW miss (the share exists; the
+    /// requested preview asset does not), NOT a share-gone.
+    Preview,
+}
+
+impl FsMcpOp {
+    /// Whether this op authenticates against the share's LINK gate
+    /// (`x-ve-password`), so a `1650`/`401` means a link-password failure rather
+    /// than an account-auth failure. Both consumption classes (`LinkAccess` and
+    /// `Preview`) gate on the link.
+    fn is_link_access(self) -> bool {
+        matches!(self, Self::LinkAccess | Self::Preview)
+    }
+
+    /// Whether this is the `preview` op, so a bare `404` is a preview miss rather
+    /// than a share-gone (the SHARE exists; the requested preview asset does not).
+    fn is_preview(self) -> bool {
+        matches!(self, Self::Preview)
+    }
+}
+
+/// Map a File Share API error to an MCP result.
+///
+/// Mirrors the CLI's `map_fileshare_error` — File-Share-specific wording lives
+/// HERE (and there), never in the global `error.rs` hints. Keyed on the actual
+/// `error.code` (HTTP status only as a secondary signal), with the same
+/// auth-class awareness as the CLI:
+///
+/// - `1650`/`401` → a link-password failure (steer to the `password` arg) ONLY on
+///   a [`FsMcpOp::LinkAccess`] op; on a management op it is account auth, so it
+///   defers to the generic suggestion ("run `fastio auth login`").
+/// - `1700`/`403` → capability insufficient (view < download < edit; a write-back
+///   `edit` grant is CLI-only).
+/// - `1609`/`404` → UNIFORM "unavailable" (never distinguish not-found / expired /
+///   revoked — no enumeration oracle).
+/// - `1680`/`403` → the bound file is not serveable (locked / DMCA / infected).
+/// - `1605`/`400` → surface the server message; on create, hint node-must-be-a-file.
+/// - A [`CliError::VersionConflict`] passes through with its current-version hint.
+/// - Everything else defers to the shared `err.suggestion()`.
+fn fileshare_err_to_result(
+    err: &fastio_cli::error::CliError,
+    ctx: &str,
+    op: FsMcpOp,
+) -> CallToolResult {
+    use fastio_cli::error::CliError;
+
+    // A CAS conflict is already fully framed by its Display + suggestion. Carry
+    // the rebase recipe (`suggestion()` → re-fetch / re-apply / retry-with-current)
+    // into the MCP result for parity with the CLI render.
+    if let CliError::VersionConflict { current_version } = err {
+        let base = format!(
+            "{ctx}: the bound file changed since the version you supplied; current version is \
+             {current_version} ({err})"
+        );
+        return match err.suggestion() {
+            Some(hint) => error_text(&format!("{base} {hint}")),
+            None => error_text(&base),
+        };
+    }
+
+    let CliError::Api(api) = err else {
+        // A non-Api error (auth / io / parse): defer to the shared suggestion.
+        if let Some(hint) = err.suggestion() {
+            return error_text(&format!("{ctx}: {hint} ({err})"));
+        }
+        return error_text(&format!("{ctx}: {err}"));
+    };
+
+    // Code-keyed reframing (HTTP status only as a secondary fallback below).
+    let note: Option<String> = match api.code {
+        1650 if op.is_link_access() => Some(
+            "this File Share requires a link password (or the one supplied is wrong) (1650). Pass \
+             the `password` arg (it travels only in the x-ve-password header and is never logged)."
+                .to_owned(),
+        ),
+        1700 => Some(
+            "your capability on this File Share is insufficient for this action (1700). \
+             Capabilities are ordered view < download < edit; writing a new version is the \
+             CLI-only `fastio fileshare upload` and needs an explicit `edit` grant."
+                .to_owned(),
+        ),
+        // Preview-specific miss (143705 / "Unable to retrieve preview"). Emitted
+        // ONLY by the storage preview-read path's default arm (server
+        // `storage/Io.php`), so keying on the code alone is op-independent and
+        // safe — the SHARE exists; only the requested preview asset does not.
+        // Distinct from the uniform-unavailable 1609 below (the share itself).
+        143_705 => Some(
+            "no preview of this type is available for the bound file (143705) — it may still be \
+             generating, or this file type may not support it. Retry shortly, or try another \
+             preview_type."
+                .to_owned(),
+        ),
+        1609 => Some(
+            "this File Share is unavailable (1609) — it may not exist, may have expired, or may \
+             have been revoked."
+                .to_owned(),
+        ),
+        1680 => Some(
+            "the bound file cannot be served (1680) — it may be locked, taken down (DMCA), or \
+             flagged as infected."
+                .to_owned(),
+        ),
+        1605 => Some(if op == FsMcpOp::Create {
+            format!(
+                "invalid request (1605): {}. The node_id must be a FILE node (not a folder or \
+                 note).",
+                api.message
+            )
+        } else {
+            format!("invalid request (1605): {}", api.message)
+        }),
+        _ => None,
+    };
+
+    // Bare-status fallback for password / unavailable when the server returns the
+    // status without the specific code (only after the code match misses).
+    let note = note.or_else(|| {
+        match api.http_status {
+        401 if op.is_link_access() => Some(
+            "this File Share requires a link password (or the one supplied is wrong). Pass the \
+             `password` arg (it travels only in the x-ve-password header and is never logged)."
+                .to_owned(),
+        ),
+        // A bare 404 on the PREVIEW op (no 1609, no 143705) is a preview miss, not
+        // a share-gone — the call reached the share but the requested preview
+        // asset does not exist. A bare 404 on any NON-preview op keeps the uniform
+        // "unavailable" below (that genuinely means the share is gone).
+        404 if op.is_preview() => Some(
+            "no preview of this type is available for the bound file — it may still be generating, \
+             or this file type may not support it. Retry shortly, or try another preview_type."
+                .to_owned(),
+        ),
+        404 => Some(
+            "this File Share is unavailable — it may not exist, may have expired, or may have \
+             been revoked."
+                .to_owned(),
+        ),
+        _ => None,
+    }
+    });
+
+    if let Some(note) = note {
+        return error_text(&format!("{ctx}: {note} ({err})"));
+    }
+    // No File-Share framing (e.g. a management 1650/401): defer to the shared
+    // suggestion so the generic account-login guidance still fires.
+    if let Some(hint) = err.suggestion() {
+        return error_text(&format!("{ctx}: {hint} ({err})"));
+    }
+    error_text(&format!("{ctx}: {err}"))
+}
+
+/// The authoritative per-action describe payload for the `fileshare` tool. Names
+/// the CLI-binary-only actions (`upload`, `ws-token`) under `cli_only_actions`
+/// and the confirm-gated ones under `destructive_actions`.
+// The length is a flat action-spec table, not branching logic (mirrors
+// `sign_describe`).
+#[allow(clippy::too_many_lines)]
+fn fileshare_describe() -> CallToolResult {
+    let actions: &[(&str, &[&str], &[&str], &str)] = &[
+        ("describe", &[], &[], ""),
+        (
+            "create",
+            &["workspace_id", "node_id"],
+            &[
+                "title",
+                "access_option",
+                "password",
+                "expires",
+                "expires_at",
+            ],
+            "binds a SINGLE FILE node and returns the durable link. node_id must be a FILE node \
+             (not a folder or note). expires and expires_at are mutually exclusive. password \
+             protects the link (x-ve-password; never logged).",
+        ),
+        (
+            "list",
+            &["workspace_id"],
+            &["offset", "limit"],
+            "offset-paginated; each row carries the grant_count / grants_preview.",
+        ),
+        (
+            "info",
+            &["fileshare_id"],
+            &["password"],
+            "details + effective_capability + the bound file metadata. ANONYMOUS-capable on a \
+             public (anyone_with_link) share; supply password for a protected link.",
+        ),
+        (
+            "update",
+            &["fileshare_id"],
+            &[
+                "title",
+                "access_option",
+                "password",
+                "clear_password",
+                "expires",
+                "expires_at",
+                "clear_expires",
+            ],
+            "supply at least one mutable field. clear_password REMOVES the password (do not also \
+             pass password); clear_expires CLEARS the expiry. expires and expires_at are mutually \
+             exclusive.",
+        ),
+        (
+            "grants-list",
+            &["fileshare_id"],
+            &[],
+            "live named-people grants (no pagination; first 1000).",
+        ),
+        (
+            "grants-add",
+            &["fileshare_id", "capability"],
+            &["user", "email"],
+            "grant or raise a user's capability. Supply EXACTLY ONE of user / email. An \
+             unregistered email sends a real invite.",
+        ),
+        (
+            "grants-remove",
+            &["fileshare_id", "confirm_revoke"],
+            &["user", "email"],
+            "REQUIRES confirm_revoke=true. Supply EXACTLY ONE of user / email. Idempotent.",
+        ),
+        (
+            "delete",
+            &["fileshare_id", "confirm_delete"],
+            &[],
+            "REQUIRES confirm_delete=true. Revokes the link and cascades its grants; the bound \
+             file is NOT touched.",
+        ),
+        (
+            "versions",
+            &["fileshare_id"],
+            &["password"],
+            "lists the bound file's versions. ANONYMOUS-capable; supply password for a protected \
+             link.",
+        ),
+        (
+            "download",
+            &["fileshare_id"],
+            &["version", "password", "output_path"],
+            "streams the bound file (or a historical version) to the local fs; returns a path + \
+             byte count. ANONYMOUS-capable; supply password for a protected link.",
+        ),
+        (
+            "preview",
+            &["fileshare_id", "preview_type"],
+            &["password", "output_path"],
+            "streams a DERIVED preview asset (PRIMARY asset only; sub-assets of a multi-file \
+             preview are not fetched) to the local fs; returns a path + byte count. \
+             ANONYMOUS-capable.",
+        ),
+        (
+            "activity",
+            &["fileshare_id"],
+            &["lastactivity", "wait", "updated"],
+            "a SINGLE activity poll (members-only; always authed). Pass wait / lastactivity / \
+             updated through — this does NOT loop.",
+        ),
+    ];
+
+    let mut action_map = serde_json::Map::new();
+    for (name, required, optional, note) in actions {
+        let mut spec = serde_json::Map::new();
+        spec.insert(
+            "required".to_owned(),
+            Value::Array(
+                required
+                    .iter()
+                    .map(|s| Value::String((*s).to_owned()))
+                    .collect(),
+            ),
+        );
+        spec.insert(
+            "optional".to_owned(),
+            Value::Array(
+                optional
+                    .iter()
+                    .map(|s| Value::String((*s).to_owned()))
+                    .collect(),
+            ),
+        );
+        if !note.is_empty() {
+            spec.insert("note".to_owned(), Value::String((*note).to_owned()));
+        }
+        action_map.insert((*name).to_owned(), Value::Object(spec));
+    }
+
+    let cli_only: Vec<Value> = [
+        "upload (write-back of a NEW VERSION of the bound file — needs local file bytes; \
+         destructive). Run `fastio fileshare upload <id> <file>`.",
+        "ws-token (realtime WebSocket-token mint — the token is a long-lived secret and must not \
+         be parked in an MCP transcript; the CLI redacts it from stdout and writes it 0600). Run \
+         `fastio fileshare ws-token <id> --token-file <path>`.",
+    ]
+    .iter()
+    .map(|s| Value::String((*s).to_owned()))
+    .collect();
+
+    let payload = serde_json::json!({
+        "tool": "fileshare",
+        "summary": "File Shares — durable, link-shareable views of a SINGLE workspace file \
+                    (replacing the retired QuickShare). READ + DRIVE over MCP; the write-back \
+                    'upload' and the realtime 'ws-token' mint are CLI-binary-only.",
+        "destructive_actions": ["delete (confirm_delete=true)", "grants-remove (confirm_revoke=true)"],
+        "side_effects": "create makes a durable shareable link. delete revokes the link + \
+                         cascades grants (bound file untouched) and REQUIRES confirm_delete=true; \
+                         grants-remove REQUIRES confirm_revoke=true. download / preview write \
+                         files to the agent's local filesystem. grants-add with an unregistered \
+                         email sends a real invite. The write-back 'upload' (new bound-file \
+                         version) and the 'ws-token' mint are CLI-binary-only (see \
+                         cli_only_actions).",
+        "guidance": {
+            "password": "A protected link requires the `password` arg on info / download / \
+                         versions / preview (and to set it on create / update). It travels ONLY \
+                         in the x-ve-password header and is NEVER logged or echoed in results.",
+            "anonymous": "info / download / versions / preview may be ANONYMOUS on a public \
+                          (anyone_with_link) share — no auth needed; a protected link needs the \
+                          password arg.",
+            "write_back": "To replace the bound file's bytes with a new version, run the CLI: \
+                           `fastio fileshare upload <id> <file> [--if-version <vid>]`. \
+                           --if-version is a server-enforced CAS precondition: when the server \
+                           detects a version conflict it reports CONFLICT_VERSION_MISMATCH and \
+                           the CLI surfaces it as a version-conflict error with the current \
+                           version id — re-download, re-apply, retry with that id. This is NOT \
+                           available over MCP (it needs local file bytes and is destructive).",
+            "ws_token": "To mint a realtime WebSocket token, run the CLI: `fastio fileshare \
+                         ws-token <id> --token-file <path>` (0600). NOT exposed over MCP — the \
+                         token is a long-lived secret (mirrors the workflow tool's CLI-only \
+                         realtime-token mint).",
+            "cli_only_actions": cli_only,
+        },
+        "actions": Value::Object(action_map),
+    });
+    success_json(&payload)
+}
+
+/// File Share tool handler — READ + DRIVE actions. The write-back `upload` and
+/// the realtime `ws-token` mint are CLI-binary-only and are routed to a guidance
+/// message BEFORE auth/arg extraction (mirrors how `sign` keeps send/void
+/// CLI-only). `delete` and `grants-remove` are confirm-gated (`confirm_delete` /
+/// `confirm_revoke`) and rejected BEFORE the network call when unconfirmed.
+#[allow(clippy::too_many_lines)] // a flat dispatch over the File Share surface
+async fn handle_fileshare(
+    state: &McpState,
+    action: &str,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    use fastio_cli::api::{event, fileshare};
+
+    // `describe` needs no auth.
+    if action == "describe" {
+        return Ok(fileshare_describe());
+    }
+    // The write-back `upload` is CLI-binary-only: it pushes a NEW VERSION of the
+    // bound file, needs the local file bytes, and is destructive. Route it to the
+    // CLI-only guidance FIRST — before auth/arg extraction — so e.g.
+    // `action=upload` with no fileshare_id returns the intended "this is
+    // CLI-only" message rather than a missing-parameter error.
+    if matches!(action, "upload" | "writeback" | "write-back") {
+        return Ok(error_text(
+            "fileshare upload (write-back) is CLI-binary-only: it pushes a NEW VERSION of the \
+             bound file and needs the local file bytes. Run it via the CLI — `fastio fileshare \
+             upload <id> <file> [--if-version <vid>] [--password …]`. --if-version is a \
+             server-enforced CAS precondition: when the server detects a version conflict it \
+             reports CONFLICT_VERSION_MISMATCH and the CLI surfaces it as a version-conflict \
+             error with the current version id. Call action='describe' for the MCP action list.",
+        ));
+    }
+    // `ws-token` (realtime WebSocket-token mint) is CLI-binary-only: the token is
+    // a long-lived secret that must not be parked in an MCP transcript. The CLI
+    // redacts it from stdout and writes it 0600 to --token-file (mirrors how the
+    // workflow tool keeps its realtime-token mint CLI-only).
+    if matches!(action, "ws-token" | "websocket" | "realtime-token") {
+        return Ok(error_text(
+            "fileshare ws-token (realtime WebSocket-token mint) is CLI-binary-only: the token is \
+             a long-lived secret that must not be parked in an MCP transcript. Run it via the CLI \
+             — `fastio fileshare ws-token <id> --token-file <path>` (written 0600). Call \
+             action='describe' for the MCP action list.",
+        ));
+    }
+    // Confirm gates PREFLIGHT — before auth and before arg extraction — so an
+    // unauthenticated or arg-less probe of a destructive action gets the gate
+    // message (not "Not authenticated" or a missing-parameter error), mirroring
+    // the CLI's `--yes` gate which fires regardless of session state. The
+    // post-auth XOR validation for grants-remove still runs (only once confirmed).
+    if action == "delete" && optional_bool(args, "confirm_delete") != Some(true) {
+        return Ok(error_text(FILESHARE_DELETE_CONFIRM));
+    }
+    if action == "grants-remove" && optional_bool(args, "confirm_revoke") != Some(true) {
+        return Ok(error_text(FILESHARE_REVOKE_CONFIRM));
+    }
+    // Auth split: the four LINK-ACCESS consumption actions (info / download /
+    // versions / preview) may run ANONYMOUSLY per the share's access tier (spec
+    // §5; CLI parity via `build_client_allow_anonymous`). When the MCP server
+    // holds no token, `state.client()` is a token-less `ApiClient` (see
+    // `McpState::new` / `FastioMcpServer::new`): the Wave-1 `get_with_password` /
+    // `download_*_with_password` helpers attach `Authorization: Bearer` ONLY when
+    // the client holds a token, so calling them as-is IS the anonymous path. A
+    // `named_people` / `any_registered` share then returns 401/403, which
+    // `fileshare_err_to_result` renders correctly. Management actions
+    // (create / list / update / delete / grants-* / activity) still require auth.
+    if !matches!(action, "info" | "download" | "versions" | "preview")
+        && let Err(e) = require_auth(state).await
+    {
+        return Ok(e);
+    }
+    let client = state.client().read().await;
+
+    match action {
+        "create" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let node_id = match required_str(args, "node_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            // A non-string `password` would be silently dropped → an UNPROTECTED
+            // share; reject it before building params.
+            if let Err(e) = fileshare_validate_password_arg(args) {
+                return Ok(e);
+            }
+            // Strictly parse the expiry inputs: a present-but-invalid `expires`
+            // (e.g. `"abc"`, `-1`, `1.5`, `null`) or a present non-string
+            // `expires_at` must be rejected here, NOT silently dropped — a
+            // silently-dropped `expires` on create would make a DURABLE share.
+            let (expires, expires_at) = match fileshare_strict_expiry(args) {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let params = fileshare::CreateFileShareParams::new()
+                .node(Some(node_id.to_owned()))
+                .title(optional_str(args, "title").map(str::to_owned))
+                .access_option(optional_str(args, "access_option").map(str::to_owned))
+                .password(fileshare_mcp_password(args))
+                .expires(expires)
+                .expires_at(expires_at);
+            if let Err(e) = params.validate() {
+                return Ok(error_text(&format!("invalid create request: {e}")));
+            }
+            match fileshare::create_fileshare(&client, workspace_id, &params).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(fileshare_err_to_result(
+                    &e,
+                    "failed to create File Share",
+                    FsMcpOp::Create,
+                )),
+            }
+        }
+        "list" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match fileshare::list_fileshares(
+                &client,
+                workspace_id,
+                optional_u32(args, "offset"),
+                optional_u32(args, "limit"),
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(fileshare_err_to_result(
+                    &e,
+                    "failed to list File Shares",
+                    FsMcpOp::ManagementOther,
+                )),
+            }
+        }
+        "info" => {
+            let fileshare_id = match required_str(args, "fileshare_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            if let Err(e) = fileshare_validate_consumption_password_arg(args) {
+                return Ok(e);
+            }
+            let password = fileshare_mcp_password(args);
+            match fileshare::get_details(&client, fileshare_id, password.as_ref()).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(fileshare_err_to_result(
+                    &e,
+                    "failed to get File Share details",
+                    FsMcpOp::LinkAccess,
+                )),
+            }
+        }
+        "update" => {
+            let fileshare_id = match required_str(args, "fileshare_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            // A non-string `password` is a hard error (a JSON number would be
+            // silently dropped → an unintended state); validate presence/type
+            // BEFORE resolving it.
+            if let Err(e) = fileshare_validate_password_arg(args) {
+                return Ok(e);
+            }
+            let clear_password = optional_bool(args, "clear_password") == Some(true);
+            // Reject `password` + `clear_password=true` (the CLI rejects the
+            // analogous `--password` + `--clear-password` via a clap conflict).
+            // Setting and clearing in one call is contradictory; surface it
+            // explicitly rather than silently clearing.
+            if clear_password && args.get("password").is_some() {
+                return Ok(error_text(
+                    "conflicting update: `password` and `clear_password=true` cannot be combined — \
+                     pass `password` to SET a password or `clear_password=true` to REMOVE it, not \
+                     both.",
+                ));
+            }
+            // Honor clear_password: when clearing, do NOT also resolve a password
+            // (the library rejects password + clear together).
+            let password = if clear_password {
+                None
+            } else {
+                fileshare_mcp_password(args)
+            };
+            // Same strict expiry parse as create: reject a present-but-invalid
+            // `expires` / non-string `expires_at` rather than silently dropping
+            // it (a silent drop would leave the expiry unchanged unexpectedly).
+            let (expires, expires_at) = match fileshare_strict_expiry(args) {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let params = fileshare::UpdateFileShareParams::new()
+                .title(optional_str(args, "title").map(str::to_owned))
+                .access_option(optional_str(args, "access_option").map(str::to_owned))
+                .password(password)
+                .clear_password(clear_password)
+                .expires(expires)
+                .expires_at(expires_at)
+                .clear_expires(optional_bool(args, "clear_expires") == Some(true));
+            if params.is_empty() {
+                return Ok(error_text(
+                    "nothing to update: supply at least one of title, access_option, password, \
+                     clear_password, expires, expires_at, or clear_expires",
+                ));
+            }
+            if let Err(e) = params.validate() {
+                return Ok(error_text(&format!("invalid update request: {e}")));
+            }
+            match fileshare::update_fileshare(&client, fileshare_id, &params).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(fileshare_err_to_result(
+                    &e,
+                    "failed to update File Share",
+                    FsMcpOp::ManagementOther,
+                )),
+            }
+        }
+        "grants-list" => {
+            let fileshare_id = match required_str(args, "fileshare_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match fileshare::list_grants(&client, fileshare_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(fileshare_err_to_result(
+                    &e,
+                    "failed to list File Share grants",
+                    FsMcpOp::ManagementOther,
+                )),
+            }
+        }
+        "grants-add" => {
+            let fileshare_id = match required_str(args, "fileshare_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let capability = match required_str(args, "capability") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let params = fileshare::GrantParams::new()
+                .user(optional_str(args, "user").map(str::to_owned))
+                .email(optional_str(args, "email").map(str::to_owned))
+                .capability(Some(capability.to_owned()));
+            if let Err(e) = params.validate_add() {
+                return Ok(error_text(&format!("invalid grant request: {e}")));
+            }
+            match fileshare::add_grant(&client, fileshare_id, &params).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(fileshare_err_to_result(
+                    &e,
+                    "failed to add File Share grant",
+                    FsMcpOp::ManagementOther,
+                )),
+            }
+        }
+        "grants-remove" => {
+            let fileshare_id = match required_str(args, "fileshare_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let params = fileshare::GrantParams::new()
+                .user(optional_str(args, "user").map(str::to_owned))
+                .email(optional_str(args, "email").map(str::to_owned));
+            // The confirm gate already fired pre-auth at the top of the handler
+            // (so an unauthed / arg-less probe sees the gate message). Here we
+            // run only the post-confirm user/email XOR validation.
+            if let Err(e) = params.validate_remove() {
+                return Ok(error_text(&format!("invalid grant request: {e}")));
+            }
+            match fileshare::remove_grant(&client, fileshare_id, &params).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(fileshare_err_to_result(
+                    &e,
+                    "failed to remove File Share grant",
+                    FsMcpOp::ManagementOther,
+                )),
+            }
+        }
+        "delete" => {
+            // The confirm gate already fired pre-auth at the top of the handler.
+            let fileshare_id = match required_str(args, "fileshare_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match fileshare::delete_fileshare(&client, fileshare_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(fileshare_err_to_result(
+                    &e,
+                    "failed to delete File Share",
+                    FsMcpOp::ManagementOther,
+                )),
+            }
+        }
+        "versions" => {
+            let fileshare_id = match required_str(args, "fileshare_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            if let Err(e) = fileshare_validate_consumption_password_arg(args) {
+                return Ok(e);
+            }
+            let password = fileshare_mcp_password(args);
+            match fileshare::list_versions(&client, fileshare_id, password.as_ref()).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(fileshare_err_to_result(
+                    &e,
+                    "failed to list File Share versions",
+                    FsMcpOp::LinkAccess,
+                )),
+            }
+        }
+        "download" => Ok(fileshare_download(&client, args).await),
+        "preview" => Ok(fileshare_preview(&client, args).await),
+        "activity" => {
+            let fileshare_id = match required_str(args, "fileshare_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            // `required_str` accepts a present-but-empty `""`; `poll_activity`
+            // does NOT guard the entity id, so an empty id would build
+            // `/activity/poll//`. Reject it explicitly here.
+            if fileshare_id.is_empty() {
+                return Ok(error_text(
+                    "invalid request: `fileshare_id` must not be empty for the activity action.",
+                ));
+            }
+            // A SINGLE poll — pass wait / lastactivity / updated through; no loop.
+            match event::poll_activity(
+                &client,
+                fileshare_id,
+                optional_str(args, "lastactivity"),
+                optional_u32(args, "wait"),
+                optional_bool(args, "updated") == Some(true),
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(fileshare_err_to_result(
+                    &e,
+                    "failed to poll File Share activity",
+                    FsMcpOp::ManagementOther,
+                )),
+            }
+        }
+        // upload / ws-token are CLI-only and handled earlier (before auth/arg
+        // extraction), so they are not matched here.
+        _ => Ok(error_text(&format!(
+            "Unknown or CLI-only fileshare action: {action}. The write-back `upload` and the \
+             realtime `ws-token` mint are CLI-binary-only (`fastio fileshare …`). Call \
+             action='describe' for the MCP action list."
+        ))),
+    }
+}
+
+/// Rejection message for `delete` invoked without `confirm_delete=true`.
+const FILESHARE_DELETE_CONFIRM: &str = "fileshare delete permanently revokes the link and cascades \
+     its grants (the bound file is not touched); pass confirm_delete=true to proceed (mirrors the \
+     CLI --yes gate).";
+
+/// Rejection message for `grants-remove` invoked without `confirm_revoke=true`.
+const FILESHARE_REVOKE_CONFIRM: &str = "fileshare grants-remove revokes this user's access to the \
+     File Share; pass confirm_revoke=true to proceed (mirrors the CLI --yes gate).";
+
+/// Strictly parse the File-Share expiry inputs, distinguishing ABSENT (→ `None`)
+/// from PRESENT-but-invalid (→ a clear error).
+///
+/// `expires` is read elsewhere via [`optional_u64`], which silently returns
+/// `None` for a present-but-invalid value (`"abc"`, `-1`, `1.5`, `true`,
+/// `null`, an object/array, or a string that does not parse to a `u64`). On
+/// `create` that silent drop is a security footgun: a bad `expires` would make
+/// a DURABLE (never-expiring) share instead of being rejected. Likewise a
+/// present non-string `expires_at` (a number/bool/null) is silently dropped by
+/// [`optional_str`].
+///
+/// This fileshare-scoped parser rejects a present-but-invalid `expires` or a
+/// present non-string `expires_at` with an explicit message, while preserving
+/// the [`optional_u64`] convenience for VALID values — a string-encoded integer
+/// such as `"60"` is still accepted. Absent keys resolve to `None`. The mutual
+/// exclusion of `expires` / `expires_at` is enforced later by the library
+/// validator (`CreateFileShareParams::validate` / `UpdateFileShareParams`).
+fn fileshare_strict_expiry(
+    args: &Map<String, Value>,
+) -> Result<(Option<u64>, Option<String>), CallToolResult> {
+    let expires = match args.get("expires") {
+        // A truly-absent key resolves to `None`.
+        None => None,
+        // A present key must resolve to a valid `u64`: a JSON number that is a
+        // non-negative integer, or a string that parses to a `u64` (preserving
+        // `optional_u64`'s convenience for valid string-encoded integers).
+        // Everything else (`"abc"`, `-1`, `1.5`, `true`, `null`, an
+        // object/array) is rejected rather than silently dropped.
+        Some(v) => match v
+            .as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        {
+            Some(n) => Some(n),
+            None => {
+                return Err(error_text(
+                    "invalid request: `expires` must be a positive integer (seconds)",
+                ));
+            }
+        },
+    };
+    let expires_at = match args.get("expires_at") {
+        None => None,
+        Some(v) if v.is_string() => v.as_str().map(str::to_owned),
+        Some(_) => {
+            return Err(error_text(
+                "invalid request: `expires_at` must be a string (an ISO-8601 / \
+                 `YYYY-MM-DD HH:MM:SS` timestamp); pass `expires` for a relative \
+                 expiry in seconds",
+            ));
+        }
+    };
+    Ok((expires, expires_at))
+}
+
+/// Resolve the optional link `password` arg, wrapping it in a [`SecretString`]
+/// immediately so the plaintext lifetime is minimal and it is never echoed.
+///
+/// Flag PRESENCE is preserved: a PRESENT-but-empty `password` (`""`) flows
+/// through as `Some("")` so the Wave-1 library validator rejects it with its
+/// clear message, rather than being silently downgraded to "absent" (which on
+/// create would produce an UNPROTECTED share). The password travels ONLY in the
+/// `x-ve-password` header (threaded by the Wave-1 client helpers).
+fn fileshare_mcp_password(args: &Map<String, Value>) -> Option<SecretString> {
+    // `Value::as_str` returns `Some("")` for a present empty string, preserving
+    // PRESENCE — exactly the semantics the validator depends on.
+    args.get("password")
+        .and_then(Value::as_str)
+        .map(|s| SecretString::from(s.to_owned()))
+}
+
+/// Reject a PRESENT-but-non-string `password` arg with a clear type error.
+///
+/// `fileshare_mcp_password` resolves via `Value::as_str`, which returns `None`
+/// for a non-string JSON value (e.g. a number or boolean). Without this guard a
+/// JSON-number password on `create` would be SILENTLY DROPPED, producing an
+/// UNPROTECTED File Share; on a link-access action it would silently fall back
+/// to the unauthenticated/no-password path. Callers MUST run this before
+/// resolving the password. An ABSENT password (`None`) is fine; a present
+/// string (including `""`) is fine — the empty-string case is rejected later by
+/// the library validator. The value is NEVER echoed in the error.
+fn fileshare_validate_password_arg(args: &Map<String, Value>) -> Result<(), CallToolResult> {
+    match args.get("password") {
+        Some(v) if !v.is_string() => Err(error_text(
+            "invalid request: `password` must be a string (the link password travels in the \
+             x-ve-password header).",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Validate the `password` arg on a CONSUMPTION / WRITE-BACK path (info /
+/// download / versions / preview / upload): reject a non-string type AND a
+/// present-but-EMPTY string.
+///
+/// On these paths the resolved password is applied DIRECTLY as the
+/// `x-ve-password` header — the library `validate()` (which rejects an empty
+/// password on management create/update) never runs. A link password is
+/// contractually 1-255 chars, so a present `""` is invalid: sending an empty
+/// header is meaningless and only masks an unprotected-share mistake. An ABSENT
+/// password (`None`) is the correct way to consume an UNPROTECTED share, so only
+/// a PRESENT empty string is rejected. The value is NEVER echoed in the error.
+fn fileshare_validate_consumption_password_arg(
+    args: &Map<String, Value>,
+) -> Result<(), CallToolResult> {
+    fileshare_validate_password_arg(args)?;
+    if args.get("password").and_then(Value::as_str) == Some("") {
+        return Err(error_text(
+            "invalid request: link password cannot be empty — omit `password` for an \
+             unprotected share.",
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a PRESENT-but-non-string TARGET-SELECTING arg with a clear type error.
+///
+/// `optional_str` resolves via `Value::as_str`, which returns `None` for a
+/// non-string JSON value (e.g. a number or boolean) — so a present-but-non-string
+/// `version` or `output_path` would be SILENTLY DROPPED and the action would
+/// proceed against the WRONG target: a non-string `version` falls back to the
+/// CURRENT file (wrong bytes, no error), and a non-string `output_path` falls
+/// back to the DEFAULT path (the file is written somewhere the caller did not
+/// ask for). Both are target-selecting, so the silent drop is a correctness bug,
+/// not a benign convenience. An ABSENT arg is fine; a present string is fine.
+/// `note` is appended to clarify the consequence of the wrong type.
+fn fileshare_validate_string_arg(
+    args: &Map<String, Value>,
+    key: &str,
+    note: &str,
+) -> Result<(), CallToolResult> {
+    match args.get(key) {
+        Some(v) if !v.is_string() => Err(error_text(&format!(
+            "invalid request: `{key}` must be a string ({note})."
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Stream a File Share's bound file (or a historical version) to the local
+/// filesystem and return a path + byte count. ANONYMOUS-capable; the optional
+/// `password` authorizes a protected link (x-ve-password). The default output
+/// directory (`.fastio/downloads/`) is created `0700`.
+async fn fileshare_download(
+    client: &fastio_cli::client::ApiClient,
+    args: &Map<String, Value>,
+) -> CallToolResult {
+    use fastio_cli::api::fileshare;
+    let fileshare_id = match required_str(args, "fileshare_id") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let Err(e) = fileshare_validate_consumption_password_arg(args) {
+        return e;
+    }
+    // `version` and `output_path` are TARGET-SELECTING: a present-but-non-string
+    // `version` would be silently dropped → the CURRENT file downloads instead of
+    // the requested one (wrong bytes, no error); a present-but-non-string
+    // `output_path` would be dropped → the file is written to the DEFAULT path.
+    // Reject either before resolving them.
+    if let Err(e) = fileshare_validate_string_arg(
+        args,
+        "version",
+        "a version id; a non-string would silently download the current file instead",
+    ) {
+        return e;
+    }
+    if let Err(e) = fileshare_validate_string_arg(
+        args,
+        "output_path",
+        "a destination path; a non-string would silently write to the default download path",
+    ) {
+        return e;
+    }
+    let password = fileshare_mcp_password(args);
+
+    let api_path = match optional_str(args, "version") {
+        Some(v) => fileshare::storage_version_read_path(fileshare_id, v),
+        None => fileshare::storage_read_path(fileshare_id),
+    };
+    let api_path = match api_path {
+        Ok(p) => p,
+        Err(e) => return error_text(&format!("invalid download request: {e}")),
+    };
+
+    // Resolve the output path. An explicit `output_path` is used VERBATIM, and
+    // — mirroring the CLI — we then SKIP the best-effort details fetch entirely
+    // (it is only ever needed to derive a default filename). Only when no
+    // `output_path` was supplied do we fetch details to name the file.
+    let out_path = if let Some(p) = optional_str(args, "output_path") {
+        std::path::PathBuf::from(p)
+    } else {
+        // Default filename: the bound file's name (best-effort details fetch,
+        // sanitized) else "<id>-download". The best-effort error is swallowed
+        // (the real download error, if any, surfaces on the stream call); the
+        // CliError/ApiError Display carries only server diagnostics, never the
+        // password (it travels only in the request header).
+        let default_name =
+            match fileshare::get_details(client, fileshare_id, password.as_ref()).await {
+                Ok(details) => fileshare::fileshare_file_name(&details).map_or_else(
+                    // FALLBACK: the bound-file name is unavailable, so the
+                    // default is derived from the caller-influenced
+                    // `fileshare_id`. Run it through `sanitize_filename` (strips
+                    // `/`, `\\`, `..`, leading dots; empty → "download") so a
+                    // crafted id with `../` or an absolute path cannot escape
+                    // `.fastio/downloads/`.
+                    || {
+                        fastio_cli::api::download::sanitize_filename(&format!(
+                            "{fileshare_id}-download"
+                        ))
+                    },
+                    |n| fastio_cli::api::download::sanitize_filename(&n),
+                ),
+                // FALLBACK: the best-effort details fetch failed; same sanitize
+                // as above so a crafted `fileshare_id` cannot traverse out of
+                // the download dir.
+                Err(_) => fastio_cli::api::download::sanitize_filename(&format!(
+                    "{fileshare_id}-download"
+                )),
+            };
+        match fileshare_resolve_output(args, &default_name) {
+            Ok(p) => p,
+            Err(e) => return e,
+        }
+    };
+
+    match client
+        .download_file_stream_with_password(&api_path, &out_path, password.as_ref())
+        .await
+    {
+        Ok(bytes) => fileshare_download_result("bound file", &out_path, bytes),
+        Err(e) => fileshare_err_to_result(&e, "failed to download File Share", FsMcpOp::LinkAccess),
+    }
+}
+
+/// Stream a File Share's PRIMARY preview asset (after at most one manual,
+/// leak-safe redirect) to the local filesystem and return a path + byte count.
+/// Multi-file previews yield the primary asset only. ANONYMOUS-capable.
+async fn fileshare_preview(
+    client: &fastio_cli::client::ApiClient,
+    args: &Map<String, Value>,
+) -> CallToolResult {
+    use fastio_cli::api::fileshare;
+    let fileshare_id = match required_str(args, "fileshare_id") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let preview_type = match required_str(args, "preview_type") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let Err(e) = fileshare_validate_consumption_password_arg(args) {
+        return e;
+    }
+    // `output_path` is target-selecting: a present-but-non-string value would be
+    // silently dropped → the preview is written to the DEFAULT path. Reject it.
+    if let Err(e) = fileshare_validate_string_arg(
+        args,
+        "output_path",
+        "a destination path; a non-string would silently write to the default download path",
+    ) {
+        return e;
+    }
+    let password = fileshare_mcp_password(args);
+
+    let api_path = match fileshare::storage_preview_path(fileshare_id, preview_type) {
+        Ok(p) => p,
+        Err(e) => return error_text(&format!("invalid preview request: {e}")),
+    };
+
+    // A preview is a derived asset, so the bound file name is not the right
+    // default — use "<id>.<preview_type>".
+    let default_name =
+        fastio_cli::api::download::sanitize_filename(&format!("{fileshare_id}.{preview_type}"));
+    let out_path = match fileshare_resolve_output(args, &default_name) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    match client
+        .download_preview_following_redirect(&api_path, &out_path, password.as_ref())
+        .await
+    {
+        Ok(bytes) => fileshare_download_result("preview", &out_path, bytes),
+        Err(e) => fileshare_err_to_result(
+            &e,
+            "failed to download File Share preview",
+            FsMcpOp::Preview,
+        ),
+    }
+}
+
+/// Resolve the output FILE path for a download / preview: an explicit
+/// `output_path` is used verbatim; otherwise `default_name` under the
+/// `.fastio/downloads/` directory (created `0700` on Unix). Returns an `Err`
+/// (an MCP result) if the default directory cannot be created.
+fn fileshare_resolve_output(
+    args: &Map<String, Value>,
+    default_name: &str,
+) -> Result<std::path::PathBuf, CallToolResult> {
+    if let Some(p) = optional_str(args, "output_path") {
+        return Ok(std::path::PathBuf::from(p));
+    }
+    let dir = std::path::Path::new(".fastio/downloads");
+    if let Err(e) = create_dir_all_private(dir) {
+        return Err(error_text(&format!(
+            "failed to create output directory '{}': {e}",
+            dir.display()
+        )));
+    }
+    Ok(dir.join(default_name))
+}
+
+/// Build the success result for a File Share download / preview (path + byte
+/// count; NEVER base64).
+fn fileshare_download_result(
+    artifact: &str,
+    out_path: &std::path::Path,
+    bytes: u64,
+) -> CallToolResult {
+    success_json(&serde_json::json!({
+        "result": "yes",
+        "downloaded": {
+            "artifact": artifact,
+            "path": out_path.display().to_string(),
+            "byte_count": bytes,
+        },
+    }))
+}
+
 /// AI instructions tool handler.
 #[allow(clippy::too_many_lines)]
 async fn handle_instructions(
@@ -14324,6 +15381,1056 @@ mod ripley_tool_tests {
         assert!(
             text.contains("confirm_cancel=true"),
             "confirm_cancel=false must be rejected, got: {text}"
+        );
+    }
+
+    // ─── File Share MCP tool ────────────────────────────────────────────────
+
+    /// The set of action names the `fileshare` tool advertises in its registry.
+    fn fileshare_tool_actions() -> Vec<&'static str> {
+        super::TOOL_DEFS
+            .iter()
+            .find(|d| d.name == "fileshare")
+            .expect("fileshare tool registered")
+            .actions
+            .to_vec()
+    }
+
+    fn fs_api_err(code: u32, http_status: u16) -> fastio_cli::error::CliError {
+        fastio_cli::error::CliError::Api(fastio_cli::error::ApiError::new(
+            code,
+            None,
+            "boom".to_owned(),
+            http_status,
+        ))
+    }
+
+    #[test]
+    fn fileshare_tool_is_registered_and_drive_oriented() {
+        let tools = ToolRouter::list_tools().tools;
+        let fs = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "fileshare")
+            .expect("fileshare tool present");
+        let desc = fs.description.as_deref().unwrap_or_default();
+        // The description must honestly state the gating split (CLI-only
+        // write-back / ws-token) and the confirm gates.
+        assert!(
+            desc.contains("CLI-BINARY-ONLY") || desc.contains("CLI-binary-only"),
+            "fileshare tool must state upload/ws-token are CLI-only, got: {desc}"
+        );
+        assert!(
+            desc.contains("confirm_delete") && desc.contains("confirm_revoke"),
+            "fileshare tool must state the confirm gates, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn fileshare_tool_omits_cli_only_actions() {
+        // upload (write-back) and ws-token are CLI-binary-only and must NOT be
+        // advertised as routable actions.
+        let actions = fileshare_tool_actions();
+        for forbidden in ["upload", "ws-token", "writeback", "write-back"] {
+            assert!(
+                !actions.contains(&forbidden),
+                "fileshare MCP tool must NOT advertise CLI-only action '{forbidden}'"
+            );
+        }
+        // The exposed read/drive + confirm-gated actions MUST be present.
+        for present in [
+            "describe",
+            "create",
+            "list",
+            "info",
+            "update",
+            "grants-list",
+            "grants-add",
+            "grants-remove",
+            "delete",
+            "versions",
+            "download",
+            "preview",
+            "activity",
+        ] {
+            assert!(
+                actions.contains(&present),
+                "fileshare MCP tool must advertise action '{present}'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fileshare_describe_needs_no_auth_and_names_cli_only() {
+        // describe must work UNAUTHENTICATED and document every advertised
+        // action plus the CLI-only carve-outs.
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("describe".to_owned()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("cli_only_actions"),
+            "describe must name CLI-only ops, got: {text}"
+        );
+        assert!(
+            text.contains("upload") && text.contains("ws-token"),
+            "describe must name the CLI-only upload + ws-token, got: {text}"
+        );
+        // describe accuracy: every advertised action appears in the payload.
+        for action in fileshare_tool_actions() {
+            assert!(
+                text.contains(action),
+                "describe payload must document advertised action '{action}'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fileshare_upload_is_cli_only_and_does_not_touch_auth() {
+        // The write-back `upload` action must return the CLI-only guidance even
+        // UNAUTHENTICATED — i.e. it short-circuits BEFORE require_auth (so the
+        // message is the CLI-only pointer, NOT "Not authenticated") and BEFORE
+        // any arg extraction (no fileshare_id supplied).
+        let router = unauthed_router();
+        for action in ["upload", "writeback", "write-back"] {
+            let mut args = Map::new();
+            args.insert("action".to_owned(), Value::String(action.to_owned()));
+            let res = router.call_tool("fileshare", args).await.expect("ok");
+            let text = result_to_string(&res);
+            assert!(
+                text.contains("CLI-binary-only") && text.contains("fastio fileshare upload"),
+                "upload must return the CLI-only message, got: {text}"
+            );
+            assert!(
+                !text.contains("Not authenticated"),
+                "upload must short-circuit BEFORE auth, got: {text}"
+            );
+            assert!(
+                !text.contains("Missing required parameter"),
+                "upload must short-circuit BEFORE arg extraction, got: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fileshare_ws_token_is_cli_only_and_does_not_touch_auth() {
+        // ws-token (realtime mint) is CLI-only — same short-circuit discipline.
+        let router = unauthed_router();
+        for action in ["ws-token", "websocket", "realtime-token"] {
+            let mut args = Map::new();
+            args.insert("action".to_owned(), Value::String(action.to_owned()));
+            let res = router.call_tool("fileshare", args).await.expect("ok");
+            let text = result_to_string(&res);
+            assert!(
+                text.contains("CLI-binary-only") && text.contains("fastio fileshare ws-token"),
+                "ws-token must return the CLI-only message, got: {text}"
+            );
+            assert!(
+                !text.contains("Not authenticated"),
+                "ws-token must short-circuit BEFORE auth, got: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fileshare_delete_rejected_without_confirm() {
+        // delete must reject pre-AUTH and pre-arg-extraction unless
+        // confirm_delete=true. An UNAUTHENTICATED, ARG-LESS probe (no
+        // fileshare_id) must still see the gate message — proving the gate fires
+        // before require_auth and before required_str. (Mirrors the CLI --yes
+        // gate, which fires regardless of session state.)
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("delete".to_owned()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("confirm_delete=true"),
+            "delete without confirm must be rejected with the gate message, got: {text}"
+        );
+        assert!(
+            !text.contains("Not authenticated") && !text.contains("Missing required parameter"),
+            "the gate must fire BEFORE auth and arg extraction, got: {text}"
+        );
+        // An explicit confirm_delete=false is still a rejection.
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("delete".to_owned()));
+        args.insert("confirm_delete".to_owned(), Value::Bool(false));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        assert!(
+            result_to_string(&res).contains("confirm_delete=true"),
+            "confirm_delete=false must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_grants_remove_rejected_without_confirm() {
+        // grants-remove must reject pre-AUTH and pre-arg-extraction unless
+        // confirm_revoke=true. An UNAUTHENTICATED, ARG-LESS probe (no
+        // fileshare_id, no user/email) must still see the gate message — proving
+        // the gate precedes both require_auth and the XOR validation.
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("grants-remove".to_owned()),
+        );
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("confirm_revoke=true"),
+            "grants-remove without confirm must be rejected, got: {text}"
+        );
+        assert!(
+            !text.contains("Not authenticated")
+                && !text.contains("Missing required parameter")
+                && !text.contains("invalid grant request"),
+            "the gate must fire BEFORE auth, arg extraction, and XOR validation, got: {text}"
+        );
+    }
+
+    /// A router with NO token whose client points at an unroutable base URL, so
+    /// a consumption action that skips `require_auth` reaches the API-call path
+    /// and fails with a NETWORK error (never "Not authenticated"). Proves the
+    /// anonymous link-access path is wired.
+    fn anon_router_bogus_base() -> ToolRouter {
+        ToolRouter::new(Arc::new(McpState::new_unauthenticated_for_test(
+            "http://127.0.0.1:1/current",
+        )))
+    }
+
+    #[tokio::test]
+    async fn fileshare_info_runs_anonymously_and_reaches_network() {
+        // The link-access `info` action must NOT require auth: an unauthenticated
+        // call reaches the API-call path and fails with a NETWORK error against
+        // the unroutable base, NOT the "Not authenticated" gate. This is the
+        // anonymous-consumption path (spec §5 / CLI parity).
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("info".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("Not authenticated"),
+            "info must run anonymously (skip require_auth), got: {text}"
+        );
+        assert!(
+            text.contains("failed to get File Share details"),
+            "info must reach the API-call path and surface the request failure, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_create_still_requires_auth_unauthenticated() {
+        // Management actions keep require_auth: an unauthenticated `create` must
+        // be refused with the auth message BEFORE any network call.
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("create".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("node_id".to_owned(), Value::String("node-1".to_owned()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("Not authenticated"),
+            "unauthenticated create must be refused with the auth message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_update_rejects_password_plus_clear_password() {
+        // password + clear_password=true is contradictory; the MCP must reject it
+        // explicitly (the CLI rejects --password + --clear-password via a clap
+        // conflict) rather than silently clearing.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("update".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert("password".to_owned(), Value::String("p-secret".to_owned()));
+        args.insert("clear_password".to_owned(), Value::Bool(true));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("cannot be combined"),
+            "password + clear_password must be rejected, got: {text}"
+        );
+        assert!(
+            !text.contains("p-secret"),
+            "the password value must NEVER appear in the error, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_create_rejects_non_string_password() {
+        // A non-string `password` (e.g. a JSON number) would be silently dropped
+        // by Value::as_str → an UNPROTECTED share. It must be rejected with a
+        // clear type error, never silently ignored.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("create".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("node_id".to_owned(), Value::String("node-1".to_owned()));
+        args.insert(
+            "password".to_owned(),
+            Value::Number(serde_json::Number::from(12345)),
+        );
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("`password` must be a string"),
+            "a non-string password must be rejected with a type error, got: {text}"
+        );
+    }
+
+    // ─── FR-1: download target-selecting args must not be silently dropped ───
+
+    #[tokio::test]
+    async fn fileshare_download_rejects_non_string_version() {
+        // A present-but-non-string `version` (e.g. a JSON number) would be
+        // silently dropped by `optional_str` → the CURRENT file downloads instead
+        // of the requested version (wrong bytes, no error). It must be rejected
+        // pre-network with a clear type error. Run anonymously so reaching the
+        // type error (and NOT the network "failed to download" error) proves the
+        // check fires BEFORE any request.
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("download".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert(
+            "version".to_owned(),
+            Value::Number(serde_json::Number::from(42)),
+        );
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("`version` must be a string"),
+            "a non-string version must be rejected with a type error, got: {text}"
+        );
+        assert!(
+            !text.contains("failed to download"),
+            "the version type check must fire BEFORE the network call, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_download_rejects_non_string_output_path() {
+        // A present-but-non-string `output_path` would be silently dropped →
+        // the file is written to the DEFAULT path instead of where the caller
+        // asked. Reject it pre-network.
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("download".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert("output_path".to_owned(), Value::Bool(true));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("`output_path` must be a string"),
+            "a non-string output_path must be rejected with a type error, got: {text}"
+        );
+        assert!(
+            !text.contains("failed to download"),
+            "the output_path type check must fire BEFORE the network call, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_preview_rejects_non_string_output_path() {
+        // Same target-selecting guard on the preview path's `output_path`.
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("preview".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert(
+            "preview_type".to_owned(),
+            Value::String("thumbnail".to_owned()),
+        );
+        args.insert(
+            "output_path".to_owned(),
+            Value::Number(serde_json::Number::from(7)),
+        );
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("`output_path` must be a string"),
+            "a non-string output_path must be rejected with a type error, got: {text}"
+        );
+        assert!(
+            !text.contains("failed to download"),
+            "the output_path type check must fire BEFORE the network call, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_download_accepts_string_version() {
+        // A valid string `version` must NOT be rejected — it proceeds into the
+        // download path (here failing on the unroutable base, NOT the type check).
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("download".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert("version".to_owned(), Value::String("v-123".to_owned()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("`version` must be a string"),
+            "a valid string version must be accepted, got: {text}"
+        );
+    }
+
+    // ─── FR-2: empty link password rejected on consumption paths (MCP) ──────
+
+    #[tokio::test]
+    async fn fileshare_info_rejects_empty_password() {
+        // An empty `password` ("") on a CONSUMPTION path would be applied as an
+        // empty `x-ve-password` header (the library validator never runs here).
+        // A link password is 1-255 chars, so it must be rejected pre-network.
+        // Run anonymously so reaching the empty-password error (NOT the network
+        // error) proves it fires before any request.
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("info".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert("password".to_owned(), Value::String(String::new()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("link password cannot be empty"),
+            "an empty consumption password must be rejected, got: {text}"
+        );
+        assert!(
+            !text.contains("failed to get File Share details"),
+            "the empty-password check must fire BEFORE the network call, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_versions_rejects_empty_password() {
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("versions".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert("password".to_owned(), Value::String(String::new()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("link password cannot be empty"),
+            "an empty consumption password must be rejected, got: {text}"
+        );
+        assert!(
+            !text.contains("failed to list File Share versions"),
+            "the empty-password check must fire BEFORE the network call, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_download_rejects_empty_password() {
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("download".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert("password".to_owned(), Value::String(String::new()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("link password cannot be empty"),
+            "an empty consumption password must be rejected, got: {text}"
+        );
+        assert!(
+            !text.contains("failed to download"),
+            "the empty-password check must fire BEFORE the network call, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_preview_rejects_empty_password() {
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("preview".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert(
+            "preview_type".to_owned(),
+            Value::String("thumbnail".to_owned()),
+        );
+        args.insert("password".to_owned(), Value::String(String::new()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("link password cannot be empty"),
+            "an empty consumption password must be rejected, got: {text}"
+        );
+        assert!(
+            !text.contains("failed to download"),
+            "the empty-password check must fire BEFORE the network call, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_info_absent_password_is_not_rejected() {
+        // An ABSENT password is the correct way to consume an UNPROTECTED share;
+        // it must NOT trigger the empty-password rejection and must reach the
+        // network path (here failing on the unroutable base).
+        let router = anon_router_bogus_base();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("info".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("link password cannot be empty"),
+            "an absent password must not be rejected, got: {text}"
+        );
+        assert!(
+            text.contains("failed to get File Share details"),
+            "an absent password must reach the consumption path, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_create_empty_password_still_uses_library_validator() {
+        // FR-2 must NOT change management behavior: an empty `password` on
+        // `create` is still handled by the library validator (not the new
+        // consumption-path rejection). The error text must be the library's
+        // "must not be empty" message, NOT the consumption-path wording.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("create".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("node_id".to_owned(), Value::String("node-1".to_owned()));
+        args.insert("password".to_owned(), Value::String(String::new()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("link password cannot be empty — omit"),
+            "create must NOT use the consumption-path wording, got: {text}"
+        );
+        assert!(
+            text.contains("invalid create request"),
+            "create with an empty password must surface the library validator, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_create_password_never_echoed_on_validation_error() {
+        // An explicit empty password ("") must reach the library validator
+        // (rejected) — and the password value must NEVER appear in the error.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("create".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("node_id".to_owned(), Value::String("node-1".to_owned()));
+        args.insert(
+            "password".to_owned(),
+            Value::String("hunter2-secret".to_owned()),
+        );
+        // Both expiries set → a validation error before the network; the secret
+        // must not leak into that error.
+        args.insert("expires".to_owned(), Value::String("60".to_owned()));
+        args.insert(
+            "expires_at".to_owned(),
+            Value::String("2030-01-01 00:00:00".to_owned()),
+        );
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("invalid create request"),
+            "a both-expiries create must fail validation pre-network, got: {text}"
+        );
+        assert!(
+            !text.contains("hunter2-secret"),
+            "the link password must NEVER appear in an error, got: {text}"
+        );
+    }
+
+    // ─── fileshare strict expiry parse (P3F2-1) ────────────────────────────
+    //
+    // `expires` was read via `optional_u64`, which silently returns None for a
+    // present-but-invalid value — so a bad `expires` on create silently made a
+    // DURABLE share. `fileshare_strict_expiry` now distinguishes ABSENT (→ None)
+    // from PRESENT-but-invalid (→ a clear error) for `expires`, and rejects a
+    // present non-string `expires_at`. Valid string-encoded integers are still
+    // accepted (the `optional_u64` convenience is preserved for valid values).
+
+    /// Helper: build a minimally-valid `create` arg map (workspace + node) on an
+    /// authed router so the only thing under test is the expiry parse.
+    async fn fileshare_create_with(key: &str, value: Value) -> (ToolRouter, String) {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("create".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("node_id".to_owned(), Value::String("node-1".to_owned()));
+        args.insert(key.to_owned(), value);
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        (router, result_to_string(&res))
+    }
+
+    const EXPIRES_ERR: &str = "`expires` must be a positive integer (seconds)";
+    const EXPIRES_AT_ERR: &str = "`expires_at` must be a string";
+
+    #[tokio::test]
+    async fn fileshare_create_rejects_non_integer_string_expires() {
+        let (_r, text) = fileshare_create_with("expires", Value::String("abc".to_owned())).await;
+        assert!(
+            text.contains(EXPIRES_ERR),
+            "a non-integer string `expires` must be rejected, not silently dropped, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_create_rejects_negative_expires() {
+        let (_r, text) =
+            fileshare_create_with("expires", Value::Number(serde_json::Number::from(-1))).await;
+        assert!(
+            text.contains(EXPIRES_ERR),
+            "a negative `expires` must be rejected, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_create_rejects_fractional_expires() {
+        let frac = serde_json::Number::from_f64(1.5).expect("finite");
+        let (_r, text) = fileshare_create_with("expires", Value::Number(frac)).await;
+        assert!(
+            text.contains(EXPIRES_ERR),
+            "a fractional `expires` must be rejected, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_create_rejects_null_expires() {
+        // An explicit `null` is PRESENT-but-invalid, not absent — it must be
+        // rejected, never silently treated as "no expiry" (a durable share).
+        let (_r, text) = fileshare_create_with("expires", Value::Null).await;
+        assert!(
+            text.contains(EXPIRES_ERR),
+            "a null `expires` must be rejected, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_create_rejects_non_string_expires_at() {
+        let (_r, text) =
+            fileshare_create_with("expires_at", Value::Number(serde_json::Number::from(12345)))
+                .await;
+        assert!(
+            text.contains(EXPIRES_AT_ERR),
+            "a non-string `expires_at` must be rejected, not silently dropped, got: {text}"
+        );
+    }
+
+    /// The non-string `expires_at` error message is a multi-line `\`-continued
+    /// string literal; a regression that bakes source indentation into the
+    /// literal (instead of single-spacing the continuation) would render as
+    /// long runs of spaces mid-message. Assert the rendered message single-
+    /// spaces cleanly with no double-space runs.
+    #[test]
+    fn fileshare_strict_expiry_non_string_at_message_single_spaced() {
+        use super::fileshare_strict_expiry;
+        let mut args = Map::new();
+        args.insert(
+            "expires_at".to_owned(),
+            Value::Number(serde_json::Number::from(12345)),
+        );
+        let err =
+            fileshare_strict_expiry(&args).expect_err("a non-string `expires_at` must be rejected");
+        let text = result_to_string(&err);
+        assert!(
+            text.contains(EXPIRES_AT_ERR),
+            "the rendered error must carry the `expires_at` type message, got: {text}"
+        );
+        assert!(
+            !text.contains("  "),
+            "the `expires_at` error must single-space cleanly with no double-space runs \
+             (source indentation must not leak into the literal), got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_update_rejects_non_integer_expires() {
+        // Same strict parse on the update path.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("update".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert(
+            "expires".to_owned(),
+            Value::String("not-a-number".to_owned()),
+        );
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains(EXPIRES_ERR),
+            "an invalid `expires` on update must be rejected, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_update_rejects_non_string_expires_at() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("update".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String("fs1".to_owned()));
+        args.insert("expires_at".to_owned(), Value::Bool(true));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains(EXPIRES_AT_ERR),
+            "a non-string `expires_at` on update must be rejected, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_create_absent_expiry_is_not_rejected() {
+        // No expires / expires_at → the strict parser yields (None, None) and the
+        // request proceeds past validation toward the network (NOT a strict-parse
+        // rejection). We assert ONLY that neither strict-expiry error fires.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("create".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("node_id".to_owned(), Value::String("node-1".to_owned()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains(EXPIRES_ERR) && !text.contains(EXPIRES_AT_ERR),
+            "an absent expiry must NOT trigger a strict-parse error, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_create_accepts_string_encoded_integer_expires() {
+        // A valid string-encoded integer (`"60"`) must pass the strict parser —
+        // preserving the `optional_u64` convenience for valid values. We pair it
+        // with an `expires_at` so the LIBRARY validator rejects the mutually
+        // exclusive pair: reaching "invalid create request" (and NOT the strict
+        // `expires must be a positive integer` error) proves `"60"` was accepted
+        // by the strict parser and forwarded into params.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("create".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("node_id".to_owned(), Value::String("node-1".to_owned()));
+        args.insert("expires".to_owned(), Value::String("60".to_owned()));
+        args.insert(
+            "expires_at".to_owned(),
+            Value::String("2030-01-01 00:00:00".to_owned()),
+        );
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains(EXPIRES_ERR),
+            "a valid string-encoded integer `expires` must be accepted, got: {text}"
+        );
+        assert!(
+            text.contains("invalid create request"),
+            "a valid `\"60\"` should reach the library validator (both-expiries error), got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fileshare_create_accepts_json_number_expires() {
+        // A JSON-number `expires` (the normal form) must also pass the strict
+        // parser. Same both-expiries technique to confirm it reached params.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("create".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("node_id".to_owned(), Value::String("node-1".to_owned()));
+        args.insert(
+            "expires".to_owned(),
+            Value::Number(serde_json::Number::from(3600)),
+        );
+        args.insert(
+            "expires_at".to_owned(),
+            Value::String("2030-01-01 00:00:00".to_owned()),
+        );
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains(EXPIRES_ERR),
+            "a JSON-number `expires` must be accepted, got: {text}"
+        );
+        assert!(
+            text.contains("invalid create request"),
+            "a valid numeric `expires` should reach the library validator, got: {text}"
+        );
+    }
+
+    // ─── R-2: activity empty fileshare_id guard ────────────────────────────
+
+    #[tokio::test]
+    async fn fileshare_activity_rejects_empty_id() {
+        // `required_str` accepts a present-but-empty `""`; the activity handler
+        // must reject it explicitly BEFORE calling `event::poll_activity`, so the
+        // malformed `/activity/poll//` path is never built (and no network call
+        // is made — the rejection fires synchronously, so this is hermetic).
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("activity".to_owned()));
+        args.insert("fileshare_id".to_owned(), Value::String(String::new()));
+        let res = router.call_tool("fileshare", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("`fileshare_id` must not be empty"),
+            "an empty fileshare_id must be rejected before poll_activity, got: {text}"
+        );
+    }
+
+    // ─── fileshare_download fallback filename sanitization (P3F2-2) ─────────
+
+    #[test]
+    fn fileshare_download_fallback_filename_is_path_safe() {
+        // The download FALLBACK default name is derived from the
+        // caller-influenced `fileshare_id` as `format!("{id}-download")` and run
+        // through `sanitize_filename`. A crafted id with `../` or an absolute
+        // path must NOT be able to escape `.fastio/downloads/`: sanitization
+        // strips directory components, `..` sequences, and leading dots, leaving
+        // a single safe basename (or "download").
+        use fastio_cli::api::download::sanitize_filename;
+        for malicious in [
+            "../../etc/passwd",
+            "/etc/passwd",
+            "..\\..\\windows\\system32",
+            "....//....//secret",
+        ] {
+            let name = sanitize_filename(&format!("{malicious}-download"));
+            assert!(
+                !name.contains('/') && !name.contains('\\'),
+                "sanitized fallback must have no path separators, got: {name}"
+            );
+            assert!(
+                !name.contains(".."),
+                "sanitized fallback must not contain `..`, got: {name}"
+            );
+            assert!(
+                !name.starts_with('.'),
+                "sanitized fallback must not start with a dot, got: {name}"
+            );
+            assert!(!name.is_empty(), "sanitized fallback must not be empty");
+        }
+        // A path-only id collapses to the empty→"download" fallback, never empty.
+        assert_eq!(sanitize_filename(&format!("{}-download", "/")), "-download");
+    }
+
+    // ─── fileshare_err_to_result (mirrors the CLI map_fileshare_error) ──────
+
+    #[test]
+    fn fileshare_err_link_1650_vs_management_1650() {
+        use super::{FsMcpOp, fileshare_err_to_result};
+        // On a LINK-ACCESS op a 1650 steers to the password arg, never to login.
+        let link = result_to_string(&fileshare_err_to_result(
+            &fs_api_err(1650, 401),
+            "failed to get File Share details",
+            FsMcpOp::LinkAccess,
+        ));
+        assert!(
+            link.contains("password"),
+            "link 1650 must steer to the password arg: {link}"
+        );
+        assert!(
+            !link.to_lowercase().contains("auth login"),
+            "link 1650 must NOT suggest account login: {link}"
+        );
+        // On a MANAGEMENT op a 1650 is account auth — defers to the generic
+        // login hint and must NOT mention a link password.
+        let mgmt = result_to_string(&fileshare_err_to_result(
+            &fs_api_err(1650, 401),
+            "failed to list File Shares",
+            FsMcpOp::ManagementOther,
+        ));
+        assert!(
+            !mgmt.to_lowercase().contains("link password") && !mgmt.contains("the `password` arg"),
+            "management 1650 must NOT frame a link password: {mgmt}"
+        );
+        assert!(
+            mgmt.to_lowercase().contains("auth login"),
+            "management 1650 must keep the generic account-login hint: {mgmt}"
+        );
+    }
+
+    #[test]
+    fn fileshare_err_1609_and_bare_404_are_uniform_unavailable() {
+        use super::{FsMcpOp, fileshare_err_to_result};
+        for code in [1609u32, 0] {
+            let m = result_to_string(&fileshare_err_to_result(
+                &fs_api_err(code, 404),
+                "failed to get",
+                FsMcpOp::LinkAccess,
+            ));
+            assert!(
+                m.contains("unavailable"),
+                "must say unavailable (code {code}): {m}"
+            );
+            assert!(
+                m.contains("not exist") && m.contains("expired") && m.contains("revoked"),
+                "must list all three reasons uniformly (code {code}): {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn fileshare_err_1700_describes_capability_order() {
+        use super::{FsMcpOp, fileshare_err_to_result};
+        let m = result_to_string(&fileshare_err_to_result(
+            &fs_api_err(1700, 403),
+            "failed to download",
+            FsMcpOp::LinkAccess,
+        ));
+        assert!(
+            m.contains("view") && m.contains("download") && m.contains("edit"),
+            "must describe capability order: {m}"
+        );
+    }
+
+    // ─── LV CLI-1: preview-specific 404 / 143705 (MCP mirror) ───────────────
+
+    #[test]
+    fn fileshare_err_preview_143705_is_preview_not_uniform_unavailable() {
+        use super::{FsMcpOp, fileshare_err_to_result};
+        // A 143705 is a PREVIEW miss — never the uniform share-gone wording.
+        // Keyed on the code alone (op-independent), so it holds on the preview op.
+        let m = result_to_string(&fileshare_err_to_result(
+            &fs_api_err(143_705, 404),
+            "failed to download File Share preview",
+            FsMcpOp::Preview,
+        ));
+        assert!(
+            m.contains("no preview of this type"),
+            "143705 must use the preview-specific wording: {m}"
+        );
+        assert!(
+            m.contains("preview_type"),
+            "143705 must steer to another preview_type: {m}"
+        );
+        assert!(
+            !m.contains("may have been revoked"),
+            "143705 must NOT use the uniform share-gone wording: {m}"
+        );
+    }
+
+    #[test]
+    fn fileshare_err_preview_bare_404_is_preview_not_uniform_unavailable() {
+        use super::{FsMcpOp, fileshare_err_to_result};
+        // A bare 404 on the PREVIEW op is a preview miss, not a share-gone.
+        let m = result_to_string(&fileshare_err_to_result(
+            &fs_api_err(0, 404),
+            "failed to download File Share preview",
+            FsMcpOp::Preview,
+        ));
+        assert!(
+            m.contains("no preview of this type"),
+            "a bare 404 on the preview op must be preview-specific: {m}"
+        );
+        assert!(
+            !m.contains("may have been revoked"),
+            "a bare 404 on the preview op must NOT be the uniform share-gone wording: {m}"
+        );
+    }
+
+    #[test]
+    fn fileshare_err_preview_1609_stays_uniform_unavailable() {
+        use super::{FsMcpOp, fileshare_err_to_result};
+        // A 1609 on the preview op means the SHARE is gone — keep uniform wording.
+        let m = result_to_string(&fileshare_err_to_result(
+            &fs_api_err(1609, 404),
+            "failed to download File Share preview",
+            FsMcpOp::Preview,
+        ));
+        assert!(
+            m.contains("unavailable") && m.contains("not exist") && m.contains("revoked"),
+            "a 1609 on the preview op must stay uniform-unavailable: {m}"
+        );
+        assert!(
+            !m.contains("no preview of this type"),
+            "a 1609 (share gone) must NOT be reframed as a preview miss: {m}"
+        );
+    }
+
+    #[test]
+    fn fileshare_err_nonpreview_bare_404_stays_uniform_unavailable() {
+        use super::{FsMcpOp, fileshare_err_to_result};
+        // The uniform-404 discipline for NON-preview ops must be untouched.
+        let m = result_to_string(&fileshare_err_to_result(
+            &fs_api_err(0, 404),
+            "failed to get",
+            FsMcpOp::LinkAccess,
+        ));
+        assert!(
+            m.contains("unavailable") && m.contains("revoked"),
+            "a bare 404 on a non-preview op must stay uniform-unavailable: {m}"
+        );
+        assert!(
+            !m.contains("no preview of this type"),
+            "a non-preview 404 must NOT borrow the preview wording: {m}"
+        );
+    }
+
+    #[test]
+    fn fileshare_err_1680_matches_cli_without_permissions_tagline() {
+        use super::{FsMcpOp, fileshare_err_to_result};
+        // P3F-6: the MCP 1680 message must NOT append "This is a property of the
+        // file, not your permissions." — the CLI headline omits it (exact parity;
+        // the CLI carries that sentence only in its separate hint line).
+        let m = result_to_string(&fileshare_err_to_result(
+            &fs_api_err(1680, 403),
+            "failed to download",
+            FsMcpOp::LinkAccess,
+        ));
+        assert!(
+            m.contains("cannot be served (1680)") && m.contains("DMCA"),
+            "1680 must explain the bound file is not serveable: {m}"
+        );
+        assert!(
+            !m.contains("property of the file"),
+            "1680 must NOT append the permissions tagline (CLI parity): {m}"
+        );
+    }
+
+    #[test]
+    fn fileshare_err_1605_create_hints_node_must_be_file() {
+        use super::{FsMcpOp, fileshare_err_to_result};
+        let create = result_to_string(&fileshare_err_to_result(
+            &fs_api_err(1605, 400),
+            "failed to create",
+            FsMcpOp::Create,
+        ));
+        assert!(
+            create.contains("FILE node"),
+            "create 1605 must hint node-is-file: {create}"
+        );
+        // Non-create 1605 just surfaces the server message, no file hint.
+        let other = result_to_string(&fileshare_err_to_result(
+            &fs_api_err(1605, 400),
+            "failed to update",
+            FsMcpOp::ManagementOther,
+        ));
+        assert!(
+            !other.contains("FILE node"),
+            "non-create 1605 must not add the file hint: {other}"
+        );
+    }
+
+    #[test]
+    fn fileshare_err_version_conflict_carries_current_version() {
+        use super::{FsMcpOp, fileshare_err_to_result};
+        let err = fastio_cli::error::CliError::VersionConflict {
+            current_version: "v9-abc".to_owned(),
+        };
+        let m = result_to_string(&fileshare_err_to_result(
+            &err,
+            "failed to write back",
+            FsMcpOp::LinkAccess,
+        ));
+        assert!(
+            m.contains("v9-abc"),
+            "a VersionConflict must surface the current version id: {m}"
+        );
+        // P3F-7: the rebase recipe from `suggestion()` must be carried into the
+        // MCP result for parity with the CLI render.
+        assert!(
+            m.contains("Re-fetch") && m.contains("re-apply") && m.contains("current version id"),
+            "a VersionConflict must carry the rebase suggestion: {m}"
         );
     }
 }

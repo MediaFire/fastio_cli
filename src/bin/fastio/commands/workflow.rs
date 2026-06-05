@@ -26,7 +26,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 
 use fastio_cli::api::orchestration::{self, DownloadedChunk};
@@ -41,6 +40,7 @@ use crate::cli::{
 };
 
 use super::CommandContext;
+use super::secret_output::{extract_secret, redact_secret_field, write_secret_file};
 
 /// Base seconds between `workflow wait` polls when unspecified.
 const DEFAULT_WAIT_INTERVAL_SECS: u64 = 3;
@@ -232,102 +232,6 @@ fn step_occurrence_state(snapshot: &Value) -> Option<String> {
 /// `failed`, `skipped`, and `cancelled`.
 fn is_terminal_step_state(state: &str) -> bool {
     matches!(state, "completed" | "failed" | "skipped" | "cancelled")
-}
-
-// ─── Secret-file writing (0600) ───────────────────────────────────────────────
-
-/// Write a one-time secret (or token) to a file with 0600 permissions, never
-/// echoing it to stdout. Emits a stderr confirmation (suppressed under
-/// `--quiet`). The secret is held in a [`SecretString`] and exposed only for
-/// the single write.
-///
-/// Delegates to [`fastio_cli::config::write_secure_file`], which creates the
-/// temp file 0600 at open time (`create_new` + `OpenOptionsExt::mode(0o600)` on
-/// Unix), writes the secret, then atomically renames it into place. This closes
-/// the TOCTOU window the previous write-then-chmod-in-place had: a one-time
-/// webhook secret / realtime token is never observable at default (umask)
-/// permissions under its final path.
-fn write_secret_file(path: &Path, secret: &SecretString, label: &str, quiet: bool) -> Result<()> {
-    fastio_cli::config::write_secure_file(path, secret.expose_secret())
-        .with_context(|| format!("failed to write {label} to '{}'", path.display()))?;
-    if !quiet {
-        eprintln!(
-            "{label} written to '{}' (0600). Store it now — it is shown ONLY once and is not \
-             retrievable later.",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-/// Extract a named secret string from an API response envelope's `response`
-/// object (or the top level), wrapping it in a [`SecretString`].
-fn extract_secret(value: &Value, key: &str) -> Option<SecretString> {
-    let payload = value.get("response").unwrap_or(value);
-    // The subscription create/rotate bodies nest the secret under the
-    // subscription object; check a couple of likely shapes.
-    payload
-        .get(key)
-        .and_then(Value::as_str)
-        .or_else(|| {
-            payload
-                .get("outbound_webhook_subscription")
-                .and_then(|o| o.get(key))
-                .and_then(Value::as_str)
-        })
-        .map(|s| SecretString::from(s.to_owned()))
-}
-
-/// Build the placeholder substituted for a redacted secret field, naming the
-/// flag the caller should pass to capture it (e.g. `--secret-file` for webhook
-/// secrets, `--token-file` for realtime tokens).
-fn redacted_placeholder(capture_flag: &str) -> String {
-    format!("<redacted; see {capture_flag}>")
-}
-
-/// Replace `key` with the redaction placeholder in a serde object, if present.
-fn redact_in_object(obj: &mut serde_json::Map<String, Value>, key: &str, placeholder: &str) {
-    if obj.contains_key(key) {
-        obj.insert(key.to_owned(), Value::String(placeholder.to_owned()));
-    }
-}
-
-/// Redact a named secret field in a response so it is not rendered to stdout.
-///
-/// Covers every shape the secret can appear in:
-/// - top-level `key`;
-/// - top-level `outbound_webhook_subscription.key` (the POST-envelope-unwrap
-///   shape `{result:true, outbound_webhook_subscription:{secret:...}}` that
-///   [`crate::handle_response`](-) produces — there is no `response` wrapper
-///   left by the time the command renders);
-/// - under `response.key`;
-/// - under `response.outbound_webhook_subscription.key`.
-///
-/// `capture_flag` names the CLI flag (`--secret-file` / `--token-file`) the user
-/// should re-run with to capture the value, so the rendered placeholder points
-/// at the right flag.
-fn redact_secret_field(value: &mut Value, key: &str, capture_flag: &str) {
-    let placeholder = redacted_placeholder(capture_flag);
-    if let Some(obj) = value.get_mut("response").and_then(Value::as_object_mut) {
-        redact_in_object(obj, key, &placeholder);
-        if let Some(sub) = obj
-            .get_mut("outbound_webhook_subscription")
-            .and_then(Value::as_object_mut)
-        {
-            redact_in_object(sub, key, &placeholder);
-        }
-    }
-    if let Some(obj) = value.as_object_mut() {
-        redact_in_object(obj, key, &placeholder);
-        // Post-unwrap shape: the subscription is a top-level child (no
-        // `response` wrapper). Descend into it too.
-        if let Some(sub) = obj
-            .get_mut("outbound_webhook_subscription")
-            .and_then(Value::as_object_mut)
-        {
-            redact_in_object(sub, key, &placeholder);
-        }
-    }
 }
 
 // ─── Validation helpers ───────────────────────────────────────────────────────
@@ -2021,82 +1925,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_secret_finds_nested_and_top_level() {
-        let nested = serde_json::json!({
-            "response": {"outbound_webhook_subscription": {"secret": "abc123"}}
-        });
-        assert_eq!(
-            extract_secret(&nested, "secret").map(|s| s.expose_secret().to_owned()),
-            Some("abc123".to_owned())
-        );
-        let top = serde_json::json!({"response": {"secret": "xyz"}});
-        assert_eq!(
-            extract_secret(&top, "secret").map(|s| s.expose_secret().to_owned()),
-            Some("xyz".to_owned())
-        );
-    }
-
-    #[test]
-    fn redact_secret_field_post_unwrap_webhook_shape() {
-        // The shape `handle_response` actually produces for outbound webhook
-        // create/rotate: the envelope is already unwrapped, so the subscription
-        // is a TOP-LEVEL child with no `response` wrapper. The pre-fix code only
-        // looked under `response`/`response.outbound_webhook_subscription` and
-        // missed this, leaking the HMAC secret to stdout.
-        let mut v = serde_json::json!({
-            "result": true,
-            "outbound_webhook_subscription": {"secret": "leak-me", "id": "s1"}
-        });
-        redact_secret_field(&mut v, "secret", "--secret-file");
-        let rendered = serde_json::to_string(&v).unwrap();
-        assert!(
-            !rendered.contains("leak-me"),
-            "secret must be ABSENT from rendered output, got: {rendered}"
-        );
-        // Non-secret fields are preserved.
-        assert_eq!(
-            v["outbound_webhook_subscription"]["id"].as_str(),
-            Some("s1")
-        );
-    }
-
-    #[test]
-    fn redact_secret_field_post_unwrap_realtime_token_shape() {
-        // The realtime-token mint also renders post-unwrap; its secret lives in
-        // a top-level `token` (or `auth_token`) field.
-        let mut v = serde_json::json!({"result": true, "token": "secret-jwt", "expires": 60});
-        redact_secret_field(&mut v, "token", "--token-file");
-        redact_secret_field(&mut v, "auth_token", "--token-file");
-        let rendered = serde_json::to_string(&v).unwrap();
-        assert!(
-            !rendered.contains("secret-jwt"),
-            "realtime token must be ABSENT from rendered output, got: {rendered}"
-        );
-        assert_eq!(v["expires"].as_i64(), Some(60));
-        // The placeholder names the realtime capture flag, not --secret-file.
-        assert_eq!(
-            v["token"].as_str(),
-            Some("<redacted; see --token-file>"),
-            "placeholder must cite the realtime token flag"
-        );
-    }
-
-    #[test]
-    fn redact_secret_field_wrapped_shapes_still_covered() {
-        // Defensive: the older wrapped shapes remain redacted too.
-        let mut nested = serde_json::json!({
-            "response": {"outbound_webhook_subscription": {"secret": "leak", "id": "s1"}}
-        });
-        redact_secret_field(&mut nested, "secret", "--secret-file");
-        assert!(!serde_json::to_string(&nested).unwrap().contains("leak"));
-
-        let mut top = serde_json::json!({"response": {"secret": "leak", "id": "s2"}});
-        redact_secret_field(&mut top, "secret", "--secret-file");
-        assert!(!serde_json::to_string(&top).unwrap().contains("leak"));
-        assert_eq!(top["response"]["id"].as_str(), Some("s2"));
-    }
-
-    #[test]
     fn normalize_alias_map_json_accepts_object_and_rejects_non_object() {
         // FIX M: `replace` validates the full map client-side. A valid object is
         // re-serialized canonically (insignificant whitespace dropped); this is
@@ -2141,20 +1969,5 @@ mod tests {
         // must hard-error rather than prompt.
         assert!(confirm_spend("x", "cost", false).is_err());
         assert!(confirm_spend("x", "cost", true).is_ok());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_secret_file_sets_0600() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("wf-secret-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("secret.txt");
-        let secret = SecretString::from("topsecret".to_owned());
-        write_secret_file(&path, &secret, "test secret", true).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "topsecret");
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

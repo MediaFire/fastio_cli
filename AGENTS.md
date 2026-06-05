@@ -277,6 +277,83 @@ outward-facing / terminal actions — **`send`** (emails real recipients) and
 delete (envelopes are voided). `document-download` covers preview needs — its
 bytes are the source/preview PDF, so there is no separate MCP preview action.
 
+## File Shares
+
+`fastio fileshare` creates **durable, link-shareable views of a SINGLE workspace
+file** — the replacement for the retired **QuickShare** (the legacy QuickShare
+surface has been fully removed from this CLI). A File Share binds one file node
+and serves it via a stable link with an optional password, an access option, an
+expiry, and per-user grants (`view < download < edit`).
+
+```bash
+fastio fileshare create --workspace WS_ID --node NODE_ID --title "Q3 Report" --access-option anyone_with_link
+fastio fileshare list   --workspace WS_ID
+fastio fileshare info   FS_ID                       # details + effective_capability (anonymous-capable)
+fastio fileshare update FS_ID --title "..." --clear-password --clear-expires
+fastio fileshare grants list  FS_ID
+fastio fileshare grants add   FS_ID --user USER_ID --capability download   # exactly one of --user / --email
+fastio fileshare grants remove FS_ID --email someone@example.com --yes
+fastio fileshare download FS_ID -o ./file.pdf [--version VID] [--password PW]
+fastio fileshare versions FS_ID
+fastio fileshare preview  FS_ID --type thumbnail -o ./thumb.jpg            # PRIMARY asset only
+fastio fileshare upload   FS_ID ./new-version.pdf [--if-version VID] --yes  # write-back: NEW VERSION
+fastio fileshare activity FS_ID                     # single activity poll (members only)
+fastio fileshare ws-token FS_ID --token-file ./ws.token                    # realtime token (0600)
+fastio fileshare delete   FS_ID --yes
+```
+
+- **Anonymous consumption.** `info` / `download` / `versions` / `preview` may be
+  used **without auth** on a public (`anyone_with_link`) share. A protected link
+  needs the password (next bullet). An **expired stored-profile** credential
+  falls back to anonymous for these reads (with one stderr warning); an explicit
+  `--token`/env token that fails stays a hard error; management / `upload` /
+  `ws-token` / `activity` always require auth.
+- **Password discipline.** A link password comes from `--password` **or** the
+  `FASTIO_FILESHARE_PASSWORD` env var (the flag wins; prefer the env var so the
+  value stays out of `ps` and shell history). It travels **only** in the
+  `x-ve-password` header and is never logged. On `update`, pass
+  `--clear-password` to remove it (don't also pass `--password`). A `1650`/`401`
+  on a consumption read means the link password is missing or wrong (not an
+  account-login problem).
+- **Write-back (CAS).** `fileshare upload` pushes a **new version** of the bound
+  file (the previous version is retained in history) and needs an `edit` grant.
+  Pass `--if-version VID` for optimistic concurrency: the precondition is
+  **server-enforced** — when the server detects a version conflict it reports
+  `CONFLICT_VERSION_MISMATCH:{vid}` and the CLI surfaces it as a version-conflict
+  error. On that conflict, re-download the current bytes, re-apply your change,
+  and retry with `--if-version {vid}`. Files ≤ 4 MB go single-shot; larger files
+  chunk + complete + poll.
+- **`ws-token`** mints a realtime WebSocket token; it is **redacted from stdout**
+  and only written (0600) to `--token-file <path>`. There is no in-CLI WebSocket
+  client (token mint only).
+
+### Over MCP
+
+The `fileshare` MCP tool exposes **read + drive** actions: `create`, `list`,
+`info`, `update`, `grants-list`, `grants-add`, `versions`, `download`, `preview`,
+`activity`, `describe`. The four LINK-ACCESS reads (`info`, `download`,
+`versions`, `preview`) run **anonymously** when the server holds no token — the
+same anonymous-consumption path as the CLI (a `named_people` / `any_registered`
+share then returns the uniform unavailable/auth error). The other actions
+require auth. The destructive actions are **confirm-gated**: `delete` requires
+`confirm_delete=true` and `grants-remove` requires `confirm_revoke=true`
+(rejected **before auth and arg extraction**, so even an unauthenticated /
+arg-less probe gets the gate message, mirroring the CLI `--yes`). The
+`password` arg must be a **string**; a non-string value (or `password` together
+with `clear_password=true` on `update`) is rejected explicitly. Two actions are
+**CLI-binary-only** and NOT routable over MCP:
+
+- **`upload`** (write-back) — it needs the local file bytes and is destructive;
+  run `fastio fileshare upload …`.
+- **`ws-token`** (realtime mint) — the token is a long-lived secret that must not
+  be parked in an MCP transcript (the CLI redacts it and writes 0600); run
+  `fastio fileshare ws-token … --token-file <path>`. This mirrors how the
+  `workflow` tool keeps its realtime-token mint CLI-only.
+
+`download` / `preview` write bytes to the agent's local filesystem (default under
+`.fastio/downloads/`, created 0700) and return a path + byte count. The
+`password` arg authorizes a protected link (x-ve-password; never echoed).
+
 ## Billing
 
 Org billing lives under `fastio org billing`:
@@ -342,7 +419,8 @@ fastio mcp
 ```
 
 It speaks MCP over stdio and exposes the CLI's operations as action-routed tools
-(`ripley`, `workflow`, `sign`, `files`, `org`, `workspace`, …). Tool results are
+(`ripley`, `workflow`, `sign`, `fileshare`, `files`, `org`, `workspace`, …). Tool
+results are
 rendered as GitHub-flavored Markdown for compact, high-signal consumption. This
 same guide is available as the `skill://guide` MCP resource and via
 `fastio skill`.

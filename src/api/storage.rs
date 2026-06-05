@@ -853,22 +853,6 @@ pub async fn read_raw(
     client.get_raw_text(&path, params.as_ref()).await
 }
 
-/// Get or create a quickshare link.
-///
-/// `GET /workspace/{workspace_id}/storage/{node_id}/quickshare/`
-pub async fn quickshare_get(
-    client: &ApiClient,
-    workspace_id: &str,
-    node_id: &str,
-) -> Result<Value, CliError> {
-    let path = format!(
-        "/workspace/{}/storage/{}/quickshare/",
-        urlencoding::encode(workspace_id),
-        urlencoding::encode(node_id),
-    );
-    client.get(&path).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::{

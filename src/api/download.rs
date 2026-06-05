@@ -207,20 +207,6 @@ pub fn get_zip_url_ctx(
     )
 }
 
-/// Get quickshare details (no auth required).
-///
-/// `GET /quickshare/{quickshare_id}/details/`
-pub async fn quickshare_details(
-    client: &ApiClient,
-    quickshare_id: &str,
-) -> Result<Value, CliError> {
-    let path = format!(
-        "/quickshare/{}/details/",
-        urlencoding::encode(quickshare_id)
-    );
-    client.get(&path).await
-}
-
 /// Extract filename from node details response.
 pub fn extract_filename(details: &Value) -> Option<String> {
     details

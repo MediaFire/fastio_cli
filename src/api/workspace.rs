@@ -386,65 +386,6 @@ pub async fn read_note_share(
     read_note_at(client, &path, version_id).await
 }
 
-/// Get quickshare details.
-///
-/// `GET /workspace/{workspace_id}/storage/{node_id}/quickshare/`
-pub async fn quickshare_get(
-    client: &ApiClient,
-    workspace_id: &str,
-    node_id: &str,
-) -> Result<Value, CliError> {
-    let path = format!(
-        "/workspace/{}/storage/{}/quickshare/",
-        urlencoding::encode(workspace_id),
-        urlencoding::encode(node_id),
-    );
-    client.get(&path).await
-}
-
-/// Delete a quickshare.
-///
-/// `DELETE /workspace/{workspace_id}/storage/{node_id}/quickshare/`
-pub async fn quickshare_delete(
-    client: &ApiClient,
-    workspace_id: &str,
-    node_id: &str,
-) -> Result<Value, CliError> {
-    let path = format!(
-        "/workspace/{}/storage/{}/quickshare/",
-        urlencoding::encode(workspace_id),
-        urlencoding::encode(node_id),
-    );
-    client.delete(&path).await
-}
-
-/// List quickshares in a workspace.
-///
-/// `GET /workspace/{workspace_id}/quickshares/`
-pub async fn quickshares_list(
-    client: &ApiClient,
-    workspace_id: &str,
-    limit: Option<u32>,
-    offset: Option<u32>,
-) -> Result<Value, CliError> {
-    let mut params = HashMap::new();
-    if let Some(l) = limit {
-        params.insert("limit".to_owned(), l.to_string());
-    }
-    if let Some(o) = offset {
-        params.insert("offset".to_owned(), o.to_string());
-    }
-    let path = format!(
-        "/workspace/{}/quickshares/",
-        urlencoding::encode(workspace_id)
-    );
-    if params.is_empty() {
-        client.get(&path).await
-    } else {
-        client.get_with_params(&path, &params).await
-    }
-}
-
 /// Disable workflow on a workspace.
 ///
 /// `POST /workspace/{workspace_id}/workflow/disable/`

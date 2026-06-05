@@ -177,13 +177,6 @@ pub enum FilesCommand {
         /// Node ID.
         node_id: String,
     },
-    /// Create or get a quickshare link.
-    Quickshare {
-        /// Workspace ID.
-        workspace: String,
-        /// Node ID.
-        node_id: String,
-    },
 }
 
 /// File lock subcommand variants.
@@ -395,9 +388,6 @@ pub async fn execute(command: &FilesCommand, ctx: &CommandContext<'_>) -> Result
         } => version_restore(ctx, workspace, node_id, version_id).await,
         FilesCommand::Lock(cmd) => file_lock(cmd, ctx).await,
         FilesCommand::Read { workspace, node_id } => read_content(ctx, workspace, node_id).await,
-        FilesCommand::Quickshare { workspace, node_id } => {
-            quickshare(ctx, workspace, node_id).await
-        }
     }
 }
 
@@ -959,18 +949,6 @@ async fn read_content(ctx: &CommandContext<'_>, workspace: &str, node_id: &str) 
     let value = api::storage::read_content(&client, workspace, node_id)
         .await
         .context("failed to read file content")?;
-    ctx.output.render(&value)?;
-    Ok(())
-}
-
-/// Get quickshare information for a file.
-async fn quickshare(ctx: &CommandContext<'_>, workspace: &str, node_id: &str) -> Result<()> {
-    validate_workspace_id(workspace)?;
-    validate_node_id(node_id, "node ID")?;
-    let client = ctx.build_client()?;
-    let value = api::storage::quickshare_get(&client, workspace, node_id)
-        .await
-        .context("failed to get quickshare")?;
     ctx.output.render(&value)?;
     Ok(())
 }

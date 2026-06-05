@@ -56,6 +56,57 @@ pub fn build_client_with_detail(
         .context("failed to create API client")
 }
 
+impl CommandContext<'_> {
+    /// Build an API client that tolerates the absence of authentication, for
+    /// File Share **consumption** reads (details / download / versions /
+    /// preview) which may be served anonymously per the share's access tier.
+    ///
+    /// Auth resolution (File Share addendum F5):
+    ///
+    /// - A resolved token (`--token` / env / a live profile) → an authenticated
+    ///   client, exactly as [`Self::build_client`].
+    /// - No credentials at all (`resolve_token` → `Ok(None)`) → an ANONYMOUS
+    ///   client (no bearer). An `anyone_with_link` share still serves.
+    /// - EXPIRED stored PROFILE credentials (`resolve_token` →
+    ///   `Err(CliError::Auth)`) → fall back to an anonymous client with a single
+    ///   stderr warning (suppressed under `--quiet`). The user explicitly asked
+    ///   to read a public link; an expired stored token should not hard-block a
+    ///   read that may not need auth at all.
+    ///
+    /// An EXPLICIT `--token` / env token failure can only arrive here as an
+    /// authenticated client (those are returned by `resolve_token` as
+    /// `Ok(Some)` before any expiry check), so this never silently downgrades an
+    /// explicit credential. Management, upload, ws-token, and activity stay on
+    /// the always-authed [`Self::build_client`].
+    pub fn build_client_allow_anonymous(&self) -> anyhow::Result<fastio_cli::client::ApiClient> {
+        let token = match fastio_cli::auth::token::resolve_token(
+            self.flag_token,
+            self.profile_name,
+            self.config_dir,
+        ) {
+            Ok(token) => token,
+            Err(fastio_cli::error::CliError::Auth(_)) => {
+                // Expired PROFILE credentials: proceed anonymously (the link may
+                // be public). Warn once so the user knows the read was not
+                // authenticated.
+                if !self.output.quiet {
+                    eprintln!(
+                        "warning: stored credentials expired — proceeding without \
+                         authentication (the File Share may require a link password or a \
+                         grant; run `fastio auth login` to authenticate)"
+                    );
+                }
+                None
+            }
+            Err(other) => {
+                return Err(anyhow::Error::from(other).context("failed to resolve token"));
+            }
+        };
+        fastio_cli::client::ApiClient::with_detail(self.api_base, token, self.output.detail)
+            .context("failed to create API client")
+    }
+}
+
 /// AI chat and prompt commands.
 pub mod ai;
 /// Approval workflow commands.
@@ -76,6 +127,8 @@ pub mod download;
 pub mod event;
 /// File and folder management commands.
 pub mod files;
+/// File Share (durable single-file link) commands.
+pub mod fileshare;
 /// External storage import commands.
 pub mod import;
 /// AI instructions commands (user / org / workspace / share).
@@ -94,6 +147,8 @@ pub mod org;
 pub mod preview;
 /// Unified (grouped-bucket) search commands.
 pub mod search;
+/// Shared one-time-secret output helpers (extract / write 0600 / redact).
+pub mod secret_output;
 /// Share link management commands.
 pub mod share;
 /// E-signature (SignEnvelope) commands.

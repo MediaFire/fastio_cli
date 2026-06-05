@@ -213,6 +213,17 @@ pub enum Commands {
     #[command(subcommand)]
     Sign(SignCommands),
 
+    /// File Shares: durable, link-shareable views of a single workspace file
+    /// (the successor to the retired `QuickShare`). Create / manage shares and
+    /// grants, read or write the bound file, and mint realtime tokens. Read
+    /// commands (info / download / versions / preview) can run anonymously when
+    /// the share's access tier allows it.
+    // No `fs` alias: it drifts in scope and collides with user expectations for
+    // `files` (a `fs` shorthand reads as "file system" / "files"). If a product
+    // decision later wants it, it can return as a documented alias.
+    #[command(subcommand)]
+    Fileshare(FileshareCommands),
+
     /// AI instructions for user / org / workspace / share profiles.
     #[command(subcommand)]
     Instructions(InstructionsCommands),
@@ -1498,6 +1509,418 @@ pub enum SignAuditCommands {
     },
 }
 
+// ─── File Shares ───────────────────────────────────────────────────────────────
+
+/// File Share subcommands (`fastio fileshare`).
+///
+/// A File Share is a durable, link-shareable view of one workspace file. The
+/// management surface (create / list / update / delete / grants / upload /
+/// ws-token / activity) requires authentication; the consumption surface (info /
+/// download / versions / preview) can run anonymously when the share's access
+/// tier permits, or with an optional link password.
+///
+/// NOTE: `Debug` is implemented MANUALLY (not derived) so the `--password`
+/// values never appear in a debug rendering — see the `impl fmt::Debug` below.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+#[non_exhaustive]
+pub enum FileshareCommands {
+    /// Create a File Share bound to a workspace file node (the binding is
+    /// immutable). Requires workspace membership.
+    Create {
+        /// Workspace ID that owns the file.
+        #[arg(long)]
+        workspace: String,
+        /// `OpaqueId` of the file node to share (must be a file, not a folder).
+        #[arg(long)]
+        node: String,
+        /// Optional display title (max 255 chars).
+        #[arg(long)]
+        title: Option<String>,
+        /// Access tier. Defaults to `named_people` server-side.
+        #[arg(long, value_parser = ["anyone_with_link", "any_registered", "named_people"])]
+        access_option: Option<String>,
+        /// Optional link password (1-255 chars). WARNING: a value passed on the
+        /// command line is visible in `ps` and your shell history. Prefer the
+        /// `FASTIO_FILESHARE_PASSWORD` environment variable, which this command
+        /// reads when `--password` is omitted. (A future `--password-file` may
+        /// be added.)
+        #[arg(long)]
+        password: Option<String>,
+        /// Relative expiry in seconds from now (1..=3155760000). Mutually
+        /// exclusive with `--expires-at`. Omitted = durable (never expires).
+        #[arg(long, conflicts_with = "expires_at")]
+        expires: Option<u64>,
+        /// Absolute expiry datetime (a value without a timezone is UTC).
+        /// Mutually exclusive with `--expires`.
+        #[arg(long)]
+        expires_at: Option<String>,
+    },
+    /// List a workspace's File Shares (offset-paginated). Requires membership.
+    List {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Result offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
+        /// Maximum number of results to return.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Show a File Share's public viewer details, including the caller's
+    /// `effective_capability`. Can run anonymously (tier-dependent); supply
+    /// `--password` for a password-protected link.
+    Info {
+        /// File Share ID.
+        fileshare_id: String,
+        /// Link password (see `create --password` for the `ps`/history warning;
+        /// `FASTIO_FILESHARE_PASSWORD` is read when this is omitted).
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Update a File Share's mutable settings (title / access / password /
+    /// expiry). Requires membership. Supply at least one change.
+    Update {
+        /// File Share ID.
+        fileshare_id: String,
+        /// New display title (max 255). A title cannot be cleared.
+        #[arg(long)]
+        title: Option<String>,
+        /// New access tier.
+        #[arg(long, value_parser = ["anyone_with_link", "any_registered", "named_people"])]
+        access_option: Option<String>,
+        /// New link password. WARNING: visible in `ps`/shell history — prefer
+        /// `FASTIO_FILESHARE_PASSWORD` (read when omitted). Mutually exclusive
+        /// with `--clear-password`.
+        #[arg(long, conflicts_with = "clear_password")]
+        password: Option<String>,
+        /// Remove the link password (the share becomes unprotected). Mutually
+        /// exclusive with `--password`.
+        #[arg(long)]
+        clear_password: bool,
+        /// New relative expiry (seconds from now). Mutually exclusive with
+        /// `--expires-at` / `--clear-expires`.
+        #[arg(long, conflicts_with_all = ["expires_at", "clear_expires"])]
+        expires: Option<u64>,
+        /// New absolute expiry datetime. Mutually exclusive with `--expires` /
+        /// `--clear-expires`.
+        #[arg(long, conflicts_with = "clear_expires")]
+        expires_at: Option<String>,
+        /// Remove the expiry (the share becomes durable again).
+        #[arg(long)]
+        clear_expires: bool,
+    },
+    /// Delete a File Share (revokes the link, cascades its grants; the bound
+    /// file is never touched). Requires membership.
+    Delete {
+        /// File Share ID.
+        fileshare_id: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Manage named-people grants on a File Share.
+    #[command(subcommand)]
+    Grants(FileshareGrantsCommands),
+    /// Download the bound file (or a historical version) to disk. Can run
+    /// anonymously (tier-dependent); supply `--password` for a protected link.
+    Download {
+        /// File Share ID.
+        fileshare_id: String,
+        /// Output file path. Defaults to the bound file's name.
+        #[arg(long, short)]
+        output: Option<String>,
+        /// Download a specific historical version by its version id (instead of
+        /// the current bound file). NOTE: when `--output` is omitted the default
+        /// filename still derives from the bound file's CURRENT name, not the
+        /// historical version's name — pass `--output` to control it.
+        #[arg(long)]
+        version: Option<String>,
+        /// Link password (visible in `ps`/history — prefer
+        /// `FASTIO_FILESHARE_PASSWORD`, read when omitted).
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// List the bound file's versions. Can run anonymously (tier-dependent).
+    Versions {
+        /// File Share ID.
+        fileshare_id: String,
+        /// Link password (read from `FASTIO_FILESHARE_PASSWORD` when omitted).
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Download a generated preview asset for the bound file. Downloads the
+    /// PRIMARY preview asset only (after at most one redirect); multi-file
+    /// previews (HLS playlists, paged documents) yield the primary asset —
+    /// sub-assets are NOT fetched. Can run anonymously (tier-dependent).
+    Preview {
+        /// File Share ID.
+        fileshare_id: String,
+        /// Preview type to fetch (e.g. `thumbnail`, `image`, `pdf`, `mp4`,
+        /// `hls_stream`). Passed through to the server verbatim.
+        #[arg(long = "type")]
+        preview_type: String,
+        /// Output file path. Defaults to `<fileshare-id>.<type>` (a preview is a
+        /// DERIVED asset, so the bound file's name is not used).
+        #[arg(long, short)]
+        output: Option<String>,
+        /// Link password (read from `FASTIO_FILESHARE_PASSWORD` when omitted).
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Replace the bound file's content with a local file (write-back). Requires
+    /// an `edit` grant on the File Share (workspace membership is not required).
+    Upload {
+        /// File Share ID.
+        fileshare_id: String,
+        /// Path to the local file whose content replaces the bound file.
+        file: String,
+        /// Compare-and-swap precondition (server-enforced): the bound file's
+        /// current version id, sent so the server can reject the replace on a
+        /// version conflict. When the server detects a mismatch it reports
+        /// `CONFLICT_VERSION_MISMATCH` and the command surfaces it as a
+        /// version-conflict error carrying the current version id.
+        #[arg(long)]
+        if_version: Option<String>,
+        /// Link password (visible in `ps`/history — prefer
+        /// `FASTIO_FILESHARE_PASSWORD`, read when omitted).
+        #[arg(long)]
+        password: Option<String>,
+        /// Override the uploaded file name (defaults to the local file's name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Skip the confirmation prompt (the write creates a new version).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Long-poll for activity on a File Share (workspace members only). Mirrors
+    /// `fastio event poll`.
+    Activity {
+        /// File Share ID.
+        fileshare_id: String,
+        /// Last activity timestamp for incremental polling.
+        #[arg(long)]
+        lastactivity: Option<String>,
+        /// Max seconds the server will hold the connection (1-95).
+        #[arg(long)]
+        wait: Option<u32>,
+        /// Return only events newer than `--lastactivity`.
+        #[arg(long)]
+        updated: bool,
+    },
+    /// Mint a short-lived realtime-channel WebSocket token for a File Share
+    /// (workspace members only). The token is REDACTED from stdout; pass
+    /// `--token-file` to capture it (written 0600).
+    WsToken {
+        /// File Share ID.
+        fileshare_id: String,
+        /// Write the minted token to this path (created 0600). When omitted the
+        /// token is redacted from output and a warning is printed.
+        #[arg(long)]
+        token_file: Option<std::path::PathBuf>,
+    },
+}
+
+/// File Share grant subcommands.
+///
+/// `Debug` is implemented manually on [`FileshareCommands`] (these variants
+/// carry no secrets, but they are reached through that manual impl).
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum FileshareGrantsCommands {
+    /// List a File Share's named-people grants (no pagination; first 1000).
+    List {
+        /// File Share ID.
+        fileshare_id: String,
+    },
+    /// Grant (or raise) a user's capability on a File Share. Supply exactly one
+    /// of `--user` or `--email`.
+    Add {
+        /// File Share ID.
+        fileshare_id: String,
+        /// Grantee's 19-digit user profile id. Mutually exclusive with
+        /// `--email`.
+        #[arg(long, conflicts_with = "email")]
+        user: Option<String>,
+        /// Grantee's email address. An unregistered email becomes a pending
+        /// invitation. Mutually exclusive with `--user`.
+        #[arg(long)]
+        email: Option<String>,
+        /// Capability to grant.
+        #[arg(long, value_parser = ["view", "download", "edit"])]
+        capability: String,
+    },
+    /// Revoke a user's grant on a File Share (idempotent). Supply exactly one of
+    /// `--user` or `--email`.
+    Remove {
+        /// File Share ID.
+        fileshare_id: String,
+        /// Grantee's 19-digit user profile id. Mutually exclusive with
+        /// `--email`.
+        #[arg(long, conflicts_with = "email")]
+        user: Option<String>,
+        /// Grantee's email address. Mutually exclusive with `--user`.
+        #[arg(long)]
+        email: Option<String>,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Manual `Debug` for [`FileshareCommands`] that REDACTS every `--password`
+/// value so a secret can never leak into a debug rendering (logs, panics).
+///
+/// `#[derive(Debug)]` would print the `Option<String>` password verbatim. Each
+/// variant is rendered field-by-field with the `password` field replaced by a
+/// fixed `Some(<redacted>)` / `None` marker; all other fields are shown as-is.
+impl fmt::Debug for FileshareCommands {
+    #[allow(clippy::too_many_lines)] // a flat field-by-field render over every variant
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Render an Option<password> as a redacted marker, preserving only
+        // whether a value was present.
+        fn pw(p: Option<&String>) -> &'static str {
+            match p {
+                Some(_) => "Some(<redacted>)",
+                None => "None",
+            }
+        }
+        match self {
+            Self::Create {
+                workspace,
+                node,
+                title,
+                access_option,
+                password,
+                expires,
+                expires_at,
+            } => f
+                .debug_struct("Create")
+                .field("workspace", workspace)
+                .field("node", node)
+                .field("title", title)
+                .field("access_option", access_option)
+                .field("password", &format_args!("{}", pw(password.as_ref())))
+                .field("expires", expires)
+                .field("expires_at", expires_at)
+                .finish(),
+            Self::List {
+                workspace,
+                offset,
+                limit,
+            } => f
+                .debug_struct("List")
+                .field("workspace", workspace)
+                .field("offset", offset)
+                .field("limit", limit)
+                .finish(),
+            Self::Info {
+                fileshare_id,
+                password,
+            } => f
+                .debug_struct("Info")
+                .field("fileshare_id", fileshare_id)
+                .field("password", &format_args!("{}", pw(password.as_ref())))
+                .finish(),
+            Self::Update {
+                fileshare_id,
+                title,
+                access_option,
+                password,
+                clear_password,
+                expires,
+                expires_at,
+                clear_expires,
+            } => f
+                .debug_struct("Update")
+                .field("fileshare_id", fileshare_id)
+                .field("title", title)
+                .field("access_option", access_option)
+                .field("password", &format_args!("{}", pw(password.as_ref())))
+                .field("clear_password", clear_password)
+                .field("expires", expires)
+                .field("expires_at", expires_at)
+                .field("clear_expires", clear_expires)
+                .finish(),
+            Self::Delete { fileshare_id, yes } => f
+                .debug_struct("Delete")
+                .field("fileshare_id", fileshare_id)
+                .field("yes", yes)
+                .finish(),
+            Self::Grants(c) => f.debug_tuple("Grants").field(c).finish(),
+            Self::Download {
+                fileshare_id,
+                output,
+                version,
+                password,
+            } => f
+                .debug_struct("Download")
+                .field("fileshare_id", fileshare_id)
+                .field("output", output)
+                .field("version", version)
+                .field("password", &format_args!("{}", pw(password.as_ref())))
+                .finish(),
+            Self::Versions {
+                fileshare_id,
+                password,
+            } => f
+                .debug_struct("Versions")
+                .field("fileshare_id", fileshare_id)
+                .field("password", &format_args!("{}", pw(password.as_ref())))
+                .finish(),
+            Self::Preview {
+                fileshare_id,
+                preview_type,
+                output,
+                password,
+            } => f
+                .debug_struct("Preview")
+                .field("fileshare_id", fileshare_id)
+                .field("preview_type", preview_type)
+                .field("output", output)
+                .field("password", &format_args!("{}", pw(password.as_ref())))
+                .finish(),
+            Self::Upload {
+                fileshare_id,
+                file,
+                if_version,
+                password,
+                name,
+                yes,
+            } => f
+                .debug_struct("Upload")
+                .field("fileshare_id", fileshare_id)
+                .field("file", file)
+                .field("if_version", if_version)
+                .field("password", &format_args!("{}", pw(password.as_ref())))
+                .field("name", name)
+                .field("yes", yes)
+                .finish(),
+            Self::Activity {
+                fileshare_id,
+                lastactivity,
+                wait,
+                updated,
+            } => f
+                .debug_struct("Activity")
+                .field("fileshare_id", fileshare_id)
+                .field("lastactivity", lastactivity)
+                .field("wait", wait)
+                .field("updated", updated)
+                .finish(),
+            Self::WsToken {
+                fileshare_id,
+                token_file,
+            } => f
+                .debug_struct("WsToken")
+                .field("fileshare_id", fileshare_id)
+                .field("token_file", token_file)
+                .finish(),
+        }
+    }
+}
+
 // ─── Auth ────────────────────────────────────────────────────────────────────
 
 /// Auth subcommands.
@@ -2735,14 +3158,6 @@ pub enum FilesCommands {
     Lock(FileLockCommands),
     /// Read file content (text).
     Read {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace: String,
-        /// Node ID.
-        node_id: String,
-    },
-    /// Create or get a quickshare link.
-    Quickshare {
         /// Workspace ID.
         #[arg(long)]
         workspace: String,
@@ -6293,5 +6708,396 @@ mod ripley_alias_tests {
             }
             other => panic!("expected Sign Envelope List, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod fileshare_parse_tests {
+    use super::{Cli, Commands, FileshareCommands, FileshareGrantsCommands};
+    use clap::Parser;
+
+    /// Helper: parse argv into a [`FileshareCommands`], panicking on a parse
+    /// error with the clap message (so the cause is visible).
+    fn parse(args: &[&str]) -> FileshareCommands {
+        let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        match cli.command {
+            Commands::Fileshare(c) => c,
+            other => panic!("expected Fileshare, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_parses_with_all_flags() {
+        let c = parse(&[
+            "fastio",
+            "fileshare",
+            "create",
+            "--workspace",
+            "ws1",
+            "--node",
+            "node1",
+            "--title",
+            "Q3",
+            "--access-option",
+            "anyone_with_link",
+            "--password",
+            "pw",
+            "--expires",
+            "3600",
+        ]);
+        match c {
+            FileshareCommands::Create {
+                workspace,
+                node,
+                title,
+                access_option,
+                expires,
+                ..
+            } => {
+                assert_eq!(workspace, "ws1");
+                assert_eq!(node, "node1");
+                assert_eq!(title.as_deref(), Some("Q3"));
+                assert_eq!(access_option.as_deref(), Some("anyone_with_link"));
+                assert_eq!(expires, Some(3600));
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fs_alias_is_removed() {
+        // P2F-7: the `fs` alias was removed (scope drift + `files` collision). The
+        // canonical `fileshare` name still routes; `fs` must no longer parse.
+        let c = parse(&["fastio", "fileshare", "list", "--workspace", "ws1"]);
+        assert!(matches!(c, FileshareCommands::List { .. }));
+        assert!(
+            Cli::try_parse_from(["fastio", "fs", "list", "--workspace", "ws1"]).is_err(),
+            "the `fs` alias must be gone"
+        );
+    }
+
+    #[test]
+    fn create_requires_workspace_and_node() {
+        // Missing --node.
+        assert!(
+            Cli::try_parse_from(["fastio", "fileshare", "create", "--workspace", "ws1"]).is_err()
+        );
+        // Missing --workspace.
+        assert!(Cli::try_parse_from(["fastio", "fileshare", "create", "--node", "n1"]).is_err());
+    }
+
+    #[test]
+    fn create_rejects_both_expiry_inputs() {
+        // --expires conflicts_with --expires-at at the clap layer.
+        assert!(
+            Cli::try_parse_from([
+                "fastio",
+                "fileshare",
+                "create",
+                "--workspace",
+                "ws1",
+                "--node",
+                "n1",
+                "--expires",
+                "60",
+                "--expires-at",
+                "2026-12-31 00:00:00",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn create_rejects_bad_access_option() {
+        // The value_parser allowlist rejects an unknown tier.
+        assert!(
+            Cli::try_parse_from([
+                "fastio",
+                "fileshare",
+                "create",
+                "--workspace",
+                "ws1",
+                "--node",
+                "n1",
+                "--access-option",
+                "public",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn update_password_conflicts_with_clear_password() {
+        assert!(
+            Cli::try_parse_from([
+                "fastio",
+                "fileshare",
+                "update",
+                "fs1",
+                "--password",
+                "pw",
+                "--clear-password",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn update_expiry_intents_conflict() {
+        // expires / expires-at / clear-expires are pairwise exclusive at clap.
+        for pair in [
+            ["--expires", "60", "--clear-expires"].as_slice(),
+            ["--expires-at", "2026-12-31 00:00:00", "--clear-expires"].as_slice(),
+            ["--expires", "60", "--expires-at"].as_slice(),
+        ] {
+            let mut args = vec!["fastio", "fileshare", "update", "fs1"];
+            args.extend_from_slice(pair);
+            // The last pair needs a value for --expires-at to reach the conflict
+            // check; append one so the only failure is the conflict.
+            if pair.last() == Some(&"--expires-at") {
+                args.push("2026-12-31 00:00:00");
+            }
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "expiry intents must conflict: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grants_add_parses_and_requires_capability() {
+        let c = parse(&[
+            "fastio",
+            "fileshare",
+            "grants",
+            "add",
+            "fs1",
+            "--user",
+            "u1",
+            "--capability",
+            "edit",
+        ]);
+        match c {
+            FileshareCommands::Grants(FileshareGrantsCommands::Add {
+                fileshare_id,
+                user,
+                capability,
+                ..
+            }) => {
+                assert_eq!(fileshare_id, "fs1");
+                assert_eq!(user.as_deref(), Some("u1"));
+                assert_eq!(capability, "edit");
+            }
+            other => panic!("expected Grants Add, got {other:?}"),
+        }
+        // --capability is required on add.
+        assert!(
+            Cli::try_parse_from([
+                "fastio",
+                "fileshare",
+                "grants",
+                "add",
+                "fs1",
+                "--user",
+                "u1",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn grants_add_user_conflicts_with_email_and_rejects_bad_capability() {
+        // --user conflicts_with --email.
+        assert!(
+            Cli::try_parse_from([
+                "fastio",
+                "fileshare",
+                "grants",
+                "add",
+                "fs1",
+                "--user",
+                "u1",
+                "--email",
+                "a@b.com",
+                "--capability",
+                "view",
+            ])
+            .is_err()
+        );
+        // An unknown capability is rejected by the value_parser allowlist.
+        assert!(
+            Cli::try_parse_from([
+                "fastio",
+                "fileshare",
+                "grants",
+                "add",
+                "fs1",
+                "--user",
+                "u1",
+                "--capability",
+                "admin",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn grants_remove_user_conflicts_with_email() {
+        assert!(
+            Cli::try_parse_from([
+                "fastio",
+                "fileshare",
+                "grants",
+                "remove",
+                "fs1",
+                "--user",
+                "u1",
+                "--email",
+                "a@b.com",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn download_versions_preview_info_parse() {
+        assert!(matches!(
+            parse(&["fastio", "fileshare", "info", "fs1"]),
+            FileshareCommands::Info { .. }
+        ));
+        assert!(matches!(
+            parse(&["fastio", "fileshare", "versions", "fs1", "--password", "pw"]),
+            FileshareCommands::Versions { .. }
+        ));
+        match parse(&[
+            "fastio",
+            "fileshare",
+            "download",
+            "fs1",
+            "--output",
+            "out.bin",
+            "--version",
+            "v7",
+        ]) {
+            FileshareCommands::Download {
+                fileshare_id,
+                output,
+                version,
+                ..
+            } => {
+                assert_eq!(fileshare_id, "fs1");
+                assert_eq!(output.as_deref(), Some("out.bin"));
+                assert_eq!(version.as_deref(), Some("v7"));
+            }
+            other => panic!("expected Download, got {other:?}"),
+        }
+        // Preview requires --type.
+        assert!(Cli::try_parse_from(["fastio", "fileshare", "preview", "fs1"]).is_err());
+        match parse(&["fastio", "fileshare", "preview", "fs1", "--type", "pdf"]) {
+            FileshareCommands::Preview {
+                fileshare_id,
+                preview_type,
+                ..
+            } => {
+                assert_eq!(fileshare_id, "fs1");
+                assert_eq!(preview_type, "pdf");
+            }
+            other => panic!("expected Preview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upload_activity_wstoken_parse() {
+        match parse(&[
+            "fastio",
+            "fileshare",
+            "upload",
+            "fs1",
+            "./new.bin",
+            "--if-version",
+            "v3",
+            "--name",
+            "new.bin",
+            "--yes",
+        ]) {
+            FileshareCommands::Upload {
+                fileshare_id,
+                file,
+                if_version,
+                name,
+                yes,
+                ..
+            } => {
+                assert_eq!(fileshare_id, "fs1");
+                assert_eq!(file, "./new.bin");
+                assert_eq!(if_version.as_deref(), Some("v3"));
+                assert_eq!(name.as_deref(), Some("new.bin"));
+                assert!(yes);
+            }
+            other => panic!("expected Upload, got {other:?}"),
+        }
+        // upload requires a file positional.
+        assert!(Cli::try_parse_from(["fastio", "fileshare", "upload", "fs1"]).is_err());
+
+        assert!(matches!(
+            parse(&[
+                "fastio",
+                "fileshare",
+                "activity",
+                "fs1",
+                "--wait",
+                "30",
+                "--updated",
+            ]),
+            FileshareCommands::Activity { .. }
+        ));
+        match parse(&[
+            "fastio",
+            "fileshare",
+            "ws-token",
+            "fs1",
+            "--token-file",
+            "/tmp/tok",
+        ]) {
+            FileshareCommands::WsToken {
+                fileshare_id,
+                token_file,
+            } => {
+                assert_eq!(fileshare_id, "fs1");
+                assert_eq!(
+                    token_file.as_deref(),
+                    Some(std::path::Path::new("/tmp/tok"))
+                );
+            }
+            other => panic!("expected WsToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn debug_redacts_password_values() {
+        // The manual Debug impl must NEVER render a password value.
+        let c = parse(&[
+            "fastio",
+            "fileshare",
+            "create",
+            "--workspace",
+            "ws1",
+            "--node",
+            "n1",
+            "--password",
+            "super-secret-pw",
+        ]);
+        let dbg = format!("{c:?}");
+        assert!(
+            !dbg.contains("super-secret-pw"),
+            "Debug must not leak the password: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Debug must show the redaction marker: {dbg}"
+        );
+        // A present-vs-absent distinction is still legible.
+        let none = parse(&["fastio", "fileshare", "info", "fs1"]);
+        assert!(format!("{none:?}").contains("None"));
     }
 }
