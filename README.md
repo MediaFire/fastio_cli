@@ -172,7 +172,7 @@ Pipelines that need machine-parseable output can opt back in with
 | Group | Description |
 |-------|-------------|
 | `org` | Org CRUD, billing, members, transfer tokens, discovery, assets |
-| `workspace` | Workspace CRUD, metadata templates, notes, quickshares (legacy — creation deprecated; read/revoke only; use `fileshare`) |
+| `workspace` | Workspace CRUD, metadata templates, notes |
 | `member` | Workspace/share member management |
 | `invitation` | Accept, decline, delete invitations |
 
@@ -182,15 +182,15 @@ Pipelines that need machine-parseable output can opt back in with
 |-------|-------------|
 | `files` | List, create folders, move, copy, rename, delete, trash, versions, search, lock |
 | `upload` | File upload (chunked with progress), text upload, URL import, session management |
-| `download` | File download (streaming with progress), folder ZIP, batch, quickshare details (legacy — reads existing links only; use `fileshare`) |
+| `download` | File download (streaming with progress), folder ZIP, batch |
 | `lock` | Acquire, check, release file locks |
 
 ### Shares & Collaboration
 
 | Group | Description |
 |-------|-------------|
-| `share` | Share CRUD, files, members, quickshares (legacy — creation deprecated; use `fileshare`), password auth |
-| `fileshare` | File Shares — durable single-file link shares (replaces QuickShare): create/list/info/update/delete, grants, download/versions/preview, upload write-back, activity, ws-token |
+| `share` | Share CRUD, files, members, password auth |
+| `fileshare` | File Shares — durable single-file link shares (replaces the retired QuickShare): create/list/info/update/delete, grants, download/versions/preview, upload write-back, activity, ws-token |
 | `comment` | Comments, replies, reactions, linking |
 | `event` | Activity events, search, polling |
 | `preview` | File preview URLs and transforms |

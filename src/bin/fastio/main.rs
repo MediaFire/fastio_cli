@@ -1013,9 +1013,6 @@ fn map_files_command(cmd: cli::FilesCommands) -> FilesCommand {
         cli::FilesCommands::Read { workspace, node_id } => {
             FilesCommand::Read { workspace, node_id }
         }
-        cli::FilesCommands::Quickshare { workspace, node_id } => {
-            FilesCommand::Quickshare { workspace, node_id }
-        }
     }
 }
 

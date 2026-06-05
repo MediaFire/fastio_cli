@@ -305,30 +305,6 @@ pub async fn guest_auth(client: &ApiClient, share_id: &str) -> Result<Value, Cli
     client.post_json(&path, &serde_json::json!({})).await
 }
 
-/// Create a quickshare from a workspace file.
-///
-/// `POST /workspace/{workspace_id}/storage/{node_id}/quickshare/`
-pub async fn create_quickshare(
-    client: &ApiClient,
-    workspace_id: &str,
-    node_id: &str,
-    expires: Option<&str>,
-    expires_at: Option<&str>,
-) -> Result<Value, CliError> {
-    let mut body = serde_json::Map::new();
-    if let Some(e) = expires_at {
-        body.insert("expires_at".to_owned(), Value::String(e.to_owned()));
-    } else if let Some(e) = expires {
-        body.insert("expires".to_owned(), Value::String(e.to_owned()));
-    }
-    let path = format!(
-        "/workspace/{}/storage/{}/quickshare/",
-        urlencoding::encode(workspace_id),
-        urlencoding::encode(node_id),
-    );
-    client.post_json(&path, &Value::Object(body)).await
-}
-
 /// List available shares for the current user.
 ///
 /// `GET /shares/available/`

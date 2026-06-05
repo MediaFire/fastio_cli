@@ -214,7 +214,7 @@ pub enum Commands {
     Sign(SignCommands),
 
     /// File Shares: durable, link-shareable views of a single workspace file
-    /// (the successor to the deprecated `QuickShare`). Create / manage shares and
+    /// (the successor to the retired `QuickShare`). Create / manage shares and
     /// grants, read or write the bound file, and mint realtime tokens. Read
     /// commands (info / download / versions / preview) can run anonymously when
     /// the share's access tier allows it.
@@ -3158,17 +3158,6 @@ pub enum FilesCommands {
     Lock(FileLockCommands),
     /// Read file content (text).
     Read {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace: String,
-        /// Node ID.
-        node_id: String,
-    },
-    /// Get an existing `QuickShare` link. DEPRECATED: `QuickShare` is superseded
-    /// by File Shares — use `fastio fileshare create --workspace <ws> --node
-    /// <node>` instead. Creating a new `QuickShare` is rejected server-side;
-    /// reading or revoking existing ones still works.
-    Quickshare {
         /// Workspace ID.
         #[arg(long)]
         workspace: String,

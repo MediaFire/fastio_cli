@@ -125,11 +125,11 @@ Each module contains typed functions mapping to Fast.io REST endpoints:
 | `auth.rs` | 21 functions | Login, signup, 2FA, API keys, OAuth sessions, PKCE |
 | `user.rs` | 16 functions | Profile, search, assets, invitations |
 | `org.rs` | 42 functions | CRUD, billing, members, transfer, discovery, assets |
-| `workspace.rs` | 38 functions | CRUD, metadata, notes, quickshares, archiving |
-| `storage.rs` | 23 functions | File/folder CRUD, versions, locks, search |
+| `workspace.rs` | 35 functions | CRUD, metadata, notes, archiving |
+| `storage.rs` | 22 functions | File/folder CRUD, versions, locks, search |
 | `upload.rs` | 17 functions | Sessions, chunks, finalize, web import, limits |
-| `download.rs` | 3 functions | Token-based downloads, ZIP, quickshare |
-| `share.rs` | 17 functions | CRUD, storage, members, password, quickshare |
+| `download.rs` | 2 functions | Token-based downloads, ZIP |
+| `share.rs` | 16 functions | CRUD, storage, members, password |
 | `ai.rs` | 14 functions | Chat CRUD, messages, search, summarize |
 | `comment.rs` | 12 functions | CRUD, reactions, linking |
 | `event.rs` | 5 functions | Search, summarize, details, polling |
@@ -139,7 +139,7 @@ Each module contains typed functions mapping to Fast.io REST endpoints:
 | `import.rs` | 22 functions | Providers, identities, sources, jobs, writebacks |
 | `locking.rs` | 3 functions | Acquire, status, release |
 | `signing.rs` | 14 functions | E-signature (SignEnvelope) — workspace-only CRUD/lifecycle, document/preview/signed/audit download paths |
-| `fileshare.rs` | 10 functions | File Shares — durable single-file link shares (replacing QuickShare): management create/list/update/delete + grants, password-capable anonymous consumption (details/versions), write-back path builders, websocket-auth token, named-key extractors |
+| `fileshare.rs` | 10 functions | File Shares — durable single-file link shares (replacing the retired QuickShare): management create/list/update/delete + grants, password-capable anonymous consumption (details/versions), write-back path builders, websocket-auth token, named-key extractors |
 | `types.rs` | — | Shared response structs |
 
 ### `commands/` — 32 Modules
@@ -153,8 +153,8 @@ Each module handles one command group, orchestrating API calls and output render
 | `auth.rs` | 21 | Login, 2FA, API keys, OAuth sessions |
 | `user.rs` | 16 | Profile, search, assets, invitations |
 | `org.rs` | 42 | Full org management with nested billing/members/invitations/transfer/assets |
-| `workspace.rs` | 24 | CRUD, metadata, notes, quickshares |
-| `files.rs` | 23 | Storage operations, locking, quickshares |
+| `workspace.rs` | 24 | CRUD, metadata, notes |
+| `files.rs` | 22 | Storage operations, locking |
 | `upload.rs` | 18 | Chunked upload with progress bars, session management |
 | `download.rs` | 3 | Streaming download with progress bars |
 | `share.rs` | 17 | Share management with nested files/members |

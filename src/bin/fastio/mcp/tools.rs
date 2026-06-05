@@ -510,7 +510,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "workspace",
-        description: "Workspaces: list, create, view, update, delete, archive/unarchive, members, shares, notes, quickshares [legacy — creation deprecated (10756); read/revoke only; use the `fileshare` tool / `fastio fileshare create`], metadata, import/export, workflow. SIDE EFFECTS — these metadata actions SPEND AI CREDITS: 'metadata-template-preview-match', 'metadata-template-suggest-fields', 'metadata-extract', 'metadata-extract-and-wait'. 'metadata-extract-and-wait' enqueues a single-file extraction and polls workspace jobs-status to a terminal state before returning.",
+        description: "Workspaces: list, create, view, update, delete, archive/unarchive, members, shares, notes, metadata, import/export, workflow. SIDE EFFECTS — these metadata actions SPEND AI CREDITS: 'metadata-template-preview-match', 'metadata-template-suggest-fields', 'metadata-extract', 'metadata-extract-and-wait'. 'metadata-extract-and-wait' enqueues a single-file extraction and polls workspace jobs-status to a terminal state before returning.",
         actions: &[
             "list",
             "create",
@@ -532,9 +532,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             "create-note",
             "update-note",
             "read-note",
-            "quickshare-get",
-            "quickshare-delete",
-            "quickshares-list",
             "enable-import",
             "disable-import",
             "metadata-template-categories",
@@ -569,7 +566,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("query", "Search query", false),
             ("confirm", "Confirmation string (delete)", false),
             ("share_id", "Share ID (import-share)", false),
-            ("node_id", "Node ID (notes, quickshare, metadata)", false),
+            ("node_id", "Node ID (notes, metadata)", false),
             ("parent_id", "Parent folder ID (create-note)", false),
             (
                 "content",
@@ -661,7 +658,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "files",
-        description: "File operations: list, details, create folders, move, copy, rename, delete, restore, purge, trash, versions, search, recent, lock, quickshare [legacy — creation deprecated (10756); read-only get; use the `fileshare` tool / `fastio fileshare create`], transfer, read content.",
+        description: "File operations: list, details, create folders, move, copy, rename, delete, restore, purge, trash, versions, search, recent, lock, transfer, read content.",
         actions: &[
             "list",
             "info",
@@ -683,7 +680,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             "lock-status",
             "lock-release",
             "read",
-            "quickshare",
         ],
         params: &[
             ("workspace_id", "Workspace ID", false),
@@ -792,19 +788,18 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "download",
-        description: "Downloads: get file download URLs, folder ZIP URLs, quickshare details. file-url returns a secret-bearing URL (short-lived scoped read token) — do not log or share it.",
-        actions: &["file-url", "zip-url", "quickshare-details"],
+        description: "Downloads: get file download URLs, folder ZIP URLs. file-url returns a secret-bearing URL (short-lived scoped read token) — do not log or share it.",
+        actions: &["file-url", "zip-url"],
         params: &[
             ("context_type", "Context: workspace or share", false),
             ("context_id", "Workspace or share ID", false),
             ("node_id", "File/folder node ID", false),
             ("version_id", "Version ID (file-url)", false),
-            ("quickshare_id", "Quickshare ID (quickshare-details)", false),
         ],
     },
     ToolDef {
         name: "share",
-        description: "Shares (data rooms): list, create, view, update, delete, archive/unarchive, password-auth, guest-auth, quickshare [legacy — creation deprecated (10756); read/revoke still served during the drain; use the `fileshare` tool / `fastio fileshare create`], workflow, discovery.",
+        description: "Shares (data rooms): list, create, view, update, delete, archive/unarchive, password-auth, guest-auth, workflow, discovery.",
         actions: &[
             "list",
             "create",
@@ -819,7 +814,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             "unarchive",
             "password-auth",
             "guest-auth",
-            "quickshare-create",
             "available",
             "check-name",
             "enable-workflow",
@@ -827,11 +821,7 @@ const TOOL_DEFS: &[ToolDef] = &[
         ],
         params: &[
             ("share_id", "Share ID", false),
-            (
-                "workspace_id",
-                "Workspace ID (create, quickshare-create)",
-                false,
-            ),
+            ("workspace_id", "Workspace ID (create)", false),
             ("name", "Share name", false),
             ("description", "Description", false),
             ("access_options", "Access options", false),
@@ -857,13 +847,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("folder", "Folder ID (files-list)", false),
             ("email", "Member email (members-add)", false),
             ("role", "Member role", false),
-            ("node_id", "Node ID (quickshare-create)", false),
-            ("expires", "Expiration (quickshare-create)", false),
-            (
-                "expires_at",
-                "ISO datetime expiration (quickshare-create)",
-                false,
-            ),
             ("sort_by", "Sort field (files-list)", false),
             ("sort_dir", "Sort direction (files-list)", false),
             ("page_size", "Page size", false),
@@ -1768,7 +1751,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "fileshare",
-        description: "File Shares: durable, link-shareable views of a SINGLE workspace file — the replacement for the deprecated QuickShare (legacy QuickShare creation now 403s with code 10756; use this tool's 'create' action). A File Share binds one file node and serves it via a stable link with optional password protection, an access option (named_people / anyone_with_link / …), an expiry, and per-user grants (view < download < edit). This tool exposes READ + DRIVE actions: create, list, info (details + effective_capability), update, grants-list, grants-add, versions, download (streams the bound file to the agent's local fs), preview (streams a derived preview asset), activity (single poll), describe. CONFIRM-GATED destructive actions: 'delete' REQUIRES confirm_delete=true (revokes the link + cascades grants; the bound file is untouched); 'grants-remove' REQUIRES confirm_revoke=true. CLI-BINARY-ONLY actions (NOT routable over MCP): 'upload' — the write-back that pushes a NEW VERSION of the bound file — needs the local file bytes and is destructive, so run `fastio fileshare upload …`; and 'ws-token' — the realtime WebSocket-token mint — is CLI-only because the token is a long-lived secret that must NOT be parked in an MCP transcript (run `fastio fileshare ws-token --token-file <path>`; mirrors how the workflow tool keeps its realtime-token mint CLI-only). The 'password' arg protects/authorizes a link (travels only in the x-ve-password header; NEVER logged or echoed in results/errors). info/download/versions/preview may be ANONYMOUS on a public (anyone_with_link) share. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Call action='describe' for the authoritative per-action reference.",
+        description: "File Shares: durable, link-shareable views of a SINGLE workspace file — the replacement for the retired QuickShare (use this tool's 'create' action). A File Share binds one file node and serves it via a stable link with optional password protection, an access option (named_people / anyone_with_link / …), an expiry, and per-user grants (view < download < edit). This tool exposes READ + DRIVE actions: create, list, info (details + effective_capability), update, grants-list, grants-add, versions, download (streams the bound file to the agent's local fs), preview (streams a derived preview asset), activity (single poll), describe. CONFIRM-GATED destructive actions: 'delete' REQUIRES confirm_delete=true (revokes the link + cascades grants; the bound file is untouched); 'grants-remove' REQUIRES confirm_revoke=true. CLI-BINARY-ONLY actions (NOT routable over MCP): 'upload' — the write-back that pushes a NEW VERSION of the bound file — needs the local file bytes and is destructive, so run `fastio fileshare upload …`; and 'ws-token' — the realtime WebSocket-token mint — is CLI-only because the token is a long-lived secret that must NOT be parked in an MCP transcript (run `fastio fileshare ws-token --token-file <path>`; mirrors how the workflow tool keeps its realtime-token mint CLI-only). The 'password' arg protects/authorizes a link (travels only in the x-ve-password header; NEVER logged or echoed in results/errors). info/download/versions/preview may be ANONYMOUS on a public (anyone_with_link) share. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Call action='describe' for the authoritative per-action reference.",
         actions: &[
             "describe",
             "create",
@@ -4004,51 +3987,6 @@ async fn handle_workspace(
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
-        "quickshare-get" => {
-            let ws_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let node_id = match required_str(args, "node_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workspace::quickshare_get(&client, ws_id, node_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "quickshare-delete" => {
-            let ws_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let node_id = match required_str(args, "node_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workspace::quickshare_delete(&client, ws_id, node_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "quickshares-list" => {
-            let ws_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workspace::quickshares_list(
-                &client,
-                ws_id,
-                optional_u32(args, "limit"),
-                optional_u32(args, "offset"),
-            )
-            .await
-            {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
         "disable-workflow" => {
             let ws_id = match required_str(args, "workspace_id") {
                 Ok(v) => v,
@@ -4765,7 +4703,6 @@ async fn handle_files(
         "lock-status" => handle_files_lock_status(state, args).await,
         "lock-release" => handle_files_lock_release(state, args).await,
         "read" => handle_files_read(state, args).await,
-        "quickshare" => handle_files_quickshare(state, args).await,
         _ => Ok(error_text(&format!("Unknown files action: {action}"))),
     }
 }
@@ -5196,25 +5133,6 @@ async fn handle_files_read(
         Err(e) => return Ok(e),
     };
     match api::storage::read_content(&client, ws_id, node_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_files_quickshare(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let ws_id = match required_str(args, "workspace_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let node_id = match required_str(args, "node_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::storage::quickshare_get(&client, ws_id, node_id).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5699,16 +5617,6 @@ async fn handle_download(
             let url = api::download::get_zip_url_ctx(state.api_base(), ctx_type, ctx_id, node_id);
             Ok(success_json(&json!({ "zip_url": url })))
         }
-        "quickshare-details" => {
-            let qs_id = match required_str(args, "quickshare_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::download::quickshare_details(&client, qs_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
         _ => Ok(error_text(&format!("Unknown download action: {action}"))),
     }
 }
@@ -5736,7 +5644,6 @@ async fn handle_share(
         "unarchive" => handle_share_unarchive(state, args).await,
         "password-auth" => handle_share_password_auth(state, args).await,
         "guest-auth" => handle_share_guest_auth(state, args).await,
-        "quickshare-create" => handle_share_quickshare_create(state, args).await,
         "available" => handle_share_available(state, args).await,
         "check-name" => handle_share_check_name(state, args).await,
         "enable-workflow" => handle_share_enable_workflow(state, args).await,
@@ -6020,55 +5927,6 @@ async fn handle_share_guest_auth(
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
-}
-
-async fn handle_share_quickshare_create(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let ws_id = match required_str(args, "workspace_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let node_id = match required_str(args, "node_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::share::create_quickshare(
-        &client,
-        ws_id,
-        node_id,
-        optional_str(args, "expires"),
-        optional_str(args, "expires_at"),
-    )
-    .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        // QuickShare CREATE is deprecated server-side (10756). The generic
-        // `cli_err_to_result` would drop the migration guidance, so map the
-        // deprecation here (the only quickshare CREATE site over MCP) to steer
-        // the agent at the fileshare tool's `create` action.
-        Err(e) => Ok(map_quickshare_deprecation_mcp(&e)),
-    }
-}
-
-/// Error message for a deprecated `QuickShare` CREATE over MCP, steering the
-/// agent at the `fileshare` tool's `create` action.
-const MCP_QUICKSHARE_DEPRECATED: &str = "QuickShare is deprecated (10756) — create a durable File \
-     Share instead via the `fileshare` tool's `create` action (or the CLI `fastio fileshare \
-     create`). Legacy QuickShare reads/revokes still work; only creation is removed.";
-
-/// Map a `QuickShare` CREATE error to an MCP result, reframing the deprecation
-/// `10756` at the migration guidance and otherwise deferring to the generic
-/// error rendering.
-fn map_quickshare_deprecation_mcp(err: &fastio_cli::error::CliError) -> CallToolResult {
-    if let fastio_cli::error::CliError::Api(api) = err
-        && api.code == 10756
-    {
-        return error_text(&format!("{MCP_QUICKSHARE_DEPRECATED} ({err})"));
-    }
-    cli_err_to_result(err)
 }
 
 async fn handle_share_available(
@@ -11926,7 +11784,6 @@ impl FsMcpOp {
 ///   revoked — no enumeration oracle).
 /// - `1680`/`403` → the bound file is not serveable (locked / DMCA / infected).
 /// - `1605`/`400` → surface the server message; on create, hint node-must-be-a-file.
-/// - `10756`/`403` → `QuickShare` deprecation → use the `create` action.
 /// - A [`CliError::VersionConflict`] passes through with its current-version hint.
 /// - Everything else defers to the shared `err.suggestion()`.
 fn fileshare_err_to_result(
@@ -11990,11 +11847,6 @@ fn fileshare_err_to_result(
         1680 => Some(
             "the bound file cannot be served (1680) — it may be locked, taken down (DMCA), or \
              flagged as infected."
-                .to_owned(),
-        ),
-        10756 => Some(
-            "QuickShare is deprecated — create a File Share instead with the `create` action \
-             (10756)."
                 .to_owned(),
         ),
         1605 => Some(if op == FsMcpOp::Create {
@@ -12197,7 +12049,7 @@ fn fileshare_describe() -> CallToolResult {
     let payload = serde_json::json!({
         "tool": "fileshare",
         "summary": "File Shares — durable, link-shareable views of a SINGLE workspace file \
-                    (replacing the deprecated QuickShare). READ + DRIVE over MCP; the write-back \
+                    (replacing the retired QuickShare). READ + DRIVE over MCP; the write-back \
                     'upload' and the realtime 'ws-token' mint are CLI-binary-only.",
         "destructive_actions": ["delete (confirm_delete=true)", "grants-remove (confirm_revoke=true)"],
         "side_effects": "create makes a durable shareable link. delete revokes the link + \
@@ -12214,8 +12066,6 @@ fn fileshare_describe() -> CallToolResult {
             "anonymous": "info / download / versions / preview may be ANONYMOUS on a public \
                           (anyone_with_link) share — no auth needed; a protected link needs the \
                           password arg.",
-            "quickshare": "QuickShare creation is deprecated (10756) — use this tool's `create` \
-                           action. Legacy QuickShare reads/revokes still work.",
             "write_back": "To replace the bound file's bytes with a new version, run the CLI: \
                            `fastio fileshare upload <id> <file> [--if-version <vid>]`. \
                            --if-version is a server-enforced CAS precondition: when the server \
@@ -15563,8 +15413,8 @@ mod ripley_tool_tests {
             .find(|t| t.name.as_ref() == "fileshare")
             .expect("fileshare tool present");
         let desc = fs.description.as_deref().unwrap_or_default();
-        // The description must honestly state the gating split + the QuickShare
-        // migration pointer.
+        // The description must honestly state the gating split (CLI-only
+        // write-back / ws-token) and the confirm gates.
         assert!(
             desc.contains("CLI-BINARY-ONLY") || desc.contains("CLI-binary-only"),
             "fileshare tool must state upload/ws-token are CLI-only, got: {desc}"
@@ -15572,10 +15422,6 @@ mod ripley_tool_tests {
         assert!(
             desc.contains("confirm_delete") && desc.contains("confirm_revoke"),
             "fileshare tool must state the confirm gates, got: {desc}"
-        );
-        assert!(
-            desc.to_lowercase().contains("quickshare"),
-            "fileshare tool must point at the QuickShare migration, got: {desc}"
         );
     }
 
@@ -16542,18 +16388,6 @@ mod ripley_tool_tests {
     }
 
     #[test]
-    fn fileshare_err_10756_steers_to_create_action() {
-        use super::{FsMcpOp, fileshare_err_to_result};
-        let m = result_to_string(&fileshare_err_to_result(
-            &fs_api_err(10756, 403),
-            "failed to create",
-            FsMcpOp::Create,
-        ));
-        assert!(m.contains("deprecated"), "must say deprecated: {m}");
-        assert!(m.contains("create"), "must steer to the create action: {m}");
-    }
-
-    #[test]
     fn fileshare_err_1605_create_hints_node_must_be_file() {
         use super::{FsMcpOp, fileshare_err_to_result};
         let create = result_to_string(&fileshare_err_to_result(
@@ -16597,29 +16431,6 @@ mod ripley_tool_tests {
         assert!(
             m.contains("Re-fetch") && m.contains("re-apply") && m.contains("current version id"),
             "a VersionConflict must carry the rebase suggestion: {m}"
-        );
-    }
-
-    #[tokio::test]
-    async fn share_quickshare_create_10756_steers_to_fileshare_tool() {
-        // The single MCP quickshare CREATE site must reframe a 10756 at the
-        // fileshare tool's create action (driven directly through the mapper —
-        // a network call is not needed to test the mapping).
-        let m = result_to_string(&super::map_quickshare_deprecation_mcp(&fs_api_err(
-            10756, 403,
-        )));
-        assert!(m.contains("deprecated"), "must say deprecated: {m}");
-        assert!(
-            m.contains("fileshare") && m.contains("create"),
-            "must steer to the fileshare tool's create action: {m}"
-        );
-        // A non-10756 error defers to the generic rendering (no deprecation note).
-        let other = result_to_string(&super::map_quickshare_deprecation_mcp(&fs_api_err(
-            1609, 404,
-        )));
-        assert!(
-            !other.contains("deprecated"),
-            "non-10756 must not get the deprecation note: {other}"
         );
     }
 }

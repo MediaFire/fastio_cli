@@ -13,7 +13,7 @@
 //! File Share (durable single-file link) API — management + consumption.
 //!
 //! A **File Share** is a durable, link-shareable view of one workspace file —
-//! the successor to the deprecated QuickShare. It is bound to a single file node
+//! the successor to the retired QuickShare. It is bound to a single file node
 //! at creation (the binding is immutable) and serves recipients (anonymous →
 //! named-people, per the access tier) without workspace membership.
 //!

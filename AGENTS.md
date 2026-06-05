@@ -280,11 +280,10 @@ bytes are the source/preview PDF, so there is no separate MCP preview action.
 ## File Shares
 
 `fastio fileshare` creates **durable, link-shareable views of a SINGLE workspace
-file** — the replacement for the deprecated **QuickShare** (QuickShare *creation*
-now 403s with code `10756`; reads/revokes of existing QuickShares still work). A
-File Share binds one file node and serves it via a stable link with an optional
-password, an access option, an expiry, and per-user grants
-(`view < download < edit`).
+file** — the replacement for the retired **QuickShare** (the legacy QuickShare
+surface has been fully removed from this CLI). A File Share binds one file node
+and serves it via a stable link with an optional password, an access option, an
+expiry, and per-user grants (`view < download < edit`).
 
 ```bash
 fastio fileshare create --workspace WS_ID --node NODE_ID --title "Q3 Report" --access-option anyone_with_link
@@ -353,9 +352,7 @@ with `clear_password=true` on `update`) is rejected explicitly. Two actions are
 
 `download` / `preview` write bytes to the agent's local filesystem (default under
 `.fastio/downloads/`, created 0700) and return a path + byte count. The
-`password` arg authorizes a protected link (x-ve-password; never echoed). On the
-MCP `share` tool, a deprecated `quickshare-create` (`10756`) is reframed to point
-at this tool's `create` action.
+`password` arg authorizes a protected link (x-ve-password; never echoed).
 
 ## Billing
 

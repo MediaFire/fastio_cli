@@ -211,11 +211,6 @@ const HINT_FS_NOT_SERVEABLE: &str = "The bound file cannot be served — it may 
 const HINT_FS_PREVIEW_UNAVAILABLE: &str = "No preview of this type is available for the bound file — it may still be generating, \
      or this file type may not support it. Retry shortly, or try another --type.";
 
-/// Override hint for the QuickShare-deprecation failure (`10756`/403). Replaces
-/// the generic-403 role guidance with the migration path.
-const HINT_FS_QUICKSHARE_DEPRECATED: &str =
-    "QuickShare is deprecated — create a File Share instead with `fastio fileshare create`.";
-
 /// Map a File Share API error to an actionable, File-Share-specific message AND
 /// hint.
 ///
@@ -230,9 +225,8 @@ const HINT_FS_QUICKSHARE_DEPRECATED: &str =
 /// 2. The `hint:` LINE — for the mapped codes the inner [`ApiError`] is wrapped
 ///    in [`CliError::MappedApi`] so the render layer prints OUR override hint (or
 ///    NONE) instead of the inner `ApiError`'s generic status hint. Without this,
-///    a mapped `1650` still printed "Run `fastio auth login`", a `1609` still
-///    printed "Verify the ID …", and a `10756` got generic-403 guidance —
-///    undercutting the careful headline.
+///    a mapped `1650` still printed "Run `fastio auth login`" and a `1609` still
+///    printed "Verify the ID …" — undercutting the careful headline.
 ///
 /// Per-code behavior:
 /// - `1650` / HTTP 401 → ON A LINK-ACCESS op (consumption / write-back, where
@@ -324,15 +318,6 @@ fn map_fileshare_error(err: CliError, ctx: &'static str, op: FsOp) -> anyhow::Er
                  (DMCA), or flagged as infected."
             ),
             FsHint::Override(Some(HINT_FS_NOT_SERVEABLE)),
-        )),
-        // QuickShare deprecation surfaced on a fileshare path (defensive — the
-        // dedicated quickshare path uses `map_quickshare_deprecation`).
-        10756 => Some((
-            format!(
-                "{ctx}: QuickShare is deprecated — create a File Share instead: \
-                 `fastio fileshare create` (10756)."
-            ),
-            FsHint::Override(Some(HINT_FS_QUICKSHARE_DEPRECATED)),
         )),
         // Invalid input — surface the server message; hint node-must-be-a-file on
         // create. The generic-400 path has NO misleading hint to override, so we
@@ -462,40 +447,6 @@ impl FsOp {
     fn is_preview(self) -> bool {
         matches!(self, Self::Preview)
     }
-}
-
-/// Map a legacy `QuickShare` `10756` error to the File-Share migration guidance.
-///
-/// Used by the (still-present) `files quickshare` create path: the server now
-/// rejects new `QuickShare` creation with `10756`, and the user should be steered
-/// to `fastio fileshare create`. Handler-scoped so the wording never lands in
-/// the global `error.rs` arms. A non-`10756` error is returned with only the
-/// operation label.
-pub fn map_quickshare_deprecation(err: CliError, ctx: &'static str) -> anyhow::Error {
-    if let CliError::Api(api) = &err
-        && api.code == 10756
-    {
-        let api = match err {
-            CliError::Api(api) => api,
-            // Unreachable given the guard above, but avoid a panic-capable
-            // expect(): fall through with the label.
-            other => return anyhow::Error::from(other).context(ctx),
-        };
-        // Wrap in MappedApi (NOT plain Api) so the render layer prints OUR
-        // migration hint instead of the inner ApiError's generic-403 "required
-        // role" line — same hint-override class the map_fileshare_error path
-        // uses for 10756. A plain Api wrap here would let cli_error_render
-        // append the generic role guidance UNDER the deprecation headline.
-        return anyhow::Error::from(CliError::MappedApi {
-            api,
-            hint: Some(HINT_FS_QUICKSHARE_DEPRECATED),
-        })
-        .context(format!(
-            "{ctx}: QuickShare is deprecated — create a File Share instead: \
-             `fastio fileshare create --workspace <ws> --node <node>` (10756)."
-        ));
-    }
-    anyhow::Error::from(err).context(ctx)
 }
 
 // ─── Dispatch ───────────────────────────────────────────────────────────────
@@ -1742,57 +1693,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn map_quickshare_deprecation_10756_steers_to_fileshare_create() {
-        let err = map_quickshare_deprecation(api_err(10756, 403), "failed to quickshare");
-        let m = err.to_string();
-        assert!(m.contains("deprecated"), "must say deprecated: {m}");
-        assert!(
-            m.contains("fastio fileshare create"),
-            "must steer to fileshare create: {m}"
-        );
-        // The mapped error must root at a CliError so the render path resolves
-        // (it now wraps in MappedApi, not plain Api).
-        assert!(
-            err.downcast_ref::<CliError>().is_some(),
-            "mapped 10756 must root at a CliError for the render path"
-        );
-        // A non-10756 error is returned with only the label.
-        let other =
-            map_quickshare_deprecation(api_err(1609, 404), "failed to quickshare").to_string();
-        assert!(
-            !other.contains("deprecated"),
-            "non-10756 must not get the deprecation note: {other}"
-        );
-    }
-
-    #[test]
-    fn render_mapped_quickshare_deprecation_10756_hint_not_generic_403() {
-        // The `files quickshare` create path routes a 10756 through
-        // map_quickshare_deprecation. Driven through the REAL render path it must
-        // print OUR QuickShare-deprecation hint — NOT the inner ApiError's
-        // generic-403 "Check that your account has the required role." line, which
-        // a plain `CliError::Api` wrap would have appended under the deprecation
-        // headline.
-        let err = map_quickshare_deprecation(api_err(10756, 403), "failed to quickshare");
-        let (headline, hint) = render_mapped(&err);
-        assert!(
-            headline.contains("deprecated"),
-            "headline must carry the deprecation note: {headline}"
-        );
-        let hint = hint
-            .expect("a mapped 10756 must carry a hint")
-            .to_lowercase();
-        assert!(
-            hint.contains("fastio fileshare create"),
-            "rendered hint must steer to `fastio fileshare create`: {hint}"
-        );
-        assert!(
-            !hint.contains("required role"),
-            "rendered hint must NOT be the generic-403 role line: {hint}"
-        );
-    }
-
     // ─── P2F-5: render-path hint override / suppression ─────────────────────
 
     #[test]
@@ -1846,28 +1746,6 @@ mod tests {
         assert!(
             !headline.to_lowercase().contains("verify the id"),
             "the 'Verify the ID' phrasing must not leak: {headline}"
-        );
-    }
-
-    #[test]
-    fn render_mapped_10756_shows_migration_hint_not_generic_403() {
-        // A 10756 surfaced through the fileshare mapper must render the migration
-        // guidance, not the generic-403 "Check that your account has the required
-        // role." hint.
-        let err = map_fileshare_error(
-            api_err(10756, 403),
-            "failed to create File Share",
-            FsOp::Create,
-        );
-        let (_headline, hint) = render_mapped(&err);
-        let hint = hint.expect("10756 must carry a hint").to_lowercase();
-        assert!(
-            hint.contains("fileshare create"),
-            "rendered hint must steer to fileshare create: {hint}"
-        );
-        assert!(
-            !hint.contains("required role"),
-            "rendered hint must NOT be the generic-403 role line: {hint}"
         );
     }
 

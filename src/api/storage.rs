@@ -853,34 +853,6 @@ pub async fn read_raw(
     client.get_raw_text(&path, params.as_ref()).await
 }
 
-/// Get an existing quickshare link's details (READ-only).
-///
-/// `GET /workspace/{workspace_id}/storage/{node_id}/quickshare/`
-///
-/// This is a pure read: it returns the existing quickshare or `1609 (Not Found)`
-/// when none exists. It does NOT create — quickshare CREATE/extend moved to the
-/// `POST` path and is deprecated (`10756`); only that POST site
-/// (`share::create_quickshare`) carries the migration guidance. This GET stays
-/// live during the drain, so it is never EXPECTED to return `10756`. The MCP
-/// read paths intentionally surface its errors through the generic mapper. The
-/// CLI command layer (`commands::files::quickshare`) additionally routes this
-/// GET's errors through the quickshare-deprecation reframe as a belt-and-braces
-/// guard: harmless on a read (non-`10756` passes through untouched), and if the
-/// server ever did emit `10756` here the migration guidance would still be
-/// correct.
-pub async fn quickshare_get(
-    client: &ApiClient,
-    workspace_id: &str,
-    node_id: &str,
-) -> Result<Value, CliError> {
-    let path = format!(
-        "/workspace/{}/storage/{}/quickshare/",
-        urlencoding::encode(workspace_id),
-        urlencoding::encode(node_id),
-    );
-    client.get(&path).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::{

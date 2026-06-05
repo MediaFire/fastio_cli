@@ -229,8 +229,8 @@ pub const HINT_RESTRICTED: &str =
 /// Shared generic "feature/plan limit reached" hint (code `1685`).
 ///
 /// Code `1685` is a GENERAL-purpose feature-limit / precondition-failed code in
-/// this API (workspace/share/upload/QuickShare limits, workflow availability,
-/// etc.), so this hint is deliberately resource-agnostic.
+/// this API (workspace/share/upload limits, workflow availability, etc.), so
+/// this hint is deliberately resource-agnostic.
 pub const HINT_FEATURE_LIMIT: &str =
     "A plan or feature limit was reached for this operation; a higher plan tier may be required.";
 
