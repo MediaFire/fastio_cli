@@ -546,6 +546,29 @@ pub async fn submit_step_output(
     client.post(&path, &form).await
 }
 
+/// Read an AI-agent step occurrence's action feed.
+///
+/// `GET /workflows/{workflow_id}/steps/{step_occurrence_id}/agent_activity/`
+/// (`workflows.txt:413`). Returns `{"agent_activity": {"actions", "available",
+/// "step_occurrence_id", "workflow_id"}}` — `actions` is ordered ascending by
+/// `seq` and each card is `{seq, label, state, affected_refs, started_at,
+/// ended_at}`. The same shape serves a running step (actions emitted so far —
+/// poll to follow progress) and a finished one (the durable list).
+/// `available: false` with empty `actions` is a neutral no-feed-yet state,
+/// NOT an error; a non-agent occurrence returns 404 instead.
+pub async fn get_step_agent_activity(
+    client: &ApiClient,
+    workflow_id: &str,
+    step_occurrence_id: &str,
+) -> Result<Value, CliError> {
+    let path = format!(
+        "/workflows/{}/steps/{}/agent_activity/",
+        urlencoding::encode(workflow_id),
+        urlencoding::encode(step_occurrence_id)
+    );
+    client.get(&path).await
+}
+
 /// List occurrences for a step definition.
 ///
 /// `GET /workflows/{workflow_id}/steps/{step_id}/occurrences/`.

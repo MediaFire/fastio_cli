@@ -609,6 +609,15 @@ pub enum WorkflowStepCommands {
         #[arg(long)]
         offset: Option<u32>,
     },
+    /// Read an AI-agent step occurrence's action feed (poll while the step
+    /// runs; durable once finished). `available: false` means no readable
+    /// feed yet — not an error. Non-agent occurrences return 404.
+    AgentActivity {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Step occurrence ID.
+        step_occurrence_id: String,
+    },
 }
 
 /// Workflow template subcommands (immutable revisions — no `update`).

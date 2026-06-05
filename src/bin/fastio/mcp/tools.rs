@@ -1500,6 +1500,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             "step-output",
             "step-advance",
             "step-occurrences",
+            "step-agent-activity",
             "template-list",
             "template-get",
             "trigger-list",
@@ -9876,6 +9877,16 @@ fn workflow_describe() -> CallToolResult {
             &["limit", "offset"],
             "",
         ),
+        (
+            "step-agent-activity",
+            &["workflow_id", "step_occurrence_id"],
+            &[],
+            "read-only action feed of an AI-agent step (cards: seq, label, state, \
+             affected_refs, started_at, ended_at; ascending seq). Same shape live or \
+             finished — poll while the step runs. available:false + empty actions = \
+             no readable feed yet (neutral, NOT an error); a non-agent occurrence \
+             returns 404. Never contains tool ids, arguments, results, or reasoning.",
+        ),
         ("template-list", &["workspace_id"], &["limit", "offset"], ""),
         ("template-get", &["template_id"], &["include_body"], ""),
         ("trigger-list", &["workspace_id"], &["enabled_filter"], ""),
@@ -10260,6 +10271,16 @@ async fn handle_workflow(
                 )
                 .await,
             )
+        }
+        "step-agent-activity" => {
+            let (wid, oid) = match (
+                required_str(args, "workflow_id"),
+                required_str(args, "step_occurrence_id"),
+            ) {
+                (Ok(w), Ok(o)) => (w, o),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            wf_render(wf::get_step_agent_activity(&client, wid, oid).await)
         }
         "template-list" => {
             let ws = match required_str(args, "workspace_id") {
@@ -14301,6 +14322,7 @@ mod ripley_tool_tests {
             "audit-export-and-download",
             "obligation-resolve",
             "step-output",
+            "step-agent-activity",
         ] {
             assert!(
                 actions.contains(&expected),
@@ -14431,6 +14453,30 @@ mod ripley_tool_tests {
         assert!(
             text.contains("workspace_id"),
             "review-active without workspace_id must report the missing param: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_step_agent_activity_routes_to_handler_not_cli_only() {
+        // step-agent-activity (the AI-agent step's read-only action feed) is an
+        // MCP read action: calling it without its required params must surface
+        // the handler's missing-param error, proving it routes to the handler
+        // rather than the CLI-only fallback.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("step-agent-activity".to_owned()),
+        );
+        let res = router.call_tool("workflow", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("CLI-only workflow action"),
+            "step-agent-activity must route to the handler, not the CLI-only fallback: {text}"
+        );
+        assert!(
+            text.contains("workflow_id"),
+            "step-agent-activity without workflow_id must report the missing param: {text}"
         );
     }
 
