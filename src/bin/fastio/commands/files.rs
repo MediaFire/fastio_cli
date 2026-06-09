@@ -1066,6 +1066,22 @@ mod tests {
     }
 
     #[test]
+    fn validate_opaque_id_accepts_29_and_30_char_forms() {
+        // Regression guard: OpaqueIds are no longer fixed-length. Workflow-family
+        // ids are 30 chars (35 hyphenated); everything else is 29 (34 hyphenated).
+        // The validator must accept BOTH lengths in raw and hyphenated form so a
+        // future 29-only assumption can't slip back in.
+        for id in [
+            "f3jm5zqzfxpxdr2dx8z5bvnb3rpjf",       // 29-char raw (non-workflow)
+            "f3jm5-zqzfx-pxdr2-dx8z5-bvnb3-rpjf",  // 34-char hyphenated
+            "wa3jm5zqzfxpxdr2dx8z5bvnb3rpjf",      // 30-char raw (workflow)
+            "wa3jm-5zqzf-xpxdr-2dx8z-5bvnb-3rpjf", // 35-char hyphenated
+        ] {
+            validate_opaque_id(id, "id").unwrap_or_else(|e| panic!("rejected {id:?}: {e}"));
+        }
+    }
+
+    #[test]
     fn validate_opaque_id_rejects_path_smuggling_chars() {
         for bad in [",", "..", "/", "abc/def", "a,b", "abc..def"] {
             let err =

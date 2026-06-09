@@ -65,8 +65,10 @@
 //! path: the **workflow id** is a 19-digit numeric profile id; the
 //! **obligation id** is a plain (short) numeric sequence string; everything
 //! else (template, trigger, subscription, pool, export-job, redaction,
-//! step-occurrence, step, event) is a hyphenated base32 `OpaqueId`. Never
-//! parse or assume structure.
+//! step-occurrence, step, event) is a hyphenated base32 `OpaqueId`. These are
+//! the **workflow family**, whose raw form is now **30 chars** (a 2-char `w`
+//! type prefix; 35 chars hyphenated) — vs 29/34 for non-workflow ids. Never
+//! parse or assume structure or a fixed length.
 
 use std::collections::HashMap;
 

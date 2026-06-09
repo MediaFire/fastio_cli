@@ -232,6 +232,16 @@ pub enum Commands {
     #[command(subcommand)]
     System(SystemCommands),
 
+    /// Inspect Fast.io identifiers offline (no auth, no network).
+    ///
+    /// Classifies an `OpaqueId` by its self-describing length and type prefix
+    /// (29-char = 1-char type; 30-char workflow-family = 2-char `w` type),
+    /// mapping it to its entity type and surfacing tier. Useful when an id
+    /// arrives in a webhook, event, or payload and you need to know what it
+    /// refers to before acting on it.
+    #[command(subcommand)]
+    Id(IdCommands),
+
     /// Start the MCP (Model Context Protocol) server over stdio.
     Mcp {
         /// Optional comma-separated list of tools to enable (default: all).
@@ -5680,6 +5690,25 @@ pub enum SystemCommands {
     Ping,
     /// System status (no authentication required).
     Status,
+}
+
+// ─── Identifier inspection ───────────────────────────────────────────────────
+
+/// Offline `OpaqueId` inspection subcommands.
+///
+/// Pure, local classification — no auth, no network. Treats every id as opaque
+/// and reads only the self-describing length + type prefix per the documented
+/// type-prefix → entity map.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum IdCommands {
+    /// Classify one or more Fast.io identifiers and print their entity type,
+    /// family, and surfacing tier.
+    Info {
+        /// One or more ids to inspect (raw or hyphenated; mixed lengths OK).
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
 }
 
 // ─── Manual Debug impls (redact sensitive fields) ────────────────────────────

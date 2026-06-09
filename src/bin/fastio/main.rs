@@ -294,6 +294,8 @@ async fn dispatch(
             commands::instructions::execute(&map_instructions_command(c), ctx).await
         }
         Commands::System(c) => commands::system::execute(&map_system_command(&c), ctx).await,
+        // Offline: pure local classification, no client/auth (like `Configure`).
+        Commands::Id(c) => commands::id::execute(&c, ctx.output),
         Commands::Completions { shell } => {
             generate_completions(shell);
             Ok(())

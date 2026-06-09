@@ -1911,6 +1911,19 @@ const TOOL_DEFS: &[ToolDef] = &[
         actions: &["ping", "status"],
         params: &[],
     },
+    ToolDef {
+        name: "id",
+        description: "Inspect Fast.io identifiers OFFLINE (no auth, no network): classify an OpaqueId by its self-describing length + type prefix (29-char = 1-char type; 30-char workflow family = 2-char 'w' type) into its entity type, family, and surfacing tier. Useful for routing an id that arrived in a webhook / event / payload to the right tool before acting. Pass `id` (one) or `ids` (many).",
+        actions: &["describe", "info"],
+        params: &[
+            ("id", "A single id to classify (info)", false),
+            (
+                "ids",
+                "Multiple ids to classify (info): a JSON array of strings, or a comma-separated string",
+                false,
+            ),
+        ],
+    },
 ];
 
 // ─── Tool Router ────────────────────────────────────────────────────────────
@@ -1987,6 +2000,7 @@ impl ToolRouter {
             "fileshare" => handle_fileshare(&self.state, action, &args).await,
             "instructions" => handle_instructions(&self.state, action, &args).await,
             "system" => handle_system(&self.state, action, &args).await,
+            "id" => Ok(handle_id(action, &args)),
             _ => Ok(error_text(&format!("Unknown tool: {name}"))),
         }
     }
@@ -12953,6 +12967,137 @@ async fn handle_system(
     }
 }
 
+/// Offline `id` tool handler — classify Fast.io identifiers with no auth and no
+/// network. `describe` returns the structured action reference; `info`
+/// classifies the `id` / `ids` parameters via [`fastio_cli::opaque_id`].
+fn handle_id(action: &str, args: &Map<String, Value>) -> CallToolResult {
+    match action {
+        "describe" => id_describe(),
+        "info" => {
+            let ids = collect_id_args(args);
+            if ids.is_empty() {
+                return error_text(
+                    "provide `id` (a single id) or `ids` (a JSON array of strings or a \
+                     comma-separated string) to classify",
+                );
+            }
+            let rows: Vec<Value> = ids
+                .iter()
+                .map(|id| fastio_cli::opaque_id::to_json(&fastio_cli::opaque_id::classify(id)))
+                .collect();
+            success_json(&Value::Array(rows))
+        }
+        _ => error_text(&format!("Unknown id action: {action}")),
+    }
+}
+
+/// Gather ids from the `id` (single string) and `ids` (a JSON array of strings,
+/// or a comma-separated / JSON-array-encoded string) parameters. Blank entries
+/// are dropped. The MCP parameter schema advertises both as strings, so the
+/// string forms of `ids` must be parsed here.
+fn collect_id_args(args: &Map<String, Value>) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(s) = optional_str(args, "id")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        ids.push(s.to_owned());
+    }
+    match args.get("ids") {
+        Some(Value::Array(arr)) => {
+            for v in arr {
+                if let Some(s) = v.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    ids.push(s.to_owned());
+                }
+            }
+        }
+        Some(Value::String(raw)) => {
+            let trimmed = raw.trim();
+            // Accept a JSON-array-encoded string, else fall back to comma-split.
+            let parsed = trimmed
+                .starts_with('[')
+                .then(|| serde_json::from_str::<Vec<String>>(trimmed).ok())
+                .flatten();
+            match parsed {
+                Some(list) => ids.extend(
+                    list.into_iter()
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty()),
+                ),
+                None => ids.extend(
+                    trimmed
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned),
+                ),
+            }
+        }
+        _ => {}
+    }
+    ids
+}
+
+/// The structured `describe` payload for the `id` tool — the authoritative
+/// per-action reference (mirrors the shape used by the other `*_describe`
+/// helpers). Needs no auth.
+fn id_describe() -> CallToolResult {
+    let actions: &[(&str, &[&str], &[&str], &str)] = &[
+        ("describe", &[], &[], ""),
+        (
+            "info",
+            &[],
+            &["id", "ids"],
+            "classify one (`id`) or many (`ids`) Fast.io identifiers offline; supply at least one",
+        ),
+    ];
+
+    let mut action_map = serde_json::Map::new();
+    for (name, required, optional, note) in actions {
+        let mut spec = serde_json::Map::new();
+        spec.insert(
+            "required".to_owned(),
+            Value::Array(
+                required
+                    .iter()
+                    .map(|s| Value::String((*s).to_owned()))
+                    .collect(),
+            ),
+        );
+        spec.insert(
+            "optional".to_owned(),
+            Value::Array(
+                optional
+                    .iter()
+                    .map(|s| Value::String((*s).to_owned()))
+                    .collect(),
+            ),
+        );
+        if !note.is_empty() {
+            spec.insert("note".to_owned(), Value::String((*note).to_owned()));
+        }
+        action_map.insert((*name).to_owned(), Value::Object(spec));
+    }
+
+    let payload = serde_json::json!({
+        "tool": "id",
+        "summary": "Offline OpaqueId classifier — maps a Fast.io id to its entity type by its \
+                    self-describing length + type prefix (29-char carries a 1-char type; 30-char \
+                    workflow-family carries a 2-char 'w' type). No auth, no network.",
+        "destructive_actions": [],
+        "side_effects": "none — pure local classification; no network calls and no credentials.",
+        "guidance": {
+            "one_of_required_body": ["id", "ids"],
+            "classification": "Workflow-family ids are detected ONLY by length-30 / leading-'w'. \
+                               A 29-char id whose 1-char code is unmapped is reported \
+                               family='unknown' (it may be a transitional workflow code pending \
+                               reassignment), NEVER guessed as workflow.",
+        },
+        "actions": Value::Object(action_map),
+    });
+    success_json(&payload)
+}
+
 #[cfg(test)]
 mod ripley_tool_tests {
     use super::{
@@ -13039,6 +13184,60 @@ mod ripley_tool_tests {
             .expect("call_tool ok");
         let text = result_to_string(&res);
         assert!(text.contains("Unknown tool"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn id_describe_needs_no_auth_and_lists_actions() {
+        // The `id` tool is fully offline — describe works unauthenticated.
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("describe".to_owned()));
+        let res = router.call_tool("id", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("info"),
+            "describe should list the info action: {text}"
+        );
+        assert!(
+            text.contains("Offline"),
+            "describe should note it is offline: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn id_info_classifies_single_and_multiple_ids_offline() {
+        // No auth, no network: a workflow id, a node id, and a comma-separated
+        // `ids` string all classify locally.
+        let router = unauthed_router();
+
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("info".to_owned()));
+        args.insert(
+            "id".to_owned(),
+            Value::String("wa3jm5zqzfxpxdr2dx8z5bvnb3rpjf".to_owned()),
+        );
+        let text = result_to_string(&router.call_tool("id", args).await.expect("ok"));
+        assert!(text.contains("WorkflowStepOccurrence"), "got: {text}");
+
+        // `ids` as a comma-separated string (the schema advertises strings).
+        let mut multi = Map::new();
+        multi.insert("action".to_owned(), Value::String("info".to_owned()));
+        multi.insert(
+            "ids".to_owned(),
+            Value::String("2yxh5ojakxr3mwzty6tvk66cjnqsw, 3867689418901071163".to_owned()),
+        );
+        let text = result_to_string(&router.call_tool("id", multi).await.expect("ok"));
+        assert!(text.contains("StorageNode"), "got: {text}");
+        assert!(text.contains("19-digit numeric profile id"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn id_info_without_id_or_ids_errors() {
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("info".to_owned()));
+        let text = result_to_string(&router.call_tool("id", args).await.expect("ok"));
+        assert!(text.contains("provide `id`"), "got: {text}");
     }
 
     #[test]

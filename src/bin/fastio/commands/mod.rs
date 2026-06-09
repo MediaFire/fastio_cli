@@ -129,6 +129,8 @@ pub mod event;
 pub mod files;
 /// File Share (durable single-file link) commands.
 pub mod fileshare;
+/// Offline OpaqueId classification command (`fastio id info`).
+pub mod id;
 /// External storage import commands.
 pub mod import;
 /// AI instructions commands (user / org / workspace / share).

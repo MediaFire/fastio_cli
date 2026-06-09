@@ -90,8 +90,9 @@
 //! Three id kinds, all treated as opaque `String` and URL-encoded into the
 //! path: the **envelope id** / **workspace id** are 19-digit numeric profile-id
 //! strings; the **document id** / **recipient id** / **field id** are base32
-//! `OpaqueId`s (34-char hyphenated or 29-char unhyphenated). Never parse or
-//! assume structure.
+//! `OpaqueId`s — 29/30-char unhyphenated or 34/35-char hyphenated (the
+//! workflow-family forms are the longer 30/35; everything else is 29/34). Never
+//! parse or assume structure or a fixed length.
 
 use serde_json::{Value, json};
 

@@ -976,6 +976,7 @@ mod tests {
     use super::{
         DEFAULT_POLL_INTERVAL_SECS, MAX_POLL_INTERVAL_SECS, MIN_POLL_INTERVAL_SECS,
         aggregate_metadata_chunks, clamp_poll_interval, confirm_ai_spend, extract_job_id,
+        validate_opaque_id,
     };
     use fastio_cli::api::metadata::{
         BulkMetadataDetailsResponse, parse_bulk_metadata_details_response,
@@ -984,6 +985,21 @@ mod tests {
 
     fn make_chunk(body: &serde_json::Value) -> BulkMetadataDetailsResponse {
         parse_bulk_metadata_details_response(body).expect("test body should parse")
+    }
+
+    #[test]
+    fn validate_opaque_id_accepts_29_and_30_char_forms() {
+        // Regression guard: OpaqueIds are no longer fixed-length. Workflow-family
+        // ids are 30 chars (35 hyphenated); everything else is 29 (34 hyphenated).
+        // Both lengths, raw and hyphenated, must validate.
+        for id in [
+            "f3jm5zqzfxpxdr2dx8z5bvnb3rpjf",       // 29-char raw
+            "f3jm5-zqzfx-pxdr2-dx8z5-bvnb3-rpjf",  // 34-char hyphenated
+            "wa3jm5zqzfxpxdr2dx8z5bvnb3rpjf",      // 30-char raw (workflow)
+            "wa3jm-5zqzf-xpxdr-2dx8z-5bvnb-3rpjf", // 35-char hyphenated
+        ] {
+            validate_opaque_id(id, "id").unwrap_or_else(|e| panic!("rejected {id:?}: {e}"));
+        }
     }
 
     #[test]

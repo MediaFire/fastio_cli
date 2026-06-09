@@ -15,5 +15,7 @@ pub mod config;
 pub mod deprecation;
 /// Structured error types with context-aware suggestions.
 pub mod error;
+/// Offline classification of Fast.io `OpaqueId` strings (type-prefix → entity).
+pub mod opaque_id;
 /// Output formatting: table, JSON, and CSV renderers with TTY detection.
 pub mod output;

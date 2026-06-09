@@ -88,6 +88,27 @@ file) in the terminal. It always emits rendered markdown — or verbatim with
 `--raw`, when piped, or with `--no-color` — and ignores `--format`/`--fields`.
 Only note nodes and markdown files are supported; other file types are rejected.
 
+### Inspecting identifiers (offline)
+
+`fastio id info <ID>...` classifies one or more Fast.io `OpaqueId`s **offline**
+(no auth, no network) so you know what an id refers to before acting on it —
+handy when an id arrives in a webhook, event, or payload. It reads the
+self-describing length and type prefix: non-workflow ids are 29 chars (1-char
+type); workflow-family ids are 30 chars (a 2-char `w` type). It reports the
+`entity_type`, `family` (`workflow` / `non-workflow` / `unknown`), `surfacing`
+tier, and a `recognized` flag. Output is always an array of records, so
+`--format json|table|csv|markdown` and `--fields` all apply.
+
+```bash
+fastio id info wa3jm5zqzfxpxdr2dx8z5bvnb3rpjf --format json   # → WorkflowStepOccurrence
+fastio id info 2yxh5-ojakx-r3mwz-ty6tv-k66cj-nqsw NODE_ID2    # → StorageNode (hyphens OK)
+```
+
+Over MCP this is the `id` tool (`action: "info"`, params `id` or `ids`).
+Workflow ids are detected only by length-30 / leading-`w`; a 29-char id whose
+1-char code is unmapped is reported `unknown` (it may be a transitional code
+pending reassignment), never guessed as workflow.
+
 ## Important: Intelligence (AI indexing) Setting
 
 Workspaces have an `intelligence` toggle. When **OFF** (default) the workspace is
