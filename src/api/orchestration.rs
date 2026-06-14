@@ -571,6 +571,29 @@ pub async fn get_step_agent_activity(
     client.get(&path).await
 }
 
+/// Read an AI-agent step occurrence's reasoning + commentary transcript.
+///
+/// `GET /workflows/{workflow_id}/steps/{step_occurrence_id}/agent_trace/`.
+/// Returns `{"agent_trace": {"reasoning", "commentary", "available",
+/// "step_occurrence_id", "workflow_id"}}`. The companion to
+/// [`get_step_agent_activity`]: `agent_activity` is the high-level action feed,
+/// `agent_trace` is the interim reasoning and the narration commentary the agent
+/// emits while working. It never contains the final answer or citations.
+/// `available: false` is a neutral no-trace-yet state, NOT an error; a non-agent
+/// occurrence (or one that does not resolve to this workflow) returns 404.
+pub async fn get_step_agent_trace(
+    client: &ApiClient,
+    workflow_id: &str,
+    step_occurrence_id: &str,
+) -> Result<Value, CliError> {
+    let path = format!(
+        "/workflows/{}/steps/{}/agent_trace/",
+        urlencoding::encode(workflow_id),
+        urlencoding::encode(step_occurrence_id)
+    );
+    client.get(&path).await
+}
+
 /// List occurrences for a step definition.
 ///
 /// `GET /workflows/{workflow_id}/steps/{step_id}/occurrences/`.
@@ -594,6 +617,124 @@ pub async fn list_step_occurrences(
         urlencoding::encode(step_id)
     );
     client.get_with_params(&path, &params).await
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Mid-Run Modifications (propose / apply changes to a running workflow)
+// ════════════════════════════════════════════════════════════════════════
+
+/// Propose a mid-run modification against a running workflow.
+///
+/// `POST /workflows/{workflow_id}/modifications/` (form-encoded). `ops` is a
+/// JSON array string of operations (each `{op, target_step_occurrence_id, …}`
+/// where `op` ∈ `skip`|`reassign`|`patch`; max 50). Proposing auto-pauses the
+/// run and returns the proposal plus a before/after diff. Only one proposal may
+/// be open per workflow (409 otherwise). `expires_in_seconds` bounds the
+/// proposal (max/default 604800 = 7 days; larger values are clamped, an absent
+/// or non-positive value defaults to the max). Requires the
+/// `workflow_mid_run_edit` plan capability (403 otherwise) and workflow ADMIN.
+pub async fn propose_modification(
+    client: &ApiClient,
+    workflow_id: &str,
+    ops: &str,
+    reason: Option<&str>,
+    expires_in_seconds: Option<u64>,
+) -> Result<Value, CliError> {
+    let mut form = HashMap::new();
+    form.insert("ops".to_owned(), ops.to_owned());
+    put_opt(&mut form, "reason", reason);
+    put_opt_u64(&mut form, "expires_in_seconds", expires_in_seconds);
+    let path = format!(
+        "/workflows/{}/modifications/",
+        urlencoding::encode(workflow_id)
+    );
+    client.post(&path, &form).await
+}
+
+/// List a workflow's modification proposals.
+///
+/// `GET /workflows/{workflow_id}/modifications/` (optional `status` filter).
+/// Member-or-above (a share-guest is excluded).
+pub async fn list_modifications(
+    client: &ApiClient,
+    workflow_id: &str,
+    status: Option<&str>,
+) -> Result<Value, CliError> {
+    let mut params = HashMap::new();
+    if let Some(s) = status {
+        params.insert("status".to_owned(), s.to_owned());
+    }
+    let path = format!(
+        "/workflows/{}/modifications/",
+        urlencoding::encode(workflow_id)
+    );
+    if params.is_empty() {
+        client.get(&path).await
+    } else {
+        client.get_with_params(&path, &params).await
+    }
+}
+
+/// Get a modification proposal's detail (changes + before/after diff).
+///
+/// `GET /workflows/{workflow_id}/modifications/{modification_id}/`.
+/// Member-or-above (a share-guest is excluded).
+pub async fn get_modification(
+    client: &ApiClient,
+    workflow_id: &str,
+    modification_id: &str,
+) -> Result<Value, CliError> {
+    let path = format!(
+        "/workflows/{}/modifications/{}/",
+        urlencoding::encode(workflow_id),
+        urlencoding::encode(modification_id)
+    );
+    client.get(&path).await
+}
+
+/// Apply a modification proposal, then finalize and resume the run.
+///
+/// `POST /workflows/{workflow_id}/modifications/{modification_id}/apply/`
+/// (form-encoded). An empty/omitted `apply_change_ids` applies every pending
+/// change; otherwise pass a JSON array string of ids covering all currently
+/// pending changes (a partial selection is rejected). A `skip` that removes a
+/// human gate (an approval/signing step) requires `confirm_removes_human_gate`,
+/// or the apply is rejected with 403. Workflow ADMIN.
+pub async fn apply_modification(
+    client: &ApiClient,
+    workflow_id: &str,
+    modification_id: &str,
+    apply_change_ids: Option<&str>,
+    confirm_removes_human_gate: bool,
+) -> Result<Value, CliError> {
+    let mut form = HashMap::new();
+    put_opt(&mut form, "apply_change_ids", apply_change_ids);
+    if confirm_removes_human_gate {
+        form.insert("confirm_removes_human_gate".to_owned(), "true".to_owned());
+    }
+    let path = format!(
+        "/workflows/{}/modifications/{}/apply/",
+        urlencoding::encode(workflow_id),
+        urlencoding::encode(modification_id)
+    );
+    client.post(&path, &form).await
+}
+
+/// Cancel a modification proposal and resume the run unchanged.
+///
+/// `POST /workflows/{workflow_id}/modifications/{modification_id}/cancel/`
+/// (empty form body). Workflow ADMIN.
+pub async fn cancel_modification(
+    client: &ApiClient,
+    workflow_id: &str,
+    modification_id: &str,
+) -> Result<Value, CliError> {
+    let path = format!(
+        "/workflows/{}/modifications/{}/cancel/",
+        urlencoding::encode(workflow_id),
+        urlencoding::encode(modification_id)
+    );
+    client.post(&path, &HashMap::new()).await
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -695,6 +836,192 @@ pub async fn deprecate_template(client: &ApiClient, template_id: &str) -> Result
         urlencoding::encode(template_id)
     );
     client.post(&path, &HashMap::new()).await
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  System Template Gallery (built-in catalog)
+// ════════════════════════════════════════════════════════════════════════
+
+/// List the system template gallery (metadata only).
+///
+/// `GET /workflow_templates/system/`. Any authenticated user; no workspace
+/// scope or plan gate. The catalog is bounded, so the whole list is returned
+/// without pagination.
+pub async fn list_system_templates(client: &ApiClient) -> Result<Value, CliError> {
+    client.get("/workflow_templates/system/").await
+}
+
+/// Get one gallery template — metadata plus the full definition body (including
+/// the `setup` block describing the inputs to collect before instantiating).
+///
+/// `GET /workflow_templates/system/{handle}/`. Any authenticated user; 404 for
+/// an unknown handle.
+pub async fn get_system_template(client: &ApiClient, handle: &str) -> Result<Value, CliError> {
+    let path = format!(
+        "/workflow_templates/system/{}/",
+        urlencoding::encode(handle)
+    );
+    client.get(&path).await
+}
+
+/// Parameters for [`instantiate_system_template`].
+pub struct FromSystemParams<'a> {
+    /// Target workspace ID.
+    pub workspace_id: &'a str,
+    /// Gallery template handle (required).
+    pub handle: &'a str,
+    /// Attach the new revision to this existing workflow (else create a new one).
+    pub workflow_id: Option<&'a str>,
+    /// `true`/`false` — create a new workflow (mutually exclusive with `workflow_id`;
+    /// `create_workflow=false` requires a `workflow_id`).
+    pub create_workflow: Option<bool>,
+    /// Override the created revision/workflow name.
+    pub name: Option<&'a str>,
+    /// Override the created revision/workflow description.
+    pub description: Option<&'a str>,
+    /// JSON object string mapping setup input ids to values.
+    pub inputs: Option<&'a str>,
+    /// Integer compare-and-set against the catalog version (409 on mismatch).
+    pub expected_version: Option<u64>,
+    /// Replay-safe idempotency key (≤128 chars).
+    pub idempotency_key: Option<&'a str>,
+    /// Publish + bind the revision (server default is `true`).
+    pub publish: Option<bool>,
+    /// Revision reason string.
+    pub reason: Option<&'a str>,
+}
+
+/// Instantiate a gallery template into a workspace as a new template revision.
+///
+/// `POST /workspace/{workspace_id}/workflow_templates/from_system/`
+/// (form-encoded). Workspace admin; requires the workspace's workflow feature.
+/// Missing/invalid setup inputs are returned together in a 422 `setup_report`.
+pub async fn instantiate_system_template(
+    client: &ApiClient,
+    params: &FromSystemParams<'_>,
+) -> Result<Value, CliError> {
+    let mut form = HashMap::new();
+    form.insert("handle".to_owned(), params.handle.to_owned());
+    put_opt(&mut form, "workflow_id", params.workflow_id);
+    put_opt_bool(&mut form, "create_workflow", params.create_workflow);
+    put_opt(&mut form, "name", params.name);
+    put_opt(&mut form, "description", params.description);
+    put_opt(&mut form, "inputs", params.inputs);
+    put_opt_u64(&mut form, "expected_version", params.expected_version);
+    put_opt(&mut form, "idempotency_key", params.idempotency_key);
+    put_opt_bool(&mut form, "publish", params.publish);
+    put_opt(&mut form, "reason", params.reason);
+    let path = format!(
+        "/workspace/{}/workflow_templates/from_system/",
+        urlencoding::encode(params.workspace_id)
+    );
+    client.post(&path, &form).await
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Workflow Agent Templates (v3.5+, admin-only persona templates)
+// ════════════════════════════════════════════════════════════════════════
+
+/// Create a workspace-scoped agent template (an agent-step instruction prompt
+/// paired with a tool allowlist).
+///
+/// `POST /workspace/{workspace_id}/workflow_agent_templates/` (form-encoded;
+/// `tool_allowlist` is a JSON array string of tool id strings). Write methods
+/// require workspace admin. v3.5 ships storage + CRUD only; the agent runtime
+/// consumes these in a later release.
+pub async fn create_agent_template(
+    client: &ApiClient,
+    workspace_id: &str,
+    name: &str,
+    instruction_prompt: &str,
+    tool_allowlist: Option<&str>,
+) -> Result<Value, CliError> {
+    let mut form = HashMap::new();
+    form.insert("name".to_owned(), name.to_owned());
+    form.insert(
+        "instruction_prompt".to_owned(),
+        instruction_prompt.to_owned(),
+    );
+    put_opt(&mut form, "tool_allowlist", tool_allowlist);
+    let path = format!(
+        "/workspace/{}/workflow_agent_templates/",
+        urlencoding::encode(workspace_id)
+    );
+    client.post(&path, &form).await
+}
+
+/// List a workspace's agent templates.
+///
+/// `GET /workspace/{workspace_id}/workflow_agent_templates/`. Requires
+/// workspace view.
+pub async fn list_agent_templates(
+    client: &ApiClient,
+    workspace_id: &str,
+) -> Result<Value, CliError> {
+    let path = format!(
+        "/workspace/{}/workflow_agent_templates/",
+        urlencoding::encode(workspace_id)
+    );
+    client.get(&path).await
+}
+
+/// Read one agent template.
+///
+/// `GET /workspace/{workspace_id}/workflow_agent_templates/{template_id}/`.
+pub async fn get_agent_template(
+    client: &ApiClient,
+    workspace_id: &str,
+    template_id: &str,
+) -> Result<Value, CliError> {
+    let path = format!(
+        "/workspace/{}/workflow_agent_templates/{}/",
+        urlencoding::encode(workspace_id),
+        urlencoding::encode(template_id)
+    );
+    client.get(&path).await
+}
+
+/// Update an agent template's mutable fields.
+///
+/// `PATCH /workspace/{workspace_id}/workflow_agent_templates/{template_id}/`
+/// (form-encoded). Mutable: `name` (≤128), `instruction_prompt` (≤8192),
+/// `tool_allowlist` (JSON array string). `id`/`workspace_id`/`created_at`/
+/// `created_by_user_id` are immutable. Workspace admin.
+pub async fn update_agent_template(
+    client: &ApiClient,
+    workspace_id: &str,
+    template_id: &str,
+    name: Option<&str>,
+    instruction_prompt: Option<&str>,
+    tool_allowlist: Option<&str>,
+) -> Result<Value, CliError> {
+    let mut form = HashMap::new();
+    put_opt(&mut form, "name", name);
+    put_opt(&mut form, "instruction_prompt", instruction_prompt);
+    put_opt(&mut form, "tool_allowlist", tool_allowlist);
+    let path = format!(
+        "/workspace/{}/workflow_agent_templates/{}/",
+        urlencoding::encode(workspace_id),
+        urlencoding::encode(template_id)
+    );
+    client.patch_form(&path, &form).await
+}
+
+/// Hard-delete an agent template.
+///
+/// `DELETE /workspace/{workspace_id}/workflow_agent_templates/{template_id}/`.
+/// Workspace admin.
+pub async fn delete_agent_template(
+    client: &ApiClient,
+    workspace_id: &str,
+    template_id: &str,
+) -> Result<Value, CliError> {
+    let path = format!(
+        "/workspace/{}/workflow_agent_templates/{}/",
+        urlencoding::encode(workspace_id),
+        urlencoding::encode(template_id)
+    );
+    client.delete(&path).await
 }
 
 // ════════════════════════════════════════════════════════════════════════

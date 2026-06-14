@@ -32,10 +32,11 @@ use fastio_cli::api::orchestration::{self, DownloadedChunk};
 use fastio_cli::error::CliError;
 
 use crate::cli::{
-    WorkflowAuditCommands, WorkflowAuditExportCommands, WorkflowCommands, WorkflowGrantCommands,
-    WorkflowInboxCommands, WorkflowObligationCommands, WorkflowOutboundCommands,
-    WorkflowPoolCommands, WorkflowRealtimeCommands, WorkflowRedactionCommands,
-    WorkflowReviewCommands, WorkflowSchemaCommands, WorkflowStepCommands, WorkflowSubjectCommands,
+    WorkflowAgentTemplateCommands, WorkflowAuditCommands, WorkflowAuditExportCommands,
+    WorkflowCommands, WorkflowGrantCommands, WorkflowInboxCommands, WorkflowModificationCommands,
+    WorkflowObligationCommands, WorkflowOutboundCommands, WorkflowPoolCommands,
+    WorkflowRealtimeCommands, WorkflowRedactionCommands, WorkflowReviewCommands,
+    WorkflowSchemaCommands, WorkflowStepCommands, WorkflowSubjectCommands,
     WorkflowTemplateCommands, WorkflowTriggerAliasCommands, WorkflowTriggerCommands,
 };
 
@@ -523,7 +524,9 @@ pub async fn execute(command: WorkflowCommands, ctx: &CommandContext<'_>) -> Res
         }
         WorkflowCommands::Grant(c) => execute_grant(c, ctx).await,
         WorkflowCommands::Step(c) => execute_step(c, ctx).await,
+        WorkflowCommands::Modification(c) => execute_modification(c, ctx).await,
         WorkflowCommands::Template(c) => execute_template(c, ctx).await,
+        WorkflowCommands::AgentTemplate(c) => execute_agent_template(c, ctx).await,
         WorkflowCommands::Trigger(c) => execute_trigger(c, ctx).await,
         WorkflowCommands::TriggerAlias(c) => execute_trigger_alias(c, ctx).await,
         WorkflowCommands::Obligation(c) => execute_obligation(c, ctx).await,
@@ -759,7 +762,83 @@ async fn execute_step(command: WorkflowStepCommands, ctx: &CommandContext<'_>) -
             ctx.output.render(&v)?;
             Ok(())
         }
+        WorkflowStepCommands::AgentTrace {
+            workflow_id,
+            step_occurrence_id,
+        } => {
+            let v = orchestration::get_step_agent_trace(&client, &workflow_id, &step_occurrence_id)
+                .await
+                .context("failed to read step agent trace")?;
+            ctx.output.render(&v)?;
+            Ok(())
+        }
     }
+}
+
+// ─── Mid-Run Modifications ────────────────────────────────────────────────────────
+
+async fn execute_modification(
+    command: WorkflowModificationCommands,
+    ctx: &CommandContext<'_>,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let v = match command {
+        WorkflowModificationCommands::Propose {
+            workflow_id,
+            ops,
+            reason,
+            expires_in_seconds,
+        } => {
+            let ops = resolve_json_arg(&ops, "ops")?;
+            orchestration::propose_modification(
+                &client,
+                &workflow_id,
+                &ops,
+                reason.as_deref(),
+                expires_in_seconds,
+            )
+            .await
+            .context("failed to propose modification")?
+        }
+        WorkflowModificationCommands::List {
+            workflow_id,
+            status,
+        } => orchestration::list_modifications(&client, &workflow_id, status.as_deref())
+            .await
+            .context("failed to list modifications")?,
+        WorkflowModificationCommands::Get {
+            workflow_id,
+            modification_id,
+        } => orchestration::get_modification(&client, &workflow_id, &modification_id)
+            .await
+            .context("failed to get modification")?,
+        WorkflowModificationCommands::Apply {
+            workflow_id,
+            modification_id,
+            apply_change_ids,
+            confirm_removes_human_gate,
+        } => {
+            let apply_change_ids =
+                resolve_opt_json_arg(apply_change_ids.as_deref(), "apply change ids")?;
+            orchestration::apply_modification(
+                &client,
+                &workflow_id,
+                &modification_id,
+                apply_change_ids.as_deref(),
+                confirm_removes_human_gate,
+            )
+            .await
+            .context("failed to apply modification")?
+        }
+        WorkflowModificationCommands::Cancel {
+            workflow_id,
+            modification_id,
+        } => orchestration::cancel_modification(&client, &workflow_id, &modification_id)
+            .await
+            .context("failed to cancel modification")?,
+    };
+    ctx.output.render(&v)?;
+    Ok(())
 }
 
 // ─── Templates ──────────────────────────────────────────────────────────────────
@@ -808,6 +887,118 @@ async fn execute_template(
                 .await
                 .context("failed to deprecate template")?
         }
+        WorkflowTemplateCommands::Gallery => orchestration::list_system_templates(&client)
+            .await
+            .context("failed to list the system template gallery")?,
+        WorkflowTemplateCommands::GalleryGet { handle } => {
+            orchestration::get_system_template(&client, &handle)
+                .await
+                .context("failed to get gallery template")?
+        }
+        WorkflowTemplateCommands::FromSystem {
+            workspace_id,
+            handle,
+            workflow_id,
+            create_workflow,
+            name,
+            description,
+            inputs,
+            expected_version,
+            idempotency_key,
+            publish,
+            reason,
+        } => {
+            let inputs = resolve_opt_json_arg(inputs.as_deref(), "inputs")?;
+            orchestration::instantiate_system_template(
+                &client,
+                &orchestration::FromSystemParams {
+                    workspace_id: &workspace_id,
+                    handle: &handle,
+                    workflow_id: workflow_id.as_deref(),
+                    create_workflow,
+                    name: name.as_deref(),
+                    description: description.as_deref(),
+                    inputs: inputs.as_deref(),
+                    expected_version,
+                    idempotency_key: idempotency_key.as_deref(),
+                    publish,
+                    reason: reason.as_deref(),
+                },
+            )
+            .await
+            .context("failed to instantiate gallery template")?
+        }
+    };
+    ctx.output.render(&v)?;
+    Ok(())
+}
+
+// ─── Agent Templates ──────────────────────────────────────────────────────────────
+
+async fn execute_agent_template(
+    command: WorkflowAgentTemplateCommands,
+    ctx: &CommandContext<'_>,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let v = match command {
+        WorkflowAgentTemplateCommands::Create {
+            workspace_id,
+            name,
+            instruction_prompt,
+            tool_allowlist,
+        } => {
+            let tool_allowlist = resolve_opt_json_arg(tool_allowlist.as_deref(), "tool allowlist")?;
+            orchestration::create_agent_template(
+                &client,
+                &workspace_id,
+                &name,
+                &instruction_prompt,
+                tool_allowlist.as_deref(),
+            )
+            .await
+            .context("failed to create agent template")?
+        }
+        WorkflowAgentTemplateCommands::List { workspace_id } => {
+            orchestration::list_agent_templates(&client, &workspace_id)
+                .await
+                .context("failed to list agent templates")?
+        }
+        WorkflowAgentTemplateCommands::Get {
+            workspace_id,
+            template_id,
+        } => orchestration::get_agent_template(&client, &workspace_id, &template_id)
+            .await
+            .context("failed to get agent template")?,
+        WorkflowAgentTemplateCommands::Update {
+            workspace_id,
+            template_id,
+            name,
+            instruction_prompt,
+            tool_allowlist,
+        } => {
+            if name.is_none() && instruction_prompt.is_none() && tool_allowlist.is_none() {
+                anyhow::bail!(
+                    "at least one update field is required (--name, --instruction-prompt, --tool-allowlist)"
+                );
+            }
+            let tool_allowlist = resolve_opt_json_arg(tool_allowlist.as_deref(), "tool allowlist")?;
+            orchestration::update_agent_template(
+                &client,
+                &workspace_id,
+                &template_id,
+                name.as_deref(),
+                instruction_prompt.as_deref(),
+                tool_allowlist.as_deref(),
+            )
+            .await
+            .context("failed to update agent template")?
+        }
+        WorkflowAgentTemplateCommands::Delete {
+            workspace_id,
+            template_id,
+        } => orchestration::delete_agent_template(&client, &workspace_id, &template_id)
+            .await
+            .context("failed to delete agent template")?,
     };
     ctx.output.render(&v)?;
     Ok(())

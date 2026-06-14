@@ -980,12 +980,13 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "comment",
-        description: "Comments: list, list-all, create, reply, delete, bulk-delete, details, reaction-add, reaction-remove, link, unlink, linked.",
+        description: "Comments: list, list-all, create, reply, update, delete, bulk-delete, details, reaction-add, reaction-remove, link, unlink, linked. This generic tool also edits/deletes/reacts to TASK comments by comment_id (use the `task` tool to post/list them).",
         actions: &[
             "list",
             "list-all",
             "create",
             "reply",
+            "update",
             "delete",
             "bulk-delete",
             "details",
@@ -1094,7 +1095,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "task",
-        description: "[legacy] Tasks: manage task lists and tasks. Legacy workflow primitive, superseded by the `workflow` orchestration tool; remains functional for now. list-lists, create-list, list-details, update-list, delete-list, list-tasks, create-task, task-details, update-task, delete-task, change-status, assign-task, bulk-status, move-task, reorder-tasks, reorder-lists, filter, summary.",
+        description: "[legacy] Tasks: manage task lists and tasks. Legacy workflow primitive, superseded by the `workflow` orchestration tool; remains functional for now. list-lists, create-list, list-details, update-list, delete-list, list-tasks, create-task, task-details, update-task, delete-task, change-status, assign-task, bulk-status, move-task, reorder-tasks, reorder-lists, filter, summary, list-comments, post-comment, list-attachments, attach, detach. Task comments are private to the task; to EDIT, DELETE, or REACT to a task comment use the generic `comment` tool by comment_id.",
         actions: &[
             "list-lists",
             "create-list",
@@ -1114,6 +1115,11 @@ const TOOL_DEFS: &[ToolDef] = &[
             "reorder-lists",
             "filter",
             "summary",
+            "list-comments",
+            "post-comment",
+            "list-attachments",
+            "attach",
+            "detach",
         ],
         params: &[
             ("profile_type", "Profile type: workspace or share", false),
@@ -1148,7 +1154,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("sort_order", "Sort order (move-task)", false),
             (
                 "node_id",
-                "Node ID to link (create-task, update-task)",
+                "Node ID to link (create-task, update-task; empty string clears the link on update-task)",
                 false,
             ),
             (
@@ -1156,6 +1162,29 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "Filter: assigned, created, status (filter action)",
                 false,
             ),
+            ("text", "Comment body (post-comment; alias: body)", false),
+            ("body", "Comment body (post-comment; alias of text)", false),
+            (
+                "parent_id",
+                "Parent comment ID for a threaded reply (post-comment)",
+                false,
+            ),
+            (
+                "reference",
+                "Anchoring reference as a JSON object string (post-comment)",
+                false,
+            ),
+            (
+                "properties",
+                "Arbitrary metadata as a JSON object string (post-comment)",
+                false,
+            ),
+            (
+                "target_ids",
+                "Comma-separated object IDs to attach, 1-100 (attach)",
+                false,
+            ),
+            ("target_id", "Single object ID to detach (detach)", false),
             ("limit", "Pagination limit", false),
             ("offset", "Pagination offset", false),
         ],
@@ -1475,7 +1504,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "workflow",
-        description: "Workflow Orchestration (v3.2): the durable multi-step runtime — distinct from the legacy task/approval/todo primitives. OFFLOAD multi-step orchestration here instead of hand-driving primitives: the compound actions 'instantiate-and-wait', 'trigger-fire-and-wait', and 'audit-export-and-download' do the full fire→poll→download loop for you. This tool exposes READ + DRIVE actions only; admin/destructive/crypto operations (workflow cancel + purge, template/pool/trigger create+lifecycle, outbound subscription management, secret/key rotation, dual-control redaction, schema set/derive, realtime token mint) are intentionally CLI-binary-only (`fastio workflow …`) — including the terminal 'cancel' lifecycle mutation, which is NOT available over MCP. Call action='describe' for the authoritative action/param reference. Idempotency keys for instantiate/fire are REQUIRED for replay safety and have no MCP auto-generate. CAS step output/advance surfaces 409 conflicts by default. The audit 'check-integrity' is integrity-only (chunk SHA-256 + content-hash chain + completeness), NOT HMAC authenticity. The v3.5b review surface is otherwise CLI-binary-only, but its workspace hydration READ is exposed here as 'review-active' (lists active arming/open review surfaces + their asset node_ids so you can badge files as under review without per-file fetches; not flag-gated). The mutating review actions (create/decision/admin-resolve) and the by-id review reads remain CLI-only.",
+        description: "Workflow Orchestration (v3.2): the durable multi-step runtime — distinct from the legacy task/approval/todo primitives. OFFLOAD multi-step orchestration here instead of hand-driving primitives: the compound actions 'instantiate-and-wait', 'trigger-fire-and-wait', and 'audit-export-and-download' do the full fire→poll→download loop for you. This tool exposes READ + DRIVE actions only; admin/destructive/crypto operations (workflow cancel + purge, template/pool/trigger create+lifecycle, outbound subscription management, secret/key rotation, dual-control redaction, schema set/derive, realtime token mint) are intentionally CLI-binary-only (`fastio workflow …`) — including the terminal 'cancel' lifecycle mutation, which is NOT available over MCP. Mid-run editing is exposed (modification-propose/-list/-get/-apply/-cancel: propose AUTO-PAUSES the run, apply finalizes + resumes; needs workflow ADMIN + the workflow_mid_run_edit plan capability). The built-in system template gallery is browsable over MCP (template-gallery, template-gallery-get); instantiating a gallery template (from_system, a template-create) is CLI-only (`fastio workflow template from-system`), consistent with the template-create boundary above. 'step-agent-trace' is the read-only reasoning+commentary companion to 'step-agent-activity' (never the final answer/citations). Call action='describe' for the authoritative action/param reference. Idempotency keys for instantiate/fire are REQUIRED for replay safety and have no MCP auto-generate. CAS step output/advance surfaces 409 conflicts by default. The audit 'check-integrity' is integrity-only (chunk SHA-256 + content-hash chain + completeness), NOT HMAC authenticity. The v3.5b review surface is otherwise CLI-binary-only, but its workspace hydration READ is exposed here as 'review-active' (lists active arming/open review surfaces + their asset node_ids so you can badge files as under review without per-file fetches; not flag-gated). The mutating review actions (create/decision/admin-resolve) and the by-id review reads remain CLI-only.",
         actions: &[
             "describe",
             "get",
@@ -1491,8 +1520,18 @@ const TOOL_DEFS: &[ToolDef] = &[
             "step-advance",
             "step-occurrences",
             "step-agent-activity",
+            "step-agent-trace",
+            "modification-propose",
+            "modification-list",
+            "modification-get",
+            "modification-apply",
+            "modification-cancel",
             "template-list",
             "template-get",
+            "template-gallery",
+            "template-gallery-get",
+            "agent-template-list",
+            "agent-template-get",
             "trigger-list",
             "trigger-get",
             "trigger-fire",
@@ -1625,6 +1664,37 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("limit", "Pagination limit", false),
             ("offset", "Pagination offset", false),
             ("cursor", "Cursor for grant-list pagination", false),
+            (
+                "modification_id",
+                "Mid-run modification proposal OpaqueId (modification-get / -apply / -cancel)",
+                false,
+            ),
+            (
+                "ops",
+                "Mid-run modification operations as a JSON ARRAY string, max 50 (modification-propose)",
+                false,
+            ),
+            ("reason", "Reason note (modification-propose)", false),
+            (
+                "expires_in_seconds",
+                "Proposal lifetime in seconds, max/default 604800 (modification-propose)",
+                false,
+            ),
+            (
+                "apply_change_ids",
+                "JSON ARRAY (or JSON-array string) of change ids to apply; omit to apply all (modification-apply)",
+                false,
+            ),
+            (
+                "confirm_removes_human_gate",
+                "Required true to apply a skip that removes a human gate (modification-apply)",
+                false,
+            ),
+            (
+                "handle",
+                "System gallery template handle (template-gallery-get)",
+                false,
+            ),
         ],
     },
     ToolDef {
@@ -7035,6 +7105,7 @@ async fn handle_comment(
         "list" => handle_comment_list(state, args).await,
         "create" => handle_comment_create(state, args).await,
         "reply" => handle_comment_reply(state, args).await,
+        "update" => handle_comment_update(state, args).await,
         "delete" => handle_comment_delete(state, args).await,
         "list-all" => handle_comment_list_all(state, args).await,
         "details" => handle_comment_details(state, args).await,
@@ -7150,6 +7221,29 @@ async fn handle_comment_reply(
     }
 }
 
+/// `comment` update action: edit a comment's body by id.
+///
+/// This is the generic comment-edit path — it also edits TASK comments by their
+/// comment id (the `task` tool posts/lists task comments, but editing is reached
+/// here). The new body accepts either `text` (preferred) or `body` (alias).
+async fn handle_comment_update(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let comment_id = match required_str(args, "comment_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let Some(text) = optional_str(args, "text").or_else(|| optional_str(args, "body")) else {
+        return Ok(error_text("Missing required parameter: text (or body)"));
+    };
+    match api::comment::update_comment(&client, comment_id, text).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
 async fn handle_comment_delete(
     state: &McpState,
     args: &Map<String, Value>,
@@ -7213,11 +7307,21 @@ async fn handle_comment_bulk_delete(
     args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
     let client = state.client().read().await;
-    let ids_str = match required_str(args, "comment_ids") {
+    let ids = match string_list_arg(args, "comment_ids") {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let ids: Vec<String> = ids_str.split(',').map(|s| s.trim().to_owned()).collect();
+    if ids.is_empty() {
+        return Ok(error_text(
+            "comment_ids must contain at least one non-empty comment ID",
+        ));
+    }
+    if ids.len() > 100 {
+        return Ok(error_text(&format!(
+            "bulk-delete accepts at most 100 comment ids (got {})",
+            ids.len()
+        )));
+    }
     match api::comment::bulk_delete_comments(&client, &ids).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
@@ -7309,7 +7413,15 @@ async fn handle_comment_linked(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    match api::comment::linked_comments(&client, etype, eid).await {
+    match api::comment::linked_comments(
+        &client,
+        etype,
+        eid,
+        optional_u32(args, "limit"),
+        optional_u32(args, "offset"),
+    )
+    .await
+    {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -7710,6 +7822,11 @@ async fn handle_task(
         "reorder-lists" => handle_task_reorder_lists(state, args).await,
         "filter" => handle_task_filter(state, args).await,
         "summary" => handle_task_summary(state, args).await,
+        "list-comments" => handle_task_list_comments(state, args).await,
+        "post-comment" => handle_task_post_comment(state, args).await,
+        "list-attachments" => handle_task_list_attachments(state, args).await,
+        "attach" => handle_task_attach(state, args).await,
+        "detach" => handle_task_detach(state, args).await,
         _ => Ok(error_text(&format!("Unknown task action: {action}"))),
     }
 }
@@ -7804,6 +7921,7 @@ async fn handle_task_create_task(
             status: optional_str(args, "status"),
             priority: optional_u8(args, "priority"),
             assignee_id: optional_str(args, "assignee_id"),
+            node_id: optional_str(args, "node_id"),
         },
     )
     .await
@@ -7855,6 +7973,7 @@ async fn handle_task_update_task(
             status: optional_str(args, "status"),
             priority: optional_u8(args, "priority"),
             assignee_id: optional_str(args, "assignee_id"),
+            node_id: optional_str(args, "node_id"),
         },
     )
     .await
@@ -8122,6 +8241,165 @@ async fn handle_task_reorder_lists(
     };
     let ids: Vec<String> = ids_str.split(',').map(|s| s.trim().to_owned()).collect();
     match api::workflow::reorder_task_lists(&client, pt, pid, &ids).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// `task` list-comments action: read a task's private comment thread.
+async fn handle_task_list_comments(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let list_id = match required_str(args, "list_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let task_id = match required_str(args, "task_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::workflow::list_task_comments(
+        &client,
+        list_id,
+        task_id,
+        optional_u32(args, "limit"),
+        optional_u32(args, "offset"),
+    )
+    .await
+    {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// `task` post-comment action: post a comment (or threaded reply) on a task.
+///
+/// `reference` and `properties` are optional JSON objects (accepted as a JSON
+/// object directly or as a JSON-object string) parsed via the shared
+/// [`json_object_arg`] helper and passed by reference; the comment body accepts
+/// either `text` (preferred) or `body` (alias). Editing/deleting a task comment
+/// is reached through the generic `comment` tool by comment id.
+async fn handle_task_post_comment(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let list_id = match required_str(args, "list_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let task_id = match required_str(args, "task_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let Some(body) = optional_str(args, "text").or_else(|| optional_str(args, "body")) else {
+        return Ok(error_text("Missing required parameter: text (or body)"));
+    };
+    let reference = match json_object_arg(args, "reference") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let properties = match json_object_arg(args, "properties") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::workflow::post_task_comment(
+        &client,
+        &api::workflow::PostTaskCommentParams {
+            list_id,
+            task_id,
+            body,
+            parent_id: optional_str(args, "parent_id"),
+            reference: reference.as_ref(),
+            properties: properties.as_ref(),
+        },
+    )
+    .await
+    {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// `task` list-attachments action: list a task's attachments (hydrated).
+async fn handle_task_list_attachments(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let list_id = match required_str(args, "list_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let task_id = match required_str(args, "task_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::workflow::list_task_attachments(&client, list_id, task_id).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// `task` attach action: attach one or more objects to a task (atomic,
+/// idempotent, cap 100). `target_ids` is a comma-separated list, split the same
+/// way as the `bulk-status` / `reorder-tasks` id params.
+async fn handle_task_attach(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let list_id = match required_str(args, "list_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let task_id = match required_str(args, "task_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let ids = match string_list_arg(args, "target_ids") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    if ids.is_empty() {
+        return Ok(error_text(
+            "target_ids must contain at least one non-empty object ID",
+        ));
+    }
+    if ids.len() > 100 {
+        return Ok(error_text(&format!(
+            "a single attach call accepts at most 100 target ids (got {})",
+            ids.len()
+        )));
+    }
+    match api::workflow::attach_to_task(&client, list_id, task_id, &ids).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// `task` detach action: detach a single object from a task (single only — there
+/// is no batch detach).
+async fn handle_task_detach(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let list_id = match required_str(args, "list_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let task_id = match required_str(args, "task_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let target_id = match required_str(args, "target_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::workflow::detach_from_task(&client, list_id, task_id, target_id).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -8525,18 +8803,104 @@ fn approval_scope_opt(args: &Map<String, Value>) -> Option<(&str, &str)> {
 /// either a JSON object passed directly or a JSON-object string; returns an
 /// error result if it is neither a JSON object nor a string encoding one.
 fn approval_properties(args: &Map<String, Value>) -> Result<Option<Value>, CallToolResult> {
-    match args.get("properties") {
+    json_object_arg(args, "properties")
+}
+
+/// Read an optional JSON-object argument that may arrive either as a JSON object
+/// directly (the common MCP-client shape) or as a serialized JSON-object string.
+/// A missing/null key is `None`; any value that is not (or does not parse to) a
+/// JSON object is rejected with a clear error rather than silently dropped.
+fn json_object_arg(args: &Map<String, Value>, key: &str) -> Result<Option<Value>, CallToolResult> {
+    match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Object(map)) => Ok(Some(Value::Object(map.clone()))),
         Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw) {
             Ok(v) if v.is_object() => Ok(Some(v)),
-            _ => Err(error_text(
-                "properties must be a JSON object (e.g. {\"key\":\"value\"})",
-            )),
+            _ => Err(error_text(&format!(
+                "{key} must be a JSON object (e.g. {{\"key\":\"value\"}})"
+            ))),
         },
-        Some(_) => Err(error_text(
-            "properties must be a JSON object (e.g. {\"key\":\"value\"})",
-        )),
+        Some(_) => Err(error_text(&format!(
+            "{key} must be a JSON object (e.g. {{\"key\":\"value\"}})"
+        ))),
+    }
+}
+
+/// Read an optional JSON-array argument for a REST field the API expects as a
+/// JSON-array STRING (e.g. workflow `ops`, `apply_change_ids`). MCP clients
+/// commonly pass these as a native JSON array; accept that OR a serialized
+/// JSON-array string and return the serialized form. A missing/null key is
+/// `None`; anything that is not (or does not parse to) a **non-empty** JSON array
+/// is rejected rather than silently dropped.
+///
+/// An explicit EMPTY array is rejected on purpose: the workflow API treats an
+/// empty/omitted `apply_change_ids` as "apply ALL pending changes", so accepting
+/// `[]` would turn an apply-nothing / empty-selection request into an apply-ALL
+/// one. To apply all, OMIT the field; to apply a subset, pass a non-empty array.
+fn json_array_string_arg(
+    args: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, CallToolResult> {
+    let empty_err = || {
+        error_text(&format!(
+            "{key} must be a non-empty JSON array (omit it entirely to apply all)"
+        ))
+    };
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(arr)) if arr.is_empty() => Err(empty_err()),
+        Some(arr @ Value::Array(_)) => Ok(Some(arr.to_string())),
+        Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw) {
+            Ok(Value::Array(arr)) if arr.is_empty() => Err(empty_err()),
+            Ok(Value::Array(_)) => Ok(Some(raw.clone())),
+            _ => Err(error_text(&format!(
+                "{key} must be a JSON array (or a JSON-array string)"
+            ))),
+        },
+        Some(_) => Err(error_text(&format!(
+            "{key} must be a JSON array (or a JSON-array string)"
+        ))),
+    }
+}
+
+/// Read a list-of-ids argument that may arrive either as a native JSON array of
+/// strings or as a comma-separated string (the established CSV form for id-list
+/// params). Returns the collected ids — the caller enforces non-empty and any cap.
+///
+/// The two forms are treated differently on purpose, because these feed mutating
+/// / destructive callers (attach, bulk-delete): a native JSON array is machine
+/// built, so a blank or non-string entry signals a generation bug and is
+/// **rejected** (fail closed); a comma-separated string is loose human/CLI input,
+/// so stray/trailing commas are tolerated by trimming and dropping blank tokens.
+fn string_list_arg(args: &Map<String, Value>, key: &str) -> Result<Vec<String>, CallToolResult> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => Ok(s
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+            .collect()),
+        Some(Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                match v.as_str() {
+                    Some(t) if !t.trim().is_empty() => out.push(t.trim().to_owned()),
+                    Some(_) => {
+                        return Err(error_text(&format!(
+                            "{key} array entries must be non-empty strings"
+                        )));
+                    }
+                    None => {
+                        return Err(error_text(&format!("{key} array entries must be strings")));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        Some(_) => Err(error_text(&format!(
+            "{key} must be a JSON array of strings or a comma-separated string"
+        ))),
     }
 }
 
@@ -9785,8 +10149,81 @@ fn workflow_describe() -> CallToolResult {
              no readable feed yet (neutral, NOT an error); a non-agent occurrence \
              returns 404. Never contains tool ids, arguments, results, or reasoning.",
         ),
+        (
+            "step-agent-trace",
+            &["workflow_id", "step_occurrence_id"],
+            &[],
+            "read-only reasoning + narration commentary of an AI-agent step (companion \
+             to step-agent-activity). Returns the interim reasoning and the commentary \
+             the agent emits while working; NEVER the final answer or citations. Poll \
+             while the step runs. available:false = no readable trace yet (neutral, NOT \
+             an error); a non-agent occurrence returns 404.",
+        ),
+        (
+            "modification-propose",
+            &["workflow_id", "ops"],
+            &["reason", "expires_in_seconds"],
+            "ops is a JSON ARRAY string (each {op, target_step_occurrence_id, …}; op ∈ \
+             skip|reassign|patch; max 50). Proposing AUTO-PAUSES the run; only one open \
+             proposal per workflow (409 otherwise). Requires workflow ADMIN + the \
+             workflow_mid_run_edit plan capability (403 otherwise).",
+        ),
+        (
+            "modification-list",
+            &["workflow_id"],
+            &["status"],
+            "member-or-above (a share-guest is excluded)",
+        ),
+        (
+            "modification-get",
+            &["workflow_id", "modification_id"],
+            &[],
+            "changes + before/after diff; member-or-above (a share-guest is excluded)",
+        ),
+        (
+            "modification-apply",
+            &["workflow_id", "modification_id"],
+            &["apply_change_ids", "confirm_removes_human_gate"],
+            "applies then finalizes + resumes. Omit apply_change_ids to apply ALL pending \
+             changes; otherwise a JSON ARRAY string covering all pending changes (a partial \
+             selection is rejected). A skip that removes a human gate requires \
+             confirm_removes_human_gate=true (else 403). Workflow ADMIN.",
+        ),
+        (
+            "modification-cancel",
+            &["workflow_id", "modification_id"],
+            &[],
+            "cancels the proposal and resumes the run unchanged. Workflow ADMIN.",
+        ),
         ("template-list", &["workspace_id"], &["limit", "offset"], ""),
         ("template-get", &["template_id"], &["include_body"], ""),
+        (
+            "template-gallery",
+            &[],
+            &[],
+            "list the built-in system template gallery (metadata only); any authenticated \
+             user, no workspace scope or plan gate; whole bounded list, no pagination",
+        ),
+        (
+            "template-gallery-get",
+            &["handle"],
+            &[],
+            "one gallery template: metadata + full definition body (incl. the setup block \
+             describing inputs to collect before instantiating); 404 for an unknown handle",
+        ),
+        (
+            "agent-template-list",
+            &["workspace_id"],
+            &[],
+            "list a workspace's v3.5 agent templates (persona = instruction prompt + tool \
+             allowlist); workspace view. Create/update/delete are CLI-only (workspace admin).",
+        ),
+        (
+            "agent-template-get",
+            &["workspace_id", "template_id"],
+            &[],
+            "read one agent template; workspace view",
+        ),
         ("trigger-list", &["workspace_id"], &["enabled_filter"], ""),
         ("trigger-get", &["trigger_id"], &[], ""),
         (
@@ -10180,6 +10617,89 @@ async fn handle_workflow(
             };
             wf_render(wf::get_step_agent_activity(&client, wid, oid).await)
         }
+        "step-agent-trace" => {
+            let (wid, oid) = match (
+                required_str(args, "workflow_id"),
+                required_str(args, "step_occurrence_id"),
+            ) {
+                (Ok(w), Ok(o)) => (w, o),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            wf_render(wf::get_step_agent_trace(&client, wid, oid).await)
+        }
+        "modification-propose" => {
+            let wid = match required_str(args, "workflow_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let ops = match json_array_string_arg(args, "ops") {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return Ok(error_text("Missing required parameter: ops (a JSON array)"));
+                }
+                Err(e) => return Ok(e),
+            };
+            wf_render(
+                wf::propose_modification(
+                    &client,
+                    wid,
+                    &ops,
+                    optional_str(args, "reason"),
+                    optional_u64(args, "expires_in_seconds"),
+                )
+                .await,
+            )
+        }
+        "modification-list" => {
+            let wid = match required_str(args, "workflow_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(wf::list_modifications(&client, wid, optional_str(args, "status")).await)
+        }
+        "modification-get" => {
+            let (wid, mid) = match (
+                required_str(args, "workflow_id"),
+                required_str(args, "modification_id"),
+            ) {
+                (Ok(w), Ok(m)) => (w, m),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            wf_render(wf::get_modification(&client, wid, mid).await)
+        }
+        "modification-apply" => {
+            let (wid, mid) = match (
+                required_str(args, "workflow_id"),
+                required_str(args, "modification_id"),
+            ) {
+                (Ok(w), Ok(m)) => (w, m),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            let apply_change_ids = match json_array_string_arg(args, "apply_change_ids") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(
+                wf::apply_modification(
+                    &client,
+                    wid,
+                    mid,
+                    apply_change_ids.as_deref(),
+                    optional_bool(args, "confirm_removes_human_gate") == Some(true),
+                )
+                .await,
+            )
+        }
+        "modification-cancel" => {
+            let (wid, mid) = match (
+                required_str(args, "workflow_id"),
+                required_str(args, "modification_id"),
+            ) {
+                (Ok(w), Ok(m)) => (w, m),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            wf_render(wf::cancel_modification(&client, wid, mid).await)
+        }
         "template-list" => {
             let ws = match required_str(args, "workspace_id") {
                 Ok(v) => v,
@@ -10208,6 +10728,31 @@ async fn handle_workflow(
                 )
                 .await,
             )
+        }
+        "template-gallery" => wf_render(wf::list_system_templates(&client).await),
+        "template-gallery-get" => {
+            let handle = match required_str(args, "handle") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(wf::get_system_template(&client, handle).await)
+        }
+        "agent-template-list" => {
+            let ws = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(wf::list_agent_templates(&client, ws).await)
+        }
+        "agent-template-get" => {
+            let (ws, tid) = match (
+                required_str(args, "workspace_id"),
+                required_str(args, "template_id"),
+            ) {
+                (Ok(w), Ok(t)) => (w, t),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            wf_render(wf::get_agent_template(&client, ws, tid).await)
         }
         "trigger-list" => {
             let ws = match required_str(args, "workspace_id") {
@@ -14177,6 +14722,83 @@ mod ripley_tool_tests {
             super::approval_properties(&Map::new())
                 .expect("absent ok")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn json_array_string_arg_accepts_array_or_string_rejects_empty_and_nonarray() {
+        // Native JSON array → serialized form preserved.
+        let mut a = Map::new();
+        a.insert("ops".to_owned(), json!([{"op": "skip"}]));
+        let got = super::json_array_string_arg(&a, "ops").expect("array ok");
+        assert_eq!(got.as_deref(), Some(r#"[{"op":"skip"}]"#));
+
+        // JSON-array string → passed through verbatim.
+        let mut s = Map::new();
+        s.insert("ops".to_owned(), Value::String(r#"["c1","c2"]"#.to_owned()));
+        let got = super::json_array_string_arg(&s, "ops").expect("string ok");
+        assert_eq!(got.as_deref(), Some(r#"["c1","c2"]"#));
+
+        // Absent → None (the documented apply-all signal for apply_change_ids).
+        assert!(
+            super::json_array_string_arg(&Map::new(), "apply_change_ids")
+                .expect("absent ok")
+                .is_none()
+        );
+
+        // Explicit empty array (native or string) is REJECTED — must omit to apply all.
+        let mut empty = Map::new();
+        empty.insert("apply_change_ids".to_owned(), json!([]));
+        assert!(super::json_array_string_arg(&empty, "apply_change_ids").is_err());
+        let mut empty_s = Map::new();
+        empty_s.insert("apply_change_ids".to_owned(), Value::String("[]".to_owned()));
+        assert!(super::json_array_string_arg(&empty_s, "apply_change_ids").is_err());
+
+        // A non-array (object / scalar / non-array string) is rejected.
+        let mut obj = Map::new();
+        obj.insert("ops".to_owned(), json!({"op": "skip"}));
+        assert!(super::json_array_string_arg(&obj, "ops").is_err());
+        let mut scalar = Map::new();
+        scalar.insert("ops".to_owned(), json!(5));
+        assert!(super::json_array_string_arg(&scalar, "ops").is_err());
+    }
+
+    #[test]
+    fn string_list_arg_filters_csv_blanks_but_rejects_array_blanks() {
+        // CSV string: trims and drops stray/trailing-comma blanks (loose human input).
+        let mut csv = Map::new();
+        csv.insert(
+            "target_ids".to_owned(),
+            Value::String(" n1 , , n2 ,".to_owned()),
+        );
+        assert_eq!(
+            super::string_list_arg(&csv, "target_ids").expect("csv ok"),
+            vec!["n1".to_owned(), "n2".to_owned()]
+        );
+
+        // Native array: a blank entry fails closed (machine-built list with a hole).
+        let mut arr_blank = Map::new();
+        arr_blank.insert("comment_ids".to_owned(), json!(["c1", ""]));
+        assert!(super::string_list_arg(&arr_blank, "comment_ids").is_err());
+
+        // Native array of clean strings → collected.
+        let mut arr = Map::new();
+        arr.insert("comment_ids".to_owned(), json!(["c1", "c2"]));
+        assert_eq!(
+            super::string_list_arg(&arr, "comment_ids").expect("array ok"),
+            vec!["c1".to_owned(), "c2".to_owned()]
+        );
+
+        // Non-string array entry rejected.
+        let mut arr_num = Map::new();
+        arr_num.insert("comment_ids".to_owned(), json!(["c1", 7]));
+        assert!(super::string_list_arg(&arr_num, "comment_ids").is_err());
+
+        // Absent → empty (caller enforces non-empty).
+        assert!(
+            super::string_list_arg(&Map::new(), "target_ids")
+                .expect("absent ok")
+                .is_empty()
         );
     }
 

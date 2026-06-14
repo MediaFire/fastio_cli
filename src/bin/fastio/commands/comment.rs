@@ -51,6 +51,13 @@ pub enum CommentCommand {
         /// Reply text.
         text: String,
     },
+    /// Edit a comment's text (author-only; by comment ID).
+    Edit {
+        /// Comment ID.
+        comment_id: String,
+        /// New comment text.
+        text: String,
+    },
     /// Delete a comment.
     Delete {
         /// Comment ID.
@@ -85,6 +92,36 @@ pub enum CommentCommand {
     Unreact {
         /// Comment ID.
         comment_id: String,
+    },
+    /// Bulk soft-delete up to 100 comments by ID.
+    BulkDelete {
+        /// Comment IDs to delete.
+        comment_ids: Vec<String>,
+    },
+    /// Link a comment to a workflow entity (task or approval).
+    Link {
+        /// Comment ID.
+        comment_id: String,
+        /// Workflow entity type (task or approval).
+        entity_type: String,
+        /// Workflow entity ID.
+        entity_id: String,
+    },
+    /// Remove a comment's link to its workflow entity.
+    Unlink {
+        /// Comment ID.
+        comment_id: String,
+    },
+    /// List comments linked to a workflow entity (task or approval).
+    Linked {
+        /// Workflow entity type (task or approval).
+        entity_type: String,
+        /// Workflow entity ID.
+        entity_id: String,
+        /// Max results.
+        limit: Option<u32>,
+        /// Offset for pagination.
+        offset: Option<u32>,
     },
 }
 
@@ -150,6 +187,7 @@ pub async fn execute(command: &CommentCommand, ctx: &CommandContext<'_>) -> Resu
             validate_entity_args(entity_type, entity_id, node_id)?;
             reply(ctx, entity_type, entity_id, node_id, comment_id, text).await
         }
+        CommentCommand::Edit { comment_id, text } => edit(ctx, comment_id, text).await,
         CommentCommand::Delete { comment_id } => delete(ctx, comment_id).await,
         CommentCommand::ListAll {
             entity_type,
@@ -173,6 +211,19 @@ pub async fn execute(command: &CommentCommand, ctx: &CommandContext<'_>) -> Resu
         CommentCommand::Info { comment_id } => info(ctx, comment_id).await,
         CommentCommand::React { comment_id, emoji } => react(ctx, comment_id, emoji).await,
         CommentCommand::Unreact { comment_id } => unreact(ctx, comment_id).await,
+        CommentCommand::BulkDelete { comment_ids } => bulk_delete(ctx, comment_ids).await,
+        CommentCommand::Link {
+            comment_id,
+            entity_type,
+            entity_id,
+        } => link(ctx, comment_id, entity_type, entity_id).await,
+        CommentCommand::Unlink { comment_id } => unlink(ctx, comment_id).await,
+        CommentCommand::Linked {
+            entity_type,
+            entity_id,
+            limit,
+            offset,
+        } => linked(ctx, entity_type, entity_id, *limit, *offset).await,
     }
 }
 
@@ -244,6 +295,16 @@ async fn reply(
     Ok(())
 }
 
+/// Edit a comment's text.
+async fn edit(ctx: &CommandContext<'_>, comment_id: &str, text: &str) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::comment::update_comment(&client, comment_id, text)
+        .await
+        .context("failed to edit comment")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
 /// Delete a comment.
 async fn delete(ctx: &CommandContext<'_>, comment_id: &str) -> Result<()> {
     let client = ctx.build_client()?;
@@ -302,6 +363,68 @@ async fn unreact(ctx: &CommandContext<'_>, comment_id: &str) -> Result<()> {
     let value = api::comment::remove_reaction(&client, comment_id)
         .await
         .context("failed to remove reaction")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Bulk soft-delete up to 100 comments.
+async fn bulk_delete(ctx: &CommandContext<'_>, comment_ids: &[String]) -> Result<()> {
+    let ids: Vec<String> = comment_ids
+        .iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    anyhow::ensure!(!ids.is_empty(), "at least one comment ID is required");
+    anyhow::ensure!(
+        ids.len() <= 100,
+        "bulk-delete accepts at most 100 comment ids (got {})",
+        ids.len()
+    );
+    let client = ctx.build_client()?;
+    let value = api::comment::bulk_delete_comments(&client, &ids)
+        .await
+        .context("failed to bulk-delete comments")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Link a comment to a workflow entity (task or approval).
+async fn link(
+    ctx: &CommandContext<'_>,
+    comment_id: &str,
+    entity_type: &str,
+    entity_id: &str,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::comment::link_comment(&client, comment_id, entity_type, entity_id)
+        .await
+        .context("failed to link comment")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Remove a comment's link to its workflow entity.
+async fn unlink(ctx: &CommandContext<'_>, comment_id: &str) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::comment::unlink_comment(&client, comment_id)
+        .await
+        .context("failed to unlink comment")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// List comments linked to a workflow entity (task or approval).
+async fn linked(
+    ctx: &CommandContext<'_>,
+    entity_type: &str,
+    entity_id: &str,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::comment::linked_comments(&client, entity_type, entity_id, limit, offset)
+        .await
+        .context("failed to list linked comments")?;
     ctx.output.render(&value)?;
     Ok(())
 }

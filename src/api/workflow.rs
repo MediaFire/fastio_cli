@@ -134,6 +134,8 @@ pub struct CreateTaskParams<'a> {
     pub priority: Option<u8>,
     /// Assignee profile ID.
     pub assignee_id: Option<&'a str>,
+    /// Primary linked storage node ID (single-node link on the task).
+    pub node_id: Option<&'a str>,
 }
 
 /// Create a task in a task list.
@@ -155,6 +157,9 @@ pub async fn create_task(
     }
     if let Some(a) = params.assignee_id {
         body["assignee_id"] = Value::String(a.to_owned());
+    }
+    if let Some(n) = params.node_id {
+        body["node_id"] = Value::String(n.to_owned());
     }
     let path = format!(
         "/tasks/{}/items/create/",
@@ -191,6 +196,8 @@ pub struct UpdateTaskParams<'a> {
     pub priority: Option<u8>,
     /// New assignee.
     pub assignee_id: Option<&'a str>,
+    /// New primary linked storage node ID (single-node link on the task).
+    pub node_id: Option<&'a str>,
 }
 
 /// Update a task.
@@ -218,6 +225,18 @@ pub async fn update_task(
     }
     if let Some(a) = params.assignee_id {
         body.insert("assignee_id".to_owned(), Value::String(a.to_owned()));
+    }
+    if let Some(n) = params.node_id {
+        // An empty string clears the link (the API accepts `node_id: null`);
+        // a non-empty value sets it.
+        body.insert(
+            "node_id".to_owned(),
+            if n.is_empty() {
+                Value::Null
+            } else {
+                Value::String(n.to_owned())
+            },
+        );
     }
     let path = format!(
         "/tasks/{}/items/{}/update/",
@@ -276,6 +295,142 @@ pub async fn change_task_status(
     let body = serde_json::json!({ "status": status });
     let path = format!(
         "/tasks/{}/items/{}/status/",
+        urlencoding::encode(list_id),
+        urlencoding::encode(task_id),
+    );
+    client.post_json(&path, &body).await
+}
+
+// ─── Task Comments ────────────────────────────────────────────────────────────
+
+/// List a task's comment thread.
+///
+/// `GET /tasks/{list_id}/items/{task_id}/comments/`
+/// Task comments are private to the task — they are not returned by the generic
+/// comment-listing endpoints and do not appear in comment search.
+pub async fn list_task_comments(
+    client: &ApiClient,
+    list_id: &str,
+    task_id: &str,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Value, CliError> {
+    let mut params = HashMap::new();
+    if let Some(l) = limit {
+        params.insert("limit".to_owned(), l.to_string());
+    }
+    if let Some(o) = offset {
+        params.insert("offset".to_owned(), o.to_string());
+    }
+    let path = format!(
+        "/tasks/{}/items/{}/comments/",
+        urlencoding::encode(list_id),
+        urlencoding::encode(task_id),
+    );
+    if params.is_empty() {
+        client.get(&path).await
+    } else {
+        client.get_with_params(&path, &params).await
+    }
+}
+
+/// Parameters for [`post_task_comment`].
+pub struct PostTaskCommentParams<'a> {
+    /// Task list ID.
+    pub list_id: &'a str,
+    /// Task ID.
+    pub task_id: &'a str,
+    /// Comment body (1–8192 chars; may include `@[user:{id}:{name}]` mentions).
+    pub body: &'a str,
+    /// Parent comment ID for a single-level threaded reply.
+    pub parent_id: Option<&'a str>,
+    /// Optional anchoring reference (JSON object) into a file position.
+    pub reference: Option<&'a Value>,
+    /// Optional arbitrary key-value metadata (JSON object).
+    pub properties: Option<&'a Value>,
+}
+
+/// Post a comment (or threaded reply) on a task.
+///
+/// `POST /tasks/{list_id}/items/{task_id}/comments/` (JSON body). This endpoint
+/// never edits — to edit or delete a task comment use the generic comment
+/// endpoints by comment ID (`comment::update_comment` / `comment::delete_comment`).
+pub async fn post_task_comment(
+    client: &ApiClient,
+    params: &PostTaskCommentParams<'_>,
+) -> Result<Value, CliError> {
+    let mut body = serde_json::json!({ "body": params.body });
+    if let Some(p) = params.parent_id {
+        body["parent_id"] = Value::String(p.to_owned());
+    }
+    if let Some(r) = params.reference {
+        body["reference"] = r.clone();
+    }
+    if let Some(p) = params.properties {
+        body["properties"] = p.clone();
+    }
+    let path = format!(
+        "/tasks/{}/items/{}/comments/",
+        urlencoding::encode(params.list_id),
+        urlencoding::encode(params.task_id),
+    );
+    client.post_json(&path, &body).await
+}
+
+// ─── Task Attachments ─────────────────────────────────────────────────────────
+
+/// List a task's attachments (hydrated).
+///
+/// `GET /tasks/{list_id}/items/{task_id}/attachments/`
+pub async fn list_task_attachments(
+    client: &ApiClient,
+    list_id: &str,
+    task_id: &str,
+) -> Result<Value, CliError> {
+    let path = format!(
+        "/tasks/{}/items/{}/attachments/",
+        urlencoding::encode(list_id),
+        urlencoding::encode(task_id),
+    );
+    client.get(&path).await
+}
+
+/// Attach one or more objects to a task.
+///
+/// `POST /tasks/{list_id}/items/{task_id}/attachments/` (JSON body). Sends the
+/// `target_ids` array form (1–100 ids), which the server accepts for both a
+/// single and a bulk attach. The operation is atomic (a partial-batch failure
+/// attaches nothing), idempotent (re-attaching is a no-op), and capped at 100
+/// attachments per task. Returns the full updated attachment list.
+pub async fn attach_to_task(
+    client: &ApiClient,
+    list_id: &str,
+    task_id: &str,
+    target_ids: &[String],
+) -> Result<Value, CliError> {
+    let body = serde_json::json!({ "target_ids": target_ids });
+    let path = format!(
+        "/tasks/{}/items/{}/attachments/",
+        urlencoding::encode(list_id),
+        urlencoding::encode(task_id),
+    );
+    client.post_json(&path, &body).await
+}
+
+/// Detach a single object from a task.
+///
+/// `POST /tasks/{list_id}/items/{task_id}/attachments/detach/` (JSON body).
+/// Detach is single-object only — there is no batch detach; call once per
+/// object. Idempotent: detaching a non-attached object returns `removed: false`.
+pub async fn detach_from_task(
+    client: &ApiClient,
+    list_id: &str,
+    task_id: &str,
+    target_id: &str,
+) -> Result<Value, CliError> {
+    let body = serde_json::json!({ "target_id": target_id });
+    let path = format!(
+        "/tasks/{}/items/{}/attachments/detach/",
         urlencoding::encode(list_id),
         urlencoding::encode(task_id),
     );

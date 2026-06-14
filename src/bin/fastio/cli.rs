@@ -487,9 +487,15 @@ pub enum WorkflowCommands {
     /// Step occurrences.
     #[command(subcommand)]
     Step(WorkflowStepCommands),
+    /// Mid-run modifications (propose / apply edits to a running workflow).
+    #[command(subcommand)]
+    Modification(WorkflowModificationCommands),
     /// Template revisions (immutable).
     #[command(subcommand)]
     Template(WorkflowTemplateCommands),
+    /// Agent templates (v3.5+ persona = instruction prompt + tool allowlist).
+    #[command(subcommand)]
+    AgentTemplate(WorkflowAgentTemplateCommands),
     /// Event-driven triggers.
     #[command(subcommand)]
     Trigger(WorkflowTriggerCommands),
@@ -523,6 +529,65 @@ pub enum WorkflowCommands {
     /// Workflow Review surface (v3.5b; flag-gated 404 when off — except `active`).
     #[command(subcommand)]
     Review(WorkflowReviewCommands),
+}
+
+/// Workflow mid-run modification subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowModificationCommands {
+    /// Propose a modification (skip / reassign / patch step occurrences) against
+    /// a running workflow. Auto-pauses the run; only one proposal may be open at
+    /// a time. Requires the `workflow_mid_run_edit` capability and workflow ADMIN.
+    Propose {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Operations as a JSON array string (or `@file.json`); each op is
+        /// `{"op":"skip"|"reassign"|"patch","target_step_occurrence_id":"…"}`.
+        ops: String,
+        /// Human-readable reason for the change.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Proposal lifetime in seconds (max/default 604800 = 7 days).
+        #[arg(long)]
+        expires_in_seconds: Option<u64>,
+    },
+    /// List a workflow's modification proposals (optional `--status` filter).
+    List {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Filter by proposal status.
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Get a proposal's detail (changes + before/after diff).
+    Get {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Modification (proposal) ID.
+        modification_id: String,
+    },
+    /// Apply a proposal's changes, then finalize and resume the run.
+    Apply {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Modification (proposal) ID.
+        modification_id: String,
+        /// Change ids to apply as a JSON array string (or `@file.json`); omit
+        /// to apply every pending change.
+        #[arg(long)]
+        apply_change_ids: Option<String>,
+        /// Required to apply a change that removes a human gate (approval/signing
+        /// step), otherwise the apply is rejected with 403.
+        #[arg(long)]
+        confirm_removes_human_gate: bool,
+    },
+    /// Cancel a proposal and resume the run unchanged.
+    Cancel {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Modification (proposal) ID.
+        modification_id: String,
+    },
 }
 
 /// Workflow grant subcommands.
@@ -628,6 +693,16 @@ pub enum WorkflowStepCommands {
         /// Step occurrence ID.
         step_occurrence_id: String,
     },
+    /// Read an AI-agent step occurrence's reasoning + commentary transcript
+    /// (the companion to `agent-activity`). Never the final answer/citations.
+    /// `available: false` means no readable trace yet — not an error.
+    /// Non-agent occurrences return 404.
+    AgentTrace {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Step occurrence ID.
+        step_occurrence_id: String,
+    },
 }
 
 /// Workflow template subcommands (immutable revisions — no `update`).
@@ -676,6 +751,103 @@ pub enum WorkflowTemplateCommands {
     /// Deprecate a revision (legal only from `published`).
     Deprecate {
         /// Template ID.
+        template_id: String,
+    },
+    /// List the system template gallery (built-in catalog; no pagination).
+    Gallery,
+    /// Get one gallery template — metadata plus its full definition + setup
+    /// block (404 for an unknown handle).
+    GalleryGet {
+        /// Gallery template handle (e.g. `system:gallery:contract-review`).
+        handle: String,
+    },
+    /// Instantiate a gallery template into a workspace as a new revision
+    /// (workspace admin; requires the workspace's workflow feature).
+    FromSystem {
+        /// Target workspace ID.
+        workspace_id: String,
+        /// Gallery template handle.
+        handle: String,
+        /// Attach the new revision to this existing workflow (else a new one).
+        #[arg(long)]
+        workflow_id: Option<String>,
+        /// Create a new workflow (mutually exclusive with `--workflow-id`).
+        #[arg(long)]
+        create_workflow: Option<bool>,
+        /// Override the created revision/workflow name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Override the created revision/workflow description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Setup inputs as a JSON object string (or `@file.json`) mapping
+        /// input ids to values.
+        #[arg(long)]
+        inputs: Option<String>,
+        /// Compare-and-set against the catalog version (409 on mismatch).
+        #[arg(long)]
+        expected_version: Option<u64>,
+        /// Replay-safe idempotency key (≤128 chars).
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Publish + bind the revision (server default is true).
+        #[arg(long)]
+        publish: Option<bool>,
+        /// Revision reason string.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+/// Workflow agent-template subcommands (v3.5+, workspace admin for writes).
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum WorkflowAgentTemplateCommands {
+    /// Create an agent template (workspace admin).
+    Create {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Template name (≤128 chars).
+        name: String,
+        /// Agent-step instruction prompt (≤8192 chars).
+        instruction_prompt: String,
+        /// Tool allowlist as a JSON array string of tool id strings (or `@file.json`).
+        #[arg(long)]
+        tool_allowlist: Option<String>,
+    },
+    /// List a workspace's agent templates.
+    List {
+        /// Workspace ID.
+        workspace_id: String,
+    },
+    /// Read one agent template.
+    Get {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Agent template ID.
+        template_id: String,
+    },
+    /// Update an agent template's mutable fields (workspace admin).
+    Update {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Agent template ID.
+        template_id: String,
+        /// New name (≤128 chars).
+        #[arg(long)]
+        name: Option<String>,
+        /// New instruction prompt (≤8192 chars).
+        #[arg(long)]
+        instruction_prompt: Option<String>,
+        /// New tool allowlist as a JSON array string (or `@file.json`).
+        #[arg(long)]
+        tool_allowlist: Option<String>,
+    },
+    /// Hard-delete an agent template (workspace admin).
+    Delete {
+        /// Workspace ID.
+        workspace_id: String,
+        /// Agent template ID.
         template_id: String,
     },
 }
@@ -3705,6 +3877,14 @@ pub enum CommentCommands {
         #[arg(long)]
         entity_id: String,
     },
+    /// Edit a comment's text (author-only; works for any comment by ID,
+    /// including task comments).
+    Edit {
+        /// Comment ID.
+        comment_id: String,
+        /// New comment text.
+        text: String,
+    },
     /// Delete a comment.
     Delete {
         /// Comment ID.
@@ -3744,6 +3924,44 @@ pub enum CommentCommands {
     Unreact {
         /// Comment ID.
         comment_id: String,
+    },
+    /// Bulk soft-delete up to 100 comments by ID (not recursive).
+    #[command(name = "bulk-delete")]
+    BulkDelete {
+        /// Comma-separated comment IDs (max 100).
+        #[arg(long, value_delimiter = ',', required = true)]
+        comment_ids: Vec<String>,
+    },
+    /// Link a comment to a workflow entity (task or approval).
+    Link {
+        /// Comment ID.
+        comment_id: String,
+        /// Workflow entity type to link to.
+        #[arg(long, value_parser = ["task", "approval"])]
+        entity_type: String,
+        /// Workflow entity ID (task or approval ID).
+        #[arg(long)]
+        entity_id: String,
+    },
+    /// Remove a comment's link to its workflow entity.
+    Unlink {
+        /// Comment ID.
+        comment_id: String,
+    },
+    /// List comments linked to a workflow entity (task or approval).
+    Linked {
+        /// Workflow entity type.
+        #[arg(long, value_parser = ["task", "approval"])]
+        entity_type: String,
+        /// Workflow entity ID (task or approval ID).
+        #[arg(long)]
+        entity_id: String,
+        /// Maximum number of results (1–200).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
     },
 }
 
@@ -4240,6 +4458,9 @@ pub enum TaskCommands {
         /// Assignee profile ID.
         #[arg(long)]
         assignee_id: Option<String>,
+        /// Primary linked storage node ID (single-node link on the task).
+        #[arg(long)]
+        node_id: Option<String>,
     },
     /// Get task details.
     Info {
@@ -4271,6 +4492,10 @@ pub enum TaskCommands {
         /// New assignee profile ID.
         #[arg(long)]
         assignee_id: Option<String>,
+        /// New primary linked storage node ID (single-node link on the task;
+        /// pass an empty string to clear the link).
+        #[arg(long)]
+        node_id: Option<String>,
     },
     /// Delete a task.
     Delete {
@@ -4378,9 +4603,110 @@ pub enum TaskCommands {
         #[arg(long, alias = "workspace")]
         profile_id: String,
     },
+    /// List a task's attachments.
+    Attachments {
+        /// Task list ID.
+        #[arg(long)]
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+    },
+    /// Attach one or more objects to a task (atomic; idempotent; max 100 total).
+    Attach {
+        /// Task list ID.
+        #[arg(long)]
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+        /// Object IDs to attach. Repeat `--target-id` for multiple, or pass a
+        /// comma-separated list (node / workflow / envelope / share / workspace
+        /// / fileshare / task IDs).
+        #[arg(long = "target-id", value_delimiter = ',', required = true)]
+        target_ids: Vec<String>,
+    },
+    /// Detach a single object from a task (no batch detach — call once per object).
+    Detach {
+        /// Task list ID.
+        #[arg(long)]
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+        /// Object ID to detach.
+        #[arg(long = "target-id")]
+        target_id: String,
+    },
+    /// Manage a task's comment thread.
+    #[command(subcommand)]
+    Comment(TaskCommentCommands),
     /// Manage task lists.
     #[command(subcommand)]
     Lists(TaskListCommands),
+}
+
+/// Task comment subcommands.
+///
+/// Post and list are task-scoped; edit / delete / react reuse the generic
+/// comment endpoints by comment ID (see also `fastio comment …`).
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum TaskCommentCommands {
+    /// List a task's comment thread.
+    List {
+        /// Task list ID.
+        #[arg(long)]
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+        /// Maximum number of results (2–200).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Post a comment (or threaded reply) on a task.
+    Post {
+        /// Task list ID.
+        #[arg(long)]
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+        /// Comment text (may include `@[user:{id}:{name}]` mentions).
+        text: String,
+        /// Parent comment ID for a single-level threaded reply.
+        #[arg(long)]
+        parent_id: Option<String>,
+        /// Optional anchoring reference as a JSON object string (or `@file.json`).
+        #[arg(long)]
+        reference: Option<String>,
+        /// Optional arbitrary metadata as a JSON object string (or `@file.json`).
+        #[arg(long)]
+        properties: Option<String>,
+    },
+    /// Edit a task comment's text (author-only; by comment ID).
+    Edit {
+        /// Comment ID.
+        comment_id: String,
+        /// New comment text.
+        text: String,
+    },
+    /// Delete a task comment (by comment ID; recursive — also deletes replies).
+    Delete {
+        /// Comment ID.
+        comment_id: String,
+    },
+    /// Add an emoji reaction to a task comment (by comment ID).
+    React {
+        /// Comment ID.
+        comment_id: String,
+        /// Emoji to react with.
+        emoji: String,
+    },
+    /// Remove your emoji reaction from a task comment (by comment ID).
+    Unreact {
+        /// Comment ID.
+        comment_id: String,
+    },
 }
 
 /// Task list subcommands.

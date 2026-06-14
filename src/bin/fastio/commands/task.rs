@@ -51,6 +51,8 @@ pub enum TaskCommand {
         priority: Option<u8>,
         /// Assignee profile ID.
         assignee_id: Option<String>,
+        /// Primary linked storage node ID.
+        node_id: Option<String>,
     },
     /// Get task details.
     Info {
@@ -75,6 +77,8 @@ pub enum TaskCommand {
         priority: Option<u8>,
         /// New assignee.
         assignee_id: Option<String>,
+        /// New primary linked storage node ID.
+        node_id: Option<String>,
     },
     /// Delete a task.
     Delete {
@@ -157,8 +161,91 @@ pub enum TaskCommand {
         /// Workspace or share ID.
         profile_id: String,
     },
+    /// List a task's attachments.
+    Attachments {
+        /// Task list ID.
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+    },
+    /// Attach one or more objects to a task.
+    Attach {
+        /// Task list ID.
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+        /// Object IDs to attach.
+        target_ids: Vec<String>,
+    },
+    /// Detach a single object from a task.
+    Detach {
+        /// Task list ID.
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+        /// Object ID to detach.
+        target_id: String,
+    },
+    /// Manage a task's comment thread.
+    Comment(TaskCommentCommand),
     /// Manage task lists.
     Lists(TaskListCommand),
+}
+
+/// Task comment subcommand variants.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum TaskCommentCommand {
+    /// List a task's comment thread.
+    List {
+        /// Task list ID.
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+        /// Max results.
+        limit: Option<u32>,
+        /// Offset for pagination.
+        offset: Option<u32>,
+    },
+    /// Post a comment (or threaded reply) on a task.
+    Post {
+        /// Task list ID.
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+        /// Comment text.
+        text: String,
+        /// Parent comment ID for a threaded reply.
+        parent_id: Option<String>,
+        /// Anchoring reference as a JSON object string.
+        reference: Option<String>,
+        /// Arbitrary metadata as a JSON object string.
+        properties: Option<String>,
+    },
+    /// Edit a task comment's text (by comment ID).
+    Edit {
+        /// Comment ID.
+        comment_id: String,
+        /// New comment text.
+        text: String,
+    },
+    /// Delete a task comment (by comment ID).
+    Delete {
+        /// Comment ID.
+        comment_id: String,
+    },
+    /// Add an emoji reaction to a task comment (by comment ID).
+    React {
+        /// Comment ID.
+        comment_id: String,
+        /// Emoji to react with.
+        emoji: String,
+    },
+    /// Remove your emoji reaction from a task comment (by comment ID).
+    Unreact {
+        /// Comment ID.
+        comment_id: String,
+    },
 }
 
 /// Task list subcommand variants.
@@ -221,6 +308,7 @@ pub async fn execute(command: &TaskCommand, ctx: &CommandContext<'_>) -> Result<
             status,
             priority,
             assignee_id,
+            node_id,
         } => {
             create(
                 ctx,
@@ -231,6 +319,7 @@ pub async fn execute(command: &TaskCommand, ctx: &CommandContext<'_>) -> Result<
                 status.as_deref(),
                 *priority,
                 assignee_id.as_deref(),
+                node_id.as_deref(),
             )
             .await
         }
@@ -243,6 +332,7 @@ pub async fn execute(command: &TaskCommand, ctx: &CommandContext<'_>) -> Result<
             status,
             priority,
             assignee_id,
+            node_id,
         } => {
             update(
                 ctx,
@@ -253,6 +343,7 @@ pub async fn execute(command: &TaskCommand, ctx: &CommandContext<'_>) -> Result<
                 status.as_deref(),
                 *priority,
                 assignee_id.as_deref(),
+                node_id.as_deref(),
             )
             .await
         }
@@ -303,6 +394,18 @@ pub async fn execute(command: &TaskCommand, ctx: &CommandContext<'_>) -> Result<
             profile_type,
             profile_id,
         } => tasks_summary(ctx, profile_type, profile_id).await,
+        TaskCommand::Attachments { list_id, task_id } => attachments(ctx, list_id, task_id).await,
+        TaskCommand::Attach {
+            list_id,
+            task_id,
+            target_ids,
+        } => attach(ctx, list_id, task_id, target_ids).await,
+        TaskCommand::Detach {
+            list_id,
+            task_id,
+            target_id,
+        } => detach(ctx, list_id, task_id, target_id).await,
+        TaskCommand::Comment(cmd) => comment(cmd, ctx).await,
         TaskCommand::Lists(cmd) => lists(cmd, ctx).await,
     }
 }
@@ -385,6 +488,7 @@ async fn create(
     status: Option<&str>,
     priority: Option<u8>,
     assignee_id: Option<&str>,
+    node_id: Option<&str>,
 ) -> Result<()> {
     validate_priority(priority)?;
 
@@ -398,6 +502,7 @@ async fn create(
             status,
             priority,
             assignee_id,
+            node_id,
         },
     )
     .await
@@ -427,15 +532,17 @@ async fn update(
     status: Option<&str>,
     priority: Option<u8>,
     assignee_id: Option<&str>,
+    node_id: Option<&str>,
 ) -> Result<()> {
     if title.is_none()
         && description.is_none()
         && status.is_none()
         && priority.is_none()
         && assignee_id.is_none()
+        && node_id.is_none()
     {
         anyhow::bail!(
-            "at least one update field is required (--title, --description, --status, --priority, --assignee-id)"
+            "at least one update field is required (--title, --description, --status, --priority, --assignee-id, --node-id)"
         );
     }
 
@@ -452,6 +559,7 @@ async fn update(
             status,
             priority,
             assignee_id,
+            node_id,
         },
     )
     .await
@@ -570,6 +678,150 @@ async fn reorder_lists(
         .await
         .context("failed to reorder task lists")?;
     ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Parse an optional JSON-object argument, supporting an `@path` form that
+/// reads the JSON from a file (`@@` escapes a literal leading `@`).
+fn parse_json_object_arg(raw: Option<&str>, label: &str) -> Result<Option<serde_json::Value>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let text = if let Some(path) = raw.strip_prefix('@') {
+        if let Some(literal) = path.strip_prefix('@') {
+            literal.to_owned()
+        } else {
+            std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read {label} from file '{path}'"))?
+        }
+    } else {
+        raw.to_owned()
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("{label} must be valid JSON"))?;
+    anyhow::ensure!(
+        value.is_object(),
+        "{label} must be a JSON object (e.g. {{\"key\":\"value\"}})"
+    );
+    Ok(Some(value))
+}
+
+/// List a task's attachments.
+async fn attachments(ctx: &CommandContext<'_>, list_id: &str, task_id: &str) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::workflow::list_task_attachments(&client, list_id, task_id)
+        .await
+        .context("failed to list task attachments")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Attach one or more objects to a task.
+async fn attach(
+    ctx: &CommandContext<'_>,
+    list_id: &str,
+    task_id: &str,
+    target_ids: &[String],
+) -> Result<()> {
+    let ids: Vec<String> = target_ids
+        .iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    anyhow::ensure!(!ids.is_empty(), "at least one --target-id is required");
+    anyhow::ensure!(
+        ids.len() <= 100,
+        "a single attach call accepts at most 100 target ids (got {})",
+        ids.len()
+    );
+    let client = ctx.build_client()?;
+    let value = api::workflow::attach_to_task(&client, list_id, task_id, &ids)
+        .await
+        .context("failed to attach to task")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Detach a single object from a task.
+async fn detach(
+    ctx: &CommandContext<'_>,
+    list_id: &str,
+    task_id: &str,
+    target_id: &str,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::workflow::detach_from_task(&client, list_id, task_id, target_id)
+        .await
+        .context("failed to detach from task")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Handle task comment subcommands.
+async fn comment(cmd: &TaskCommentCommand, ctx: &CommandContext<'_>) -> Result<()> {
+    let client = ctx.build_client()?;
+    match cmd {
+        TaskCommentCommand::List {
+            list_id,
+            task_id,
+            limit,
+            offset,
+        } => {
+            let value =
+                api::workflow::list_task_comments(&client, list_id, task_id, *limit, *offset)
+                    .await
+                    .context("failed to list task comments")?;
+            ctx.output.render(&value)?;
+        }
+        TaskCommentCommand::Post {
+            list_id,
+            task_id,
+            text,
+            parent_id,
+            reference,
+            properties,
+        } => {
+            let reference = parse_json_object_arg(reference.as_deref(), "reference")?;
+            let properties = parse_json_object_arg(properties.as_deref(), "properties")?;
+            let value = api::workflow::post_task_comment(
+                &client,
+                &api::workflow::PostTaskCommentParams {
+                    list_id,
+                    task_id,
+                    body: text,
+                    parent_id: parent_id.as_deref(),
+                    reference: reference.as_ref(),
+                    properties: properties.as_ref(),
+                },
+            )
+            .await
+            .context("failed to post task comment")?;
+            ctx.output.render(&value)?;
+        }
+        TaskCommentCommand::Edit { comment_id, text } => {
+            let value = api::comment::update_comment(&client, comment_id, text)
+                .await
+                .context("failed to edit task comment")?;
+            ctx.output.render(&value)?;
+        }
+        TaskCommentCommand::Delete { comment_id } => {
+            api::comment::delete_comment(&client, comment_id)
+                .await
+                .context("failed to delete task comment")?;
+            let value = json!({ "status": "deleted", "comment_id": comment_id });
+            ctx.output.render(&value)?;
+        }
+        TaskCommentCommand::React { comment_id, emoji } => {
+            let value = api::comment::add_reaction(&client, comment_id, emoji)
+                .await
+                .context("failed to add reaction")?;
+            ctx.output.render(&value)?;
+        }
+        TaskCommentCommand::Unreact { comment_id } => {
+            let value = api::comment::remove_reaction(&client, comment_id)
+                .await
+                .context("failed to remove reaction")?;
+            ctx.output.render(&value)?;
+        }
+    }
     Ok(())
 }
 

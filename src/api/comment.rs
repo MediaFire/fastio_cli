@@ -82,6 +82,23 @@ pub async fn add_comment(
     client.post_json(&path, &body).await
 }
 
+/// Edit an existing comment by ID.
+///
+/// `POST /comments/{comment_id}/update/`
+/// Author-only. Works for every comment surface — workspace, share, node,
+/// File Share, and task comments (the entity-scoped create/update route cannot
+/// address a task comment). The edit cannot move the comment; entity, scope,
+/// threading, and any workflow link are immutable.
+pub async fn update_comment(
+    client: &ApiClient,
+    comment_id: &str,
+    text: &str,
+) -> Result<Value, CliError> {
+    let body = serde_json::json!({ "body": text });
+    let path = format!("/comments/{}/update/", urlencoding::encode(comment_id));
+    client.post_json(&path, &body).await
+}
+
 /// Delete a comment.
 ///
 /// `DELETE /comments/{comment_id}/delete/`
@@ -190,16 +207,29 @@ pub async fn unlink_comment(client: &ApiClient, comment_id: &str) -> Result<Valu
 
 /// Find comments linked to a workflow entity.
 ///
-/// `GET /comments/linked/{entity_type}/{entity_id}/`
+/// `GET /comments/linked/{entity_type}/{entity_id}/` (optional `limit`/`offset`).
 pub async fn linked_comments(
     client: &ApiClient,
     entity_type: &str,
     entity_id: &str,
+    limit: Option<u32>,
+    offset: Option<u32>,
 ) -> Result<Value, CliError> {
+    let mut params = HashMap::new();
+    if let Some(l) = limit {
+        params.insert("limit".to_owned(), l.to_string());
+    }
+    if let Some(o) = offset {
+        params.insert("offset".to_owned(), o.to_string());
+    }
     let path = format!(
         "/comments/linked/{}/{}/",
         urlencoding::encode(entity_type),
         urlencoding::encode(entity_id),
     );
-    client.get(&path).await
+    if params.is_empty() {
+        client.get(&path).await
+    } else {
+        client.get_with_params(&path, &params).await
+    }
 }

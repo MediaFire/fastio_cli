@@ -34,7 +34,7 @@ use commands::preview::PreviewCommand;
 use commands::search::SearchCommand;
 use commands::share::{ShareCommand, ShareFilesCommand, ShareMembersCommand};
 use commands::system::SystemCommand;
-use commands::task::{TaskCommand, TaskListCommand};
+use commands::task::{TaskCommand, TaskCommentCommand, TaskListCommand};
 use commands::todo::TodoCommand;
 use commands::upload::UploadCommand;
 use commands::user::{
@@ -1357,6 +1357,9 @@ fn map_comment_command(cmd: cli::CommentCommands) -> CommentCommand {
             comment_id,
             text,
         },
+        cli::CommentCommands::Edit { comment_id, text } => {
+            CommentCommand::Edit { comment_id, text }
+        }
         cli::CommentCommands::Delete { comment_id } => CommentCommand::Delete { comment_id },
         cli::CommentCommands::ListAll {
             entity_type,
@@ -1376,6 +1379,30 @@ fn map_comment_command(cmd: cli::CommentCommands) -> CommentCommand {
             CommentCommand::React { comment_id, emoji }
         }
         cli::CommentCommands::Unreact { comment_id } => CommentCommand::Unreact { comment_id },
+        cli::CommentCommands::BulkDelete { comment_ids } => {
+            CommentCommand::BulkDelete { comment_ids }
+        }
+        cli::CommentCommands::Link {
+            comment_id,
+            entity_type,
+            entity_id,
+        } => CommentCommand::Link {
+            comment_id,
+            entity_type,
+            entity_id,
+        },
+        cli::CommentCommands::Unlink { comment_id } => CommentCommand::Unlink { comment_id },
+        cli::CommentCommands::Linked {
+            entity_type,
+            entity_id,
+            limit,
+            offset,
+        } => CommentCommand::Linked {
+            entity_type,
+            entity_id,
+            limit,
+            offset,
+        },
     }
 }
 
@@ -1738,6 +1765,7 @@ fn map_task_command(cmd: cli::TaskCommands) -> TaskCommand {
             status,
             priority,
             assignee_id,
+            node_id,
         } => TaskCommand::Create {
             workspace,
             list_id,
@@ -1746,6 +1774,7 @@ fn map_task_command(cmd: cli::TaskCommands) -> TaskCommand {
             status,
             priority,
             assignee_id,
+            node_id,
         },
         cli::TaskCommands::Info { list_id, task_id } => TaskCommand::Info { list_id, task_id },
         cli::TaskCommands::Update {
@@ -1756,6 +1785,7 @@ fn map_task_command(cmd: cli::TaskCommands) -> TaskCommand {
             status,
             priority,
             assignee_id,
+            node_id,
         } => TaskCommand::Update {
             list_id,
             task_id,
@@ -1764,6 +1794,7 @@ fn map_task_command(cmd: cli::TaskCommands) -> TaskCommand {
             status,
             priority,
             assignee_id,
+            node_id,
         },
         cli::TaskCommands::Delete { list_id, task_id } => TaskCommand::Delete { list_id, task_id },
         cli::TaskCommands::Assign {
@@ -1832,7 +1863,75 @@ fn map_task_command(cmd: cli::TaskCommands) -> TaskCommand {
             profile_type,
             profile_id,
         },
+        cli::TaskCommands::Attachments { list_id, task_id } => {
+            TaskCommand::Attachments { list_id, task_id }
+        }
+        cli::TaskCommands::Attach {
+            list_id,
+            task_id,
+            target_ids,
+        } => TaskCommand::Attach {
+            list_id,
+            task_id,
+            target_ids,
+        },
+        cli::TaskCommands::Detach {
+            list_id,
+            task_id,
+            target_id,
+        } => TaskCommand::Detach {
+            list_id,
+            task_id,
+            target_id,
+        },
+        cli::TaskCommands::Comment(comment_cmd) => {
+            TaskCommand::Comment(map_task_comment_command(comment_cmd))
+        }
         cli::TaskCommands::Lists(lists_cmd) => TaskCommand::Lists(map_task_list_command(lists_cmd)),
+    }
+}
+
+/// Convert clap-parsed task comment commands to the internal enum.
+fn map_task_comment_command(cmd: cli::TaskCommentCommands) -> TaskCommentCommand {
+    match cmd {
+        cli::TaskCommentCommands::List {
+            list_id,
+            task_id,
+            limit,
+            offset,
+        } => TaskCommentCommand::List {
+            list_id,
+            task_id,
+            limit,
+            offset,
+        },
+        cli::TaskCommentCommands::Post {
+            list_id,
+            task_id,
+            text,
+            parent_id,
+            reference,
+            properties,
+        } => TaskCommentCommand::Post {
+            list_id,
+            task_id,
+            text,
+            parent_id,
+            reference,
+            properties,
+        },
+        cli::TaskCommentCommands::Edit { comment_id, text } => {
+            TaskCommentCommand::Edit { comment_id, text }
+        }
+        cli::TaskCommentCommands::Delete { comment_id } => {
+            TaskCommentCommand::Delete { comment_id }
+        }
+        cli::TaskCommentCommands::React { comment_id, emoji } => {
+            TaskCommentCommand::React { comment_id, emoji }
+        }
+        cli::TaskCommentCommands::Unreact { comment_id } => {
+            TaskCommentCommand::Unreact { comment_id }
+        }
     }
 }
 
