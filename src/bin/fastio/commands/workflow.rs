@@ -85,6 +85,43 @@ fn resolve_opt_json_arg(raw: Option<&str>, label: &str) -> Result<Option<String>
     }
 }
 
+/// Resolve an optional JSON ARRAY argument into a [`Value`], supporting the
+/// `@file.json` form (see [`resolve_json_arg`]) and rejecting a non-array
+/// client-side. Used for the review send-for-review / quick-approval reviewer
+/// rosters and asset lists.
+fn resolve_opt_json_array_value(raw: Option<&str>, label: &str) -> Result<Option<Value>> {
+    match raw {
+        None => Ok(None),
+        Some(r) => {
+            let text = resolve_json_arg(r, label)?;
+            let value: Value = serde_json::from_str(&text)
+                .with_context(|| format!("{label} is not valid JSON"))?;
+            if !value.is_array() {
+                anyhow::bail!("{label} must be a JSON array");
+            }
+            Ok(Some(value))
+        }
+    }
+}
+
+/// Resolve an optional JSON OBJECT argument into a [`Value`], supporting the
+/// `@file.json` form and rejecting a non-object client-side. Used for the
+/// review-comment `--anchor-json` reference.
+fn resolve_opt_json_object_value(raw: Option<&str>, label: &str) -> Result<Option<Value>> {
+    match raw {
+        None => Ok(None),
+        Some(r) => {
+            let text = resolve_json_arg(r, label)?;
+            let value: Value = serde_json::from_str(&text)
+                .with_context(|| format!("{label} is not valid JSON"))?;
+            if !value.is_object() {
+                anyhow::bail!("{label} must be a JSON object");
+            }
+            Ok(Some(value))
+        }
+    }
+}
+
 // ─── Idempotency-key gating ───────────────────────────────────────────────────
 
 /// Resolve the idempotency key for `instantiate` / `trigger fire`.
@@ -342,6 +379,221 @@ fn is_terminal_state(state: &str) -> bool {
     matches!(state, "completed" | "cancelled" | "archived" | "deleted")
 }
 
+/// Read the run's lifecycle `status` from a state snapshot.
+///
+/// Prefers `run_summary.status` (the digest that additionally carries
+/// `not_started` for a never-instantiated workflow), falling back to
+/// `runtime.status`. Both are the runtime lifecycle enum
+/// `queued`/`running`/`completed`/`failed`/`cancelled`.
+///
+/// Distinct from [`workflow_state`], which reads the PROFILE lifecycle
+/// (`workflow.state`: `active`/`completed`/`cancelled`/…). This finer run
+/// `status` is what tells an approval-rejected *completion* (`completed`) from a
+/// `failed` run — the two cases the terminal notice disambiguates.
+fn run_status(payload: &Value) -> Option<&str> {
+    payload
+        .get("run_summary")
+        .and_then(|r| r.get("status"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .get("runtime")
+                .and_then(|r| r.get("status"))
+                .and_then(Value::as_str)
+        })
+}
+
+/// Whether a run `status` is terminal (the run has stopped). Per the
+/// `GET /state/` wire shape the terminal runtime statuses are `completed`,
+/// `failed`, and `cancelled` (`queued`/`running`/`not_started` are in-flight).
+fn is_terminal_run_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled")
+}
+
+/// Whether a `wait` poll loop should stop on this state snapshot.
+///
+/// Breaks when EITHER the RUN `status` is terminal (`completed`/`failed`/
+/// `cancelled`) OR the PROFILE lifecycle `workflow.state` is terminal. The run
+/// status is the PRIMARY signal: a FAILED run sets `run_summary`/`runtime`
+/// status=`failed` while the profile `workflow.state` stays `active` (the
+/// profile lifecycle enum has no `failed`, and the backend does not auto-mirror
+/// a run failure onto it). A profile-only predicate would therefore never break
+/// on a failed run, so `wait` would hang to its `WAIT_MAX_SECS` timeout AND the
+/// run-FAILED / native-review notice would never fire. The profile predicate is
+/// retained as the fallback that additionally covers `archived` / `deleted`,
+/// which have no run-status counterpart.
+///
+/// Peeling is consistent with the existing readers: [`run_status`] takes the
+/// `response`-peeled payload (mirroring [`emit_terminal_notice`]), while
+/// [`workflow_state`] peels the envelope internally.
+fn wait_is_terminal(snapshot: &Value) -> bool {
+    let payload = snapshot.get("response").unwrap_or(snapshot);
+    run_status(payload).is_some_and(is_terminal_run_status)
+        || workflow_state(snapshot).is_some_and(|s| is_terminal_state(&s))
+}
+
+/// A human-facing label for a step occurrence: its display `step_name`, falling
+/// back to the raw `step_id` (then a generic `step`).
+fn step_label(step: &Value) -> String {
+    step.get("step_name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| step.get("step_id").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .unwrap_or("step")
+        .to_owned()
+}
+
+/// Find the failure reason of a `failed` run from its step occurrences.
+///
+/// Per the `GET /state/` wire shape a failed run carries NO run-level reason
+/// string: the cause lives ONLY as a structured `failure_reason: {code, message}`
+/// object on the step occurrence that failed (e.g.
+/// `native_review_tier_not_provisioned` on a native `approval` step that could
+/// not run). Walks `recent_steps[]` first, then `active_steps[]` defensively,
+/// for the LAST occurrence whose `state` is `"failed"` or `"skipped"` (a
+/// natural-language-gate skip rides the same field) carrying a `failure_reason`
+/// object, returning `(step label, failure_reason.code)`.
+fn failed_step_reason(payload: &Value) -> Option<(String, String)> {
+    ["recent_steps", "active_steps"].iter().find_map(|key| {
+        let steps = payload.get(*key).and_then(Value::as_array)?;
+        // Prefer the LAST terminal step that carries a reason (a run typically
+        // fails on one step, and the failing step is the tail of the feed).
+        steps.iter().rev().find_map(|step| {
+            let state = step.get("state").and_then(Value::as_str)?;
+            if state != "failed" && state != "skipped" {
+                return None;
+            }
+            let code = step
+                .get("failure_reason")
+                .and_then(|fr| fr.get("code"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())?;
+            Some((step_label(step), code.to_owned()))
+        })
+    })
+}
+
+/// Whether a step `output` envelope carries the backend rejected-outcome token
+/// (`"rejected"`). Backend-confirmed: BOTH a resolved manual `approval` step and
+/// an `approval_in_place` step write the terminal occurrence output via the
+/// shared `ApprovalStepHandler::completedResult()` (`approval_in_place` delegates
+/// resolution to a composed `ApprovalStepHandler`), stamping
+/// `output.outcome = "approved" | "rejected" | "cancelled"` — so `outcome` is the
+/// real key for both. `decision` / `resolved_outcome` are retained as defensive
+/// fallbacks for older / alternate native-surface shapes. Matched
+/// case-insensitively across those keys.
+fn output_is_rejected(output: Option<&Value>) -> bool {
+    let Some(output) = output.and_then(Value::as_object) else {
+        return false;
+    };
+    ["decision", "resolved_outcome", "outcome"]
+        .iter()
+        .filter_map(|k| output.get(*k))
+        .filter_map(Value::as_str)
+        .any(|v| v.eq_ignore_ascii_case("rejected"))
+}
+
+/// Detect, from state alone, that a `completed` run ended on an approval
+/// REJECTION.
+///
+/// The clean `terminal_reason: "approval_rejected"` token is event-only
+/// (`workflow.completed`) and is absent from `GET /state/`; an approval-rejected
+/// run reports `status: "completed"` with no first-class flag. This is the
+/// state-only heuristic: scan `recent_steps[]` (then `active_steps[]`) for an
+/// `approval` / `approval_in_place` step in a terminal state whose `output`
+/// carries the rejected token. Returns the step label when found.
+fn rejected_approval_step(payload: &Value) -> Option<String> {
+    ["recent_steps", "active_steps"].iter().find_map(|key| {
+        let steps = payload.get(*key).and_then(Value::as_array)?;
+        steps.iter().rev().find_map(|step| {
+            let step_type = step.get("step_type").and_then(Value::as_str)?;
+            if step_type != "approval" && step_type != "approval_in_place" {
+                return None;
+            }
+            let state = step.get("state").and_then(Value::as_str)?;
+            if !is_terminal_step_state(state) {
+                return None;
+            }
+            output_is_rejected(step.get("output")).then(|| step_label(step))
+        })
+    })
+}
+
+/// Extract a human-facing completion-reason notice from a TERMINAL state
+/// snapshot, or `None` when the run completed plainly (nothing to flag) or is
+/// not yet terminal.
+///
+/// Reads strictly from the real `GET /state/` wire shape (there is NO top-level
+/// `terminal_reason` and NO run-level reason string — see
+/// `temp/planexecute-cli-api-update-2026-06-23/c4-wire-shape.md`):
+///
+/// - **Run status** comes from [`run_status`] (`run_summary.status` else
+///   `runtime.status`). A non-terminal status emits nothing.
+/// - **`failed`** — the cause is per-step: surface `failure_reason.code` from the
+///   failing step occurrence (e.g. `native_review_tier_not_provisioned`) via
+///   [`failed_step_reason`]; a failure with no per-step reason still flags the
+///   failure generically.
+/// - **`completed`** — a clean success emits nothing. An approval-rejected
+///   completion has no run-level flag in state, so it is detected heuristically
+///   from a rejected approval step occurrence ([`rejected_approval_step`]); a
+///   fake `terminal_reason` is never synthesized for a normal success.
+/// - **`cancelled`** — flagged; the snapshot carries no cancellation reason.
+fn terminal_completion_notice(payload: &Value) -> Option<String> {
+    let status = run_status(payload)?;
+    if !is_terminal_run_status(status) {
+        return None;
+    }
+    match status {
+        "failed" => Some(match failed_step_reason(payload) {
+            Some((step, code)) => format!("run FAILED: {step} — {code}"),
+            None => "run FAILED.".to_owned(),
+        }),
+        "completed" => rejected_approval_step(payload)
+            .map(|_step| "run completed via approval REJECTION (not a normal success).".to_owned()),
+        "cancelled" => Some("run cancelled.".to_owned()),
+        _ => None,
+    }
+}
+
+/// Decide the terminal completion-reason notice to emit for a state snapshot,
+/// applying every gate of [`emit_terminal_notice`] EXCEPT the final print.
+///
+/// - Suppressed under `quiet` (returns `None`).
+/// - Peels the `response` envelope wrapper (mirroring [`workflow_state`]) so the
+///   signal fields are found wherever the snapshot carries them.
+/// - Gated strictly on a TERMINAL run status. `workflow state` calls the emitter
+///   on EVERY snapshot — including mid-flight reads (`running`/`queued`) — so a
+///   terminal completion notice must never fire on a still-running run, even if
+///   a stray `recent_steps[]` row looks terminal. (`terminal_completion_notice`
+///   self-gates on the same condition; this makes the boundary explicit.)
+///
+/// Returns the notice TEXT that would be printed, or `None` when nothing should
+/// be emitted. Kept separate from the [`eprintln!`] side effect so the
+/// quiet/peel/terminal-gate decision contract is directly unit-testable.
+fn terminal_notice_for(quiet: bool, snapshot: &Value) -> Option<String> {
+    if quiet {
+        return None;
+    }
+    let payload = snapshot.get("response").unwrap_or(snapshot);
+    if !run_status(payload).is_some_and(is_terminal_run_status) {
+        return None;
+    }
+    terminal_completion_notice(payload)
+}
+
+/// Print the terminal completion-reason notice (if any) to stderr.
+///
+/// Delegates the decision (quiet gate, `response`-envelope peel, terminal-status
+/// gate) to [`terminal_notice_for`], then emits the result to STDERR — never
+/// stdout — so structured output (especially `--format json`) on stdout stays
+/// byte-clean and machine-parseable.
+fn emit_terminal_notice(ctx: &CommandContext<'_>, snapshot: &Value) {
+    if let Some(notice) = terminal_notice_for(ctx.output.quiet, snapshot) {
+        eprintln!("notice: {notice}");
+    }
+}
+
 // ─── Dispatch ─────────────────────────────────────────────────────────────────
 
 /// Execute a `fastio workflow` command.
@@ -353,14 +605,20 @@ pub async fn execute(command: WorkflowCommands, ctx: &CommandContext<'_>) -> Res
             name,
             description,
             template_id,
+            definition,
             agent_credit_cap,
             visibility,
         } => {
+            // `definition` and `template_id` are mutually exclusive (enforced by
+            // clap `conflicts_with`); validate the inline definition is JSON
+            // client-side before the create call.
+            let definition = resolve_opt_json_arg(definition.as_deref(), "definition")?;
             let client = ctx.build_client()?;
             let params = orchestration::CreateWorkflowParams::new()
                 .name(name)
                 .description(description)
                 .template_id(template_id)
+                .definition(definition)
                 .agent_credit_cap(agent_credit_cap)
                 .visibility(visibility);
             let v = orchestration::create_workflow(&client, &workspace_id, &params)
@@ -373,9 +631,24 @@ pub async fn execute(command: WorkflowCommands, ctx: &CommandContext<'_>) -> Res
             workspace_id,
             limit,
             offset,
+            template_id,
+            state,
+            archived,
+            created_by_me,
+            participant_me,
+            include,
         } => {
             let client = ctx.build_client()?;
-            let v = orchestration::list_workflows(&client, &workspace_id, limit, offset)
+            let params = orchestration::ListWorkflowsParams::new()
+                .limit(limit)
+                .offset(offset)
+                .template_id(template_id)
+                .state(state)
+                .archived(archived)
+                .created_by_me(created_by_me)
+                .participant_me(participant_me)
+                .include(include);
+            let v = orchestration::list_workflows(&client, &workspace_id, &params)
                 .await
                 .context("failed to list workflows")?;
             ctx.output.render(&v)?;
@@ -455,6 +728,7 @@ pub async fn execute(command: WorkflowCommands, ctx: &CommandContext<'_>) -> Res
             trigger_payload,
             external_subject_id,
             pool_key,
+            step_seeds,
         } => {
             let key = resolve_idempotency_key(
                 idempotency_key.as_deref(),
@@ -462,11 +736,13 @@ pub async fn execute(command: WorkflowCommands, ctx: &CommandContext<'_>) -> Res
                 ctx.output.quiet,
             )?;
             let payload = resolve_opt_json_arg(trigger_payload.as_deref(), "trigger payload")?;
+            let step_seeds = resolve_opt_json_arg(step_seeds.as_deref(), "step seeds")?;
             let client = ctx.build_client()?;
             let params = orchestration::InstantiateParams::new(key)
                 .trigger_payload(payload)
                 .external_subject_id(external_subject_id)
-                .pool_key(pool_key);
+                .pool_key(pool_key)
+                .step_seeds(step_seeds);
             let v = orchestration::instantiate_workflow(&client, &workflow_id, &params)
                 .await
                 .context("failed to instantiate workflow")?;
@@ -478,6 +754,10 @@ pub async fn execute(command: WorkflowCommands, ctx: &CommandContext<'_>) -> Res
             let v = orchestration::get_workflow_state(&client, &workflow_id)
                 .await
                 .context("failed to get workflow state")?;
+            // Flag a notable terminal reason (approval-rejected completion,
+            // native-review fail-closed) for a run that is already terminal, so a
+            // direct `state` read surfaces WHY it ended, not just the raw fields.
+            emit_terminal_notice(ctx, &v);
             // The state snapshot is a single rich object, not a list; render it
             // faithfully so table/CSV don't collapse to an empty `active_steps`.
             ctx.output.render_state_snapshot(&v)?;
@@ -572,7 +852,16 @@ async fn wait_for_workflow(
         let mut next_sleep = jittered(interval);
         match orchestration::get_workflow_state(&client, workflow_id).await {
             Ok(snapshot) => {
-                if workflow_state(&snapshot).is_some_and(|s| is_terminal_state(&s)) {
+                if wait_is_terminal(&snapshot) {
+                    // Surface WHY the run ended (run FAILED + per-step reason,
+                    // approval-rejected completion, native-review fail-closed,
+                    // or another terminal reason) BEFORE the snapshot render, so
+                    // a non-JSON consumer is not left treating a failed or
+                    // `approval_rejected` completion as a plain success. A FAILED
+                    // run breaks here via the run-status predicate even though
+                    // its profile `workflow.state` is still `active`. The
+                    // structured snapshot still renders in full.
+                    emit_terminal_notice(ctx, &snapshot);
                     // Faithful object render (see `State` handler): the terminal
                     // snapshot's `active_steps` is empty, so flattening would
                     // emit an empty table.
@@ -772,6 +1061,52 @@ async fn execute_step(command: WorkflowStepCommands, ctx: &CommandContext<'_>) -
             ctx.output.render(&v)?;
             Ok(())
         }
+        WorkflowStepCommands::Files {
+            workflow_id,
+            step_occurrence_id,
+            node_ids,
+        } => {
+            anyhow::ensure!(
+                !node_ids.is_empty(),
+                "at least one --node-ids value is required"
+            );
+            let v = orchestration::submit_step_files(
+                &client,
+                &workflow_id,
+                &step_occurrence_id,
+                &node_ids,
+            )
+            .await
+            .context("failed to provide files to step")?;
+            ctx.output.render(&v)?;
+            Ok(())
+        }
+        WorkflowStepCommands::Complete {
+            workflow_id,
+            step_occurrence_id,
+        } => {
+            let v = orchestration::complete_step(&client, &workflow_id, &step_occurrence_id)
+                .await
+                .context("failed to complete step")?;
+            ctx.output.render(&v)?;
+            Ok(())
+        }
+        WorkflowStepCommands::Reassign {
+            workflow_id,
+            step_occurrence_id,
+            new_assignee_user_id,
+        } => {
+            let v = orchestration::reassign_step(
+                &client,
+                &workflow_id,
+                &step_occurrence_id,
+                &new_assignee_user_id,
+            )
+            .await
+            .context("failed to reassign step")?;
+            ctx.output.render(&v)?;
+            Ok(())
+        }
     }
 }
 
@@ -863,7 +1198,8 @@ async fn execute_template(
             workspace_id,
             limit,
             offset,
-        } => orchestration::list_templates(&client, &workspace_id, limit, offset)
+            usage,
+        } => orchestration::list_templates(&client, &workspace_id, limit, offset, usage.as_deref())
             .await
             .context("failed to list templates")?,
         WorkflowTemplateCommands::Get {
@@ -1638,6 +1974,33 @@ fn check_integrity(
     }
 }
 
+/// Build the `mode=request` form fields for a dual-control redaction.
+///
+/// Extracted as a pure function so the optional-`redaction_paths` wiring is
+/// testable without a network round-trip: the field is inserted only when the
+/// caller supplied paths (omitted → the server derives the scope from the
+/// target event). `reason`, `target_event_id`, and `target_workflow_id` are
+/// always sent.
+fn build_redaction_request_fields(
+    target_event_id: &str,
+    target_workflow_id: &str,
+    redaction_paths: Option<&str>,
+    reason: &str,
+) -> HashMap<String, String> {
+    let mut fields = HashMap::new();
+    fields.insert("mode".to_owned(), "request".to_owned());
+    fields.insert("target_event_id".to_owned(), target_event_id.to_owned());
+    fields.insert(
+        "target_workflow_id".to_owned(),
+        target_workflow_id.to_owned(),
+    );
+    if let Some(paths) = redaction_paths {
+        fields.insert("redaction_paths".to_owned(), paths.to_owned());
+    }
+    fields.insert("reason".to_owned(), reason.to_owned());
+    fields
+}
+
 async fn execute_redaction(
     command: WorkflowRedactionCommands,
     ctx: &CommandContext<'_>,
@@ -1651,13 +2014,16 @@ async fn execute_redaction(
             redaction_paths,
             reason,
         } => {
-            let paths = resolve_json_arg(&redaction_paths, "redaction paths")?;
-            let mut fields = HashMap::new();
-            fields.insert("mode".to_owned(), "request".to_owned());
-            fields.insert("target_event_id".to_owned(), target_event_id);
-            fields.insert("target_workflow_id".to_owned(), target_workflow_id);
-            fields.insert("redaction_paths".to_owned(), paths);
-            fields.insert("reason".to_owned(), reason);
+            // `redaction_paths` is OPTIONAL: when omitted the server derives the
+            // scope from the redactable identifiers present in the target event.
+            // Only forward the field when the caller supplied it.
+            let paths = resolve_opt_json_arg(redaction_paths.as_deref(), "redaction paths")?;
+            let fields = build_redaction_request_fields(
+                &target_event_id,
+                &target_workflow_id,
+                paths.as_deref(),
+                &reason,
+            );
             orchestration::audit_redaction(&client, &workspace_id, &fields)
                 .await
                 .context("failed to request redaction")?
@@ -1906,6 +2272,7 @@ async fn execute_realtime(
 
 // ─── Review (v3.5b) ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)] // a flat dispatch over the Workflow Review surface
 async fn execute_review(command: WorkflowReviewCommands, ctx: &CommandContext<'_>) -> Result<()> {
     let client = ctx.build_client()?;
     let v = match command {
@@ -1931,16 +2298,28 @@ async fn execute_review(command: WorkflowReviewCommands, ctx: &CommandContext<'_
             decision,
             version_id_pinned,
             comment,
-        } => orchestration::review_decision(
-            &client,
-            &surface_id,
-            &asset_id,
-            &decision,
-            &version_id_pinned,
-            comment.as_deref(),
-        )
-        .await
-        .context("failed to record review decision")?,
+        } => {
+            // The server requires a non-empty reason for `reject` /
+            // `request_changes` (422 `ERR_REASON_REQUIRED`). Guard client-side
+            // before the call so the user gets a clear, immediate message.
+            let reason_required = matches!(decision.as_str(), "reject" | "request_changes");
+            let reason_empty = comment.as_deref().is_none_or(|c| c.trim().is_empty());
+            if reason_required && reason_empty {
+                anyhow::bail!(
+                    "a reason is required for a '{decision}' decision; pass --comment \"<reason>\""
+                );
+            }
+            orchestration::review_decision(
+                &client,
+                &surface_id,
+                &asset_id,
+                &decision,
+                &version_id_pinned,
+                comment.as_deref(),
+            )
+            .await
+            .context("failed to record review decision")?
+        }
         WorkflowReviewCommands::AdminResolve {
             surface_id,
             resolution,
@@ -1954,6 +2333,159 @@ async fn execute_review(command: WorkflowReviewCommands, ctx: &CommandContext<'_
         } => orchestration::review_workspace_active(&client, &workspace_id, limit, offset)
             .await
             .context("failed to list active reviews")?,
+        WorkflowReviewCommands::ReviewerAddMember {
+            surface_id,
+            member_user_id,
+            required,
+        } => orchestration::review_reviewer_add_member(
+            &client,
+            &surface_id,
+            &member_user_id,
+            required,
+        )
+        .await
+        .context("failed to add member reviewer")?,
+        WorkflowReviewCommands::ReviewerAddExternal {
+            surface_id,
+            email,
+            name,
+            invite_notes,
+        } => orchestration::review_reviewer_add_external(
+            &client,
+            &surface_id,
+            &email,
+            &name,
+            invite_notes.as_deref(),
+        )
+        .await
+        .context("failed to add external reviewer")?,
+        WorkflowReviewCommands::ReviewerRemove {
+            surface_id,
+            reviewer_id,
+        } => orchestration::review_reviewer_remove(&client, &surface_id, &reviewer_id)
+            .await
+            .context("failed to remove reviewer")?,
+        WorkflowReviewCommands::ReviewerNotificationOptOut {
+            surface_id,
+            reviewer_id,
+            opt_out,
+        } => orchestration::review_reviewer_notification_opt_out(
+            &client,
+            &surface_id,
+            &reviewer_id,
+            opt_out,
+        )
+        .await
+        .context("failed to set reviewer notification opt-out")?,
+        WorkflowReviewCommands::LinkTokenRevoke {
+            link_token_id,
+            reason,
+        } => orchestration::review_link_token_revoke(&client, &link_token_id, reason.as_deref())
+            .await
+            .context("failed to revoke link token")?,
+        WorkflowReviewCommands::CommentsList {
+            asset_id,
+            limit,
+            offset,
+        } => orchestration::review_asset_comments_list(&client, &asset_id, limit, offset)
+            .await
+            .context("failed to list review comments")?,
+        WorkflowReviewCommands::CommentAdd {
+            asset_id,
+            body,
+            anchor_json,
+        } => {
+            let anchor = resolve_opt_json_object_value(anchor_json.as_deref(), "anchor")?;
+            orchestration::review_asset_comment_create(&client, &asset_id, &body, anchor.as_ref())
+                .await
+                .context("failed to add review comment")?
+        }
+        WorkflowReviewCommands::CommentUpdate {
+            asset_id,
+            comment_id,
+            body,
+        } => orchestration::review_asset_comment_update(&client, &asset_id, &comment_id, &body)
+            .await
+            .context("failed to update review comment")?,
+        WorkflowReviewCommands::CommentDelete {
+            asset_id,
+            comment_id,
+        } => orchestration::review_asset_comment_delete(&client, &asset_id, &comment_id)
+            .await
+            .context("failed to delete review comment")?,
+        WorkflowReviewCommands::SendForReview {
+            workspace,
+            workflow,
+            step_occurrence_id,
+            reviewer_user_ids,
+            reviewers_json,
+            assets_json,
+            reviewed_node_ids,
+            version_id,
+            policy_mode,
+            policy_quorum_n,
+            deadline_at,
+            message,
+            external_invite_notes,
+        } => {
+            if reviewers_json.is_some() && reviewer_user_ids.is_some() {
+                anyhow::bail!(
+                    "pass only one of --reviewers-json or --reviewer-user-ids (they are mutually exclusive)"
+                );
+            }
+            let reviewers = resolve_opt_json_array_value(reviewers_json.as_deref(), "reviewers")?;
+            let assets = resolve_opt_json_array_value(assets_json.as_deref(), "assets")?;
+            let params = orchestration::SendForReviewParams {
+                workspace_id: &workspace,
+                workflow_id: &workflow,
+                step_occurrence_id: &step_occurrence_id,
+                reviewers: reviewers.as_ref(),
+                reviewer_user_ids: reviewer_user_ids.as_deref(),
+                assets: assets.as_ref(),
+                reviewed_node_ids: reviewed_node_ids.as_deref(),
+                version_id: version_id.as_deref(),
+                policy_mode: policy_mode.as_deref(),
+                policy_quorum_n,
+                deadline_at: deadline_at.as_deref(),
+                message: message.as_deref(),
+                external_invite_notes: external_invite_notes.as_deref(),
+            };
+            orchestration::review_send_for_review(&client, &params)
+                .await
+                .context("failed to send for review")?
+        }
+        WorkflowReviewCommands::QuickApproval {
+            workspace,
+            node_id,
+            idempotency_key,
+            reviewer_user_ids,
+            reviewers_json,
+            policy_mode,
+            policy_quorum_n,
+            approval_timeout_seconds,
+            message,
+        } => {
+            if reviewers_json.is_some() && reviewer_user_ids.is_some() {
+                anyhow::bail!(
+                    "pass only one of --reviewers-json or --reviewer-user-ids (they are mutually exclusive)"
+                );
+            }
+            let reviewers = resolve_opt_json_array_value(reviewers_json.as_deref(), "reviewers")?;
+            let params = orchestration::QuickApprovalParams {
+                workspace_id: &workspace,
+                node_id: &node_id,
+                idempotency_key: &idempotency_key,
+                reviewers: reviewers.as_ref(),
+                reviewer_user_ids: reviewer_user_ids.as_deref(),
+                policy_mode: policy_mode.as_deref(),
+                policy_quorum_n,
+                approval_timeout_seconds,
+                message: message.as_deref(),
+            };
+            orchestration::review_quick_approval(&client, &params)
+                .await
+                .context("failed to request quick approval")?
+        }
     };
     ctx.output.render(&v)?;
     Ok(())
@@ -1967,6 +2499,37 @@ mod tests {
     fn idempotency_key_required_without_explicit_or_generate() {
         let err = resolve_idempotency_key(None, false, true).unwrap_err();
         assert!(err.to_string().contains("--idempotency-key is required"));
+    }
+
+    #[test]
+    fn redaction_request_fields_omit_paths_when_none() {
+        let fields = build_redaction_request_fields("evt-1", "1234567890123456789", None, "GDPR");
+        assert_eq!(fields.get("mode").map(String::as_str), Some("request"));
+        assert_eq!(
+            fields.get("target_event_id").map(String::as_str),
+            Some("evt-1")
+        );
+        assert_eq!(
+            fields.get("target_workflow_id").map(String::as_str),
+            Some("1234567890123456789")
+        );
+        assert_eq!(fields.get("reason").map(String::as_str), Some("GDPR"));
+        // Omitted paths must not appear — the server derives the scope.
+        assert!(!fields.contains_key("redaction_paths"));
+    }
+
+    #[test]
+    fn redaction_request_fields_include_paths_when_supplied() {
+        let fields = build_redaction_request_fields(
+            "evt-1",
+            "1234567890123456789",
+            Some(r#"["payload.pii.email"]"#),
+            "GDPR",
+        );
+        assert_eq!(
+            fields.get("redaction_paths").map(String::as_str),
+            Some(r#"["payload.pii.email"]"#)
+        );
     }
 
     #[test]
@@ -2063,6 +2626,373 @@ mod tests {
         }
         for s in ["pending", "in_progress", "waiting", "blocked"] {
             assert!(!is_terminal_step_state(s), "{s} should be mutable");
+        }
+    }
+
+    #[test]
+    fn run_status_prefers_run_summary_then_runtime() {
+        // `run_summary.status` wins when both are present (it is the digest that
+        // also carries `not_started`).
+        let snap = serde_json::json!({
+            "runtime": {"status": "running"},
+            "run_summary": {"status": "failed"},
+        });
+        assert_eq!(run_status(&snap), Some("failed"));
+        // Falls back to runtime.status when run_summary carries none.
+        let snap = serde_json::json!({"runtime": {"status": "completed"}});
+        assert_eq!(run_status(&snap), Some("completed"));
+        // None when neither carries a status.
+        assert_eq!(run_status(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn terminal_run_status_detection() {
+        for s in ["completed", "failed", "cancelled"] {
+            assert!(is_terminal_run_status(s), "{s} should be terminal");
+        }
+        for s in ["queued", "running", "not_started"] {
+            assert!(!is_terminal_run_status(s), "{s} should be in-flight");
+        }
+    }
+
+    #[test]
+    fn failed_run_surfaces_step_failure_reason_code() {
+        // The `GET /state/` wire shape carries NO run-level failure reason: a
+        // failed run's cause lives ONLY as a structured `failure_reason {code,
+        // message}` object on the failed step occurrence in `recent_steps[]`. The
+        // notice must name that code (e.g. native_review_tier_not_provisioned) and
+        // flag the run as a failure.
+        let snap = serde_json::json!({
+            "run_summary": {"status": "failed"},
+            "recent_steps": [
+                {"step_id": "s1", "step_name": "Collect", "state": "completed"},
+                {
+                    "step_id": "s2",
+                    "step_name": "Native Approval",
+                    "step_type": "approval",
+                    "state": "failed",
+                    "failure_reason": {
+                        "code": "native_review_tier_not_provisioned",
+                        "message": "native_review_tier_not_provisioned"
+                    }
+                }
+            ],
+        });
+        let notice = terminal_completion_notice(&snap).expect("notice for failed run");
+        assert!(
+            notice.contains("native_review_tier_not_provisioned"),
+            "must name the failure_reason.code: {notice}"
+        );
+        assert!(notice.to_uppercase().contains("FAILED"), "{notice}");
+        assert!(
+            notice.contains("Native Approval"),
+            "should name the failing step: {notice}"
+        );
+    }
+
+    #[test]
+    fn failed_run_reads_skipped_step_and_active_steps_fallback() {
+        // A natural-language-gate skip rides the same `failure_reason` path on a
+        // `skipped` occurrence, and the reader falls back to `active_steps[]` when
+        // `recent_steps[]` carries no reason.
+        let snap = serde_json::json!({
+            "run_summary": {"status": "failed"},
+            "recent_steps": [],
+            "active_steps": [
+                {
+                    "step_id": "s9",
+                    "step_name": "Gate",
+                    "step_type": "agent",
+                    "state": "skipped",
+                    "failure_reason": {"code": "nl_gate_denied", "message": "nl_gate_denied"}
+                }
+            ],
+        });
+        let notice = terminal_completion_notice(&snap).expect("notice for skipped-reason run");
+        assert!(notice.contains("nl_gate_denied"), "{notice}");
+    }
+
+    #[test]
+    fn failed_run_without_step_reason_is_still_flagged() {
+        // A failed run whose steps carry no `failure_reason` still surfaces the
+        // failure generically so the user is not left thinking it succeeded.
+        let snap = serde_json::json!({"run_summary": {"status": "failed"}});
+        let notice = terminal_completion_notice(&snap).expect("notice for bare failure");
+        assert!(notice.to_uppercase().contains("FAILED"), "{notice}");
+
+        // A failed run with a failed step but no reason object: still generic.
+        let snap = serde_json::json!({
+            "run_summary": {"status": "failed"},
+            "recent_steps": [{"step_id": "s1", "state": "failed"}],
+        });
+        let notice = terminal_completion_notice(&snap).expect("notice for reasonless failure");
+        assert!(notice.to_uppercase().contains("FAILED"), "{notice}");
+    }
+
+    #[test]
+    fn completed_run_with_rejected_approval_is_flagged() {
+        // An approval-rejected run reports status=completed (a rejection is a
+        // completed approval, not a failure); the clean `approval_rejected` token
+        // is event-only and absent from state. Detection is the state-only
+        // heuristic: a terminal approval step whose output is `rejected`.
+        let snap = serde_json::json!({
+            "run_summary": {"status": "completed"},
+            "recent_steps": [
+                {
+                    "step_id": "a1",
+                    "step_name": "Sign-off",
+                    "step_type": "approval",
+                    "state": "completed",
+                    "output": {"decision": "rejected", "reviewer": "42"}
+                }
+            ],
+        });
+        let notice = terminal_completion_notice(&snap).expect("notice for rejected approval");
+        assert!(
+            notice.to_lowercase().contains("rejection")
+                || notice.to_lowercase().contains("rejected"),
+            "must flag the approval rejection: {notice}"
+        );
+        assert!(
+            notice.to_lowercase().contains("not a normal success"),
+            "must distinguish from a normal success: {notice}"
+        );
+
+        // `approval_in_place` writes the SAME terminal output key as manual
+        // `approval` — it delegates resolution to the composed
+        // `ApprovalStepHandler::completedResult()`, which stamps
+        // `output.outcome = "rejected"` (backend-confirmed). The fixture uses
+        // that real key.
+        let in_place = serde_json::json!({
+            "run_summary": {"status": "completed"},
+            "recent_steps": [
+                {
+                    "step_id": "a2",
+                    "step_type": "approval_in_place",
+                    "state": "completed",
+                    "output": {"status": "resolved", "surface_id": "sfc-1", "outcome": "rejected"}
+                }
+            ],
+        });
+        assert!(
+            terminal_completion_notice(&in_place).is_some(),
+            "approval_in_place rejection (output.outcome) must be detected"
+        );
+
+        // Defensive fallback: a native surface that resolves on the alternate
+        // `resolved_outcome` key is still detected.
+        let alt_key = serde_json::json!({
+            "run_summary": {"status": "completed"},
+            "recent_steps": [
+                {
+                    "step_id": "a3",
+                    "step_type": "approval_in_place",
+                    "state": "completed",
+                    "output": {"resolved_outcome": "rejected"}
+                }
+            ],
+        });
+        assert!(
+            terminal_completion_notice(&alt_key).is_some(),
+            "resolved_outcome fallback must still be detected"
+        );
+    }
+
+    #[test]
+    fn normal_completion_emits_no_notice() {
+        // A run that completed plainly (no rejected approval step) must NOT emit a
+        // notice — a fake terminal_reason is never synthesized for a success.
+        let snap = serde_json::json!({
+            "run_summary": {"status": "completed"},
+            "recent_steps": [
+                {
+                    "step_id": "a1",
+                    "step_type": "approval",
+                    "state": "completed",
+                    "output": {"decision": "approved"}
+                }
+            ],
+        });
+        assert_eq!(terminal_completion_notice(&snap), None);
+    }
+
+    #[test]
+    fn cancelled_run_is_flagged() {
+        // A cancelled run is flagged; the snapshot carries no cancellation reason.
+        let snap = serde_json::json!({"run_summary": {"status": "cancelled"}});
+        let notice = terminal_completion_notice(&snap).expect("notice for cancelled run");
+        assert!(notice.to_lowercase().contains("cancel"), "{notice}");
+    }
+
+    #[test]
+    fn non_terminal_run_emits_no_notice_even_with_stray_failed_step() {
+        // A mid-flight run (running/queued) must NOT emit a terminal notice — even
+        // if a stray `recent_steps[]` row looks failed (the terminal-status gate).
+        let snap = serde_json::json!({
+            "run_summary": {"status": "running"},
+            "recent_steps": [
+                {
+                    "step_id": "s1",
+                    "state": "failed",
+                    "failure_reason": {"code": "transient_retO", "message": "x"}
+                }
+            ],
+        });
+        assert_eq!(terminal_completion_notice(&snap), None);
+        // A never-instantiated run (no status at all) emits nothing.
+        assert_eq!(terminal_completion_notice(&serde_json::json!({})), None);
+        // `not_started` is explicitly non-terminal.
+        let snap = serde_json::json!({"run_summary": {"status": "not_started"}});
+        assert_eq!(terminal_completion_notice(&snap), None);
+    }
+
+    #[test]
+    fn wait_breaks_on_failed_run_even_with_active_profile_state() {
+        // FIX C4 wait-arm: a FAILED run sets run_summary/runtime status="failed"
+        // while the PROFILE `workflow.state` stays "active" (the profile
+        // lifecycle has no `failed` and is not auto-mirrored). The wait loop must
+        // still treat this as terminal — otherwise `wait` hangs to its timeout
+        // and the FAILED notice never fires. The profile predicate alone (the old
+        // break condition) would return false here.
+        let failed = serde_json::json!({
+            "workflow": {"state": "active"},
+            "run_summary": {"status": "failed"},
+            "recent_steps": [
+                {
+                    "step_id": "s2",
+                    "step_name": "Native Approval",
+                    "step_type": "approval",
+                    "state": "failed",
+                    "failure_reason": {
+                        "code": "native_review_tier_not_provisioned",
+                        "message": "native_review_tier_not_provisioned"
+                    }
+                }
+            ],
+        });
+        // The OLD profile-only predicate would NOT break (state is "active")...
+        assert!(!workflow_state(&failed).is_some_and(|s| is_terminal_state(&s)));
+        // ...but the wait predicate DOES break on the terminal run status...
+        assert!(
+            wait_is_terminal(&failed),
+            "a failed run with an active profile state must be treated as terminal"
+        );
+        // ...and the terminal notice that emit_terminal_notice prints fires,
+        // naming the failure (so the break is not silent).
+        let notice = terminal_notice_for(false, &failed).expect("FAILED notice must fire");
+        assert!(notice.to_uppercase().contains("FAILED"), "{notice}");
+        assert!(
+            notice.contains("native_review_tier_not_provisioned"),
+            "must name the per-step failure code: {notice}"
+        );
+    }
+
+    #[test]
+    fn wait_keeps_polling_on_running_run() {
+        // A running run with an active profile state is NOT terminal — the loop
+        // must keep polling, and no notice fires.
+        let running = serde_json::json!({
+            "workflow": {"state": "active"},
+            "run_summary": {"status": "running"},
+        });
+        assert!(
+            !wait_is_terminal(&running),
+            "a running run must NOT be treated as terminal"
+        );
+        assert_eq!(terminal_notice_for(false, &running), None);
+        // A queued run is likewise non-terminal.
+        let queued = serde_json::json!({"run_summary": {"status": "queued"}});
+        assert!(!wait_is_terminal(&queued));
+    }
+
+    #[test]
+    fn wait_terminal_peels_response_envelope_and_honors_profile_fallback() {
+        // The terminal signal is found whether the snapshot is wrapped in a
+        // `response` envelope or flat (run_status takes the peeled payload;
+        // workflow_state peels internally).
+        let wrapped = serde_json::json!({
+            "response": {
+                "workflow": {"state": "active"},
+                "run_summary": {"status": "completed"},
+            }
+        });
+        assert!(wait_is_terminal(&wrapped), "envelope-wrapped run must peel");
+
+        // Profile-state FALLBACK: a snapshot with NO run status but an
+        // `archived`/`deleted` profile state (which has no run-status
+        // counterpart) is still terminal via the profile predicate.
+        for state in ["archived", "deleted", "completed", "cancelled"] {
+            let profile_only = serde_json::json!({"workflow": {"state": state}});
+            assert!(
+                wait_is_terminal(&profile_only),
+                "terminal profile state {state} must break the wait loop"
+            );
+        }
+        // A bare snapshot with neither signal keeps polling.
+        assert!(!wait_is_terminal(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn terminal_notice_for_peels_response_envelope() {
+        // FIX 2(a): the terminal fields under a `response` envelope are found and
+        // the notice fires.
+        let wrapped = serde_json::json!({
+            "response": {
+                "run_summary": {"status": "cancelled"},
+            }
+        });
+        let notice = terminal_notice_for(false, &wrapped).expect("notice under envelope");
+        assert!(notice.to_lowercase().contains("cancel"), "{notice}");
+    }
+
+    #[test]
+    fn terminal_notice_for_suppressed_under_quiet() {
+        // FIX 2(b): `--quiet` suppresses the notice even on a terminal failure.
+        let failed = serde_json::json!({"run_summary": {"status": "failed"}});
+        assert_eq!(terminal_notice_for(true, &failed), None);
+        // Not quiet → the same snapshot DOES produce a notice.
+        assert!(terminal_notice_for(false, &failed).is_some());
+    }
+
+    #[test]
+    fn terminal_notice_for_early_returns_on_non_terminal() {
+        // FIX 2(c): a running snapshot returns None (no notice) — even if a stray
+        // step row looks failed (the explicit terminal-run-status gate).
+        let running = serde_json::json!({
+            "run_summary": {"status": "running"},
+            "recent_steps": [{"step_id": "s1", "state": "failed"}],
+        });
+        assert_eq!(terminal_notice_for(false, &running), None);
+    }
+
+    #[test]
+    fn emit_terminal_notice_threads_ctx_quiet_gate() {
+        // FIX 2(d): exercise the real `emit_terminal_notice` entry point through a
+        // minimal `CommandContext`, confirming the ctx.output.quiet gate is read
+        // correctly and the full path runs without panic over both a terminal and
+        // a non-terminal snapshot. The notice can ONLY reach stderr (the sole sink
+        // is `eprintln!`), so stdout stays byte-clean by construction; the notice
+        // STRING itself is asserted via `terminal_notice_for` above.
+        use fastio_cli::output::OutputConfig;
+        use std::path::Path;
+
+        let failed = serde_json::json!({"run_summary": {"status": "failed"}});
+        let running = serde_json::json!({"run_summary": {"status": "running"}});
+        let cfg_dir = Path::new("/nonexistent");
+
+        for quiet in [false, true] {
+            let output = OutputConfig::from_flags(Some("json"), None, true, quiet);
+            let ctx = CommandContext {
+                output: &output,
+                profile_name: "test",
+                api_base: "https://example.invalid",
+                flag_token: None,
+                config_dir: cfg_dir,
+            };
+            // Both a terminal-failed and a still-running snapshot must run the
+            // real emitter without panicking, regardless of the quiet flag.
+            emit_terminal_notice(&ctx, &failed);
+            emit_terminal_notice(&ctx, &running);
         }
     }
 

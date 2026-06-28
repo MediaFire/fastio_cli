@@ -46,6 +46,9 @@ pub enum FilesCommand {
         name: String,
         /// Parent folder node ID (defaults to root).
         parent: Option<String>,
+        /// Always create a new folder (auto-renamed on a name collision)
+        /// instead of returning an existing same-named folder.
+        force: bool,
     },
     /// Move a file or folder.
     Move {
@@ -73,6 +76,41 @@ pub enum FilesCommand {
         node_id: String,
         /// New name.
         new_name: String,
+    },
+    /// Update a file or folder: rename, replace content, or set metadata
+    /// title/short overrides. At least one field must be provided.
+    Update {
+        /// Workspace ID (omit when targeting a share).
+        workspace: Option<String>,
+        /// Share ID (alternative storage context to `--workspace`).
+        share: Option<String>,
+        /// Node ID to update.
+        node_id: String,
+        /// New name.
+        name: Option<String>,
+        /// JSON-encoded content source (same shape as add-file's `from`).
+        from: Option<String>,
+        /// Custom title override (max 50 chars; `null` clears).
+        metadata_title: Option<String>,
+        /// Custom short description override (max 2048 chars; `null` clears).
+        metadata_short: Option<String>,
+    },
+    /// Add a file to a folder from a completed upload or by content hash.
+    AddFile {
+        /// Workspace ID (omit when targeting a share).
+        workspace: Option<String>,
+        /// Share ID (alternative storage context to `--workspace`).
+        share: Option<String>,
+        /// Parent folder node ID (defaults to root).
+        parent: Option<String>,
+        /// Filename for the new node.
+        name: String,
+        /// Completed upload session ID to attach (mutually exclusive with --hash).
+        upload_id: Option<String>,
+        /// Content hash to deduplicate against (requires --hash-type).
+        hash: Option<String>,
+        /// Hash algorithm for --hash (md5, sha1, sha256, sha384).
+        hash_type: Option<String>,
     },
     /// Delete a file or folder (move to trash).
     Delete {
@@ -140,6 +178,8 @@ pub enum FilesCommand {
         page_size: Option<u32>,
         /// Cursor for next page.
         cursor: Option<String>,
+        /// Filter by node type: file, folder, link, note.
+        node_type: Option<String>,
     },
     /// Add a share link to a folder.
     AddLink {
@@ -189,6 +229,11 @@ pub enum FileLockCommand {
         workspace: String,
         /// Node ID.
         node_id: String,
+        /// Lock duration in seconds (60-3600).
+        duration: Option<u32>,
+        /// Client metadata as a JSON object (e.g.
+        /// `{"device_name":"…","client_version":"…"}`).
+        client_info: Option<String>,
     },
     /// Check lock status.
     Status {
@@ -306,7 +351,17 @@ pub async fn execute(command: &FilesCommand, ctx: &CommandContext<'_>) -> Result
             workspace,
             name,
             parent,
-        } => create_folder(ctx, workspace, parent.as_deref().unwrap_or("root"), name).await,
+            force,
+        } => {
+            create_folder(
+                ctx,
+                workspace,
+                parent.as_deref().unwrap_or("root"),
+                name,
+                *force,
+            )
+            .await
+        }
         FilesCommand::Move {
             workspace,
             node_id,
@@ -322,6 +377,48 @@ pub async fn execute(command: &FilesCommand, ctx: &CommandContext<'_>) -> Result
             node_id,
             new_name,
         } => rename_node(ctx, workspace, node_id, new_name).await,
+        FilesCommand::Update {
+            workspace,
+            share,
+            node_id,
+            name,
+            from,
+            metadata_title,
+            metadata_short,
+        } => {
+            update_node(
+                ctx,
+                workspace.as_deref(),
+                share.as_deref(),
+                node_id,
+                name.as_deref(),
+                from.as_deref(),
+                metadata_title.as_deref(),
+                metadata_short.as_deref(),
+            )
+            .await
+        }
+        FilesCommand::AddFile {
+            workspace,
+            share,
+            parent,
+            name,
+            upload_id,
+            hash,
+            hash_type,
+        } => {
+            add_file(
+                ctx,
+                workspace.as_deref(),
+                share.as_deref(),
+                parent.as_deref().unwrap_or("root"),
+                name,
+                upload_id.as_deref(),
+                hash.as_deref(),
+                hash_type.as_deref(),
+            )
+            .await
+        }
         FilesCommand::Delete { workspace, node_id } => delete_node(ctx, workspace, node_id).await,
         FilesCommand::Restore { workspace, node_id } => restore_node(ctx, workspace, node_id).await,
         FilesCommand::Purge { workspace, node_id } => purge_node(ctx, workspace, node_id).await,
@@ -370,7 +467,17 @@ pub async fn execute(command: &FilesCommand, ctx: &CommandContext<'_>) -> Result
             workspace,
             page_size,
             cursor,
-        } => recent(ctx, workspace, *page_size, cursor.as_deref()).await,
+            node_type,
+        } => {
+            recent(
+                ctx,
+                workspace,
+                *page_size,
+                cursor.as_deref(),
+                node_type.as_deref(),
+            )
+            .await
+        }
         FilesCommand::AddLink {
             workspace,
             parent,
@@ -394,7 +501,9 @@ pub async fn execute(command: &FilesCommand, ctx: &CommandContext<'_>) -> Result
 /// Handle file lock subcommands.
 async fn file_lock(cmd: &FileLockCommand, ctx: &CommandContext<'_>) -> Result<()> {
     match cmd {
-        FileLockCommand::Acquire { workspace, node_id }
+        FileLockCommand::Acquire {
+            workspace, node_id, ..
+        }
         | FileLockCommand::Status { workspace, node_id }
         | FileLockCommand::Release {
             workspace, node_id, ..
@@ -405,10 +514,21 @@ async fn file_lock(cmd: &FileLockCommand, ctx: &CommandContext<'_>) -> Result<()
     }
     let client = ctx.build_client()?;
     match cmd {
-        FileLockCommand::Acquire { workspace, node_id } => {
-            let value = api::storage::lock_acquire(&client, workspace, node_id)
-                .await
-                .context("failed to acquire lock")?;
+        FileLockCommand::Acquire {
+            workspace,
+            node_id,
+            duration,
+            client_info,
+        } => {
+            let value = api::storage::lock_acquire(
+                &client,
+                workspace,
+                node_id,
+                *duration,
+                client_info.as_deref(),
+            )
+            .await
+            .context("failed to acquire lock")?;
             ctx.output.render(&value)?;
         }
         FileLockCommand::Status { workspace, node_id } => {
@@ -688,13 +808,142 @@ async fn create_folder(
     workspace: &str,
     parent: &str,
     name: &str,
+    force: bool,
 ) -> Result<()> {
     validate_workspace_id(workspace)?;
     anyhow::ensure!(!name.trim().is_empty(), "folder name must not be empty");
     let client = ctx.build_client()?;
-    let value = api::storage::create_folder(&client, workspace, parent, name)
+    let value = api::storage::create_folder(&client, workspace, parent, name, force)
         .await
         .context("failed to create folder")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Resolve the storage context (`type`, `id`) from a `--workspace` /
+/// `--share` selector. Exactly one must be supplied.
+fn resolve_storage_ctx<'a>(
+    workspace: Option<&'a str>,
+    share: Option<&'a str>,
+) -> Result<(&'static str, &'a str)> {
+    match (workspace, share) {
+        (Some(w), None) => {
+            validate_workspace_id(w)?;
+            Ok(("workspace", w))
+        }
+        (None, Some(s)) => {
+            validate_opaque_id(s, "share ID")?;
+            Ok(("share", s))
+        }
+        (Some(_), Some(_)) => {
+            anyhow::bail!("provide either --workspace or --share, not both")
+        }
+        (None, None) => anyhow::bail!("provide --workspace or --share"),
+    }
+}
+
+/// Update a file/folder: rename, replace content, or override metadata.
+#[allow(clippy::too_many_arguments)]
+async fn update_node(
+    ctx: &CommandContext<'_>,
+    workspace: Option<&str>,
+    share: Option<&str>,
+    node_id: &str,
+    name: Option<&str>,
+    from: Option<&str>,
+    metadata_title: Option<&str>,
+    metadata_short: Option<&str>,
+) -> Result<()> {
+    let (context_type, context_id) = resolve_storage_ctx(workspace, share)?;
+    validate_node_id(node_id, "node ID")?;
+    anyhow::ensure!(
+        name.is_some() || from.is_some() || metadata_title.is_some() || metadata_short.is_some(),
+        "provide at least one of --name, --from, --metadata-title, or --metadata-short"
+    );
+    let client = ctx.build_client()?;
+    let value = api::storage::update_node(
+        &client,
+        context_type,
+        context_id,
+        node_id,
+        name,
+        from,
+        metadata_title,
+        metadata_short,
+    )
+    .await
+    .context("failed to update node")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Build the JSON `from` source object for `files add-file`. Exactly one
+/// source must be provided: a completed `upload_id`, or a `hash` paired with
+/// a `hash_type`.
+pub(crate) fn build_addfile_from(
+    upload_id: Option<&str>,
+    hash: Option<&str>,
+    hash_type: Option<&str>,
+) -> Result<String> {
+    match (upload_id, hash, hash_type) {
+        (Some(id), None, None) => {
+            anyhow::ensure!(!id.trim().is_empty(), "--upload-id must not be empty");
+            Ok(json!({ "type": "upload", "upload": { "id": id } }).to_string())
+        }
+        (None, Some(h), Some(ht)) => {
+            anyhow::ensure!(!h.trim().is_empty(), "--hash must not be empty");
+            Ok(json!({ "type": "hash", "hash": { "hash": h, "hash_type": ht } }).to_string())
+        }
+        (None, Some(_), None) => {
+            anyhow::bail!("--hash requires --hash-type (md5, sha1, sha256, sha384)")
+        }
+        (None, None, Some(_)) => anyhow::bail!("--hash-type requires --hash"),
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            anyhow::bail!("provide either --upload-id or --hash/--hash-type, not both")
+        }
+        (None, None, None) => {
+            anyhow::bail!("provide a source: --upload-id, or --hash with --hash-type")
+        }
+    }
+}
+
+/// Reject a hash-based `add-file` source in a workspace context.
+///
+/// The workspace add-file handler accepts only an upload source — hash-based
+/// dedup is currently supported only in a share context. Reject early with a
+/// clear message instead of letting the server return a generic 1605 error.
+///
+/// Shared with the MCP `files` handler so an MCP `add-file` (which is
+/// workspace-scoped) rejects a hash source the same way the CLI does.
+pub(crate) fn validate_addfile_hash_context(context_type: &str, hash: Option<&str>) -> Result<()> {
+    anyhow::ensure!(
+        !(hash.is_some() && context_type == "workspace"),
+        "hash-based add-file is currently only supported in a share context; \
+         use --upload-id for a workspace (or supply --share with --hash)"
+    );
+    Ok(())
+}
+
+/// Add a file to a folder from a completed upload or by content-hash dedup.
+#[allow(clippy::too_many_arguments)]
+async fn add_file(
+    ctx: &CommandContext<'_>,
+    workspace: Option<&str>,
+    share: Option<&str>,
+    parent: &str,
+    name: &str,
+    upload_id: Option<&str>,
+    hash: Option<&str>,
+    hash_type: Option<&str>,
+) -> Result<()> {
+    let (context_type, context_id) = resolve_storage_ctx(workspace, share)?;
+    anyhow::ensure!(!name.trim().is_empty(), "filename must not be empty");
+    validate_addfile_hash_context(context_type, hash)?;
+    let from = build_addfile_from(upload_id, hash, hash_type)?;
+    let client = ctx.build_client()?;
+    let value = api::storage::add_file(&client, context_type, context_id, parent, name, &from)
+        .await
+        .context("failed to add file")?;
     ctx.output.render(&value)?;
     Ok(())
 }
@@ -876,11 +1125,12 @@ async fn recent(
     workspace: &str,
     page_size: Option<u32>,
     cursor: Option<&str>,
+    node_type: Option<&str>,
 ) -> Result<()> {
     validate_workspace_id(workspace)?;
     validate_page_size(page_size)?;
     let client = ctx.build_client()?;
-    let value = api::storage::list_recent(&client, workspace, page_size, cursor)
+    let value = api::storage::list_recent(&client, workspace, page_size, cursor, node_type)
         .await
         .context("failed to list recent files")?;
     ctx.output.render(&value)?;
@@ -955,12 +1205,79 @@ async fn read_content(ctx: &CommandContext<'_>, workspace: &str, node_id: &str) 
 
 #[cfg(test)]
 mod tests {
-    use super::{aggregate_chunks, validate_node_id, validate_opaque_id};
+    use super::{
+        aggregate_chunks, build_addfile_from, resolve_storage_ctx, validate_addfile_hash_context,
+        validate_node_id, validate_opaque_id,
+    };
     use fastio_cli::api::storage::{BulkDetailsResponse, parse_bulk_details_response};
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     fn make_chunk(body: &serde_json::Value) -> BulkDetailsResponse {
         parse_bulk_details_response(body).expect("test body should parse")
+    }
+
+    #[test]
+    fn addfile_from_upload_source() {
+        let s = build_addfile_from(Some("u1"), None, None).expect("ok");
+        let v: Value = serde_json::from_str(&s).expect("valid json");
+        assert_eq!(v["type"], "upload");
+        assert_eq!(v["upload"]["id"], "u1");
+    }
+
+    #[test]
+    fn addfile_from_hash_source() {
+        let s = build_addfile_from(None, Some("abc123"), Some("sha256")).expect("ok");
+        let v: Value = serde_json::from_str(&s).expect("valid json");
+        assert_eq!(v["type"], "hash");
+        assert_eq!(v["hash"]["hash"], "abc123");
+        assert_eq!(v["hash"]["hash_type"], "sha256");
+    }
+
+    #[test]
+    fn addfile_from_rejects_missing_source() {
+        assert!(build_addfile_from(None, None, None).is_err());
+    }
+
+    #[test]
+    fn addfile_from_rejects_hash_without_type() {
+        assert!(build_addfile_from(None, Some("abc"), None).is_err());
+    }
+
+    #[test]
+    fn addfile_from_rejects_both_sources() {
+        assert!(build_addfile_from(Some("u1"), Some("abc"), Some("sha256")).is_err());
+    }
+
+    #[test]
+    fn addfile_hash_rejected_in_workspace_context() {
+        // The workspace handler only accepts an upload source.
+        assert!(validate_addfile_hash_context("workspace", Some("abc")).is_err());
+    }
+
+    #[test]
+    fn addfile_hash_allowed_in_share_context() {
+        assert!(validate_addfile_hash_context("share", Some("abc")).is_ok());
+    }
+
+    #[test]
+    fn addfile_upload_allowed_in_both_contexts() {
+        // No hash → upload-only path, valid for workspace and share alike.
+        assert!(validate_addfile_hash_context("workspace", None).is_ok());
+        assert!(validate_addfile_hash_context("share", None).is_ok());
+    }
+
+    #[test]
+    fn storage_ctx_resolves_workspace_or_share() {
+        assert_eq!(
+            resolve_storage_ctx(Some("19"), None).expect("ok"),
+            ("workspace", "19")
+        );
+        assert_eq!(
+            resolve_storage_ctx(None, Some("55")).expect("ok"),
+            ("share", "55")
+        );
+        assert!(resolve_storage_ctx(None, None).is_err());
+        assert!(resolve_storage_ctx(Some("19"), Some("55")).is_err());
     }
 
     #[test]

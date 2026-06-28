@@ -314,11 +314,13 @@ pub async fn execute(command: &AiCommand, ctx: &CommandContext<'_>) -> Result<()
             chat_id,
         } => {
             let client = ctx.build_client()?;
-            let value = api::ai::publish_chat(&client, profile_type, profile_id, chat_id)
-                .await
-                .context("failed to publish chat")?;
-            ctx.output.render(&value)?;
-            Ok(())
+            match api::ai::publish_chat(&client, profile_type, profile_id, chat_id).await {
+                Ok(value) => {
+                    ctx.output.render(&value)?;
+                    Ok(())
+                }
+                Err(e) => Err(map_publish_error(e)),
+            }
         }
         AiCommand::Delete {
             profile_type,
@@ -604,17 +606,23 @@ async fn chat(
 
     // Step 1: Create chat or send message to existing chat
     let (chat_id, initial_response) = if let Some(cid) = existing_chat_id {
-        let resp = api::ai::send_message(&client, workspace, cid, message, None, &scope)
-            .await
-            .context("failed to send AI message")?;
+        let resp = match api::ai::send_message(&client, workspace, cid, message, None, &scope).await
+        {
+            Ok(v) => v,
+            Err(e) => return Err(map_ai_send_error(e, "failed to send AI message")),
+        };
         (cid.to_owned(), resp)
     } else {
         let mut options = ChatCreateOptions::default();
         options.personality = Some("detailed".to_owned());
         options.scope = scope;
-        let resp = api::ai::create_chat(&client, workspace, message, "chat_with_files", &options)
-            .await
-            .context("failed to create AI chat")?;
+        let resp =
+            match api::ai::create_chat(&client, workspace, message, "chat_with_files", &options)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return Err(map_ai_send_error(e, "failed to create AI chat")),
+            };
         let cid = resp
             .get("chat_id")
             .or_else(|| resp.get("chat").and_then(|c| c.get("id")))
@@ -878,9 +886,11 @@ async fn ask(
         form.insert("files_attach".to_owned(), v.clone());
     }
 
-    let resp = api::ai::ai_api_form(&client, profile_type, profile_id, "agent/", &form)
-        .await
-        .context("failed to create AI chat")?;
+    let resp = match api::ai::ai_api_form(&client, profile_type, profile_id, "agent/", &form).await
+    {
+        Ok(v) => v,
+        Err(e) => return Err(map_ai_send_error(e, "failed to create AI chat")),
+    };
 
     let chat_id =
         extract_chat_id(&resp).ok_or_else(|| anyhow::anyhow!("no chat_id in response"))?;
@@ -940,7 +950,9 @@ async fn ask(
 
 /// Outcome of the bounded `ask` wait loop.
 enum WaitOutcome {
-    /// The message reached `complete`/`errored`; carries its details body.
+    /// The message reached a terminal state (`complete` / `errored` /
+    /// `needs_input`); carries its details body. A `needs_input` body carries a
+    /// clarifying question that `render_answer` surfaces (ai.txt:849).
     Complete(Value),
     /// The wait budget elapsed without a terminal state.
     TimedOut,
@@ -996,9 +1008,18 @@ async fn wait_for_answer(
         .await
         {
             Ok(msg_data) => {
-                let msg = msg_data.get("message").unwrap_or(&msg_data);
+                // Unwrap the workspace `message` OR share `turn` detail wrapper
+                // (ai.txt:771) so a share `needs_input` turn's `state` is read
+                // rather than missed — without this the loop polls to a
+                // misleading timeout for shares.
+                let msg = api::ai::message_detail(&msg_data);
                 let state = extract_string_field(msg, "state").unwrap_or_default();
-                if state == "complete" || state == "errored" {
+                // Terminal states are complete / errored / needs_input. A
+                // `needs_input` turn answered with a clarifying question is
+                // terminal too (ai.txt:849) — without it here the loop would
+                // poll to a misleading timeout. `render_answer` surfaces the
+                // clarification question for that case.
+                if api::ai::is_terminal_state(&state) {
                     return WaitOutcome::Complete(msg_data);
                 }
             }
@@ -1124,20 +1145,32 @@ fn json_id_to_string(v: &Value) -> Option<String> {
 
 /// Build the rendered answer payload from a completed message-details body.
 fn render_answer(chat_id: &str, message_id: &str, msg_data: &Value) -> Value {
-    let msg = msg_data.get("message").unwrap_or(msg_data);
+    // Unwrap the workspace `message` OR share `turn` detail wrapper (ai.txt:771)
+    // so state/text/response are read from the right object in both contexts.
+    let msg = api::ai::message_detail(msg_data);
     let state = extract_string_field(msg, "state").unwrap_or_default();
     // The response text lives at top-level `text` (ai.txt:761) or
     // `response.text`; accept either.
-    let response_text = msg_data
-        .get("text")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            msg.get("response")
-                .and_then(|r| r.get("text"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| msg.get("text").and_then(Value::as_str))
-        .unwrap_or_default();
+    //
+    // On a `needs_input` turn, however, `text` is the USER's ORIGINAL question
+    // echoed back (ai.txt) — NOT an answer — so populating `response` from it
+    // would misleadingly render the user's own words as the reply. Leave
+    // `response` empty for needs_input; the `clarification` field below carries
+    // the assistant's actual question.
+    let response_text = if state == "needs_input" {
+        ""
+    } else {
+        msg_data
+            .get("text")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                msg.get("response")
+                    .and_then(|r| r.get("text"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| msg.get("text").and_then(Value::as_str))
+            .unwrap_or_default()
+    };
 
     let mut result = serde_json::json!({
         "chat_id": chat_id,
@@ -1154,6 +1187,32 @@ fn render_answer(chat_id: &str, message_id: &str, msg_data: &Value) -> Value {
         && let Some(obj) = result.as_object_mut()
     {
         obj.insert("citations".to_owned(), c);
+    }
+
+    // `needs_input` (ai.txt:849): the assistant answered with a clarifying
+    // question instead of a full response (so `response` is typically empty).
+    // Surface the question and how to reply so the user isn't left with a blank
+    // answer. The clarifying question lives in the message's `clarification`
+    // object (or a bare `question` field on a share turn).
+    if state == "needs_input"
+        && let Some(obj) = result.as_object_mut()
+    {
+        let question = api::ai::extract_clarification_question(msg_data);
+        let message = match question.as_deref() {
+            Some(q) => format!(
+                "Ripley needs more information to continue: {q}\n\
+                 Reply by sending your answer as a new message in this same chat \
+                 (chat_id={chat_id})."
+            ),
+            None => format!(
+                "Ripley needs more information to continue but did not include a question. \
+                 Reply by sending a new message in this same chat (chat_id={chat_id})."
+            ),
+        };
+        if let Some(q) = question {
+            obj.insert("clarification".to_owned(), Value::String(q));
+        }
+        obj.insert("message".to_owned(), Value::String(message));
     }
     result
 }
@@ -1289,6 +1348,81 @@ fn delegated_jobs_unavailable() -> Result<()> {
     )
 }
 
+// ─── Error mapping ──────────────────────────────────────────────────────────
+//
+// Ripley-specific wording lives HERE (and in the MCP mirror), never in the
+// global `error.rs` hints which stay resource-agnostic — mirroring the
+// File-Share (`map_fileshare_error`) and signing (`map_signing_error`) layers.
+// Each mapper reframes the rendered `hint:` line by wrapping the inner
+// `ApiError` in `CliError::MappedApi` so the render layer prints OUR override
+// instead of the inner `ApiError`'s misleading generic status hint.
+
+/// Override `hint:` line for a publish-disabled failure (HTTP 403). Publishing
+/// a chat public is turned off platform-wide (ai.txt:266,872-887), so steer the
+/// user to that fact rather than the generic-403 "check that your account has
+/// the required role" (the role is not the problem).
+const HINT_PUBLISH_DISABLED: &str = "Publishing chats publicly is currently disabled platform-wide. \
+     Chats published before this change remain public; new chats cannot be made public.";
+
+/// Override `hint:` line for a "conversation too large" 409 on the AI
+/// send/create path. The condition is PERMANENT (a thread only grows), so this
+/// overrides the generic-409 "wait a moment and retry" — retrying the same chat
+/// cannot succeed; the recovery is to start a NEW chat.
+const HINT_CONVERSATION_TOO_LARGE: &str = "This conversation is too large to continue — start a new chat \
+     (`fastio ripley ask …`) to keep going. Retrying the same chat will not help.";
+
+/// Map a publish-chat error. A 403 means publishing is disabled platform-wide
+/// (ai.txt:266,872-887): reframe it with a clear headline and override the
+/// misleading generic-403 hint. Every other error keeps the operation label and
+/// its generic suggestion.
+fn map_publish_error(err: CliError) -> anyhow::Error {
+    const CTX: &str = "failed to publish chat";
+    if let CliError::Api(api) = err {
+        if api.http_status == 403 {
+            return anyhow::Error::from(CliError::MappedApi {
+                api,
+                hint: Some(HINT_PUBLISH_DISABLED),
+            })
+            .context(format!(
+                "{CTX}: publishing chats publicly is currently disabled platform-wide (403). \
+                 Chats published before this change remain public."
+            ));
+        }
+        return anyhow::Error::from(CliError::Api(api)).context(CTX);
+    }
+    anyhow::Error::from(err).context(CTX)
+}
+
+/// Map an AI chat send/create error. A 409 (a conversation-too-large
+/// per-call-site code, or any 409 on this path — the size cap is the only
+/// documented 409 cause for these endpoints) means the thread exceeded the size
+/// cap. That is PERMANENT, so reframe with a clear "start a new chat" headline
+/// and override the misleading generic-409 "wait and retry". Every other error
+/// keeps the operation label and its generic suggestion.
+fn map_ai_send_error(err: CliError, ctx: &'static str) -> anyhow::Error {
+    if let CliError::Api(api) = err {
+        // `api` here shadows the `api` module, so reference the shared const by
+        // its fully-qualified path. Match the SPECIFIC `STATE_TOO_LARGE` per-site
+        // codes ONLY — NOT a bare 409. The create/message endpoints also return
+        // 409 (`APP_CONFLICT`) for a retryable `SEQUENCE_FAILURE` (a sub-second
+        // fresh-race; the client should retry the SAME idempotency key, NOT start
+        // a new chat), so a blanket 409 → "too large" would give wrong recovery
+        // advice. Other 409s fall through to the generic conflict handling.
+        if fastio_cli::api::ai::CONVERSATION_TOO_LARGE_CODES.contains(&api.code) {
+            return anyhow::Error::from(CliError::MappedApi {
+                api,
+                hint: Some(HINT_CONVERSATION_TOO_LARGE),
+            })
+            .context(format!(
+                "{ctx}: this conversation is too large to continue (409) — start a new chat to \
+                 keep going"
+            ));
+        }
+        return anyhow::Error::from(CliError::Api(api)).context(ctx);
+    }
+    anyhow::Error::from(err).context(ctx)
+}
+
 #[cfg(test)]
 mod phase2_tests {
     use super::{
@@ -1383,6 +1517,260 @@ mod phase2_tests {
         assert!(
             out.get("citations").is_some(),
             "citations should be surfaced"
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase8_tests {
+    use super::{
+        HINT_CONVERSATION_TOO_LARGE, HINT_PUBLISH_DISABLED, map_ai_send_error, map_publish_error,
+        render_answer,
+    };
+    use fastio_cli::error::{ApiError, CliError};
+    use serde_json::json;
+
+    /// Construct a `CliError::Api` with the given code + HTTP status.
+    fn api_err(code: u32, http_status: u16) -> CliError {
+        CliError::Api(ApiError::new(code, None, "boom".to_owned(), http_status))
+    }
+
+    /// Drive a mapped error through the REAL render path so the test inspects
+    /// the `(headline, hint)` a user actually sees on stderr — the load-bearing
+    /// surface, since the regression these mappers guard against is the inner
+    /// `ApiError`'s GENERIC hint leaking onto the `hint:` line. Mirrors the
+    /// File-Share `render_mapped` helper.
+    fn render_mapped(err: &anyhow::Error) -> (String, Option<&'static str>) {
+        let cli_err = err
+            .downcast_ref::<CliError>()
+            .expect("a mapped Ripley error must be rooted at a CliError");
+        crate::cli_error_render(err, cli_err)
+    }
+
+    #[test]
+    fn render_answer_surfaces_clarification_on_needs_input() {
+        // R2/R4: a `needs_input` turn (ai.txt:849) carries a clarifying question
+        // in a `clarification` object; render_answer must surface it (and a
+        // reply hint) rather than an empty answer.
+        let msg = json!({
+            "message": {"state": "needs_input"},
+            "clarification": {"type": "clarification", "question": "Which workspace?"},
+        });
+        let out = render_answer("C1", "M1", &msg);
+        assert_eq!(
+            out.get("state").and_then(|v| v.as_str()),
+            Some("needs_input")
+        );
+        assert_eq!(
+            out.get("clarification").and_then(|v| v.as_str()),
+            Some("Which workspace?"),
+            "the clarifying question must be surfaced: {out}"
+        );
+        let message = out
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            message.contains("Which workspace?") && message.contains("chat_id=C1"),
+            "the message must restate the question and how to reply: {message}"
+        );
+    }
+
+    #[test]
+    fn render_answer_needs_input_without_question_still_guides_reply() {
+        // A `needs_input` turn with no clarification object/question still yields
+        // a guidance message (and no bogus `clarification` field).
+        let msg = json!({"message": {"state": "needs_input"}});
+        let out = render_answer("C9", "M9", &msg);
+        assert!(
+            out.get("clarification").is_none(),
+            "no question → no field: {out}"
+        );
+        let message = out
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            message.contains("more information") && message.contains("chat_id=C9"),
+            "must still guide the user to reply: {message}"
+        );
+    }
+
+    #[test]
+    fn render_answer_complete_has_no_clarification_message() {
+        // A normal `complete` answer must NOT gain a needs_input clarification
+        // message — that path is gated on the state.
+        let msg = json!({"message": {"state": "complete"}, "text": "the answer"});
+        let out = render_answer("C2", "M2", &msg);
+        assert!(out.get("clarification").is_none());
+        assert!(
+            out.get("message").is_none(),
+            "no needs_input message on complete: {out}"
+        );
+    }
+
+    #[test]
+    fn render_answer_needs_input_does_not_echo_user_text_into_response() {
+        // R3: on a `needs_input` turn the body's `text` is the USER's ORIGINAL
+        // question echoed back — it must NOT be rendered as the answer. The
+        // `response` field stays empty; the `clarification` carries the actual
+        // assistant question.
+        let msg = json!({
+            "message": {"state": "needs_input", "text": "What were the Q3 figures?"},
+            "clarification": {"question": "Which fiscal year?"},
+        });
+        let out = render_answer("C3", "M3", &msg);
+        assert_eq!(
+            out.get("response").and_then(|v| v.as_str()),
+            Some(""),
+            "needs_input must not echo the user's text into response: {out}"
+        );
+        assert_eq!(
+            out.get("clarification").and_then(|v| v.as_str()),
+            Some("Which fiscal year?"),
+            "the assistant's clarifying question must still be surfaced: {out}"
+        );
+    }
+
+    #[test]
+    fn render_answer_share_turn_needs_input_surfaces_clarification() {
+        // R2/R4: a SHARE detail wraps the turn under `turn` (ai.txt:771), NOT
+        // `message`. render_answer must read state/clarification from the turn
+        // wrapper just like the workspace `message` case.
+        let msg = json!({
+            "turn": {"state": "needs_input", "text": "echoed user question"},
+            "clarification": {"type": "clarification", "question": "Which share folder?"},
+        });
+        let out = render_answer("CS", "MS", &msg);
+        assert_eq!(
+            out.get("state").and_then(|v| v.as_str()),
+            Some("needs_input"),
+            "share turn state must be read from the `turn` wrapper: {out}"
+        );
+        assert_eq!(
+            out.get("response").and_then(|v| v.as_str()),
+            Some(""),
+            "share needs_input must not echo the user's text: {out}"
+        );
+        assert_eq!(
+            out.get("clarification").and_then(|v| v.as_str()),
+            Some("Which share folder?"),
+            "share turn clarification must be surfaced: {out}"
+        );
+    }
+
+    #[test]
+    fn render_answer_share_turn_complete_pulls_response_text() {
+        // A complete SHARE turn still renders its answer — `response` comes from
+        // the turn's `response.text` (the wrapper-unwrap must not break the
+        // happy path).
+        let msg = json!({
+            "turn": {"state": "complete", "response": {"text": "the share answer"}},
+        });
+        let out = render_answer("CS2", "MS2", &msg);
+        assert_eq!(out.get("state").and_then(|v| v.as_str()), Some("complete"));
+        assert_eq!(
+            out.get("response").and_then(|v| v.as_str()),
+            Some("the share answer"),
+            "a complete share turn must surface its answer text: {out}"
+        );
+    }
+
+    #[test]
+    fn publish_403_maps_to_disabled_message_and_hint() {
+        // R8: a 403 on publish means publishing is disabled platform-wide — the
+        // headline must say so and the rendered hint must be OUR override, not
+        // the generic-403 "check that your account has the required role".
+        let err = map_publish_error(api_err(0, 403));
+        let (headline, hint) = render_mapped(&err);
+        assert!(
+            headline.to_lowercase().contains("disabled"),
+            "headline must say publishing is disabled: {headline}"
+        );
+        assert_eq!(
+            hint,
+            Some(HINT_PUBLISH_DISABLED),
+            "hint must be the override"
+        );
+        assert!(
+            !hint
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("required role"),
+            "must NOT keep the generic-403 role hint: {hint:?}"
+        );
+    }
+
+    #[test]
+    fn publish_non_403_passes_through_with_label() {
+        // A non-403 publish error keeps the operation label and its generic
+        // suggestion (e.g. a 406 chat-not-found).
+        let err = map_publish_error(api_err(1658, 406));
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("failed to publish chat"),
+            "label kept: {chain}"
+        );
+        let (_h, hint) = render_mapped(&err);
+        assert_ne!(
+            hint,
+            Some(HINT_PUBLISH_DISABLED),
+            "a non-403 must NOT claim publishing is disabled"
+        );
+    }
+
+    #[test]
+    fn ai_send_bare_409_sequence_failure_not_mislabeled_too_large() {
+        // R6 precision: the create/message endpoints return 409 (`APP_CONFLICT`)
+        // for BOTH `STATE_TOO_LARGE` (start a new chat) AND a retryable
+        // `SEQUENCE_FAILURE` (a fresh-race; retry the same idempotency key). A
+        // bare 409 WITHOUT a too-large per-site code must NOT be mislabeled
+        // "too large" — that would give the wrong recovery advice. It falls
+        // through to the generic conflict handling, keeping the operation label.
+        let err = map_ai_send_error(api_err(0, 409), "failed to create AI chat");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("failed to create AI chat"),
+            "generic label kept for a non-too-large 409: {chain}"
+        );
+        let (_headline, hint) = render_mapped(&err);
+        assert_ne!(
+            hint,
+            Some(HINT_CONVERSATION_TOO_LARGE),
+            "a bare 409 (e.g. SEQUENCE_FAILURE) must NOT claim the conversation is too large"
+        );
+    }
+
+    #[test]
+    fn ai_send_too_large_code_maps_even_without_409_status() {
+        // The specific per-call-site codes map to the too-large hint regardless
+        // of the HTTP status the transport reports.
+        for code in [168_116u32, 153_795, 148_135, 144_657] {
+            let err = map_ai_send_error(api_err(code, 400), "failed to send AI message");
+            let (_h, hint) = render_mapped(&err);
+            assert_eq!(
+                hint,
+                Some(HINT_CONVERSATION_TOO_LARGE),
+                "code {code} must map"
+            );
+        }
+    }
+
+    #[test]
+    fn ai_send_non_409_passes_through_with_label() {
+        // An unrelated error (e.g. a 402 billing) keeps the operation label and
+        // its own generic suggestion — it must NOT be mislabeled too-large.
+        let err = map_ai_send_error(api_err(0, 402), "failed to create AI chat");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("failed to create AI chat"),
+            "label kept: {chain}"
+        );
+        let (_h, hint) = render_mapped(&err);
+        assert_ne!(
+            hint,
+            Some(HINT_CONVERSATION_TOO_LARGE),
+            "a non-409 must NOT claim the conversation is too large"
         );
     }
 }

@@ -85,14 +85,14 @@ or skip the manual browse and let `ripley` `ask` answer over the content.
   CLI-binary-only.)
 - `sign` — e-signature envelopes (workspace-scoped; read + draft-drive only;
   `send`/`void` are CLI-binary-only — envelopes are voided, not deleted).
-- The `task`/`worklog`/`approval`/`todo` tools are `[legacy]` — superseded by
-  `workflow`.
+- `task` — Tasks API (task lists, tasks, comments, attachments); a separate
+  surface from `workflow` orchestration.
 
 ## Available Tool Domains
 - auth, user, org, workspace, files, upload, download, share
 - ripley, member, comment, event, invitation, preview, asset
-- workflow, sign, metadata, instructions, system
-- task, worklog, approval, todo (legacy)
+- workflow, sign, metadata, system
+- task
 
 Each tool uses an `action` parameter to select the operation; call
 `action: \"describe\"` on the `workflow` or `sign` tool for its authoritative

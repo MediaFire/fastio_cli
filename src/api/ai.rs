@@ -612,14 +612,282 @@ pub async fn ai_api_form(
     client.post(&path, form).await
 }
 
+/// Per-call-site `error.code` values the agent send/create endpoints return
+/// when the conversation exceeds the size cap (`Result::STATE_TOO_LARGE` →
+/// `APP_CONFLICT` → HTTP 409): workspace continue-message, workspace
+/// new-thread, share continue-message, share new-thread. All four are HTTP 409
+/// (source: the Ripley SSE wire contract, §4). Shared by the CLI
+/// `map_ai_send_error` and the MCP `ai_send_err_to_result` so the two
+/// error-mapping paths cannot drift out of sync.
+pub const CONVERSATION_TOO_LARGE_CODES: [u32; 4] = [168_116, 153_795, 148_135, 144_657];
+
+/// Return the message-detail object inside a message-details body, handling
+/// BOTH the workspace `message` wrapper and the share `turn` wrapper.
+///
+/// A workspace ask returns `{message: {state, text, response, actions, …}}`
+/// while a SHARE ask returns `{turn: {state, …}}`
+/// (`~/vividengine/llms/ai.txt:771`: "The message detail is returned under a
+/// `message` object (a `turn` object on the share endpoint)."). When neither
+/// wrapper is present (an already-unwrapped or bare detail) the top-level body
+/// is returned unchanged. Centralizing the wrapper rule here keeps the CLI
+/// `ask`/render and MCP `ask` paths from each re-deriving — and drifting on —
+/// it; without it a share `needs_input` turn's `state` is never read (no
+/// `message` key), so the wait loop polls to a misleading timeout and the
+/// clarification is missed.
+#[must_use]
+pub fn message_detail(msg_data: &Value) -> &Value {
+    msg_data
+        .get("message")
+        .or_else(|| msg_data.get("turn"))
+        .unwrap_or(msg_data)
+}
+
+/// Is an agent message/turn `state` terminal (the poll/wait loop should stop)?
+///
+/// Terminal states are `complete`, `errored`, and `needs_input`. The first two
+/// are the documented message-detail states (`~/vividengine/llms/ai.txt:750`);
+/// `needs_input` is the additional terminal state a turn reaches when the
+/// assistant answers with a clarifying question instead of a full response
+/// (`ai.txt:849` — it is terminal, NOT `errored`, and the stream/poll closes).
+/// Without `needs_input` here the `ask`/`chat` wait loops would poll such a turn
+/// until the wait budget elapses and surface a misleading timeout.
+#[must_use]
+pub fn is_terminal_state(state: &str) -> bool {
+    matches!(state, "complete" | "errored" | "needs_input")
+}
+
+/// Extract the clarifying question from a `needs_input` agent message-details
+/// body, if present.
+///
+/// A `needs_input` turn (`~/vividengine/llms/ai.txt:849`) carries a single
+/// clarifying question instead of a full answer. The question lives in a
+/// `clarification` object (`{type, question}`), present at one of several
+/// locations checked in priority order:
+/// 1. the envelope-unwrapped top level (`clarification`),
+/// 2. the message-detail object — `message` (workspace) or `turn` (share), via
+///    [`message_detail`] — at `.clarification`,
+/// 3. the service-level `result.clarification` REST-detail recovery path
+///    (`vividengine.ripley-sse-contract.md` §2 — distinct from the
+///    `{result:"yes"|"no"}` envelope the client already unwraps),
+/// 4. the detail's `response.clarification`,
+/// 5. a bare `question` field on the turn (top level or nested) — the share
+///    `turn` may carry the clarifying question this way.
+///
+/// Returns the first non-empty `question` string, or `None` when none is
+/// present.
+///
+/// Note: `message.text` is deliberately NOT consulted — that is the user's
+/// ORIGINAL question, not the assistant's clarifying question.
+#[must_use]
+pub fn extract_clarification_question(msg_data: &Value) -> Option<String> {
+    /// Pull a non-empty `clarification.question` string off a JSON object.
+    fn clarification_q(v: &Value) -> Option<&str> {
+        v.get("clarification")
+            .and_then(|c| c.get("question"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
+    /// Pull a non-empty bare `question` string off a JSON object.
+    fn bare_q(v: &Value) -> Option<&str> {
+        v.get("question")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
+
+    let msg = message_detail(msg_data);
+    clarification_q(msg_data)
+        .or_else(|| clarification_q(msg))
+        // Service-level `result.clarification` (REST-detail recovery), distinct
+        // from the already-unwrapped `{result:"yes"|"no"}` transport envelope.
+        .or_else(|| msg_data.get("result").and_then(clarification_q))
+        .or_else(|| msg.get("response").and_then(clarification_q))
+        // Fallback: a bare `question` field on the turn (top level or nested).
+        .or_else(|| bare_q(msg_data))
+        .or_else(|| bare_q(msg))
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatCreateOptions, ChatScope, agent_chat_path, build_cancel_path, build_share_form,
-        parse_cancel_response,
+        CONVERSATION_TOO_LARGE_CODES, ChatCreateOptions, ChatScope, agent_chat_path,
+        build_cancel_path, build_share_form, extract_clarification_question, is_terminal_state,
+        message_detail, parse_cancel_response,
     };
     use crate::error::CliError;
     use serde_json::json;
+
+    #[test]
+    fn is_terminal_state_includes_needs_input() {
+        // `needs_input` (ai.txt:849) is terminal alongside complete/errored —
+        // without it the wait loops would poll a clarifying-question turn to a
+        // misleading timeout.
+        for s in ["complete", "errored", "needs_input"] {
+            assert!(is_terminal_state(s), "{s} must be terminal");
+        }
+        for s in ["ready", "in_progress", "processing", ""] {
+            assert!(!is_terminal_state(s), "{s} must NOT be terminal");
+        }
+    }
+
+    #[test]
+    fn clarification_from_top_level_object() {
+        // The contract's `result.clarification = {type, question}` lands at the
+        // envelope-unwrapped top level.
+        let body = json!({
+            "message": {"state": "needs_input"},
+            "clarification": {"type": "clarification", "question": "Which workspace?"},
+        });
+        assert_eq!(
+            extract_clarification_question(&body).as_deref(),
+            Some("Which workspace?")
+        );
+    }
+
+    #[test]
+    fn clarification_from_nested_message_object() {
+        // A share `turn`/`message`-nested clarification is also found.
+        let body = json!({
+            "message": {
+                "state": "needs_input",
+                "clarification": {"question": "Which file version?"},
+            },
+        });
+        assert_eq!(
+            extract_clarification_question(&body).as_deref(),
+            Some("Which file version?")
+        );
+    }
+
+    #[test]
+    fn clarification_bare_question_fallback() {
+        // The turn may carry a bare `question` field (no clarification object).
+        let body = json!({"message": {"state": "needs_input"}, "question": "Clarify scope?"});
+        assert_eq!(
+            extract_clarification_question(&body).as_deref(),
+            Some("Clarify scope?")
+        );
+    }
+
+    #[test]
+    fn clarification_ignores_user_question_text_and_returns_none() {
+        // `message.text` is the USER's original question, never the clarifying
+        // question — it must NOT be surfaced as a clarification.
+        let body = json!({
+            "message": {"state": "needs_input", "text": "What were Q3 figures?"},
+        });
+        assert!(extract_clarification_question(&body).is_none());
+    }
+
+    #[test]
+    fn message_detail_unwraps_message_turn_and_bare() {
+        // Workspace detail → `message`; share detail → `turn`; an already
+        // unwrapped/bare detail falls back to the top-level body itself.
+        let ws = json!({"message": {"state": "complete", "text": "ws"}});
+        assert_eq!(
+            message_detail(&ws),
+            &json!({"state": "complete", "text": "ws"})
+        );
+
+        let share = json!({"turn": {"state": "needs_input"}});
+        assert_eq!(message_detail(&share), &json!({"state": "needs_input"}));
+
+        // `message` wins over a stray `turn` if (improbably) both are present.
+        let both = json!({"message": {"state": "complete"}, "turn": {"state": "x"}});
+        assert_eq!(message_detail(&both), &json!({"state": "complete"}));
+
+        let bare = json!({"state": "errored"});
+        assert_eq!(message_detail(&bare), &bare);
+    }
+
+    #[test]
+    fn share_turn_needs_input_is_detected_terminal_via_helpers() {
+        // The exact combination the CLI + MCP wait loops compute: unwrap the
+        // share `turn` wrapper, then classify its `state`. A share
+        // `{turn:{state:"needs_input"}}` must be TERMINAL — without the
+        // `message_detail` unwrap, `state` reads empty and the loop polls to a
+        // misleading timeout (the bug this fix closes).
+        let body = json!({"turn": {"state": "needs_input"}});
+        let detail = message_detail(&body);
+        let state = detail
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(state, "needs_input");
+        assert!(
+            is_terminal_state(state),
+            "a share needs_input turn must terminate the wait loop"
+        );
+    }
+
+    #[test]
+    fn clarification_from_share_turn_wrapper() {
+        // SHARE asks return the detail under a `turn` object (ai.txt:771); the
+        // clarification nested there must be found just like the `message` case.
+        let body = json!({
+            "turn": {
+                "state": "needs_input",
+                "clarification": {"type": "clarification", "question": "Which share folder?"},
+            },
+        });
+        assert_eq!(
+            extract_clarification_question(&body).as_deref(),
+            Some("Which share folder?")
+        );
+    }
+
+    #[test]
+    fn clarification_from_share_turn_bare_question() {
+        // A share `turn` may carry a bare `question` rather than a clarification
+        // object — still surfaced.
+        let body = json!({"turn": {"state": "needs_input", "question": "Clarify the scope?"}});
+        assert_eq!(
+            extract_clarification_question(&body).as_deref(),
+            Some("Clarify the scope?")
+        );
+    }
+
+    #[test]
+    fn clarification_from_service_level_result_object() {
+        // REST-detail recovery path: the service-level `result.clarification`
+        // (ripley-sse-contract §2), distinct from the `{result:"yes"|"no"}`
+        // transport envelope the client already unwraps.
+        let body = json!({
+            "turn": {"state": "needs_input"},
+            "result": {"clarification": {"type": "clarification", "question": "Which document?"}},
+        });
+        assert_eq!(
+            extract_clarification_question(&body).as_deref(),
+            Some("Which document?")
+        );
+    }
+
+    #[test]
+    fn clarification_empty_question_is_skipped() {
+        // An empty `question` string is not a usable clarification — fall
+        // through to the next location (here, the bare `question`).
+        let body = json!({
+            "message": {
+                "state": "needs_input",
+                "clarification": {"question": ""},
+                "question": "Real follow-up?",
+            },
+        });
+        assert_eq!(
+            extract_clarification_question(&body).as_deref(),
+            Some("Real follow-up?")
+        );
+    }
+
+    #[test]
+    fn conversation_too_large_codes_are_the_four_call_sites() {
+        // The shared const is the single source of truth for both the CLI and
+        // MCP send-error mappers (ripley-sse-contract §4).
+        assert_eq!(
+            CONVERSATION_TOO_LARGE_CODES,
+            [168_116, 153_795, 148_135, 144_657]
+        );
+    }
 
     #[test]
     fn agent_chat_path_builds_details_with_trailing_slash() {

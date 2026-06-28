@@ -62,6 +62,16 @@ impl McpState {
         *self.authenticated.write().await = true;
     }
 
+    /// Clear the in-memory token for this session, de-authenticating it.
+    ///
+    /// Used by the `signout` action to actually drop the live MCP credential —
+    /// it does NOT revoke the server-side session or API key (those have their
+    /// own revocation paths: `fastio auth signout` and `api-key-delete`).
+    pub async fn clear_token(&self) {
+        self.client.write().await.clear_token();
+        *self.authenticated.write().await = false;
+    }
+
     /// Construct an unauthenticated state for unit tests.
     ///
     /// Used by tool-router tests to exercise dispatch (e.g. the hidden `ai`
@@ -138,9 +148,9 @@ impl ServerHandler for FastioMcpServer {
                  tool's compound `*-and-wait` actions over tight detail-poll loops. \
                  `workflow` and `sign` expose READ + DRIVE actions only -- destructive / \
                  terminal mutations (workflow `cancel`; sign `send`/`void` -- envelopes are \
-                 voided, not deleted) are CLI-binary-only. The `task`/`worklog`/`approval`/`todo` \
-                 tools are \
-                 `[legacy]` and superseded by `workflow`. Tool results are rendered as \
+                 voided, not deleted) are CLI-binary-only. The `task` tool is the Tasks API \
+                 (task lists, tasks, comments, attachments); `workflow` is the separate \
+                 durable orchestration surface. Tool results are rendered as \
                  GitHub-flavored Markdown (shape-compatible with the server-side \
                  `?output=markdown` contract) for compact, high-signal consumption. Run \
                  `fastio auth login` in a terminal first to authenticate."
@@ -271,5 +281,28 @@ mod tests {
             Some("override-token")
         );
         assert!(*server.state.authenticated.read().await);
+    }
+
+    /// `clear_token` genuinely de-authenticates the live MCP session — it drops
+    /// the in-memory bearer token AND flips `authenticated` to false. Regression
+    /// guard for the `signout` bug where the in-memory token was never cleared,
+    /// so the session stayed authenticated after "signing out".
+    #[tokio::test]
+    async fn clear_token_deauthenticates_session() {
+        let state = McpState::new_unauthenticated_for_test("http://example.test/api/current");
+        state.set_token("live-token".to_owned()).await;
+        assert!(state.is_authenticated().await);
+        assert_eq!(state.client().read().await.get_token(), Some("live-token"));
+
+        state.clear_token().await;
+        assert!(
+            !state.is_authenticated().await,
+            "session must be de-authenticated after clear_token"
+        );
+        assert_eq!(
+            state.client().read().await.get_token(),
+            None,
+            "in-memory token must be dropped after clear_token"
+        );
     }
 }

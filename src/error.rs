@@ -286,6 +286,32 @@ pub const HINT_ARTIFACT_NOT_READY: &str = "The requested artifact is generated a
 pub const HINT_INVALID_HEADER_VALUE: &str = "The supplied value contains a control character or newline, which cannot be \
      carried in an HTTP header. Non-ASCII letters are fine; re-check the value and remove any control characters or line breaks.";
 
+/// Shared generic "invalid input" hint (code `1605`).
+///
+/// Code `1605` ("Invalid Input") is a GENERAL-purpose 400 in this API: storage
+/// `update/` (rename) and `transfer/` return it on a name conflict or invalid
+/// name (corrected from an opaque HTTP 500 on 2026-06-14), but the SAME code also
+/// covers an invalid AI chat `type`/`privacy`/`personality` value, a bad scope
+/// combination, a metadata-template node-cap overflow, and more. A bare 400
+/// yields no hint at all, so this surfaces the actionable shape — fix the
+/// offending value and retry — while staying resource-agnostic (it must NOT name
+/// a single feature or assume "name conflict"); the server's `error.text` (and
+/// any `param`/`reason` detail) carries the specific cause.
+pub const HINT_INVALID_INPUT: &str = "The server rejected a value in this request as invalid or conflicting. \
+     Check the error message above for the offending field (e.g. a name that already exists, or an out-of-range value), correct it, and retry.";
+
+/// Shared "a reason/comment is required" hint (server 422 `ERR_REASON_REQUIRED`).
+///
+/// A workflow-review `reject` / `request_changes` decision (and any other
+/// decision the server gates the same way) MUST carry a non-empty reason; the
+/// CLI guards this client-side, but a caller that bypasses the guard (e.g. an
+/// MCP client, or a value that slips past it) gets a bare 422 whose generic
+/// status hint is unhelpful. This hint names the actionable fix. Kept
+/// resource-agnostic (it phrases it as "a reason/comment") so it stays reusable
+/// for any reason-required decision; the server's `error.text` carries specifics.
+pub const HINT_REASON_REQUIRED: &str = "This action requires a non-empty reason. \
+     Re-run with a comment/reason (e.g. `--comment \"<reason>\"`) explaining the decision.";
+
 /// Shared compare-and-swap (optimistic-concurrency) conflict hint
 /// ([`CliError::VersionConflict`]).
 ///
@@ -352,6 +378,12 @@ impl ApiError {
                 "Account email not verified. Run `fastio auth verify --email <your-email>` to resend the verification email.",
             );
         }
+        // The 422 reason-required error is keyed by its string `error_code`
+        // (`ERR_REASON_REQUIRED`), not a numeric code, so match it here before
+        // the numeric-code / HTTP-status fallbacks (a bare 422 yields no hint).
+        if self.error_code.as_deref() == Some("ERR_REASON_REQUIRED") {
+            return Some(HINT_REASON_REQUIRED);
+        }
         // Billing / entitlement codes share centrally-defined hint strings so
         // billing, signing, Ripley, and workflow stay consistent. These are
         // checked before the HTTP-status fallback because several map onto
@@ -362,6 +394,11 @@ impl ApiError {
             1696 => return Some(HINT_CREDIT_LIMIT),
             1670 => return Some(HINT_RESTRICTED),
             1685 => return Some(HINT_FEATURE_LIMIT),
+            // Generic "Invalid Input" (HTTP 400). Covers storage rename/transfer
+            // name-conflicts (corrected from HTTP 500 on 2026-06-14) and many
+            // other invalid-value cases. The bare-400 fallback below yields no
+            // hint, so map the code to actionable (resource-agnostic) guidance.
+            1605 => return Some(HINT_INVALID_INPUT),
             9992 => return Some(HINT_UNKNOWN_ROUTE),
             // Access-denied codes that surface as HTTP 401 but are NOT a missing
             // login (the caller IS authenticated). Without these arms the bare
@@ -425,40 +462,76 @@ fn render_details(f: &mut fmt::Formatter<'_>, details: &serde_json::Value) -> fm
     if let Some(reason) = details.get("reason").filter(|v| !v.is_null()) {
         match reason {
             Value::String(s) => write!(f, "\n  reason: {}", truncate_detail(s))?,
-            other => write!(f, "\n  reason: {}", truncate_detail(&compact_json(other)))?,
-        }
-    }
-
-    // `params[]` (400): per-field validation failures. Cap the number of
-    // rendered entries so a pathological response can't flood stderr / MCP.
-    if let Some(Value::Array(params)) = details.get("params") {
-        for p in params.iter().take(MAX_RENDERED_PARAMS) {
-            let name = p.get("name").and_then(Value::as_str).unwrap_or("?");
-            let msg = p
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| p.get("kind").and_then(Value::as_str))
-                .unwrap_or("invalid");
-            // Both the field name and the message are untrusted server text;
-            // bound each so a pathological name can't blow up the render either.
-            write!(
+            other => write!(
                 f,
-                "\n  param {}: {}",
-                truncate_detail(name),
-                truncate_detail(msg)
-            )?;
-        }
-        if params.len() > MAX_RENDERED_PARAMS {
-            write!(f, "\n  … ({} more)", params.len() - MAX_RENDERED_PARAMS)?;
+                "\n  reason: {}",
+                truncate_detail(&compact_json_bounded(other))
+            )?,
         }
     }
 
-    // `validation_report` (422): structured template/schema report.
+    // `params` (400 / 409): two shapes.
+    //   - An ARRAY of per-field validation failures (the modern replacement for
+    //     the retired per-field integer codes; `name`/`kind`/`code`/`message`).
+    //   - An OBJECT of structured diagnostics for a single conflict — e.g. the
+    //     workflow-review / CAS 409 carries `{code, reason, current_round_id}`.
+    //     Without the object arm, that payload reaches `ApiError::details` but is
+    //     silently dropped from `Display`, so the user never sees WHY the write
+    //     was rejected or which round is current.
+    // Cap the number of rendered entries either way so a pathological response
+    // can't flood stderr / MCP.
+    match details.get("params") {
+        Some(Value::Array(params)) => {
+            for p in params.iter().take(MAX_RENDERED_PARAMS) {
+                let name = p.get("name").and_then(Value::as_str).unwrap_or("?");
+                let msg = p
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| p.get("kind").and_then(Value::as_str))
+                    .unwrap_or("invalid");
+                // Both the field name and the message are untrusted server text;
+                // bound each so a pathological name can't blow up the render either.
+                write!(
+                    f,
+                    "\n  param {}: {}",
+                    truncate_detail(name),
+                    truncate_detail(msg)
+                )?;
+            }
+            if params.len() > MAX_RENDERED_PARAMS {
+                write!(f, "\n  … ({} more)", params.len() - MAX_RENDERED_PARAMS)?;
+            }
+        }
+        Some(Value::Object(fields)) => {
+            for (key, val) in fields.iter().take(MAX_RENDERED_PARAMS) {
+                // Render scalars as themselves; nest objects/arrays compactly so
+                // no field is dropped. Both key and value are untrusted server
+                // text, so bound each.
+                let rendered = match val {
+                    Value::String(s) => truncate_detail(s).into_owned(),
+                    Value::Null => "null".to_owned(),
+                    // Serialize nested object/array values with a byte cap so a
+                    // large/hostile diagnostic can't drive an unbounded
+                    // allocation here before truncation.
+                    other => truncate_detail(&compact_json_bounded(other)).into_owned(),
+                };
+                write!(f, "\n  param {}: {}", truncate_detail(key), rendered)?;
+            }
+            if fields.len() > MAX_RENDERED_PARAMS {
+                write!(f, "\n  … ({} more)", fields.len() - MAX_RENDERED_PARAMS)?;
+            }
+        }
+        _ => {}
+    }
+
+    // `validation_report` (422): structured template/schema report. Serialized
+    // with the same byte cap as the object-params arm so a large report can't
+    // drive an unbounded allocation before truncation.
     if let Some(report) = details.get("validation_report").filter(|v| !v.is_null()) {
         write!(
             f,
             "\n  validation_report: {}",
-            truncate_detail(&compact_json(report))
+            truncate_detail(&compact_json_bounded(report))
         )?;
     }
 
@@ -481,11 +554,60 @@ const MAX_RENDERED_PARAMS: usize = 10;
 /// Maximum rendered length of a single detail value (keeps stderr readable).
 const DETAIL_MAX_LEN: usize = 400;
 
-/// Serialize a JSON value compactly, falling back to its `Debug` form if
-/// serialization somehow fails (it cannot for in-memory `Value`s, but the
-/// no-`unwrap` rule forbids relying on that).
-fn compact_json(value: &serde_json::Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
+/// Byte cap applied while serializing a nested object/array detail value. Sized
+/// a little above [`DETAIL_MAX_LEN`] so the captured prefix still spans the
+/// truncation point that [`truncate_detail`] clips, while bounding the
+/// allocation (and serialization work) a large/hostile nested value can drive.
+const COMPACT_JSON_CAP: usize = DETAIL_MAX_LEN + 64;
+
+/// A `std::io::Write` sink that captures at most `cap` bytes and then refuses
+/// further writes, so [`serde_json::to_writer`] aborts early instead of
+/// materializing a full string for a large/hostile nested value.
+struct CappedWriter {
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl std::io::Write for CappedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.cap.saturating_sub(self.buf.len());
+        if remaining == 0 {
+            // At capacity — signal "full" so the serializer stops here.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "detail value capped",
+            ));
+        }
+        let take = data.len().min(remaining);
+        self.buf.extend_from_slice(&data[..take]);
+        Ok(take)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialize a JSON value compactly but bounded to approximately
+/// [`COMPACT_JSON_CAP`] bytes, so rendering a structured `error.params` /
+/// `validation_report` value during `Display` cannot drive an unbounded
+/// allocation. The byte buffer is hard-capped at [`COMPACT_JSON_CAP`]; the
+/// returned `String` can exceed that by at most +2 bytes, because the captured
+/// prefix is lossy-decoded ([`String::from_utf8_lossy`]) and a multi-byte char
+/// split at the cap boundary is replaced by a 3-byte U+FFFD (so a 1-byte
+/// fragment grows by +2). Lossy decoding is also why a char split at the cap
+/// boundary can never panic. [`truncate_detail`] then clips the result to
+/// [`DETAIL_MAX_LEN`].
+fn compact_json_bounded(value: &serde_json::Value) -> String {
+    let mut writer = CappedWriter {
+        buf: Vec::new(),
+        cap: COMPACT_JSON_CAP,
+    };
+    // The only error is our own "capped" signal (or, in principle, a serializer
+    // failure that cannot occur for an in-memory `Value`); either way the
+    // captured prefix is what we render.
+    let _ = serde_json::to_writer(&mut writer, value);
+    String::from_utf8_lossy(&writer.buf).into_owned()
 }
 
 /// Truncate a detail string on a char boundary, appending an ellipsis marker
@@ -720,6 +842,22 @@ mod tests {
     }
 
     #[test]
+    fn suggestion_reason_required_error_code_maps_to_hint() {
+        // The 422 reason-required error is keyed by its string error_code, not a
+        // numeric code, and must yield the actionable reason hint (not the bare
+        // 422 fallback, which is None).
+        let e = ApiError::new(
+            0,
+            Some("ERR_REASON_REQUIRED".to_owned()),
+            "comment_text required".to_owned(),
+            422,
+        );
+        assert_eq!(e.suggestion(), Some(HINT_REASON_REQUIRED));
+        // A plain 422 with no recognized code still yields no hint.
+        assert_eq!(api_err(0, 422).suggestion(), None);
+    }
+
+    #[test]
     fn suggestion_unverified_email_code_unchanged() {
         assert!(
             api_err(10587, 403)
@@ -788,6 +926,91 @@ mod tests {
         assert!(
             rendered.contains("steps[0].kind"),
             "nested field surfaced: {rendered}"
+        );
+    }
+
+    #[test]
+    fn suggestion_invalid_input_code_1605_maps_to_hint() {
+        // Code 1605 ("Invalid Input") is a general-purpose 400 — storage
+        // rename/transfer name-conflicts (corrected from HTTP 500 on 2026-06-14)
+        // plus many other invalid-value cases. It must yield the actionable
+        // invalid-input hint, not the bare-400 fallback (which is None). The hint
+        // stays resource-agnostic (names no single feature, assumes no one cause).
+        assert_eq!(api_err(1605, 400).suggestion(), Some(HINT_INVALID_INPUT));
+        // A plain 400 with no recognized code still yields no hint.
+        assert_eq!(api_err(0, 400).suggestion(), None);
+        for needle in ["fileshare", "file share", "sign", "envelope", "workflow"] {
+            assert!(
+                !HINT_INVALID_INPUT.to_lowercase().contains(needle),
+                "invalid-input hint must stay resource-agnostic ({needle})"
+            );
+        }
+    }
+
+    #[test]
+    fn display_renders_object_valued_params() {
+        // The workflow-review / CAS 409 carries an OBJECT-valued `error.params`
+        // ({code, reason, current_round_id}), not an array. Each field must
+        // surface in Display so the user sees WHY the decision was rejected and
+        // which round is current — not just a bare 409.
+        let details = serde_json::json!({
+            "params": {
+                "code": "ERR_DECISION_CAS_CONFLICT",
+                "reason": "reviewer_already_decided_this_round",
+                "current_round_id": "wr12345",
+            },
+        });
+        let e = ApiError {
+            code: 0,
+            error_code: Some("ERR_DECISION_CAS_CONFLICT".to_owned()),
+            message: "conflict".to_owned(),
+            http_status: 409,
+            details: Some(Box::new(details)),
+        };
+        let rendered = e.to_string();
+        assert!(
+            rendered.contains("param code: ERR_DECISION_CAS_CONFLICT"),
+            "object param `code` surfaced: {rendered}"
+        );
+        assert!(
+            rendered.contains("param reason: reviewer_already_decided_this_round"),
+            "object param `reason` surfaced: {rendered}"
+        );
+        assert!(
+            rendered.contains("param current_round_id: wr12345"),
+            "object param `current_round_id` surfaced: {rendered}"
+        );
+    }
+
+    #[test]
+    fn display_object_params_bounds_field_count() {
+        // An object-valued params with more than MAX_RENDERED_PARAMS keys is
+        // capped, with a "… (N more)" summary, mirroring the array path.
+        let mut map = serde_json::Map::new();
+        for i in 0..25 {
+            map.insert(format!("k{i}"), serde_json::json!(format!("v{i}")));
+        }
+        let details = serde_json::json!({ "params": serde_json::Value::Object(map) });
+        let e = ApiError {
+            code: 0,
+            error_code: None,
+            message: "conflict".to_owned(),
+            http_status: 409,
+            details: Some(Box::new(details)),
+        };
+        let rendered = e.to_string();
+        // BTreeMap-style ordering is not guaranteed for serde_json::Map without
+        // preserve_order, but with it (the crate enables it) insertion order
+        // holds. Assert the cap + summary regardless of which keys land first.
+        assert!(
+            rendered.contains("… (15 more)"),
+            "must summarize the elided object params: {rendered}"
+        );
+        // Exactly MAX_RENDERED_PARAMS `param ` lines render (10).
+        assert_eq!(
+            rendered.matches("\n  param ").count(),
+            10,
+            "object params must be capped at MAX_RENDERED_PARAMS: {rendered}"
         );
     }
 
@@ -907,6 +1130,61 @@ mod tests {
             rendered.len() < 600,
             "render stayed bounded: {}",
             rendered.len()
+        );
+    }
+
+    #[test]
+    fn display_bounds_large_nested_object_param_value() {
+        // A nested object/array value on an object-valued param must be serialized
+        // with a byte cap and truncated — a large/hostile diagnostic cannot drive
+        // an unbounded allocation during Display.
+        let huge: Vec<serde_json::Value> = (0..50_000)
+            .map(|i| serde_json::json!(format!("payload-element-{i}")))
+            .collect();
+        let details = serde_json::json!({
+            "params": { "diagnostic": { "nested": huge } }
+        });
+        let e = ApiError {
+            code: 0,
+            error_code: None,
+            message: "conflict".to_owned(),
+            http_status: 409,
+            details: Some(Box::new(details)),
+        };
+        let rendered = e.to_string();
+        // The nested value is rendered (the field is not dropped) but clipped.
+        assert!(
+            rendered.contains("param diagnostic:"),
+            "nested object param must still surface: {}",
+            rendered.len()
+        );
+        assert!(
+            rendered.contains("(truncated)"),
+            "oversized nested value must be truncated: {}",
+            rendered.len()
+        );
+        // The whole render stays small regardless of the multi-megabyte input.
+        assert!(
+            rendered.len() < 600,
+            "render must stay bounded despite a huge nested value: {}",
+            rendered.len()
+        );
+    }
+
+    #[test]
+    fn compact_json_bounded_caps_output() {
+        // The bounded serializer never returns more than the byte cap, even for a
+        // value whose full serialization would be orders of magnitude larger.
+        let huge: Vec<serde_json::Value> = (0..50_000).map(|i| serde_json::json!(i)).collect();
+        let out = compact_json_bounded(&serde_json::json!(huge));
+        assert!(
+            out.len() <= COMPACT_JSON_CAP,
+            "bounded serialization exceeded the cap: {} > {COMPACT_JSON_CAP}",
+            out.len()
+        );
+        assert!(
+            out.starts_with('['),
+            "captured the serialized prefix: {out}"
         );
     }
 }

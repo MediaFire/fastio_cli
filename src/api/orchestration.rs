@@ -12,10 +12,10 @@
 //!
 //! Maps to the owner-side REST surface documented at
 //! `~/vividengine/llms/workflows.txt`. This module is **distinct from the
-//! legacy task-management primitives** in [`crate::api::workflow`] (tasks,
-//! worklogs, approvals, todos): those endpoints live under
-//! `/workspace/{id}/tasks/` and friends, share no IDs or state with this
-//! surface, and are not orchestration. This module ships the workflow
+//! task-management primitives** in [`crate::api::workflow`] (the Tasks API):
+//! those endpoints live under `/workspace/{id}/tasks/` and friends, share no
+//! IDs or state with this surface, and are not orchestration. This module ships
+//! the workflow
 //! *profile + runtime*, immutable *templates*, *triggers*, human
 //! *obligations*, per-workflow *extraction schemas*, the tamper-evident
 //! *audit chain* (events / signed export / dual-control redaction),
@@ -120,6 +120,13 @@ pub struct CreateWorkflowParams {
     pub agent_credit_cap: Option<u64>,
     /// Optional visibility (`workspace` / `private` / `participants_only`).
     pub visibility: Option<String>,
+    /// Optional inline one-off workflow `definition` — a JSON template-body
+    /// string with the same authoring contract as `template create`. **Mutually
+    /// exclusive with `template_id`** (the command layer enforces this); when
+    /// present the server validates → snapshots → publishes → binds the
+    /// definition in one call and the response additionally carries the created
+    /// `workflow_template`.
+    pub definition: Option<String>,
 }
 
 impl CreateWorkflowParams {
@@ -165,6 +172,14 @@ impl CreateWorkflowParams {
         self.visibility = visibility;
         self
     }
+
+    /// Set the inline one-off `definition` (a JSON template-body string).
+    /// Mutually exclusive with [`Self::template_id`].
+    #[must_use]
+    pub fn definition(mut self, definition: Option<String>) -> Self {
+        self.definition = definition;
+        self
+    }
 }
 
 /// Create a workflow profile in a workspace.
@@ -181,6 +196,7 @@ pub async fn create_workflow(
     put_opt(&mut form, "template_id", params.template_id.as_deref());
     put_opt_u64(&mut form, "agent_credit_cap", params.agent_credit_cap);
     put_opt(&mut form, "visibility", params.visibility.as_deref());
+    put_opt(&mut form, "definition", params.definition.as_deref());
     let path = format!(
         "/workspace/{}/workflows/",
         urlencoding::encode(workspace_id)
@@ -188,27 +204,144 @@ pub async fn create_workflow(
     client.post(&path, &form).await
 }
 
-/// List workflow profiles in a workspace (offset-paginated).
+/// Filters for [`list_workflows`].
 ///
-/// `GET /workspace/{workspace_id}/workflows/`.
+/// `GET /workspace/{workspace_id}/workflows/` accepts (beyond `limit`/`offset`)
+/// the candidate-narrowing filters `?template_id=`, `?state=`, `?archived=`,
+/// `?created_by=me`, `?participant=me`, and the per-item enrichment selector
+/// `?include=run_summary,run_meta`. All filters narrow the candidate set BEFORE
+/// pagination (so `pagination.total` reflects the filtered count) and compose
+/// (multiple filters AND together). `#[non_exhaustive]` because the list surface
+/// keeps gaining filters.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct ListWorkflowsParams {
+    /// Pagination limit.
+    pub limit: Option<u32>,
+    /// Pagination offset.
+    pub offset: Option<u32>,
+    /// Narrow to a single template's runs by exact `template_id` match.
+    pub template_id: Option<String>,
+    /// Filter by a single lifecycle `state`.
+    pub state: Option<String>,
+    /// Archived filter: `true` / `false` / `all`.
+    pub archived: Option<String>,
+    /// Only runs the caller manually started (sends `created_by=me`).
+    pub created_by_me: bool,
+    /// Only runs where the caller holds an actionable obligation
+    /// (sends `participant=me`).
+    pub participant_me: bool,
+    /// Per-item enrichment selector — a CSV of `run_summary` / `run_meta`.
+    pub include: Option<String>,
+}
+
+impl ListWorkflowsParams {
+    /// An empty parameter set (equivalent to [`Default::default`]). Provided so
+    /// the binary crate can build this `#[non_exhaustive]` struct without
+    /// struct-literal syntax; set fields with the setter methods.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the pagination limit.
+    #[must_use]
+    pub fn limit(mut self, limit: Option<u32>) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Set the pagination offset.
+    #[must_use]
+    pub fn offset(mut self, offset: Option<u32>) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    /// Filter to a single template's runs.
+    #[must_use]
+    pub fn template_id(mut self, template_id: Option<String>) -> Self {
+        self.template_id = template_id;
+        self
+    }
+
+    /// Filter by a single lifecycle state.
+    #[must_use]
+    pub fn state(mut self, state: Option<String>) -> Self {
+        self.state = state;
+        self
+    }
+
+    /// Set the archived filter (`true` / `false` / `all`).
+    #[must_use]
+    pub fn archived(mut self, archived: Option<String>) -> Self {
+        self.archived = archived;
+        self
+    }
+
+    /// Limit to runs the caller manually started (`created_by=me`).
+    #[must_use]
+    pub fn created_by_me(mut self, created_by_me: bool) -> Self {
+        self.created_by_me = created_by_me;
+        self
+    }
+
+    /// Limit to runs where the caller holds an actionable obligation
+    /// (`participant=me`).
+    #[must_use]
+    pub fn participant_me(mut self, participant_me: bool) -> Self {
+        self.participant_me = participant_me;
+        self
+    }
+
+    /// Set the per-item enrichment selector (CSV of `run_summary` / `run_meta`).
+    #[must_use]
+    pub fn include(mut self, include: Option<String>) -> Self {
+        self.include = include;
+        self
+    }
+}
+
+/// Build the query map for [`list_workflows`] from a [`ListWorkflowsParams`].
+///
+/// Extracted so the filter encoding (the `me`-valued boolean aliases in
+/// particular) is unit-testable without a live request.
+fn build_list_workflows_query(params: &ListWorkflowsParams) -> HashMap<String, String> {
+    let mut query = HashMap::new();
+    if let Some(l) = params.limit {
+        query.insert("limit".to_owned(), l.to_string());
+    }
+    if let Some(o) = params.offset {
+        query.insert("offset".to_owned(), o.to_string());
+    }
+    put_opt(&mut query, "template_id", params.template_id.as_deref());
+    put_opt(&mut query, "state", params.state.as_deref());
+    put_opt(&mut query, "archived", params.archived.as_deref());
+    if params.created_by_me {
+        query.insert("created_by".to_owned(), "me".to_owned());
+    }
+    if params.participant_me {
+        query.insert("participant".to_owned(), "me".to_owned());
+    }
+    put_opt(&mut query, "include", params.include.as_deref());
+    query
+}
+
+/// List workflow profiles in a workspace (offset-paginated, filterable).
+///
+/// `GET /workspace/{workspace_id}/workflows/`. See [`ListWorkflowsParams`] for
+/// the candidate-narrowing filters and the `include` enrichment selector.
 pub async fn list_workflows(
     client: &ApiClient,
     workspace_id: &str,
-    limit: Option<u32>,
-    offset: Option<u32>,
+    params: &ListWorkflowsParams,
 ) -> Result<Value, CliError> {
-    let mut params = HashMap::new();
-    if let Some(l) = limit {
-        params.insert("limit".to_owned(), l.to_string());
-    }
-    if let Some(o) = offset {
-        params.insert("offset".to_owned(), o.to_string());
-    }
+    let query = build_list_workflows_query(params);
     let path = format!(
         "/workspace/{}/workflows/",
         urlencoding::encode(workspace_id)
     );
-    client.get_with_params(&path, &params).await
+    client.get_with_params(&path, &query).await
 }
 
 /// Get a single workflow profile.
@@ -258,7 +391,9 @@ pub async fn delete_workflow(
 /// Transfer a workflow to another workspace in the same organization.
 ///
 /// `POST /workflows/{workflow_id}/transfer/` (form-encoded). Cross-org
-/// transfer is rejected server-side (`workflows.txt:768`).
+/// transfer is rejected server-side (`workflows.txt:768`). The endpoint ALWAYS
+/// requires `confirm=true` (the request fails validation without it), so it is
+/// sent unconditionally alongside `target_workspace_id`.
 pub async fn transfer_workflow(
     client: &ApiClient,
     workflow_id: &str,
@@ -269,6 +404,7 @@ pub async fn transfer_workflow(
         "target_workspace_id".to_owned(),
         target_workspace_id.to_owned(),
     );
+    form.insert("confirm".to_owned(), "true".to_owned());
     let path = format!("/workflows/{}/transfer/", urlencoding::encode(workflow_id));
     client.post(&path, &form).await
 }
@@ -291,6 +427,14 @@ pub struct InstantiateParams {
     pub external_subject_id: Option<String>,
     /// Optional concurrency pool key to admit this run under.
     pub pool_key: Option<String>,
+    /// Optional run-start file seeds — a JSON OBJECT string mapping the
+    /// workflow's **published-definition (reminted) step ids** to arrays of
+    /// storage-node ids (`{"<step_id>":["<node_id>",...]}`) to pre-seed
+    /// `wait_for_files` steps at run start. Keys MUST be the reminted step ids
+    /// (from `system_gallery.step_id_map` on a `from_system` response, or
+    /// `GET /workflows/{id}/state/`) — a seed keyed by a gallery-fixed step id
+    /// is silently dropped.
+    pub step_seeds: Option<String>,
 }
 
 impl InstantiateParams {
@@ -304,6 +448,7 @@ impl InstantiateParams {
             trigger_payload: None,
             external_subject_id: None,
             pool_key: None,
+            step_seeds: None,
         }
     }
 
@@ -325,6 +470,14 @@ impl InstantiateParams {
     #[must_use]
     pub fn pool_key(mut self, pool_key: Option<String>) -> Self {
         self.pool_key = pool_key;
+        self
+    }
+
+    /// Set the run-start `step_seeds` (a JSON object string keyed by reminted
+    /// definition step ids).
+    #[must_use]
+    pub fn step_seeds(mut self, step_seeds: Option<String>) -> Self {
+        self.step_seeds = step_seeds;
         self
     }
 }
@@ -350,6 +503,7 @@ pub async fn instantiate_workflow(
         params.external_subject_id.as_deref(),
     );
     put_opt(&mut form, "pool_key", params.pool_key.as_deref());
+    put_opt(&mut form, "step_seeds", params.step_seeds.as_deref());
     let path = format!(
         "/workflows/{}/instantiate/",
         urlencoding::encode(workflow_id)
@@ -619,6 +773,88 @@ pub async fn list_step_occurrences(
     client.get_with_params(&path, &params).await
 }
 
+/// Serialize a node-id list into the form value the `files/` endpoint expects.
+///
+/// The endpoint reads `node_ids` as a single form/query field whose value is a
+/// **JSON array string** (`jsonDecode`-d server-side) — matching the
+/// orchestration convention of JSON-string values in a form body, not a JSON
+/// request body. Extracted so the encoding is unit-testable.
+fn node_ids_form_value(node_ids: &[String]) -> String {
+    Value::Array(node_ids.iter().cloned().map(Value::String).collect()).to_string()
+}
+
+/// Provide existing file node ids to a `waiting` `wait_for_files` step.
+///
+/// `POST /workflows/{workflow_id}/steps/{step_occurrence_id}/files/`
+/// (form-encoded; `node_ids` is a JSON ARRAY STRING of storage-node ids). The
+/// files are referenced **in place** (no move/copy) and the step is
+/// re-evaluated. Requires workflow admin. Returns 409 if the step is not
+/// `waiting` or is not a `wait_for_files` step, and 422 if the submission would
+/// exceed the per-step submitted-id limit.
+pub async fn submit_step_files(
+    client: &ApiClient,
+    workflow_id: &str,
+    step_occurrence_id: &str,
+    node_ids: &[String],
+) -> Result<Value, CliError> {
+    let mut form = HashMap::new();
+    form.insert("node_ids".to_owned(), node_ids_form_value(node_ids));
+    let path = format!(
+        "/workflows/{}/steps/{}/files/",
+        urlencoding::encode(workflow_id),
+        urlencoding::encode(step_occurrence_id)
+    );
+    client.post(&path, &form).await
+}
+
+/// Explicitly advance a manual-completion `wait_for_files` step.
+///
+/// `POST /workflows/{workflow_id}/steps/{step_occurrence_id}/complete/` (no
+/// body). Signals "done" on a manual-mode (`manual_completion: true`) ad-hoc
+/// `wait_for_files` step once at least the required file count has been
+/// provided; returns the updated step occurrence. 200 once it leaves `waiting`,
+/// 422 until the minimum is reached, a retryable 409 right after a `files/`
+/// submit, and 409 if the step is not a manual ad-hoc `wait_for_files` in the
+/// `waiting` state.
+pub async fn complete_step(
+    client: &ApiClient,
+    workflow_id: &str,
+    step_occurrence_id: &str,
+) -> Result<Value, CliError> {
+    let path = format!(
+        "/workflows/{}/steps/{}/complete/",
+        urlencoding::encode(workflow_id),
+        urlencoding::encode(step_occurrence_id)
+    );
+    client.post(&path, &HashMap::new()).await
+}
+
+/// Reassign a waiting `task` step to a new assignee.
+///
+/// `POST /workflows/{workflow_id}/steps/{step_occurrence_id}/reassign/`
+/// (form-encoded; `new_assignee_user_id`). The caller must be a workflow admin
+/// or the task's current assignee, and the new assignee must be a workspace
+/// member; rejected with 409 while a modification proposal is open. The user id
+/// is sent as an opaque string (19-digit ids — avoids any i64 overflow).
+pub async fn reassign_step(
+    client: &ApiClient,
+    workflow_id: &str,
+    step_occurrence_id: &str,
+    new_assignee_user_id: &str,
+) -> Result<Value, CliError> {
+    let mut form = HashMap::new();
+    form.insert(
+        "new_assignee_user_id".to_owned(),
+        new_assignee_user_id.to_owned(),
+    );
+    let path = format!(
+        "/workflows/{}/steps/{}/reassign/",
+        urlencoding::encode(workflow_id),
+        urlencoding::encode(step_occurrence_id)
+    );
+    client.post(&path, &form).await
+}
+
 // ════════════════════════════════════════════════════════════════════════
 //  Mid-Run Modifications (propose / apply changes to a running workflow)
 // ════════════════════════════════════════════════════════════════════════
@@ -765,12 +1001,15 @@ pub async fn create_template(
 
 /// List template revisions for a workspace.
 ///
-/// `GET /workspace/{workspace_id}/workflow_templates/`.
+/// `GET /workspace/{workspace_id}/workflow_templates/`. The optional `usage`
+/// filter is `library` (only non-one-off templates), `one_off` (only inline
+/// one-off templates), or `all` (default, unchanged behavior).
 pub async fn list_templates(
     client: &ApiClient,
     workspace_id: &str,
     limit: Option<u32>,
     offset: Option<u32>,
+    usage: Option<&str>,
 ) -> Result<Value, CliError> {
     let mut params = HashMap::new();
     if let Some(l) = limit {
@@ -779,6 +1018,7 @@ pub async fn list_templates(
     if let Some(o) = offset {
         params.insert("offset".to_owned(), o.to_string());
     }
+    put_opt(&mut params, "usage", usage);
     let path = format!(
         "/workspace/{}/workflow_templates/",
         urlencoding::encode(workspace_id)
@@ -1920,20 +2160,20 @@ pub async fn realtime_token(client: &ApiClient, workflow_id: &str) -> Result<Val
 
 /// Get-or-create a review surface for a step occurrence (idempotent).
 ///
-/// `POST /workflow-review/surface/create/` (form-encoded). The create / get /
-/// asset / decision / admin-resolve endpoints in this section 404 when the
+/// `POST /workflow-review/surface/create/` (JSON body — `readJsonBody`). The
+/// create / get / asset / decision / admin-resolve endpoints in this section 404 when the
 /// workspace's native-review rollout flag is off; the `review_workspace_active`
 /// hydration read below is the exception (never flag-gated).
 pub async fn review_surface_create(
     client: &ApiClient,
     step_occurrence_id: &str,
 ) -> Result<Value, CliError> {
-    let mut form = HashMap::new();
-    form.insert(
-        "step_occurrence_id".to_owned(),
-        step_occurrence_id.to_owned(),
-    );
-    client.post("/workflow-review/surface/create/", &form).await
+    // The review surface endpoints require a JSON body (`readJsonBody`), unlike
+    // the form-encoded orchestration write surface.
+    let body = serde_json::json!({ "step_occurrence_id": step_occurrence_id });
+    client
+        .post_json("/workflow-review/surface/create/", &body)
+        .await
 }
 
 /// Fetch a review surface (assets + reviewers + per-asset decision matrix).
@@ -1966,9 +2206,14 @@ pub async fn review_asset_get(
 /// Record a review decision (`approve` / `reject` / `request_changes`).
 ///
 /// `POST /workflow-review/surface/{surface_id}/asset/{asset_id}/decision/`
-/// (form-encoded). CAS-checks `version_id_pinned` against the asset's
-/// `current_version_id` (409 `ERR_VERSION_MISMATCH` on mismatch) and dedupes
-/// on `(asset_id, reviewer_id, round_id)`.
+/// (JSON body — `readJsonBody`). The decision is sent under the wire key
+/// **`action`** and the reason under **`comment_text`** (NOT `decision` /
+/// `comment`); `version_id_pinned` matches the wire key. CAS-checks
+/// `version_id_pinned` against the asset's `current_version_id` (409
+/// `ERR_VERSION_MISMATCH` on mismatch) and dedupes on
+/// `(asset_id, reviewer_id, round_id)`. The server requires a non-empty reason
+/// for `reject` / `request_changes` (422 `ERR_REASON_REQUIRED`); the command
+/// layer also guards this client-side before the call.
 pub async fn review_decision(
     client: &ApiClient,
     surface_id: &str,
@@ -1977,34 +2222,37 @@ pub async fn review_decision(
     version_id_pinned: &str,
     comment: Option<&str>,
 ) -> Result<Value, CliError> {
-    let mut form = HashMap::new();
-    form.insert("decision".to_owned(), decision.to_owned());
-    form.insert("version_id_pinned".to_owned(), version_id_pinned.to_owned());
-    put_opt(&mut form, "comment", comment);
+    let mut body = serde_json::json!({
+        "action": decision,
+        "version_id_pinned": version_id_pinned,
+    });
+    if let Some(c) = comment {
+        body["comment_text"] = serde_json::Value::String(c.to_owned());
+    }
     let path = format!(
         "/workflow-review/surface/{}/asset/{}/decision/",
         urlencoding::encode(surface_id),
         urlencoding::encode(asset_id)
     );
-    client.post(&path, &form).await
+    client.post_json(&path, &body).await
 }
 
 /// Workspace admin force-resolves a stuck review surface.
 ///
-/// `POST /workflow-review/surface/{surface_id}/admin-resolve/` (form-encoded;
-/// `resolution` is `approved` / `rejected` / `cancelled`).
+/// `POST /workflow-review/surface/{surface_id}/admin-resolve/` (JSON body —
+/// `readJsonBody`; `resolution` is `approved` / `rejected` / `cancelled`).
 pub async fn review_admin_resolve(
     client: &ApiClient,
     surface_id: &str,
     resolution: &str,
 ) -> Result<Value, CliError> {
-    let mut form = HashMap::new();
-    form.insert("resolution".to_owned(), resolution.to_owned());
+    // JSON body (`readJsonBody`), like the other review-surface mutations.
+    let body = serde_json::json!({ "resolution": resolution });
     let path = format!(
         "/workflow-review/surface/{}/admin-resolve/",
         urlencoding::encode(surface_id)
     );
-    client.post(&path, &form).await
+    client.post_json(&path, &body).await
 }
 
 /// List the ACTIVE (`arming` / `open`) review surfaces in a workspace, each
@@ -2045,6 +2293,452 @@ pub async fn review_workspace_active(
         urlencoding::encode(workspace_id)
     );
     client.get_with_params(&path, &params).await
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Workflow Review — reviewer-roster management (admin) + asset comments +
+//  send-for-review + the "Request approval" quick path
+//
+//  These surfaces extend the v3.5b review section above. Like the other
+//  review mutations they are **CLI-only** on MCP (the MCP `workflow` tool
+//  exposes only the `review-active` hydration read; create / decision /
+//  admin-resolve and these roster mutations stay CLI-binary-only). All take a
+//  JSON body (`readJsonBody`) and 404 when the workspace's native-review
+//  rollout flag is off.
+// ════════════════════════════════════════════════════════════════════════
+
+/// Build the `add-member` request body (`{ member_user_id, [required] }`).
+///
+/// `member_user_id` is sent as a STRING — workspace-member ids are 19-digit
+/// numerics that can exceed `i64`, and the server accepts a numeric string
+/// (`is_numeric`). `required` is omitted when `None` (server default: `true`).
+fn review_add_member_body(member_user_id: &str, required: Option<bool>) -> Value {
+    let mut body = serde_json::json!({ "member_user_id": member_user_id });
+    if let Some(r) = required {
+        body["required"] = Value::Bool(r);
+    }
+    body
+}
+
+/// Workspace admin adds an existing workspace MEMBER to a review surface.
+///
+/// `POST /workflow-review/surface/{surface_id}/reviewer/add-member/` (JSON
+/// body). Admin-only (the caller bypasses the roster). Re-adding a previously
+/// removed member re-activates the same row in place (the response carries a
+/// `reactivated` flag). The surface must not be terminal.
+pub async fn review_reviewer_add_member(
+    client: &ApiClient,
+    surface_id: &str,
+    member_user_id: &str,
+    required: Option<bool>,
+) -> Result<Value, CliError> {
+    let body = review_add_member_body(member_user_id, required);
+    let path = format!(
+        "/workflow-review/surface/{}/reviewer/add-member/",
+        urlencoding::encode(surface_id)
+    );
+    client.post_json(&path, &body).await
+}
+
+/// Build the `add-external` request body (`{ email, name, [invite_notes] }`).
+fn review_add_external_body(email: &str, name: &str, invite_notes: Option<&str>) -> Value {
+    let mut body = serde_json::json!({ "email": email, "name": name });
+    if let Some(notes) = invite_notes {
+        body["invite_notes"] = Value::String(notes.to_owned());
+    }
+    body
+}
+
+/// Workspace admin adds an EXTERNAL (by-email) reviewer to a review surface.
+///
+/// `POST /workflow-review/surface/{surface_id}/reviewer/add-external/` (JSON
+/// body). Admin-only and **extended-tier only** (external reviewing requires
+/// the `extended` native-review tier). The email must not match an active
+/// workspace member, and `+tag` / gmail-dot aliased addresses are rejected.
+/// The external is provisioned a claim-only account invite (no JWT link-token
+/// is issued); the response carries `invite_provisioned`, `email_sent`, and
+/// `reactivated`.
+pub async fn review_reviewer_add_external(
+    client: &ApiClient,
+    surface_id: &str,
+    email: &str,
+    name: &str,
+    invite_notes: Option<&str>,
+) -> Result<Value, CliError> {
+    let body = review_add_external_body(email, name, invite_notes);
+    let path = format!(
+        "/workflow-review/surface/{}/reviewer/add-external/",
+        urlencoding::encode(surface_id)
+    );
+    client.post_json(&path, &body).await
+}
+
+/// Workspace admin removes a reviewer from a review surface (soft-remove).
+///
+/// `POST /workflow-review/surface/{surface_id}/reviewer/{reviewer_id}/remove/`
+/// (no body). Admin-only. Prior decisions are preserved for audit; pending
+/// obligations + any live link-tokens for the reviewer are revoked. Idempotent
+/// — a second call returns `409 ERR_ALREADY_REMOVED`. The response carries the
+/// stamped reviewer row plus `obligations_revoked` + `decisions_preserved`.
+pub async fn review_reviewer_remove(
+    client: &ApiClient,
+    surface_id: &str,
+    reviewer_id: &str,
+) -> Result<Value, CliError> {
+    let body = serde_json::json!({});
+    let path = format!(
+        "/workflow-review/surface/{}/reviewer/{}/remove/",
+        urlencoding::encode(surface_id),
+        urlencoding::encode(reviewer_id)
+    );
+    client.post_json(&path, &body).await
+}
+
+/// Set a reviewer's per-decision notification opt-out (explicit, idempotent).
+///
+/// `POST /workflow-review/surface/{surface_id}/reviewer/{reviewer_id}/notification-opt-out/`
+/// (JSON body `{ opt_out }`). Self-service for the reviewer's own row (member
+/// session or claimed-external session) or any roster row for a workspace
+/// admin. Sets whether the reviewer is notified each time ANOTHER reviewer
+/// records a decision; resolved / lock-override notifications are never
+/// suppressed. The response echoes `notification_opt_out_per_decision`.
+pub async fn review_reviewer_notification_opt_out(
+    client: &ApiClient,
+    surface_id: &str,
+    reviewer_id: &str,
+    opt_out: bool,
+) -> Result<Value, CliError> {
+    let body = serde_json::json!({ "opt_out": opt_out });
+    let path = format!(
+        "/workflow-review/surface/{}/reviewer/{}/notification-opt-out/",
+        urlencoding::encode(surface_id),
+        urlencoding::encode(reviewer_id)
+    );
+    client.post_json(&path, &body).await
+}
+
+/// Build the `link-token revoke` body (`{ [reason] }`).
+fn review_link_token_revoke_body(reason: Option<&str>) -> Value {
+    let mut body = serde_json::json!({});
+    if let Some(r) = reason {
+        body["reason"] = Value::String(r.to_owned());
+    }
+    body
+}
+
+/// Workspace admin revokes an external-reviewer link-token.
+///
+/// `POST /workflow-review/link-token/{link_token_id}/revoke/` (JSON body —
+/// optional `reason`, 1-60 chars, default `admin`). Admin-only. Idempotent — a
+/// second call returns `409 ERR_ALREADY_REVOKED`. The response carries the
+/// revoked row (`id`, `surface_id`, `reviewer_id`, `revoked_at`,
+/// `revoke_reason`). Note: the authored external path no longer issues
+/// link-tokens (claimed-external auth replaced them); this revokes any
+/// legacy/live token still outstanding.
+pub async fn review_link_token_revoke(
+    client: &ApiClient,
+    link_token_id: &str,
+    reason: Option<&str>,
+) -> Result<Value, CliError> {
+    let body = review_link_token_revoke_body(reason);
+    let path = format!(
+        "/workflow-review/link-token/{}/revoke/",
+        urlencoding::encode(link_token_id)
+    );
+    client.post_json(&path, &body).await
+}
+
+/// List review-scoped comments for an asset's surface.
+///
+/// `GET /workflow-review/asset/{asset_id}/comments/`. Accepts `limit`
+/// (default 50) and `offset`. Returns `{ comments, pagination }`. Caller must
+/// be on the surface's reviewer roster or a workspace admin (or a claimed
+/// external reviewer). The asset id is the only URL variable (the asset
+/// belongs to exactly one surface).
+pub async fn review_asset_comments_list(
+    client: &ApiClient,
+    asset_id: &str,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Value, CliError> {
+    let mut params = HashMap::new();
+    if let Some(l) = limit {
+        params.insert("limit".to_owned(), l.to_string());
+    }
+    if let Some(o) = offset {
+        params.insert("offset".to_owned(), o.to_string());
+    }
+    let path = format!(
+        "/workflow-review/asset/{}/comments/",
+        urlencoding::encode(asset_id)
+    );
+    client.get_with_params(&path, &params).await
+}
+
+/// Build the `asset comment create` body (`{ body, [anchor] }`).
+///
+/// `anchor` (a region/version reference object) is passed through verbatim
+/// when present. Attachments are NOT supported on review comments
+/// (`target_id` / `target_ids` are rejected server-side), so this surface
+/// deliberately offers no attachment field.
+fn review_asset_comment_create_body(body: &str, anchor: Option<&Value>) -> Value {
+    let mut out = serde_json::json!({ "body": body });
+    if let Some(a) = anchor {
+        out["anchor"] = a.clone();
+    }
+    out
+}
+
+/// Author a review-scoped comment on an asset.
+///
+/// `POST /workflow-review/asset/{asset_id}/comments/` (JSON body `{ body,
+/// [anchor] }`). `body` must be non-empty. Caller must be on the reviewer
+/// roster or a workspace admin (or a claimed external reviewer). Returns the
+/// created `comment`.
+pub async fn review_asset_comment_create(
+    client: &ApiClient,
+    asset_id: &str,
+    body: &str,
+    anchor: Option<&Value>,
+) -> Result<Value, CliError> {
+    let payload = review_asset_comment_create_body(body, anchor);
+    let path = format!(
+        "/workflow-review/asset/{}/comments/",
+        urlencoding::encode(asset_id)
+    );
+    client.post_json(&path, &payload).await
+}
+
+/// Update a review-scoped comment's body.
+///
+/// `POST /workflow-review/asset/{asset_id}/comments/{comment_id}/update/`
+/// (JSON body `{ body }`). The author edits their own; a workspace admin may
+/// edit any (moderation). Returns the updated `comment`.
+pub async fn review_asset_comment_update(
+    client: &ApiClient,
+    asset_id: &str,
+    comment_id: &str,
+    body: &str,
+) -> Result<Value, CliError> {
+    let payload = serde_json::json!({ "body": body });
+    let path = format!(
+        "/workflow-review/asset/{}/comments/{}/update/",
+        urlencoding::encode(asset_id),
+        urlencoding::encode(comment_id)
+    );
+    client.post_json(&path, &payload).await
+}
+
+/// Delete a review-scoped comment.
+///
+/// `POST /workflow-review/asset/{asset_id}/comments/{comment_id}/delete/` (no
+/// body). The author soft-deletes their own; a workspace admin hard-deletes
+/// (moderation). Idempotent on an already-deleted row. Returns
+/// `{ deleted: true }`.
+pub async fn review_asset_comment_delete(
+    client: &ApiClient,
+    asset_id: &str,
+    comment_id: &str,
+) -> Result<Value, CliError> {
+    let body = serde_json::json!({});
+    let path = format!(
+        "/workflow-review/asset/{}/comments/{}/delete/",
+        urlencoding::encode(asset_id),
+        urlencoding::encode(comment_id)
+    );
+    client.post_json(&path, &body).await
+}
+
+/// Parameters for [`review_send_for_review`].
+///
+/// The roster is supplied as EITHER `reviewers` (a mixed-roster JSON array,
+/// each `{kind: "member", member_user_id}` or `{kind: "external", email,
+/// name}`) OR `reviewer_user_ids` (member-shorthand id strings) — the two are
+/// mutually exclusive server-side. The reviewed files are supplied as EITHER
+/// `assets` (a JSON array of `{node_id, version_id}`) OR `reviewed_node_ids`
+/// paired with a single `version_id`.
+pub struct SendForReviewParams<'a> {
+    /// Owning workspace id (sent as a numeric string).
+    pub workspace_id: &'a str,
+    /// The instantiated workflow runtime id (sent as a numeric string).
+    pub workflow_id: &'a str,
+    /// The `approval` step occurrence the surface attaches to.
+    pub step_occurrence_id: &'a str,
+    /// Mixed-roster array (`reviewers[]`); mutually exclusive with `reviewer_user_ids`.
+    pub reviewers: Option<&'a Value>,
+    /// Member-shorthand reviewer ids (`reviewer_user_ids[]`).
+    pub reviewer_user_ids: Option<&'a [String]>,
+    /// Reviewed assets (`assets[]` of `{node_id, version_id}`).
+    pub assets: Option<&'a Value>,
+    /// Reviewed node ids, paired with a single `version_id` shorthand.
+    pub reviewed_node_ids: Option<&'a [String]>,
+    /// Single version id applied to every `reviewed_node_ids` entry.
+    pub version_id: Option<&'a str>,
+    /// Approval policy mode (default `single`).
+    pub policy_mode: Option<&'a str>,
+    /// Quorum threshold (required when `policy_mode` is `quorum`).
+    pub policy_quorum_n: Option<i64>,
+    /// Reviewer deadline (UTC `Y-m-d H:i:s` timestamp).
+    pub deadline_at: Option<&'a str>,
+    /// Reviewer-facing request note.
+    pub message: Option<&'a str>,
+    /// Notes shown on the external-reviewer claim invite.
+    pub external_invite_notes: Option<&'a str>,
+}
+
+/// Build the `send-for-review` request body from [`SendForReviewParams`].
+///
+/// Member ids in `reviewer_user_ids` are emitted as STRINGS (19-digit ids can
+/// exceed `i64`; the server accepts numeric strings). Only the present
+/// optional fields are emitted so the server's defaults and mutual-exclusion
+/// checks apply unchanged.
+fn send_for_review_body(p: &SendForReviewParams) -> Value {
+    let mut body = serde_json::json!({
+        "workspace_id": p.workspace_id,
+        "workflow_id": p.workflow_id,
+        "step_occurrence_id": p.step_occurrence_id,
+    });
+    if let Some(reviewers) = p.reviewers {
+        body["reviewers"] = reviewers.clone();
+    }
+    if let Some(ids) = p.reviewer_user_ids {
+        body["reviewer_user_ids"] = Value::Array(
+            ids.iter()
+                .map(|id| Value::String(id.clone()))
+                .collect::<Vec<_>>(),
+        );
+    }
+    if let Some(assets) = p.assets {
+        body["assets"] = assets.clone();
+    }
+    if let Some(nodes) = p.reviewed_node_ids {
+        body["reviewed_node_ids"] = Value::Array(
+            nodes
+                .iter()
+                .map(|n| Value::String(n.clone()))
+                .collect::<Vec<_>>(),
+        );
+    }
+    if let Some(v) = p.version_id {
+        body["version_id"] = Value::String(v.to_owned());
+    }
+    if let Some(m) = p.policy_mode {
+        body["policy_mode"] = Value::String(m.to_owned());
+    }
+    if let Some(n) = p.policy_quorum_n {
+        body["policy_quorum_n"] = Value::Number(n.into());
+    }
+    if let Some(d) = p.deadline_at {
+        body["deadline_at"] = Value::String(d.to_owned());
+    }
+    if let Some(msg) = p.message {
+        body["message"] = Value::String(msg.to_owned());
+    }
+    if let Some(notes) = p.external_invite_notes {
+        body["external_invite_notes"] = Value::String(notes.to_owned());
+    }
+    body
+}
+
+/// Mint a review surface from an existing workflow + `approval` step occurrence.
+///
+/// `POST /workflow-review/send-for-review/` (JSON body). A higher-level
+/// shortcut over `surface/create`: it mints the surface AND, for every
+/// external reviewer, provisions a claim-only account invite. Workspace member
+/// auth (`PERM_MEMBER`); any external reviewer escalates the requirement to
+/// workspace admin + the `extended` tier. The response carries the real
+/// `surface_id`, the `surface`, `assets`, `reviewers`, and
+/// `invites_provisioned`.
+pub async fn review_send_for_review(
+    client: &ApiClient,
+    params: &SendForReviewParams<'_>,
+) -> Result<Value, CliError> {
+    let body = send_for_review_body(params);
+    client
+        .post_json("/workflow-review/send-for-review/", &body)
+        .await
+}
+
+/// Parameters for [`review_quick_approval`].
+///
+/// The "Request approval" quick path: one call provisions a private file share
+/// for the reviewers and starts a single-step `approval_in_place` run on one
+/// file. The roster is EITHER `reviewers` (mixed-roster JSON array) OR
+/// `reviewer_user_ids` (member-shorthand id strings).
+pub struct QuickApprovalParams<'a> {
+    /// Owning workspace id (sent as a numeric string).
+    pub workspace_id: &'a str,
+    /// The single FILE node to request approval on.
+    pub node_id: &'a str,
+    /// Required idempotency key (1-128 chars; keys the run + dedup).
+    pub idempotency_key: &'a str,
+    /// Mixed-roster array (`reviewers[]`); mutually exclusive with `reviewer_user_ids`.
+    pub reviewers: Option<&'a Value>,
+    /// Member-shorthand reviewer ids (`reviewer_user_ids[]`).
+    pub reviewer_user_ids: Option<&'a [String]>,
+    /// Approval policy mode (default `single`; non-`single` requires `extended`).
+    pub policy_mode: Option<&'a str>,
+    /// Quorum threshold (required when `policy_mode` is `quorum`).
+    pub policy_quorum_n: Option<i64>,
+    /// Approval SLA in seconds (60-7,776,000; a timed-out gate rejects).
+    pub approval_timeout_seconds: Option<i64>,
+    /// Reviewer-facing request note (shown in the request email).
+    pub message: Option<&'a str>,
+}
+
+/// Build the `quick-approval` request body from [`QuickApprovalParams`].
+///
+/// Member ids in `reviewer_user_ids` are emitted as STRINGS (see
+/// [`send_for_review_body`]). Only present optional fields are emitted.
+fn quick_approval_body(p: &QuickApprovalParams) -> Value {
+    let mut body = serde_json::json!({
+        "workspace_id": p.workspace_id,
+        "node_id": p.node_id,
+        "idempotency_key": p.idempotency_key,
+    });
+    if let Some(reviewers) = p.reviewers {
+        body["reviewers"] = reviewers.clone();
+    }
+    if let Some(ids) = p.reviewer_user_ids {
+        body["reviewer_user_ids"] = Value::Array(
+            ids.iter()
+                .map(|id| Value::String(id.clone()))
+                .collect::<Vec<_>>(),
+        );
+    }
+    if let Some(m) = p.policy_mode {
+        body["policy_mode"] = Value::String(m.to_owned());
+    }
+    if let Some(n) = p.policy_quorum_n {
+        body["policy_quorum_n"] = Value::Number(n.into());
+    }
+    if let Some(t) = p.approval_timeout_seconds {
+        body["approval_timeout_seconds"] = Value::Number(t.into());
+    }
+    if let Some(msg) = p.message {
+        body["message"] = Value::String(msg.to_owned());
+    }
+    body
+}
+
+/// "Request approval" quick path — one-call in-place approval for a single file.
+///
+/// `POST /workflow-review/quick-approval/` (JSON body). Provisions a private
+/// file share for the reviewers and starts a single-step `approval_in_place`
+/// run targeting the file. Workspace member auth; an external reviewer
+/// escalates to workspace admin + the `extended` tier. The review surface is
+/// minted lazily, so the response `surface_id` is typically `null` — poll the
+/// run at the returned `poll` path. A retry over the same file returns `409`
+/// with the existing surface/workflow/fileshare ids. **REST-only — there is no
+/// MCP action for this path.**
+pub async fn review_quick_approval(
+    client: &ApiClient,
+    params: &QuickApprovalParams<'_>,
+) -> Result<Value, CliError> {
+    let body = quick_approval_body(params);
+    client
+        .post_json("/workflow-review/quick-approval/", &body)
+        .await
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -2477,12 +3171,10 @@ mod tests {
 
     #[test]
     fn instantiate_form_carries_idempotency_key_and_json_payload() {
-        let params = InstantiateParams {
-            idempotency_key: "job-001".to_owned(),
-            trigger_payload: Some(r#"{"customer":"acme"}"#.to_owned()),
-            external_subject_id: Some("sub_abc".to_owned()),
-            pool_key: None,
-        };
+        let params = InstantiateParams::new("job-001".to_owned())
+            .trigger_payload(Some(r#"{"customer":"acme"}"#.to_owned()))
+            .external_subject_id(Some("sub_abc".to_owned()))
+            .step_seeds(Some(r#"{"step-a":["n1","n2"]}"#.to_owned()));
         let mut form = HashMap::new();
         form.insert("idempotency_key".to_owned(), params.idempotency_key.clone());
         put_opt(
@@ -2496,6 +3188,7 @@ mod tests {
             params.external_subject_id.as_deref(),
         );
         put_opt(&mut form, "pool_key", params.pool_key.as_deref());
+        put_opt(&mut form, "step_seeds", params.step_seeds.as_deref());
         assert_eq!(
             form.get("idempotency_key").map(String::as_str),
             Some("job-001")
@@ -2504,7 +3197,128 @@ mod tests {
             form.get("trigger_payload").map(String::as_str),
             Some(r#"{"customer":"acme"}"#)
         );
+        // step_seeds is forwarded verbatim (the JSON object string the caller built).
+        assert_eq!(
+            form.get("step_seeds").map(String::as_str),
+            Some(r#"{"step-a":["n1","n2"]}"#)
+        );
         assert!(!form.contains_key("pool_key"));
+    }
+
+    #[test]
+    fn create_workflow_form_carries_inline_definition() {
+        let params = CreateWorkflowParams::new()
+            .name(Some("One-off".to_owned()))
+            .definition(Some(r#"{"steps":{}}"#.to_owned()));
+        let mut form = HashMap::new();
+        put_opt(&mut form, "name", params.name.as_deref());
+        put_opt(&mut form, "template_id", params.template_id.as_deref());
+        put_opt(&mut form, "definition", params.definition.as_deref());
+        assert_eq!(
+            form.get("definition").map(String::as_str),
+            Some(r#"{"steps":{}}"#)
+        );
+        // definition and template_id are mutually exclusive; only definition set here.
+        assert!(!form.contains_key("template_id"));
+    }
+
+    #[test]
+    fn step_files_node_ids_serialize_as_json_array_string() {
+        // The `files/` endpoint reads `node_ids` as a single form field whose
+        // value is a JSON array string — NOT a JSON request body.
+        let ids = vec!["n1".to_owned(), "n2".to_owned()];
+        assert_eq!(node_ids_form_value(&ids), r#"["n1","n2"]"#);
+        assert_eq!(node_ids_form_value(&[]), "[]");
+        // Path encodes both the workflow id and the step occurrence id.
+        let path = format!(
+            "/workflows/{}/steps/{}/files/",
+            urlencoding::encode("4011234567890123456"),
+            urlencoding::encode("wso-abc/def")
+        );
+        assert_eq!(
+            path,
+            "/workflows/4011234567890123456/steps/wso-abc%2Fdef/files/"
+        );
+    }
+
+    #[test]
+    fn step_complete_path_encodes_ids() {
+        let path = format!(
+            "/workflows/{}/steps/{}/complete/",
+            urlencoding::encode("4011234567890123456"),
+            urlencoding::encode("wso 1")
+        );
+        assert_eq!(
+            path,
+            "/workflows/4011234567890123456/steps/wso%201/complete/"
+        );
+    }
+
+    #[test]
+    fn step_reassign_form_and_path() {
+        // The user id is sent verbatim as a string (no integer parse → no
+        // 19-digit i64 overflow risk).
+        let mut form = HashMap::new();
+        form.insert(
+            "new_assignee_user_id".to_owned(),
+            "3867689418901071163".to_owned(),
+        );
+        assert_eq!(
+            form.get("new_assignee_user_id").map(String::as_str),
+            Some("3867689418901071163")
+        );
+        let path = format!(
+            "/workflows/{}/steps/{}/reassign/",
+            urlencoding::encode("4011234567890123456"),
+            urlencoding::encode("wso-xyz")
+        );
+        assert_eq!(
+            path,
+            "/workflows/4011234567890123456/steps/wso-xyz/reassign/"
+        );
+    }
+
+    #[test]
+    fn list_workflows_query_encodes_filters_and_me_aliases() {
+        let params = ListWorkflowsParams::new()
+            .limit(Some(25))
+            .template_id(Some("wtpl-1".to_owned()))
+            .state(Some("active".to_owned()))
+            .archived(Some("all".to_owned()))
+            .created_by_me(true)
+            .participant_me(true)
+            .include(Some("run_summary,run_meta".to_owned()));
+        let q = build_list_workflows_query(&params);
+        assert_eq!(q.get("limit").map(String::as_str), Some("25"));
+        assert_eq!(q.get("template_id").map(String::as_str), Some("wtpl-1"));
+        assert_eq!(q.get("state").map(String::as_str), Some("active"));
+        assert_eq!(q.get("archived").map(String::as_str), Some("all"));
+        // The boolean flags map to the documented `=me` query values.
+        assert_eq!(q.get("created_by").map(String::as_str), Some("me"));
+        assert_eq!(q.get("participant").map(String::as_str), Some("me"));
+        assert_eq!(
+            q.get("include").map(String::as_str),
+            Some("run_summary,run_meta")
+        );
+        // offset was never set → absent.
+        assert!(!q.contains_key("offset"));
+    }
+
+    #[test]
+    fn list_workflows_query_omits_unset_filters() {
+        // A default params set forwards no filter keys at all.
+        let q = build_list_workflows_query(&ListWorkflowsParams::new());
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn list_templates_usage_filter_inserted_only_when_present() {
+        let mut params = HashMap::new();
+        put_opt(&mut params, "usage", Some("one_off"));
+        assert_eq!(params.get("usage").map(String::as_str), Some("one_off"));
+        let mut none_params = HashMap::new();
+        put_opt(&mut none_params, "usage", None);
+        assert!(!none_params.contains_key("usage"));
     }
 
     #[test]
@@ -2549,6 +3363,172 @@ mod tests {
         }
         assert_eq!(params.get("limit").map(String::as_str), Some("25"));
         assert!(!params.contains_key("offset"));
+    }
+
+    // ---- workflow-review: reviewer management + comments + send/quick ----
+
+    #[test]
+    fn review_add_member_path_and_body() {
+        let path = format!(
+            "/workflow-review/surface/{}/reviewer/add-member/",
+            urlencoding::encode("surf/1")
+        );
+        assert_eq!(
+            path,
+            "/workflow-review/surface/surf%2F1/reviewer/add-member/"
+        );
+        // member_user_id is a STRING (19-digit ids exceed i64); `required`
+        // omitted when None, present when Some.
+        let body = review_add_member_body("9007199254740993123", None);
+        assert_eq!(body["member_user_id"], "9007199254740993123");
+        assert!(body.get("required").is_none());
+        let body = review_add_member_body("123", Some(false));
+        assert_eq!(body["required"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn review_add_external_path_and_body() {
+        let path = format!(
+            "/workflow-review/surface/{}/reviewer/add-external/",
+            urlencoding::encode("s1")
+        );
+        assert_eq!(path, "/workflow-review/surface/s1/reviewer/add-external/");
+        let body = review_add_external_body("a@b.com", "Ann", None);
+        assert_eq!(body["email"], "a@b.com");
+        assert_eq!(body["name"], "Ann");
+        assert!(body.get("invite_notes").is_none());
+        let body = review_add_external_body("a@b.com", "Ann", Some("please review"));
+        assert_eq!(body["invite_notes"], "please review");
+    }
+
+    #[test]
+    fn review_reviewer_remove_path_encodes_both_ids() {
+        let path = format!(
+            "/workflow-review/surface/{}/reviewer/{}/remove/",
+            urlencoding::encode("s/1"),
+            urlencoding::encode("r/2")
+        );
+        assert_eq!(
+            path,
+            "/workflow-review/surface/s%2F1/reviewer/r%2F2/remove/"
+        );
+    }
+
+    #[test]
+    fn review_notification_opt_out_body_is_bool() {
+        let body = serde_json::json!({ "opt_out": true });
+        assert_eq!(body["opt_out"], serde_json::json!(true));
+        let path = format!(
+            "/workflow-review/surface/{}/reviewer/{}/notification-opt-out/",
+            urlencoding::encode("s1"),
+            urlencoding::encode("r1")
+        );
+        assert_eq!(
+            path,
+            "/workflow-review/surface/s1/reviewer/r1/notification-opt-out/"
+        );
+    }
+
+    #[test]
+    fn review_link_token_revoke_path_and_body() {
+        let path = format!(
+            "/workflow-review/link-token/{}/revoke/",
+            urlencoding::encode("tok/9")
+        );
+        assert_eq!(path, "/workflow-review/link-token/tok%2F9/revoke/");
+        assert_eq!(review_link_token_revoke_body(None), serde_json::json!({}));
+        assert_eq!(
+            review_link_token_revoke_body(Some("rotated"))["reason"],
+            "rotated"
+        );
+    }
+
+    #[test]
+    fn review_asset_comment_routes_and_body() {
+        // List/create share the asset-keyed path.
+        let path = format!(
+            "/workflow-review/asset/{}/comments/",
+            urlencoding::encode("a1")
+        );
+        assert_eq!(path, "/workflow-review/asset/a1/comments/");
+        // update/delete carry the comment id too.
+        let upd = format!(
+            "/workflow-review/asset/{}/comments/{}/update/",
+            urlencoding::encode("a1"),
+            urlencoding::encode("c1")
+        );
+        assert_eq!(upd, "/workflow-review/asset/a1/comments/c1/update/");
+        // create body: `body` required; `anchor` passed through when present.
+        let body = review_asset_comment_create_body("looks good", None);
+        assert_eq!(body["body"], "looks good");
+        assert!(body.get("anchor").is_none());
+        let anchor = serde_json::json!({ "page": 3 });
+        let body = review_asset_comment_create_body("see page", Some(&anchor));
+        assert_eq!(body["anchor"]["page"], 3);
+        // No attachment field is ever emitted (review comments reject attachments).
+        assert!(body.get("target_id").is_none());
+        assert!(body.get("target_ids").is_none());
+    }
+
+    #[test]
+    fn send_for_review_body_emits_present_fields_only() {
+        let ids = vec!["100".to_owned(), "200".to_owned()];
+        let params = SendForReviewParams {
+            workspace_id: "9001",
+            workflow_id: "4011",
+            step_occurrence_id: "step1",
+            reviewers: None,
+            reviewer_user_ids: Some(&ids),
+            assets: None,
+            reviewed_node_ids: Some(&["node1".to_owned()]),
+            version_id: Some("ver1"),
+            policy_mode: Some("quorum"),
+            policy_quorum_n: Some(2),
+            deadline_at: None,
+            message: Some("please review"),
+            external_invite_notes: None,
+        };
+        let body = send_for_review_body(&params);
+        assert_eq!(body["workspace_id"], "9001");
+        assert_eq!(body["workflow_id"], "4011");
+        assert_eq!(body["step_occurrence_id"], "step1");
+        // member ids are emitted as STRINGS in an array.
+        assert_eq!(body["reviewer_user_ids"], serde_json::json!(["100", "200"]));
+        assert_eq!(body["reviewed_node_ids"], serde_json::json!(["node1"]));
+        assert_eq!(body["version_id"], "ver1");
+        assert_eq!(body["policy_mode"], "quorum");
+        assert_eq!(body["policy_quorum_n"], 2);
+        assert_eq!(body["message"], "please review");
+        // Absent optionals are omitted (not null) so server defaults apply.
+        assert!(body.get("reviewers").is_none());
+        assert!(body.get("assets").is_none());
+        assert!(body.get("deadline_at").is_none());
+        assert!(body.get("external_invite_notes").is_none());
+    }
+
+    #[test]
+    fn quick_approval_body_requires_idempotency_key_and_omits_absent() {
+        let params = QuickApprovalParams {
+            workspace_id: "9001",
+            node_id: "node1",
+            idempotency_key: "key-123",
+            reviewers: None,
+            reviewer_user_ids: Some(&["100".to_owned()]),
+            policy_mode: None,
+            policy_quorum_n: None,
+            approval_timeout_seconds: Some(3600),
+            message: None,
+        };
+        let body = quick_approval_body(&params);
+        assert_eq!(body["workspace_id"], "9001");
+        assert_eq!(body["node_id"], "node1");
+        assert_eq!(body["idempotency_key"], "key-123");
+        assert_eq!(body["reviewer_user_ids"], serde_json::json!(["100"]));
+        assert_eq!(body["approval_timeout_seconds"], 3600);
+        assert!(body.get("policy_mode").is_none());
+        assert!(body.get("policy_quorum_n").is_none());
+        assert!(body.get("message").is_none());
+        assert!(body.get("reviewers").is_none());
     }
 
     // ---- sha256 / integrity ----

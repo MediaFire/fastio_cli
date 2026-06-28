@@ -38,24 +38,67 @@ pub async fn get_user_by_id(client: &ApiClient, user_id: &str) -> Result<Value, 
     client.get(&path).await
 }
 
+/// Fields for a `POST /user/update/` profile update.
+///
+/// Every field is optional; only the ones set are sent. This struct
+/// deliberately does NOT derive `Debug` because it carries `password` and
+/// `current_password` secrets — see CLAUDE.md coding-standard #9.
+///
+/// Per `auth.txt`, changing `email_address` or `password` on an account that
+/// already has a password REQUIRES `current_password`; an `email_address`
+/// change does not take effect until confirmed via
+/// [`crate::api::auth::email_change_confirm`]. Setting `phone_country` /
+/// `phone_number` requires 2FA to be disabled first, and both must be sent
+/// together.
+///
+/// Construct with struct-literal syntax plus `..Default::default()` so new
+/// fields can be added without breaking callers. It is deliberately not
+/// `#[non_exhaustive]` — that attribute would block the struct expression from
+/// the separate `fastio` binary crate.
+#[derive(Default)]
+pub struct UserUpdate<'a> {
+    /// First name.
+    pub first_name: Option<&'a str>,
+    /// Last name.
+    pub last_name: Option<&'a str>,
+    /// New email address (triggers a confirm-by-email change flow).
+    pub email_address: Option<&'a str>,
+    /// New password.
+    pub password: Option<&'a str>,
+    /// Current password proof (required to change email or password on an
+    /// account that already has one).
+    pub current_password: Option<&'a str>,
+    /// Numeric phone country code (e.g. `"1"` for US).
+    pub phone_country: Option<&'a str>,
+    /// Numeric phone number.
+    pub phone_number: Option<&'a str>,
+}
+
 /// Update the current user's profile.
 ///
 /// `POST /user/update/` with form-encoded body.
-pub async fn update_user(
-    client: &ApiClient,
-    first_name: Option<&str>,
-    last_name: Option<&str>,
-    email_address: Option<&str>,
-) -> Result<Value, CliError> {
+pub async fn update_user(client: &ApiClient, update: &UserUpdate<'_>) -> Result<Value, CliError> {
     let mut form = HashMap::new();
-    if let Some(v) = first_name {
+    if let Some(v) = update.first_name {
         form.insert("first_name".to_owned(), v.to_owned());
     }
-    if let Some(v) = last_name {
+    if let Some(v) = update.last_name {
         form.insert("last_name".to_owned(), v.to_owned());
     }
-    if let Some(v) = email_address {
+    if let Some(v) = update.email_address {
         form.insert("email_address".to_owned(), v.to_owned());
+    }
+    if let Some(v) = update.password {
+        form.insert("password".to_owned(), v.to_owned());
+    }
+    if let Some(v) = update.current_password {
+        form.insert("current_password".to_owned(), v.to_owned());
+    }
+    if let Some(v) = update.phone_country {
+        form.insert("phone_country".to_owned(), v.to_owned());
+    }
+    if let Some(v) = update.phone_number {
+        form.insert("phone_number".to_owned(), v.to_owned());
     }
     client.post("/user/update/", &form).await
 }
@@ -239,10 +282,11 @@ pub async fn accept_all_invitations(
 
 /// Search users by query.
 ///
-/// `GET /users/search/`
+/// `GET /users/search/` — the query is sent as the `search` param (the server
+/// reads `PostOrQueryInput('search')`; an old `query` key is silently ignored).
 pub async fn search_users(client: &ApiClient, query: &str) -> Result<Value, CliError> {
     let mut params = HashMap::new();
-    params.insert("query".to_owned(), query.to_owned());
+    params.insert("search".to_owned(), query.to_owned());
     client.get_with_params("/users/search/", &params).await
 }
 

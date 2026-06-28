@@ -201,10 +201,7 @@ Pipelines that need machine-parseable output can opt back in with
 | Group | Description |
 |-------|-------------|
 | `ai` | Chat, search, history, message management, summarize |
-| `task` | Tasks, task lists, assignment, status changes |
-| `worklog` | Worklog entries, interjections, acknowledgments |
-| `approval` | Request, approve, reject approvals |
-| `todo` | Todo items with toggle, bulk operations |
+| `task` | Tasks API: task lists, tasks, assignment, status changes, comments, attachments |
 
 ### Platform
 

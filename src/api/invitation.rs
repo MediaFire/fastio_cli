@@ -10,10 +10,9 @@ use serde_json::Value;
 use crate::client::ApiClient;
 use crate::error::CliError;
 
-/// List invitations for an entity (workspace or share).
+/// List invitations for an entity (workspace or share), optionally by state.
 ///
-/// `GET /{entity_type}/{entity_id}/members/invitations/list/`
-#[allow(dead_code)]
+/// `GET /{entity_type}/{entity_id}/members/invitations/list/[{state}/]`
 pub async fn list_invitations(
     client: &ApiClient,
     entity_type: &str,
@@ -37,6 +36,39 @@ pub async fn list_invitations(
     client.get(&path).await
 }
 
+/// Parameters for updating an invitation (workspace or share).
+///
+/// All fields are optional — only provided fields are sent.
+#[derive(Default)]
+pub struct UpdateInvitationParams<'a> {
+    /// New invitation state: `pending`, `accepted`, `declined`.
+    pub new_state: Option<&'a str>,
+    /// Updated permission level: `admin`, `member`, `guest`, `view`.
+    pub permissions: Option<&'a str>,
+    /// Updated notification preference.
+    pub notify_options: Option<&'a str>,
+    /// Updated membership expiration datetime.
+    pub expires: Option<&'a str>,
+}
+
+/// Build the form body for [`update_invitation`] (pure; unit-tested).
+fn build_update_invitation_form(params: &UpdateInvitationParams<'_>) -> HashMap<String, String> {
+    let mut form = HashMap::new();
+    if let Some(v) = params.new_state {
+        form.insert("state".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.permissions {
+        form.insert("permissions".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.notify_options {
+        form.insert("notify_options".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.expires {
+        form.insert("expires".to_owned(), v.to_owned());
+    }
+    form
+}
+
 /// Update an invitation.
 ///
 /// `POST /{entity_type}/{entity_id}/members/invitation/{invitation_id}/`
@@ -45,16 +77,9 @@ pub async fn update_invitation(
     entity_type: &str,
     entity_id: &str,
     invitation_id: &str,
-    new_state: Option<&str>,
-    permissions: Option<&str>,
+    params: &UpdateInvitationParams<'_>,
 ) -> Result<Value, CliError> {
-    let mut form = HashMap::new();
-    if let Some(v) = new_state {
-        form.insert("state".to_owned(), v.to_owned());
-    }
-    if let Some(v) = permissions {
-        form.insert("permissions".to_owned(), v.to_owned());
-    }
+    let form = build_update_invitation_form(params);
     let path = format!(
         "/{}/{}/members/invitation/{}/",
         urlencoding::encode(entity_type),
@@ -112,4 +137,46 @@ pub async fn list_user_invitations(
 pub async fn accept_all_user_invitations(client: &ApiClient) -> Result<Value, CliError> {
     let form = HashMap::new();
     client.post("/user/invitations/acceptall/", &form).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UpdateInvitationParams, build_update_invitation_form};
+
+    #[test]
+    fn update_invitation_form_empty_when_no_fields() {
+        let form = build_update_invitation_form(&UpdateInvitationParams::default());
+        assert!(form.is_empty());
+    }
+
+    #[test]
+    fn update_invitation_form_maps_new_state_to_state_key() {
+        // The request field is `state`, not `new_state`.
+        let form = build_update_invitation_form(&UpdateInvitationParams {
+            new_state: Some("declined"),
+            ..Default::default()
+        });
+        assert_eq!(form.get("state").map(String::as_str), Some("declined"));
+        assert!(!form.contains_key("new_state"));
+    }
+
+    #[test]
+    fn update_invitation_form_carries_all_fields() {
+        let form = build_update_invitation_form(&UpdateInvitationParams {
+            new_state: Some("pending"),
+            permissions: Some("view"),
+            notify_options: Some("Notify me in app"),
+            expires: Some("2030-01-01 00:00:00"),
+        });
+        assert_eq!(form.get("state").map(String::as_str), Some("pending"));
+        assert_eq!(form.get("permissions").map(String::as_str), Some("view"));
+        assert_eq!(
+            form.get("notify_options").map(String::as_str),
+            Some("Notify me in app")
+        );
+        assert_eq!(
+            form.get("expires").map(String::as_str),
+            Some("2030-01-01 00:00:00")
+        );
+    }
 }

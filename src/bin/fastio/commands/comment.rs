@@ -37,6 +37,14 @@ pub enum CommentCommand {
         node_id: String,
         /// Comment text.
         text: String,
+        /// Anchoring reference as a JSON object string (or `@file.json`).
+        reference: Option<String>,
+        /// Arbitrary metadata as a JSON object string (or `@file.json`).
+        properties: Option<String>,
+        /// Inline-attach a single object (object ID).
+        target_id: Option<String>,
+        /// Inline-attach multiple objects (object IDs, ≤25).
+        target_ids: Vec<String>,
     },
     /// Reply to an existing comment.
     Reply {
@@ -98,11 +106,11 @@ pub enum CommentCommand {
         /// Comment IDs to delete.
         comment_ids: Vec<String>,
     },
-    /// Link a comment to a workflow entity (task or approval).
+    /// Link a comment to a workflow entity (task or `workflow_review`).
     Link {
         /// Comment ID.
         comment_id: String,
-        /// Workflow entity type (task or approval).
+        /// Workflow entity type (task or `workflow_review`).
         entity_type: String,
         /// Workflow entity ID.
         entity_id: String,
@@ -112,9 +120,9 @@ pub enum CommentCommand {
         /// Comment ID.
         comment_id: String,
     },
-    /// List comments linked to a workflow entity (task or approval).
+    /// List comments linked to a workflow entity (task or `workflow_review`).
     Linked {
-        /// Workflow entity type (task or approval).
+        /// Workflow entity type (task or `workflow_review`).
         entity_type: String,
         /// Workflow entity ID.
         entity_id: String,
@@ -122,6 +130,27 @@ pub enum CommentCommand {
         limit: Option<u32>,
         /// Offset for pagination.
         offset: Option<u32>,
+    },
+    /// List the objects attached to a comment.
+    Attachments {
+        /// Comment ID.
+        comment_id: String,
+    },
+    /// Attach one or more objects to a comment.
+    Attach {
+        /// Comment ID.
+        comment_id: String,
+        /// Attach a single object (object ID).
+        target_id: Option<String>,
+        /// Attach multiple objects (object IDs, ≤25).
+        target_ids: Vec<String>,
+    },
+    /// Detach a single object from a comment.
+    Detach {
+        /// Comment ID.
+        comment_id: String,
+        /// Object ID to detach.
+        target_id: String,
     },
 }
 
@@ -146,6 +175,7 @@ fn validate_entity_args(entity_type: &str, entity_id: &str, node_id: &str) -> Re
 }
 
 /// Execute a comment subcommand.
+#[allow(clippy::too_many_lines)]
 pub async fn execute(command: &CommentCommand, ctx: &CommandContext<'_>) -> Result<()> {
     match command {
         CommentCommand::List {
@@ -173,9 +203,24 @@ pub async fn execute(command: &CommentCommand, ctx: &CommandContext<'_>) -> Resu
             entity_id,
             node_id,
             text,
+            reference,
+            properties,
+            target_id,
+            target_ids,
         } => {
             validate_entity_args(entity_type, entity_id, node_id)?;
-            create(ctx, entity_type, entity_id, node_id, text).await
+            create(
+                ctx,
+                entity_type,
+                entity_id,
+                node_id,
+                text,
+                reference.as_deref(),
+                properties.as_deref(),
+                target_id.as_deref(),
+                target_ids,
+            )
+            .await
         }
         CommentCommand::Reply {
             entity_type,
@@ -224,6 +269,16 @@ pub async fn execute(command: &CommentCommand, ctx: &CommandContext<'_>) -> Resu
             limit,
             offset,
         } => linked(ctx, entity_type, entity_id, *limit, *offset).await,
+        CommentCommand::Attachments { comment_id } => attachments(ctx, comment_id).await,
+        CommentCommand::Attach {
+            comment_id,
+            target_id,
+            target_ids,
+        } => attach(ctx, comment_id, target_id.as_deref(), target_ids).await,
+        CommentCommand::Detach {
+            comment_id,
+            target_id,
+        } => detach(ctx, comment_id, target_id).await,
     }
 }
 
@@ -256,17 +311,48 @@ async fn list(
 }
 
 /// Add a comment.
+///
+/// Supports the optional create extensions: an anchoring `reference`, arbitrary
+/// `properties`, and inline attachment(s) (`target_id` single or `target_ids`
+/// batch, ≤25). `--target-id` / `--target-ids` are mutually exclusive (enforced
+/// by clap), so an empty `target_ids` slice means "single or none".
+#[allow(clippy::too_many_arguments)]
 async fn create(
     ctx: &CommandContext<'_>,
     entity_type: &str,
     entity_id: &str,
     node_id: &str,
     text: &str,
+    reference: Option<&str>,
+    properties: Option<&str>,
+    target_id: Option<&str>,
+    target_ids: &[String],
 ) -> Result<()> {
+    let reference = super::parse_json_object_arg(reference, "reference")?;
+    let properties = super::parse_json_object_arg(properties, "properties")?;
+    let target_ids = clean_target_ids(target_ids);
+    anyhow::ensure!(
+        target_ids.len() <= 25,
+        "a comment accepts at most 25 attachments (got {})",
+        target_ids.len()
+    );
     let client = ctx.build_client()?;
-    let value = api::comment::add_comment(&client, entity_type, entity_id, node_id, text, None)
-        .await
-        .context("failed to create comment")?;
+    let value = api::comment::add_comment(
+        &client,
+        &api::comment::AddCommentParams {
+            entity_type,
+            entity_id,
+            node_id,
+            body: text,
+            parent_id: None,
+            reference: reference.as_ref(),
+            properties: properties.as_ref(),
+            target_id,
+            target_ids: (!target_ids.is_empty()).then_some(target_ids.as_slice()),
+        },
+    )
+    .await
+    .context("failed to create comment")?;
     ctx.output.render(&value)?;
     Ok(())
 }
@@ -283,11 +369,17 @@ async fn reply(
     let client = ctx.build_client()?;
     let value = api::comment::add_comment(
         &client,
-        entity_type,
-        entity_id,
-        node_id,
-        text,
-        Some(comment_id),
+        &api::comment::AddCommentParams {
+            entity_type,
+            entity_id,
+            node_id,
+            body: text,
+            parent_id: Some(comment_id),
+            reference: None,
+            properties: None,
+            target_id: None,
+            target_ids: None,
+        },
     )
     .await
     .context("failed to reply to comment")?;
@@ -388,7 +480,7 @@ async fn bulk_delete(ctx: &CommandContext<'_>, comment_ids: &[String]) -> Result
     Ok(())
 }
 
-/// Link a comment to a workflow entity (task or approval).
+/// Link a comment to a workflow entity (task or `workflow_review`).
 async fn link(
     ctx: &CommandContext<'_>,
     comment_id: &str,
@@ -413,7 +505,7 @@ async fn unlink(ctx: &CommandContext<'_>, comment_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// List comments linked to a workflow entity (task or approval).
+/// List comments linked to a workflow entity (task or `workflow_review`).
 async fn linked(
     ctx: &CommandContext<'_>,
     entity_type: &str,
@@ -427,4 +519,87 @@ async fn linked(
         .context("failed to list linked comments")?;
     ctx.output.render(&value)?;
     Ok(())
+}
+
+/// List the objects attached to a comment.
+async fn attachments(ctx: &CommandContext<'_>, comment_id: &str) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::comment::list_comment_attachments(&client, comment_id)
+        .await
+        .context("failed to list comment attachments")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Attach one or more objects to a comment.
+///
+/// `--target-id` / `--target-ids` are mutually exclusive (enforced by clap);
+/// exactly one must be supplied (guarded here).
+async fn attach(
+    ctx: &CommandContext<'_>,
+    comment_id: &str,
+    target_id: Option<&str>,
+    target_ids: &[String],
+) -> Result<()> {
+    let ids = clean_target_ids(target_ids);
+    let targets = match (target_id, ids.is_empty()) {
+        (Some(id), true) => api::comment::CommentAttachTargets::Single(id),
+        (None, false) => api::comment::CommentAttachTargets::Multiple(ids.as_slice()),
+        (Some(_), false) => {
+            // Defensive: clap's `conflicts_with` already rejects this pairing.
+            anyhow::bail!("--target-id and --target-ids are mutually exclusive");
+        }
+        (None, true) => {
+            anyhow::bail!("one of --target-id or --target-ids is required");
+        }
+    };
+    anyhow::ensure!(
+        ids.len() <= 25,
+        "a comment accepts at most 25 attachments (got {})",
+        ids.len()
+    );
+    let client = ctx.build_client()?;
+    let value = api::comment::attach_comment(&client, comment_id, &targets)
+        .await
+        .context("failed to attach to comment")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Detach a single object from a comment.
+async fn detach(ctx: &CommandContext<'_>, comment_id: &str, target_id: &str) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::comment::detach_comment(&client, comment_id, target_id)
+        .await
+        .context("failed to detach from comment")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Trim and drop blank entries from a `--target-ids` list.
+fn clean_target_ids(target_ids: &[String]) -> Vec<String> {
+    target_ids
+        .iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_target_ids;
+
+    #[test]
+    fn clean_target_ids_trims_and_drops_blanks() {
+        let input = vec![
+            " a ".to_owned(),
+            String::new(),
+            "b".to_owned(),
+            "   ".to_owned(),
+        ];
+        assert_eq!(
+            clean_target_ids(&input),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+    }
 }

@@ -81,7 +81,62 @@ pub async fn remove_member(
     client.delete(&path).await
 }
 
-/// Update a member's role.
+/// Parameters for updating a member (workspace or share).
+///
+/// All fields are optional — only provided fields are sent. `permissions`
+/// cannot be set to `owner` (use transfer ownership). For shares, `permissions`
+/// also accepts `view`.
+#[derive(Default)]
+pub struct UpdateMemberParams<'a> {
+    /// New permission level.
+    pub permissions: Option<&'a str>,
+    /// Notification preference.
+    pub notify_options: Option<&'a str>,
+    /// Membership expiration `YYYY-MM-DD HH:MM:SS`; `null`/`""` to clear.
+    pub expires: Option<&'a str>,
+}
+
+/// Build the form body for [`update_member`] (pure; unit-tested).
+fn build_member_update_form(params: &UpdateMemberParams<'_>) -> HashMap<String, String> {
+    let mut form = HashMap::new();
+    if let Some(v) = params.permissions {
+        form.insert("permissions".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.notify_options {
+        form.insert("notify_options".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.expires {
+        form.insert("expires".to_owned(), v.to_owned());
+    }
+    form
+}
+
+/// Path for the member-update endpoint (pure; unit-tested).
+fn member_update_path(entity_type: &str, entity_id: &str, member_id: &str) -> String {
+    format!(
+        "/{}/{}/member/{}/update/",
+        urlencoding::encode(entity_type),
+        urlencoding::encode(entity_id),
+        urlencoding::encode(member_id),
+    )
+}
+
+/// Update a member's permissions, notification preference, and/or expiration.
+///
+/// `POST /{entity_type}/{entity_id}/member/{member_id}/update/`
+pub async fn update_member(
+    client: &ApiClient,
+    entity_type: &str,
+    entity_id: &str,
+    member_id: &str,
+    params: &UpdateMemberParams<'_>,
+) -> Result<Value, CliError> {
+    let form = build_member_update_form(params);
+    let path = member_update_path(entity_type, entity_id, member_id);
+    client.post(&path, &form).await
+}
+
+/// Update only a member's role (thin wrapper over [`update_member`]).
 ///
 /// `POST /{entity_type}/{entity_id}/member/{member_id}/update/`
 pub async fn update_member_role(
@@ -91,15 +146,17 @@ pub async fn update_member_role(
     member_id: &str,
     role: &str,
 ) -> Result<Value, CliError> {
-    let mut form = HashMap::new();
-    form.insert("permissions".to_owned(), role.to_owned());
-    let path = format!(
-        "/{}/{}/member/{}/update/",
-        urlencoding::encode(entity_type),
-        urlencoding::encode(entity_id),
-        urlencoding::encode(member_id),
-    );
-    client.post(&path, &form).await
+    update_member(
+        client,
+        entity_type,
+        entity_id,
+        member_id,
+        &UpdateMemberParams {
+            permissions: Some(role),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 /// Get member details.
@@ -122,7 +179,10 @@ pub async fn get_member_details(
 
 /// Transfer ownership of a workspace or share.
 ///
-/// `GET /{entity_type}/{entity_id}/member/{member_id}/transfer_ownership/`
+/// `POST /{entity_type}/{entity_id}/member/{member_id}/transfer_ownership/` —
+/// POST is the canonical (mutating) verb; the body is empty and the target
+/// member is a URL path part. (The server still accepts GET for backward
+/// compatibility, but the CLI uses the canonical POST.)
 pub async fn transfer_ownership(
     client: &ApiClient,
     entity_type: &str,
@@ -135,7 +195,7 @@ pub async fn transfer_ownership(
         urlencoding::encode(entity_id),
         urlencoding::encode(member_id),
     );
-    client.get(&path).await
+    client.post(&path, &HashMap::new()).await
 }
 
 /// Leave a workspace or share.
@@ -186,4 +246,56 @@ pub async fn join_invitation(
         urlencoding::encode(invitation_action),
     );
     client.post_json(&path, &serde_json::json!({})).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UpdateMemberParams, build_member_update_form, member_update_path};
+
+    #[test]
+    fn update_path_targets_member_update_and_url_encodes() {
+        assert_eq!(
+            member_update_path("share", "123", "456"),
+            "/share/123/member/456/update/"
+        );
+        // Path segments must be percent-encoded so an id can't break out.
+        let p = member_update_path("share", "a/b", "c d");
+        assert!(p.contains("a%2Fb"), "{p}");
+        assert!(p.contains("c%20d"), "{p}");
+    }
+
+    #[test]
+    fn update_form_empty_when_no_fields() {
+        let form = build_member_update_form(&UpdateMemberParams::default());
+        assert!(form.is_empty());
+    }
+
+    #[test]
+    fn update_form_carries_permissions_notify_expires() {
+        let form = build_member_update_form(&UpdateMemberParams {
+            permissions: Some("view"),
+            notify_options: Some("Notify me in app"),
+            expires: Some("2030-01-01 00:00:00"),
+        });
+        assert_eq!(form.get("permissions").map(String::as_str), Some("view"));
+        assert_eq!(
+            form.get("notify_options").map(String::as_str),
+            Some("Notify me in app")
+        );
+        assert_eq!(
+            form.get("expires").map(String::as_str),
+            Some("2030-01-01 00:00:00")
+        );
+    }
+
+    #[test]
+    fn update_form_only_permissions_when_role_only() {
+        // The `update_member_role` wrapper sends ONLY permissions.
+        let form = build_member_update_form(&UpdateMemberParams {
+            permissions: Some("admin"),
+            ..Default::default()
+        });
+        assert_eq!(form.len(), 1);
+        assert_eq!(form.get("permissions").map(String::as_str), Some("admin"));
+    }
 }

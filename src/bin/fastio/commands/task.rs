@@ -428,7 +428,6 @@ async fn filter_tasks(
         limit,
         offset,
         status,
-        entry_type: None,
     };
     let value =
         api::workflow::list_tasks_filtered(&client, profile_type, profile_id, filter, &query)
@@ -681,29 +680,6 @@ async fn reorder_lists(
     Ok(())
 }
 
-/// Parse an optional JSON-object argument, supporting an `@path` form that
-/// reads the JSON from a file (`@@` escapes a literal leading `@`).
-fn parse_json_object_arg(raw: Option<&str>, label: &str) -> Result<Option<serde_json::Value>> {
-    let Some(raw) = raw else { return Ok(None) };
-    let text = if let Some(path) = raw.strip_prefix('@') {
-        if let Some(literal) = path.strip_prefix('@') {
-            literal.to_owned()
-        } else {
-            std::fs::read_to_string(path)
-                .with_context(|| format!("failed to read {label} from file '{path}'"))?
-        }
-    } else {
-        raw.to_owned()
-    };
-    let value: serde_json::Value =
-        serde_json::from_str(&text).with_context(|| format!("{label} must be valid JSON"))?;
-    anyhow::ensure!(
-        value.is_object(),
-        "{label} must be a JSON object (e.g. {{\"key\":\"value\"}})"
-    );
-    Ok(Some(value))
-}
-
 /// List a task's attachments.
 async fn attachments(ctx: &CommandContext<'_>, list_id: &str, task_id: &str) -> Result<()> {
     let client = ctx.build_client()?;
@@ -779,8 +755,8 @@ async fn comment(cmd: &TaskCommentCommand, ctx: &CommandContext<'_>) -> Result<(
             reference,
             properties,
         } => {
-            let reference = parse_json_object_arg(reference.as_deref(), "reference")?;
-            let properties = parse_json_object_arg(properties.as_deref(), "properties")?;
+            let reference = super::parse_json_object_arg(reference.as_deref(), "reference")?;
+            let properties = super::parse_json_object_arg(properties.as_deref(), "properties")?;
             let value = api::workflow::post_task_comment(
                 &client,
                 &api::workflow::PostTaskCommentParams {

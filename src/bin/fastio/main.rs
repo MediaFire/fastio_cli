@@ -12,7 +12,6 @@ use colored::Colorize;
 
 use cli::{AuthCommands, Cli, Commands};
 use commands::ai::AiCommand;
-use commands::approval::ApprovalCommand;
 use commands::apps::AppsCommand;
 use commands::asset::AssetCommand;
 use commands::auth::{ApiKeyCommand, AuthCommand, OauthCommand, TwoFaCommand};
@@ -21,7 +20,6 @@ use commands::download::DownloadCommand;
 use commands::event::EventCommand;
 use commands::files::{FileLockCommand, FilesCommand};
 use commands::import::ImportCommand;
-use commands::instructions::InstructionsCommand;
 use commands::invitation::InvitationCommand;
 use commands::lock::LockCommand;
 use commands::member::MemberCommand;
@@ -32,15 +30,17 @@ use commands::org::{
 };
 use commands::preview::PreviewCommand;
 use commands::search::SearchCommand;
-use commands::share::{ShareCommand, ShareFilesCommand, ShareMembersCommand};
+use commands::share::{
+    ShareCommand, ShareCreateArgs, ShareFilesCommand, ShareInvitationCommand, ShareMembersCommand,
+    ShareUpdateArgs,
+};
 use commands::system::SystemCommand;
 use commands::task::{TaskCommand, TaskCommentCommand, TaskListCommand};
-use commands::todo::TodoCommand;
 use commands::upload::UploadCommand;
 use commands::user::{
-    AvatarCommand, SettingsCommand, UserAssetCommand, UserCommand, UserInvitationsCommand,
+    AvatarCommand, SettingsCommand, UserAssetCommand, UserCommand, UserEmailChangeCommand,
+    UserInvitationsCommand,
 };
-use commands::worklog::WorklogCommand;
 use commands::workspace::WorkspaceCommand;
 use fastio_cli::config::Config;
 use fastio_cli::output::OutputConfig;
@@ -244,25 +244,11 @@ async fn dispatch(
         Commands::Share(c) => commands::share::execute(&map_share_command(c), ctx).await,
         Commands::Comment(c) => commands::comment::execute(&map_comment_command(c), ctx).await,
         Commands::Event(c) => commands::event::execute(&map_event_command(c), ctx).await,
+        Commands::Dashboard(c) => commands::dashboard::execute(c, ctx).await,
         Commands::Preview(c) => commands::preview::execute(&map_preview_command(c), ctx).await,
         Commands::Asset(c) => commands::asset::execute(&map_asset_command(c), ctx).await,
         Commands::Ripley(c) => commands::ai::execute(&map_ripley_command(c), ctx).await,
-        Commands::Task(c) => {
-            fastio_cli::deprecation::warn_legacy("task", "`fastio workflow`", ctx.output.quiet);
-            commands::task::execute(&map_task_command(c), ctx).await
-        }
-        Commands::Worklog(c) => {
-            fastio_cli::deprecation::warn_legacy("worklog", "`fastio workflow`", ctx.output.quiet);
-            commands::worklog::execute(&map_worklog_command(c), ctx).await
-        }
-        Commands::Approval(c) => {
-            fastio_cli::deprecation::warn_legacy("approval", "`fastio workflow`", ctx.output.quiet);
-            commands::approval::execute(&map_approval_command(c), ctx).await
-        }
-        Commands::Todo(c) => {
-            fastio_cli::deprecation::warn_legacy("todo", "`fastio workflow`", ctx.output.quiet);
-            commands::todo::execute(&map_todo_command(c), ctx).await
-        }
+        Commands::Task(c) => commands::task::execute(&map_task_command(c), ctx).await,
         Commands::Apps(c) => commands::apps::execute(&map_apps_command(&c), ctx).await,
         Commands::Import(c) => commands::import::execute(&map_import_command(&c), ctx).await,
         Commands::Lock(c) => commands::lock::execute(&map_lock_command(&c), ctx).await,
@@ -286,13 +272,15 @@ async fn dispatch(
             )
             .await
         }
+        Commands::HowTo {
+            question,
+            surface,
+            context,
+        } => commands::howto::execute(ctx, &question, surface.as_deref(), context.as_deref()).await,
         Commands::Metadata(c) => commands::metadata::execute(&map_metadata_command(c), ctx).await,
         Commands::Workflow(c) => commands::workflow::execute(c, ctx).await,
         Commands::Sign(c) => commands::sign::execute(c, ctx).await,
         Commands::Fileshare(c) => commands::fileshare::execute(c, ctx).await,
-        Commands::Instructions(c) => {
-            commands::instructions::execute(&map_instructions_command(c), ctx).await
-        }
         Commands::System(c) => commands::system::execute(&map_system_command(&c), ctx).await,
         // Offline: pure local classification, no client/auth (like `Configure`).
         Commands::Id(c) => commands::id::execute(&c, ctx.output),
@@ -334,17 +322,21 @@ fn map_auth_command(cmd: AuthCommands) -> AuthCommand {
     match cmd {
         AuthCommands::Login { email, password } => AuthCommand::Login { email, password },
         AuthCommands::Logout => AuthCommand::Logout,
+        AuthCommands::Signout => AuthCommand::Signout,
+        AuthCommands::InvalidateAll => AuthCommand::InvalidateAll,
         AuthCommands::Status => AuthCommand::Status,
         AuthCommands::Signup {
             email,
             password,
             first_name,
             last_name,
+            agent,
         } => AuthCommand::Signup {
             email,
             password,
             first_name,
             last_name,
+            agent,
         },
         AuthCommands::Verify { email, code } => AuthCommand::Verify { email, code },
         AuthCommands::TwoFa(tfa) => AuthCommand::TwoFa(match tfa {
@@ -356,7 +348,17 @@ fn map_auth_command(cmd: AuthCommands) -> AuthCommand {
             cli::TwoFaCommands::VerifySetup { token } => TwoFaCommand::VerifySetup { token },
         }),
         AuthCommands::ApiKey(ak) => AuthCommand::ApiKey(match ak {
-            cli::ApiKeyCommands::Create { name, scopes } => ApiKeyCommand::Create { name, scopes },
+            cli::ApiKeyCommands::Create {
+                name,
+                scopes,
+                agent_name,
+                expires,
+            } => ApiKeyCommand::Create {
+                name,
+                scopes,
+                agent_name,
+                expires,
+            },
             cli::ApiKeyCommands::List => ApiKeyCommand::List,
             cli::ApiKeyCommands::Delete { key_id } => ApiKeyCommand::Delete { key_id },
             cli::ApiKeyCommands::Get { key_id } => ApiKeyCommand::Get { key_id },
@@ -364,10 +366,14 @@ fn map_auth_command(cmd: AuthCommands) -> AuthCommand {
                 key_id,
                 name,
                 scopes,
+                agent_name,
+                expires,
             } => ApiKeyCommand::Update {
                 key_id,
                 name,
                 scopes,
+                agent_name,
+                expires,
             },
         }),
         AuthCommands::Check => AuthCommand::Check,
@@ -386,8 +392,19 @@ fn map_auth_command(cmd: AuthCommands) -> AuthCommand {
         AuthCommands::Oauth(o) => AuthCommand::Oauth(match o {
             cli::OauthCommands::List => OauthCommand::List,
             cli::OauthCommands::Details { session_id } => OauthCommand::Details { session_id },
+            cli::OauthCommands::Rename {
+                session_id,
+                device_name,
+                agent_name,
+            } => OauthCommand::Rename {
+                session_id,
+                device_name,
+                agent_name,
+            },
             cli::OauthCommands::Revoke { session_id } => OauthCommand::Revoke { session_id },
-            cli::OauthCommands::RevokeAll => OauthCommand::RevokeAll,
+            cli::OauthCommands::RevokeAll { exclude_current } => {
+                OauthCommand::RevokeAll { exclude_current }
+            }
         }),
         AuthCommands::Scopes => AuthCommand::Scopes,
         AuthCommands::PasswordResetCheck { code } => AuthCommand::PasswordResetCheck { code },
@@ -402,11 +419,31 @@ fn map_user_command(cmd: cli::UserCommands) -> UserCommand {
             first_name,
             last_name,
             display_name,
+            phone_country,
+            phone_number,
+            password,
+            current_password,
         } => UserCommand::Update {
             first_name,
             last_name,
             display_name,
+            phone_country,
+            phone_number,
+            password,
+            current_password,
         },
+        cli::UserCommands::EmailChange(ec) => UserCommand::EmailChange(match ec {
+            cli::UserEmailChangeCommands::Request {
+                new_email,
+                current_password,
+            } => UserEmailChangeCommand::Request {
+                new_email,
+                current_password,
+            },
+            cli::UserEmailChangeCommands::Confirm { token } => {
+                UserEmailChangeCommand::Confirm { token }
+            }
+        }),
         cli::UserCommands::Avatar(av) => UserCommand::Avatar(match av {
             cli::UserAvatarCommands::Upload { file } => AvatarCommand::Upload { file },
             cli::UserAvatarCommands::Remove => AvatarCommand::Remove,
@@ -493,6 +530,17 @@ fn map_org_command(cmd: cli::OrgCommands) -> OrgCommand {
             industry,
             billing_email,
             homepage_url,
+            accent_color,
+            background_color,
+            background_mode,
+            use_background,
+            facebook_url,
+            twitter_url,
+            instagram_url,
+            youtube_url,
+            perm_member_manage,
+            perm_authorized_domains,
+            owner_defined,
         } => OrgCommand::Update {
             org_id,
             name,
@@ -501,6 +549,17 @@ fn map_org_command(cmd: cli::OrgCommands) -> OrgCommand {
             industry,
             billing_email,
             homepage_url,
+            accent_color,
+            background_color,
+            background_mode,
+            use_background,
+            facebook_url,
+            twitter_url,
+            instagram_url,
+            youtube_url,
+            perm_member_manage,
+            perm_authorized_domains,
+            owner_defined,
         },
         cli::OrgCommands::Delete { org_id, confirm } => OrgCommand::Delete { org_id, confirm },
         cli::OrgCommands::Members(m) => OrgCommand::Members(map_org_members_command(m)),
@@ -566,11 +625,19 @@ fn map_org_command(cmd: cli::OrgCommands) -> OrgCommand {
             name,
             folder_name,
             description,
+            perm_join,
+            perm_member_manage,
+            intelligence,
+            workflow,
         } => OrgCommand::CreateWorkspace {
             org_id,
             name,
             folder_name,
             description,
+            perm_join,
+            perm_member_manage,
+            intelligence,
+            workflow,
         },
     }
 }
@@ -752,12 +819,30 @@ fn map_workspace_command(cmd: cli::WorkspaceCommands) -> WorkspaceCommand {
             description,
             folder_name,
             intelligence,
+            perm_join,
+            perm_member_manage,
+            nl_summaries_enabled,
+            nl_summaries_daily_cap,
+            workflow_approval_native_enabled,
+            accent_color,
+            background_color1,
+            background_color2,
+            owner_defined,
         } => WorkspaceCommand::Update {
             workspace_id,
             name,
             description,
             folder_name,
             intelligence,
+            perm_join,
+            perm_member_manage,
+            nl_summaries_enabled,
+            nl_summaries_daily_cap,
+            workflow_approval_native_enabled,
+            accent_color,
+            background_color1,
+            background_color2,
+            owner_defined,
         },
         cli::WorkspaceCommands::Delete {
             workspace_id,
@@ -899,10 +984,12 @@ fn map_files_command(cmd: cli::FilesCommands) -> FilesCommand {
             workspace,
             name,
             parent,
+            force,
         } => FilesCommand::CreateFolder {
             workspace,
             name,
             parent,
+            force,
         },
         cli::FilesCommands::Move {
             workspace,
@@ -930,6 +1017,40 @@ fn map_files_command(cmd: cli::FilesCommands) -> FilesCommand {
             workspace,
             node_id,
             new_name,
+        },
+        cli::FilesCommands::Update {
+            workspace,
+            share,
+            node_id,
+            name,
+            from,
+            metadata_title,
+            metadata_short,
+        } => FilesCommand::Update {
+            workspace,
+            share,
+            node_id,
+            name,
+            from,
+            metadata_title,
+            metadata_short,
+        },
+        cli::FilesCommands::AddFile {
+            workspace,
+            share,
+            name,
+            parent,
+            upload_id,
+            hash,
+            hash_type,
+        } => FilesCommand::AddFile {
+            workspace,
+            share,
+            parent,
+            name,
+            upload_id,
+            hash,
+            hash_type,
         },
         cli::FilesCommands::Delete { workspace, node_id } => {
             FilesCommand::Delete { workspace, node_id }
@@ -979,10 +1100,12 @@ fn map_files_command(cmd: cli::FilesCommands) -> FilesCommand {
             workspace,
             page_size,
             cursor,
+            node_type,
         } => FilesCommand::Recent {
             workspace,
             page_size,
             cursor,
+            node_type,
         },
         cli::FilesCommands::AddLink {
             workspace,
@@ -1021,9 +1144,17 @@ fn map_files_command(cmd: cli::FilesCommands) -> FilesCommand {
 /// Convert clap-parsed file lock subcommands to the internal enum.
 fn map_file_lock_command(lk: cli::FileLockCommands) -> FileLockCommand {
     match lk {
-        cli::FileLockCommands::Acquire { workspace, node_id } => {
-            FileLockCommand::Acquire { workspace, node_id }
-        }
+        cli::FileLockCommands::Acquire {
+            workspace,
+            node_id,
+            duration,
+            client_info,
+        } => FileLockCommand::Acquire {
+            workspace,
+            node_id,
+            duration,
+            client_info,
+        },
         cli::FileLockCommands::Status { workspace, node_id } => {
             FileLockCommand::Status { workspace, node_id }
         }
@@ -1060,11 +1191,13 @@ fn map_upload_command(cmd: cli::UploadCommands) -> UploadCommand {
         },
         cli::UploadCommands::Text {
             workspace,
+            share,
             name,
             content,
             folder,
         } => UploadCommand::Text {
             workspace,
+            share,
             name,
             content,
             folder,
@@ -1082,11 +1215,13 @@ fn map_upload_command(cmd: cli::UploadCommands) -> UploadCommand {
         },
         cli::UploadCommands::CreateSession {
             workspace,
+            share,
             filename,
             filesize,
             folder,
         } => UploadCommand::CreateSession {
             workspace,
+            share,
             filename,
             filesize,
             folder,
@@ -1115,13 +1250,35 @@ fn map_upload_command(cmd: cli::UploadCommands) -> UploadCommand {
             upload_key,
             chunk_num,
         },
-        cli::UploadCommands::WebList => UploadCommand::WebList,
+        cli::UploadCommands::WebList {
+            limit,
+            offset,
+            status,
+        } => UploadCommand::WebList {
+            limit,
+            offset,
+            status,
+        },
         cli::UploadCommands::WebCancel { upload_id } => UploadCommand::WebCancel { upload_id },
         cli::UploadCommands::WebStatus { upload_id } => UploadCommand::WebStatus { upload_id },
-        cli::UploadCommands::Limits => UploadCommand::Limits,
-        cli::UploadCommands::Extensions => UploadCommand::Extensions,
+        cli::UploadCommands::Limits {
+            action,
+            org,
+            instance_id,
+            folder_id,
+            file_id,
+        } => UploadCommand::Limits {
+            action,
+            org,
+            instance_id,
+            folder_id,
+            file_id,
+        },
+        cli::UploadCommands::Algos => UploadCommand::Algos,
+        cli::UploadCommands::Extensions { plan } => UploadCommand::Extensions { plan },
         cli::UploadCommands::Stream {
             workspace,
+            share,
             file_path,
             folder,
             max_size,
@@ -1130,6 +1287,7 @@ fn map_upload_command(cmd: cli::UploadCommands) -> UploadCommand {
             hash_algo,
         } => UploadCommand::Stream {
             workspace,
+            share,
             file_path,
             folder,
             max_size,
@@ -1139,11 +1297,13 @@ fn map_upload_command(cmd: cli::UploadCommands) -> UploadCommand {
         },
         cli::UploadCommands::CreateStreamSession {
             workspace,
+            share,
             filename,
             folder,
             max_size,
         } => UploadCommand::CreateStreamSession {
             workspace,
+            share,
             filename,
             folder,
             max_size,
@@ -1169,19 +1329,25 @@ fn map_download_command(cmd: cli::DownloadCommands) -> DownloadCommand {
     match cmd {
         cli::DownloadCommands::File {
             workspace,
+            share,
             node_id,
             output,
+            version,
         } => DownloadCommand::File {
             workspace,
+            share,
             node_id,
             output_path: output,
+            version,
         },
         cli::DownloadCommands::Folder {
             workspace,
+            share,
             node_id,
             output,
         } => DownloadCommand::Folder {
             workspace,
+            share,
             node_id,
             output_path: output,
         },
@@ -1198,48 +1364,131 @@ fn map_download_command(cmd: cli::DownloadCommands) -> DownloadCommand {
 }
 
 /// Convert clap-parsed share commands to the internal enum.
+#[allow(clippy::too_many_lines)]
 fn map_share_command(cmd: cli::ShareCommands) -> ShareCommand {
     match cmd {
         cli::ShareCommands::List { limit, offset } => ShareCommand::List { limit, offset },
         cli::ShareCommands::Create {
             name,
             workspace,
+            share_type,
             description,
             access_options,
+            invite,
+            storage_mode,
+            folder_node_id,
+            create_folder,
+            folder_name,
+            custom_name,
             password,
+            expires,
+            notify,
+            comments_enabled,
+            guest_chat_enabled,
+            display_type,
+            workspace_style,
             anonymous_uploads,
             intelligence,
             download_security,
-        } => ShareCommand::Create {
+            accent_color,
+            background_color1,
+            background_color2,
+            background_image,
+            link_1,
+            link_2,
+            link_3,
+            owner_defined,
+        } => ShareCommand::Create(Box::new(ShareCreateArgs {
             workspace_id: workspace,
             name,
+            share_type,
             description,
             access_options,
+            invite,
+            storage_mode,
+            folder_node_id,
+            create_folder,
+            folder_name,
+            custom_name,
             password,
+            expires,
+            notify,
+            comments_enabled,
+            guest_chat_enabled,
+            display_type,
+            workspace_style,
             anonymous_uploads,
             intelligence,
             download_security,
-        },
+            accent_color,
+            background_color1,
+            background_color2,
+            background_image,
+            link_1,
+            link_2,
+            link_3,
+            owner_defined,
+        })),
         cli::ShareCommands::Info { share_id } => ShareCommand::Info { share_id },
         cli::ShareCommands::Update {
             share_id,
             name,
+            title,
+            custom_name,
             description,
+            share_type,
             access_options,
+            invite,
+            password,
+            expires,
+            notify,
             download_enabled,
             comments_enabled,
-            anonymous_uploads,
             download_security,
-        } => ShareCommand::Update {
+            display_type,
+            workspace_style,
+            guest_chat_enabled,
+            intelligence,
+            anonymous_uploads,
+            accent_color,
+            background_color1,
+            background_color2,
+            background_image,
+            link_1,
+            link_2,
+            link_3,
+            owner_defined,
+            share_link_node_id,
+        } => ShareCommand::Update(Box::new(ShareUpdateArgs {
             share_id,
             name,
+            title,
+            custom_name,
             description,
+            share_type,
             access_options,
+            invite,
+            password,
+            expires,
+            notify,
             download_enabled,
             comments_enabled,
-            anonymous_uploads,
             download_security,
-        },
+            display_type,
+            workspace_style,
+            guest_chat_enabled,
+            intelligence,
+            anonymous_uploads,
+            accent_color,
+            background_color1,
+            background_color2,
+            background_image,
+            link_1,
+            link_2,
+            link_3,
+            owner_defined,
+            share_link_node_id,
+        })),
         cli::ShareCommands::Delete { share_id, confirm } => {
             ShareCommand::Delete { share_id, confirm }
         }
@@ -1260,6 +1509,9 @@ fn map_share_command(cmd: cli::ShareCommands) -> ShareCommand {
         }
         cli::ShareCommands::Files(f) => ShareCommand::Files(map_share_files_command(f)),
         cli::ShareCommands::Members(m) => ShareCommand::Members(map_share_members_command(m)),
+        cli::ShareCommands::Invitation(i) => {
+            ShareCommand::Invitation(map_share_invitation_command(i))
+        }
     }
 }
 
@@ -1300,11 +1552,50 @@ fn map_share_members_command(m: cli::ShareMembersCommands) -> ShareMembersComman
             share_id,
             email,
             role,
+            notify_options,
+            expires,
+            force_notification,
+            message,
+            invitation_expires,
         } => ShareMembersCommand::Add {
             share_id,
             email,
             role,
+            notify_options,
+            expires,
+            force_notification,
+            message,
+            invitation_expires,
         },
+        cli::ShareMembersCommands::Update {
+            share_id,
+            member_id,
+            role,
+            notify_options,
+            expires,
+        } => ShareMembersCommand::Update {
+            share_id,
+            member_id,
+            role,
+            notify_options,
+            expires,
+        },
+        cli::ShareMembersCommands::Info {
+            share_id,
+            member_id,
+        } => ShareMembersCommand::Info {
+            share_id,
+            member_id,
+        },
+        cli::ShareMembersCommands::Transfer {
+            share_id,
+            member_id,
+        } => ShareMembersCommand::Transfer {
+            share_id,
+            member_id,
+        },
+        cli::ShareMembersCommands::Leave { share_id } => ShareMembersCommand::Leave { share_id },
+        cli::ShareMembersCommands::Join { share_id } => ShareMembersCommand::Join { share_id },
         cli::ShareMembersCommands::Remove {
             share_id,
             member_id,
@@ -1315,7 +1606,39 @@ fn map_share_members_command(m: cli::ShareMembersCommands) -> ShareMembersComman
     }
 }
 
+/// Convert clap-parsed share invitation subcommands to the internal enum.
+fn map_share_invitation_command(i: cli::ShareInvitationCommands) -> ShareInvitationCommand {
+    match i {
+        cli::ShareInvitationCommands::List { share_id, state } => {
+            ShareInvitationCommand::List { share_id, state }
+        }
+        cli::ShareInvitationCommands::Update {
+            share_id,
+            invitation_id,
+            state,
+            role,
+            notify_options,
+            expires,
+        } => ShareInvitationCommand::Update {
+            share_id,
+            invitation_id,
+            state,
+            role,
+            notify_options,
+            expires,
+        },
+        cli::ShareInvitationCommands::Delete {
+            share_id,
+            invitation_id,
+        } => ShareInvitationCommand::Delete {
+            share_id,
+            invitation_id,
+        },
+    }
+}
+
 /// Convert clap-parsed comment commands to the internal enum.
+#[allow(clippy::too_many_lines)]
 fn map_comment_command(cmd: cli::CommentCommands) -> CommentCommand {
     match cmd {
         cli::CommentCommands::List {
@@ -1338,11 +1661,19 @@ fn map_comment_command(cmd: cli::CommentCommands) -> CommentCommand {
             text,
             entity_type,
             entity_id,
+            reference,
+            properties,
+            target_id,
+            target_ids,
         } => CommentCommand::Create {
             entity_type,
             entity_id,
             node_id,
             text,
+            reference,
+            properties,
+            target_id,
+            target_ids,
         },
         cli::CommentCommands::Reply {
             comment_id,
@@ -1403,6 +1734,25 @@ fn map_comment_command(cmd: cli::CommentCommands) -> CommentCommand {
             limit,
             offset,
         },
+        cli::CommentCommands::Attachments { comment_id } => {
+            CommentCommand::Attachments { comment_id }
+        }
+        cli::CommentCommands::Attach {
+            comment_id,
+            target_id,
+            target_ids,
+        } => CommentCommand::Attach {
+            comment_id,
+            target_id,
+            target_ids,
+        },
+        cli::CommentCommands::Detach {
+            comment_id,
+            target_id,
+        } => CommentCommand::Detach {
+            comment_id,
+            target_id,
+        },
     }
 }
 
@@ -1412,15 +1762,35 @@ fn map_event_command(cmd: cli::EventCommands) -> EventCommand {
         cli::EventCommands::List {
             workspace,
             share,
+            user_id,
+            org_id,
             event,
             category,
+            subcategory,
+            parent_event_id,
+            calling_user_id,
+            object_id,
+            visibility,
+            acknowledged,
+            created_min,
+            created_max,
             limit,
             offset,
         } => EventCommand::List {
             workspace,
             share,
+            user_id,
+            org_id,
             event,
             category,
+            subcategory,
+            parent_event_id,
+            calling_user_id,
+            object_id,
+            visibility,
+            acknowledged,
+            created_min,
+            created_max,
             limit,
             offset,
         },
@@ -1438,18 +1808,36 @@ fn map_event_command(cmd: cli::EventCommands) -> EventCommand {
         cli::EventCommands::Summarize {
             workspace,
             share,
+            user_id,
+            org_id,
             event,
             category,
             subcategory,
+            parent_event_id,
+            calling_user_id,
+            object_id,
+            visibility,
+            acknowledged,
+            created_min,
+            created_max,
             user_context,
             limit,
             offset,
         } => EventCommand::Summarize {
             workspace,
             share,
+            user_id,
+            org_id,
             event,
             category,
             subcategory,
+            parent_event_id,
+            calling_user_id,
+            object_id,
+            visibility,
+            acknowledged,
+            created_min,
+            created_max,
             user_context,
             limit,
             offset,
@@ -1489,6 +1877,11 @@ fn map_preview_command(cmd: cli::PreviewCommands) -> PreviewCommand {
             height,
             output_format,
             size,
+            crop_width,
+            crop_height,
+            crop_x,
+            crop_y,
+            rotate,
         } => PreviewCommand::Transform {
             context_type,
             context_id,
@@ -1498,6 +1891,11 @@ fn map_preview_command(cmd: cli::PreviewCommands) -> PreviewCommand {
             height,
             output_format,
             size,
+            crop_width,
+            crop_height,
+            crop_x,
+            crop_y,
+            rotate,
         },
     }
 }
@@ -1976,320 +2374,6 @@ fn map_task_list_command(cmd: cli::TaskListCommands) -> TaskListCommand {
     }
 }
 
-/// Convert clap-parsed worklog commands to the internal enum.
-fn map_worklog_command(cmd: cli::WorklogCommands) -> WorklogCommand {
-    match cmd {
-        cli::WorklogCommands::List {
-            workspace,
-            entity_type,
-            entity_id,
-            limit,
-            offset,
-        } => WorklogCommand::List {
-            workspace,
-            entity_type,
-            entity_id,
-            limit,
-            offset,
-        },
-        cli::WorklogCommands::Append {
-            workspace,
-            message,
-            entity_type,
-            entity_id,
-        } => WorklogCommand::Append {
-            workspace,
-            message,
-            entity_type,
-            entity_id,
-        },
-        cli::WorklogCommands::Interject {
-            workspace,
-            message,
-            entity_type,
-            entity_id,
-        } => WorklogCommand::Interject {
-            workspace,
-            message,
-            entity_type,
-            entity_id,
-        },
-        cli::WorklogCommands::Details { entry_id } => WorklogCommand::Details { entry_id },
-        cli::WorklogCommands::ListInterjections {
-            entity_type,
-            entity_id,
-            limit,
-            offset,
-        } => WorklogCommand::ListInterjections {
-            entity_type,
-            entity_id,
-            limit,
-            offset,
-        },
-        cli::WorklogCommands::Acknowledge { entry_id } => WorklogCommand::Acknowledge { entry_id },
-        cli::WorklogCommands::ListAll {
-            profile_type,
-            profile_id,
-            limit,
-            offset,
-        } => WorklogCommand::ListAll {
-            profile_type,
-            profile_id,
-            limit,
-            offset,
-        },
-        cli::WorklogCommands::Filter {
-            profile_type,
-            profile_id,
-            filter,
-            entry_type,
-            limit,
-            offset,
-        } => WorklogCommand::Filter {
-            profile_type,
-            profile_id,
-            filter,
-            entry_type,
-            limit,
-            offset,
-        },
-        cli::WorklogCommands::Summary {
-            profile_type,
-            profile_id,
-        } => WorklogCommand::Summary {
-            profile_type,
-            profile_id,
-        },
-    }
-}
-
-/// Build an optional approval scope from a profile type and an optional
-/// profile ID. When the ID is absent (`--profile-id`/`--workspace` omitted),
-/// returns `None` so the command falls back to the legacy unscoped route,
-/// preserving the historical `approval approve <id>` syntax. The `profile_type`
-/// default is irrelevant when no ID is supplied.
-fn optional_approval_scope(
-    profile_type: String,
-    profile_id: Option<String>,
-) -> Option<commands::approval::ApprovalScope> {
-    profile_id.map(|profile_id| commands::approval::ApprovalScope {
-        profile_type,
-        profile_id,
-    })
-}
-
-/// Convert clap-parsed approval commands to the internal enum.
-#[allow(clippy::too_many_lines)]
-fn map_approval_command(cmd: cli::ApprovalCommands) -> ApprovalCommand {
-    use commands::approval::ApprovalScope;
-    match cmd {
-        cli::ApprovalCommands::List {
-            workspace,
-            status,
-            limit,
-            offset,
-        } => ApprovalCommand::List {
-            workspace,
-            status,
-            limit,
-            offset,
-        },
-        cli::ApprovalCommands::Request {
-            profile_type,
-            profile_id,
-            entity_type,
-            entity_id,
-            description,
-            approver_id,
-            deadline,
-            node_id,
-            properties,
-        } => ApprovalCommand::Request {
-            scope: ApprovalScope {
-                profile_type,
-                profile_id,
-            },
-            entity_type,
-            entity_id,
-            description,
-            approver_id,
-            deadline,
-            node_id,
-            properties,
-        },
-        cli::ApprovalCommands::Info {
-            profile_type,
-            profile_id,
-            approval_id,
-        } => ApprovalCommand::Info {
-            scope: optional_approval_scope(profile_type, profile_id),
-            approval_id,
-        },
-        cli::ApprovalCommands::Approve {
-            profile_type,
-            profile_id,
-            approval_id,
-            comment,
-        } => ApprovalCommand::Approve {
-            scope: optional_approval_scope(profile_type, profile_id),
-            approval_id,
-            comment,
-        },
-        cli::ApprovalCommands::Reject {
-            profile_type,
-            profile_id,
-            approval_id,
-            comment,
-        } => ApprovalCommand::Reject {
-            scope: optional_approval_scope(profile_type, profile_id),
-            approval_id,
-            comment,
-        },
-        cli::ApprovalCommands::Update {
-            profile_type,
-            profile_id,
-            approval_id,
-            description,
-            approver_id,
-            deadline,
-            node_id,
-            properties,
-        } => ApprovalCommand::Update {
-            scope: optional_approval_scope(profile_type, profile_id),
-            approval_id,
-            description,
-            approver_id,
-            deadline,
-            node_id,
-            properties,
-        },
-        cli::ApprovalCommands::Delete {
-            profile_type,
-            profile_id,
-            approval_id,
-        } => ApprovalCommand::Delete {
-            scope: optional_approval_scope(profile_type, profile_id),
-            approval_id,
-        },
-        cli::ApprovalCommands::Filter {
-            profile_type,
-            profile_id,
-            filter,
-            status,
-            limit,
-            offset,
-        } => ApprovalCommand::Filter {
-            scope: ApprovalScope {
-                profile_type,
-                profile_id,
-            },
-            filter,
-            status,
-            limit,
-            offset,
-        },
-        cli::ApprovalCommands::Summary {
-            profile_type,
-            profile_id,
-        } => ApprovalCommand::Summary {
-            scope: ApprovalScope {
-                profile_type,
-                profile_id,
-            },
-        },
-        cli::ApprovalCommands::Mine {
-            filter,
-            status,
-            limit,
-            offset,
-        } => ApprovalCommand::Mine {
-            filter,
-            status,
-            limit,
-            offset,
-        },
-    }
-}
-
-/// Convert clap-parsed todo commands to the internal enum.
-fn map_todo_command(cmd: cli::TodoCommands) -> TodoCommand {
-    match cmd {
-        cli::TodoCommands::List {
-            profile_type,
-            profile_id,
-            limit,
-            offset,
-        } => TodoCommand::List {
-            profile_type,
-            profile_id,
-            limit,
-            offset,
-        },
-        cli::TodoCommands::Create {
-            workspace,
-            share,
-            title,
-            assignee_id,
-        } => {
-            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
-            TodoCommand::Create {
-                profile_type,
-                profile_id,
-                title,
-                assignee_id,
-            }
-        }
-        cli::TodoCommands::Update {
-            todo_id,
-            title,
-            done,
-            assignee_id,
-        } => TodoCommand::Update {
-            todo_id,
-            title,
-            done,
-            assignee_id,
-        },
-        cli::TodoCommands::Toggle { todo_id } => TodoCommand::Toggle { todo_id },
-        cli::TodoCommands::Delete { todo_id } => TodoCommand::Delete { todo_id },
-        cli::TodoCommands::BulkToggle {
-            workspace,
-            share,
-            todo_ids,
-            done,
-        } => {
-            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
-            let ids: Vec<String> = todo_ids.split(',').map(|s| s.trim().to_owned()).collect();
-            TodoCommand::BulkToggle {
-                profile_type,
-                profile_id,
-                todo_ids: ids,
-                done,
-            }
-        }
-        cli::TodoCommands::Filter {
-            profile_type,
-            profile_id,
-            filter,
-            limit,
-            offset,
-        } => TodoCommand::Filter {
-            profile_type,
-            profile_id,
-            filter,
-            limit,
-            offset,
-        },
-        cli::TodoCommands::Summary {
-            profile_type,
-            profile_id,
-        } => TodoCommand::Summary {
-            profile_type,
-            profile_id,
-        },
-    }
-}
-
 /// Resolve workspace/share options into a `(profile_type, profile_id)` pair.
 ///
 /// Clap ensures at least one of `workspace` or `share` is present via
@@ -2499,10 +2583,14 @@ fn map_lock_command(cmd: &cli::LockCommands) -> LockCommand {
             context_type,
             context_id,
             node_id,
+            duration,
+            client_info,
         } => LockCommand::Acquire {
             context_type: context_type.clone(),
             context_id: context_id.clone(),
             node_id: node_id.clone(),
+            duration: *duration,
+            client_info: client_info.clone(),
         },
         cli::LockCommands::Status {
             context_type,
@@ -2736,77 +2824,6 @@ fn map_metadata_command(cmd: cli::MetadataCommands) -> MetadataCommand {
             template_id,
             parent_node_id,
         },
-    }
-}
-
-/// Convert clap-parsed instructions commands to the internal enum.
-#[allow(clippy::too_many_lines)]
-fn map_instructions_command(cmd: cli::InstructionsCommands) -> InstructionsCommand {
-    match cmd {
-        cli::InstructionsCommands::GetUser => InstructionsCommand::GetUser,
-        cli::InstructionsCommands::SetUser { content } => InstructionsCommand::SetUser { content },
-        cli::InstructionsCommands::ClearUser => InstructionsCommand::ClearUser,
-
-        cli::InstructionsCommands::GetOrg { org_id } => InstructionsCommand::GetOrg { org_id },
-        cli::InstructionsCommands::SetOrg { org_id, content } => {
-            InstructionsCommand::SetOrg { org_id, content }
-        }
-        cli::InstructionsCommands::ClearOrg { org_id } => InstructionsCommand::ClearOrg { org_id },
-        cli::InstructionsCommands::GetOrgUser { org_id } => {
-            InstructionsCommand::GetOrgUser { org_id }
-        }
-        cli::InstructionsCommands::SetOrgUser { org_id, content } => {
-            InstructionsCommand::SetOrgUser { org_id, content }
-        }
-        cli::InstructionsCommands::ClearOrgUser { org_id } => {
-            InstructionsCommand::ClearOrgUser { org_id }
-        }
-
-        cli::InstructionsCommands::GetWorkspace { workspace_id } => {
-            InstructionsCommand::GetWorkspace { workspace_id }
-        }
-        cli::InstructionsCommands::SetWorkspace {
-            workspace_id,
-            content,
-        } => InstructionsCommand::SetWorkspace {
-            workspace_id,
-            content,
-        },
-        cli::InstructionsCommands::ClearWorkspace { workspace_id } => {
-            InstructionsCommand::ClearWorkspace { workspace_id }
-        }
-        cli::InstructionsCommands::GetWorkspaceUser { workspace_id } => {
-            InstructionsCommand::GetWorkspaceUser { workspace_id }
-        }
-        cli::InstructionsCommands::SetWorkspaceUser {
-            workspace_id,
-            content,
-        } => InstructionsCommand::SetWorkspaceUser {
-            workspace_id,
-            content,
-        },
-        cli::InstructionsCommands::ClearWorkspaceUser { workspace_id } => {
-            InstructionsCommand::ClearWorkspaceUser { workspace_id }
-        }
-
-        cli::InstructionsCommands::GetShare { share_id } => {
-            InstructionsCommand::GetShare { share_id }
-        }
-        cli::InstructionsCommands::SetShare { share_id, content } => {
-            InstructionsCommand::SetShare { share_id, content }
-        }
-        cli::InstructionsCommands::ClearShare { share_id } => {
-            InstructionsCommand::ClearShare { share_id }
-        }
-        cli::InstructionsCommands::GetShareUser { share_id } => {
-            InstructionsCommand::GetShareUser { share_id }
-        }
-        cli::InstructionsCommands::SetShareUser { share_id, content } => {
-            InstructionsCommand::SetShareUser { share_id, content }
-        }
-        cli::InstructionsCommands::ClearShareUser { share_id } => {
-            InstructionsCommand::ClearShareUser { share_id }
-        }
     }
 }
 

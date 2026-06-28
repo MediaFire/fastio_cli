@@ -33,6 +33,7 @@
 //! | Update | `POST .../{env}/update/` (JSON; PATCH also accepted) | `sign_envelope` |
 //! | Send | `POST .../{env}/send/` (bodyless) | `sign_envelope` |
 //! | Void | `POST .../{env}/void/` (JSON `{"reason"}`) | `sign_envelope` |
+//! | Retry | `POST .../{env}/retry/` (bodyless) | `sign_envelope` |
 //! | Doc download/preview | `GET .../{env}/documents/{doc}/download|preview/` | bytes |
 //! | Signed PDF | `GET .../{env}/documents/{doc}/signed/download/` | bytes |
 //! | Audit cert | `GET .../{env}/audit/download/` | bytes |
@@ -1053,6 +1054,54 @@ pub async fn void_envelope(
     client.post_json(&path, &json!({ "reason": reason })).await
 }
 
+/// Manually re-drive a stuck envelope through the self-healing recovery routine
+/// (`signing.txt:33`).
+///
+/// `POST /workspace/{id}/sign_envelopes/{envelope_id}/retry/` (no body). This is
+/// an admin action that re-drives an envelope whose async signing pipeline has
+/// stalled; it is **idempotent with no-op success** (re-driving a non-stuck or
+/// already-terminal envelope succeeds without side effects), and a permanent
+/// signing-pipeline failure cascades the envelope to the terminal `failed`
+/// state. Like `/send/`, the route is a **bodyless** POST routed through
+/// [`ApiClient::post_empty`] (no JSON body, no `Content-Type`); the response is
+/// the named-key envelope shape (`{"result": true, "sign_envelope": {…}}`),
+/// which `post_empty` preserves verbatim (there is no `response` key to unwrap).
+pub async fn retry_envelope(
+    client: &ApiClient,
+    workspace_id: &str,
+    envelope_id: &str,
+) -> Result<Value, CliError> {
+    let path = envelope_action_path(workspace_id, envelope_id, "retry")?;
+    client.post_empty(&path).await
+}
+
+/// Mint the calling workspace member's signing link for a sign envelope
+/// (`dashboard.txt:297-407`).
+///
+/// `POST /workspace/{id}/sign_envelopes/{envelope_id}/my_sign_link/` (no body).
+/// This is the primary action endpoint for dashboard `signature` cards — the
+/// `envelope_id` comes from a signature card's `target.id`. Like `/send/` and
+/// `/retry/`, the route is a **bodyless** POST routed through
+/// [`ApiClient::post_empty`] (no JSON body, no `Content-Type`).
+///
+/// A **write-scope token is required** — a read-only scoped token is rejected
+/// server-side with `10754`. The response is a structured object (NOT just a
+/// URL, and there is no `decision` field); the caller derives state from the
+/// returned fields: `sign_url` is non-null only when the caller can sign now;
+/// `is_terminal: true` means completed/void/declined; `reauth_required: true`
+/// means re-authenticate first; otherwise (`sign_url: null`, not terminal, no
+/// reauth) the caller is blocked by routing order (see `blocked_signers`). It is
+/// a named-key boolean envelope (`{"result": true, "sign_url": …}`, NO
+/// `response` key), which `post_empty` preserves verbatim.
+pub async fn my_sign_link(
+    client: &ApiClient,
+    workspace_id: &str,
+    envelope_id: &str,
+) -> Result<Value, CliError> {
+    let path = envelope_action_path(workspace_id, envelope_id, "my_sign_link")?;
+    client.post_empty(&path).await
+}
+
 // ─── Download paths (streamed by the command layer) ─────────────────────────────
 
 /// Build the path to a document's byte endpoint:
@@ -1177,6 +1226,37 @@ mod tests {
         assert_eq!(
             envelope_action_path("ws1", "env1", "void").unwrap(),
             "/workspace/ws1/sign_envelopes/env1/void/"
+        );
+    }
+
+    #[test]
+    fn action_path_builds_retry_route() {
+        // `retry_envelope` POSTs the bodyless `.../{env}/retry/` route via
+        // `post_empty`; lock the exact suffixed string so a regression to an
+        // unsuffixed (9992-prone) route is caught.
+        assert_eq!(
+            envelope_action_path("ws1", "env1", "retry").unwrap(),
+            "/workspace/ws1/sign_envelopes/env1/retry/"
+        );
+        // The envelope id is URL-encoded into the path.
+        assert_eq!(
+            envelope_action_path("ws1", "env/1", "retry").unwrap(),
+            "/workspace/ws1/sign_envelopes/env%2F1/retry/"
+        );
+    }
+
+    #[test]
+    fn action_path_builds_my_sign_link_route() {
+        // `my_sign_link` POSTs the bodyless `.../{env}/my_sign_link/` route via
+        // `post_empty` (the dashboard signature-card primary action); lock the
+        // exact suffixed string and the id encoding.
+        assert_eq!(
+            envelope_action_path("ws1", "env1", "my_sign_link").unwrap(),
+            "/workspace/ws1/sign_envelopes/env1/my_sign_link/"
+        );
+        assert_eq!(
+            envelope_action_path("ws1", "env/1", "my_sign_link").unwrap(),
+            "/workspace/ws1/sign_envelopes/env%2F1/my_sign_link/"
         );
     }
 

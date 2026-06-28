@@ -8,12 +8,16 @@ use super::CommandContext;
 use fastio_cli::api;
 
 /// User subcommand variants.
-#[derive(Debug, Clone)]
+///
+/// Does NOT derive `Debug`: `Update` carries `password` / `current_password`
+/// secrets (CLAUDE.md coding-standard #9). This mirrors the secret-bearing
+/// internal `AuthCommand` / `TwoFaCommand` enums, which also omit `Debug`.
+#[derive(Clone)]
 #[non_exhaustive]
 pub enum UserCommand {
     /// Get current user profile.
     Info,
-    /// Update user profile.
+    /// Update user profile (name, phone, password).
     Update {
         /// First name.
         first_name: Option<String>,
@@ -21,7 +25,17 @@ pub enum UserCommand {
         last_name: Option<String>,
         /// Display name (alias for first name).
         display_name: Option<String>,
+        /// Numeric phone country code.
+        phone_country: Option<String>,
+        /// Numeric phone number.
+        phone_number: Option<String>,
+        /// New password.
+        password: Option<String>,
+        /// Current password proof.
+        current_password: Option<String>,
     },
+    /// Email-change subcommands.
+    EmailChange(UserEmailChangeCommand),
     /// Avatar subcommands.
     Avatar(AvatarCommand),
     /// Settings subcommands.
@@ -66,6 +80,27 @@ pub enum UserCommand {
         country_code: String,
         /// Phone number (e.g. "5551234567").
         phone_number: String,
+    },
+}
+
+/// Email-change subcommand variants.
+///
+/// Does NOT derive `Debug`: both variants carry secrets (`current_password`,
+/// `token`) — see CLAUDE.md coding-standard #9.
+#[derive(Clone)]
+#[non_exhaustive]
+pub enum UserEmailChangeCommand {
+    /// Request an email-address change.
+    Request {
+        /// New email address.
+        new_email: String,
+        /// Current password proof.
+        current_password: Option<String>,
+    },
+    /// Confirm a pending email-address change.
+    Confirm {
+        /// One-time confirmation token.
+        token: String,
     },
 }
 
@@ -154,15 +189,26 @@ pub async fn execute(command: &UserCommand, ctx: &CommandContext<'_>) -> Result<
             first_name,
             last_name,
             display_name,
+            phone_country,
+            phone_number,
+            password,
+            current_password,
         } => {
             update(
                 ctx,
-                first_name.as_deref(),
-                last_name.as_deref(),
-                display_name.as_deref(),
+                UpdateArgs {
+                    first_name: first_name.as_deref(),
+                    last_name: last_name.as_deref(),
+                    display_name: display_name.as_deref(),
+                    phone_country: phone_country.as_deref(),
+                    phone_number: phone_number.as_deref(),
+                    password: password.as_deref(),
+                    current_password: current_password.as_deref(),
+                },
             )
             .await
         }
+        UserCommand::EmailChange(cmd) => email_change(cmd, ctx).await,
         UserCommand::Avatar(cmd) => avatar(cmd, ctx).await,
         UserCommand::Settings(cmd) => settings(cmd, ctx).await,
         UserCommand::Search { query } => {
@@ -341,24 +387,97 @@ async fn info(ctx: &CommandContext<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Update user profile fields.
-async fn update(
-    ctx: &CommandContext<'_>,
-    first_name: Option<&str>,
-    last_name: Option<&str>,
-    display_name: Option<&str>,
-) -> Result<()> {
-    let effective_first = first_name.or(display_name);
+/// Borrowed `user update` arguments (avoids a long positional parameter list).
+struct UpdateArgs<'a> {
+    first_name: Option<&'a str>,
+    last_name: Option<&'a str>,
+    display_name: Option<&'a str>,
+    phone_country: Option<&'a str>,
+    phone_number: Option<&'a str>,
+    password: Option<&'a str>,
+    current_password: Option<&'a str>,
+}
 
-    if effective_first.is_none() && last_name.is_none() {
-        anyhow::bail!("at least one of --first-name, --last-name, or --display-name is required");
+/// Update user profile fields (name, phone, password).
+async fn update(ctx: &CommandContext<'_>, args: UpdateArgs<'_>) -> Result<()> {
+    let effective_first = args.first_name.or(args.display_name);
+
+    if effective_first.is_none()
+        && args.last_name.is_none()
+        && args.phone_country.is_none()
+        && args.phone_number.is_none()
+        && args.password.is_none()
+    {
+        anyhow::bail!(
+            "at least one update field is required \
+             (--first-name, --last-name, --display-name, --phone-country, \
+             --phone-number, or --password)"
+        );
+    }
+    // Phone country and number must be set together (server requires the pair).
+    if args.phone_country.is_some() != args.phone_number.is_some() {
+        anyhow::bail!("--phone-country and --phone-number must be provided together");
     }
 
     let client = ctx.build_client()?;
-    let value = api::user::update_user(&client, effective_first, last_name, None)
-        .await
-        .context("failed to update user profile")?;
+    let value = api::user::update_user(
+        &client,
+        &api::user::UserUpdate {
+            first_name: effective_first,
+            last_name: args.last_name,
+            phone_country: args.phone_country,
+            phone_number: args.phone_number,
+            password: args.password,
+            current_password: args.current_password,
+            ..Default::default()
+        },
+    )
+    .await
+    .context("failed to update user profile")?;
     ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Handle email-change subcommands (request + confirm).
+async fn email_change(cmd: &UserEmailChangeCommand, ctx: &CommandContext<'_>) -> Result<()> {
+    let client = ctx.build_client()?;
+    match cmd {
+        UserEmailChangeCommand::Request {
+            new_email,
+            current_password,
+        } => {
+            // Step 1: request the change via /user/update/. The server emails a
+            // confirmation link to the new address; the change applies only
+            // after `confirm`.
+            api::user::update_user(
+                &client,
+                &api::user::UserUpdate {
+                    email_address: Some(new_email),
+                    current_password: current_password.as_deref(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("failed to request email change")?;
+            let value = json!({
+                "status": "email_change_requested",
+                "new_email": new_email,
+                "message": "Confirmation link sent to the new address. \
+                            Confirm with: fastio user email-change confirm --token <token>",
+            });
+            ctx.output.render(&value)?;
+        }
+        UserEmailChangeCommand::Confirm { token } => {
+            // Step 2: confirm with the one-time token from the link.
+            api::auth::email_change_confirm(&client, token)
+                .await
+                .context("failed to confirm email change")?;
+            let value = json!({
+                "status": "email_changed",
+            });
+            ctx.output.render(&value)?;
+        }
+    }
     Ok(())
 }
 
@@ -425,10 +544,16 @@ async fn settings(cmd: &SettingsCommand, ctx: &CommandContext<'_>) -> Result<()>
             if first_name.is_none() && last_name.is_none() {
                 anyhow::bail!("at least one of --first-name or --last-name is required");
             }
-            let value =
-                api::user::update_user(&client, first_name.as_deref(), last_name.as_deref(), None)
-                    .await
-                    .context("failed to update user settings")?;
+            let value = api::user::update_user(
+                &client,
+                &api::user::UserUpdate {
+                    first_name: first_name.as_deref(),
+                    last_name: last_name.as_deref(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("failed to update user settings")?;
             ctx.output.render(&value)?;
         }
     }

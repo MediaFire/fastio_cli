@@ -23,6 +23,40 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::fmt;
 
+/// The named size presets accepted by `preview transform --size`
+/// (case-insensitive; matches the server's `ImageNamedTranformations`).
+const PREVIEW_SIZE_PRESETS: &[&str] = &["IconTiny", "IconSmall", "IconMedium", "Preview"];
+
+/// Validate `preview transform --size` against the named presets,
+/// case-insensitively (the server matches `strtolower`-to-`strtolower`), and
+/// pass the user's value through unchanged. Defense-in-depth mirroring the
+/// api-layer `validate_transform_params`.
+fn parse_preview_size(value: &str) -> Result<String, String> {
+    if PREVIEW_SIZE_PRESETS
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(value))
+    {
+        Ok(value.to_owned())
+    } else {
+        Err(format!(
+            "invalid size '{value}' (valid: IconTiny, IconSmall, IconMedium, Preview)"
+        ))
+    }
+}
+
+/// Validate `preview transform --rotate` against the allowed rotations
+/// {0, 90, 180, 270}. Defense-in-depth mirroring the api-layer validation.
+fn parse_preview_rotate(value: &str) -> Result<u32, String> {
+    let n: u32 = value
+        .parse()
+        .map_err(|_| format!("invalid rotate '{value}' (valid: 0, 90, 180, 270)"))?;
+    if matches!(n, 0 | 90 | 180 | 270) {
+        Ok(n)
+    } else {
+        Err(format!("invalid rotate '{n}' (valid: 0, 90, 180, 270)"))
+    }
+}
+
 /// Fast.io cloud storage CLI.
 #[derive(Parser)]
 #[command(
@@ -77,6 +111,11 @@ pub struct Cli {
 }
 
 /// Top-level command groups.
+///
+/// Some subcommand groups (e.g. `Share`, with its full create/update settings
+/// surface) are large; boxing a clap subcommand payload is non-idiomatic, and
+/// the top-level command is parsed once, so the size difference is immaterial.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 #[non_exhaustive]
 pub enum Commands {
@@ -123,40 +162,22 @@ pub enum Commands {
     /// Activity events.
     #[command(subcommand)]
     Event(EventCommands),
+    /// Per-workspace dashboard: the calling member's ranked, actionable card
+    /// feed (approvals, tasks, reviews, confirmations, @mentions, file activity,
+    /// pending signatures). Dismiss / snooze / undismiss are per-member and
+    /// out-of-band — they only hide a card from your own feed, never resolving
+    /// the underlying obligation, workflow, or signature.
+    #[command(subcommand)]
+    Dashboard(DashboardCommands),
     /// File previews.
     #[command(subcommand)]
     Preview(PreviewCommands),
     /// Organization and workspace assets.
     #[command(subcommand)]
     Asset(AssetCommands),
-    /// [legacy] Task management. Superseded by `fastio workflow`; remains
-    /// functional for now.
-    #[command(
-        subcommand,
-        long_about = "[legacy] Task management.\n\nThis is a legacy primitive, superseded by `fastio workflow`; it remains functional for now. Prefer `fastio workflow` for new work."
-    )]
+    /// Tasks API: task lists, tasks, comments, and attachments.
+    #[command(subcommand)]
     Task(TaskCommands),
-    /// [legacy] Worklog management. Superseded by `fastio workflow`; remains
-    /// functional for now.
-    #[command(
-        subcommand,
-        long_about = "[legacy] Worklog management.\n\nThis is a legacy primitive, superseded by `fastio workflow`; it remains functional for now. Prefer `fastio workflow` for new work."
-    )]
-    Worklog(WorklogCommands),
-    /// [legacy] Approval workflows. Superseded by `fastio workflow`; remains
-    /// functional for now.
-    #[command(
-        subcommand,
-        long_about = "[legacy] Approval workflows.\n\nThis is a legacy primitive, superseded by `fastio workflow`; it remains functional for now. Prefer `fastio workflow` for new work."
-    )]
-    Approval(ApprovalCommands),
-    /// [legacy] Todo items. Superseded by `fastio workflow`; remains functional
-    /// for now.
-    #[command(
-        subcommand,
-        long_about = "[legacy] Todo items.\n\nThis is a legacy primitive, superseded by `fastio workflow`; it remains functional for now. Prefer `fastio workflow` for new work."
-    )]
-    Todo(TodoCommands),
 
     /// Connected apps and integrations.
     #[command(subcommand)]
@@ -195,14 +216,36 @@ pub enum Commands {
         no_pager: bool,
     },
 
+    /// Ask a grounded "how do I…" question about Fast.io and get a
+    /// product-aware answer (or a short clarifying question) back in one call.
+    ///
+    /// Org-less and open to any authenticated user — answers are generated over
+    /// Fast.io's own how-to knowledge, so you get usage guidance without
+    /// scraping the docs. For Q&A over your OWN files, use `ripley ask`
+    /// instead; how-to answers questions about Fast.io itself.
+    #[command(visible_alias = "howto")]
+    HowTo {
+        /// The natural-language question (1–2000 characters, non-blank).
+        question: String,
+        /// Phrase the answer for a specific client: `mcp` (Fast.io MCP
+        /// consolidated tools) or `code` (execute-proxy calls for a code-mode
+        /// agent). Omit for the default REST-API phrasing.
+        #[arg(long, value_parser = ["mcp", "code"])]
+        surface: Option<String>,
+        /// Optional free-text background about your situation (what you are
+        /// trying to accomplish, what you have tried). Up to 8000 characters;
+        /// treated strictly as data, never as instructions.
+        #[arg(long)]
+        context: Option<String>,
+    },
+
     /// Metadata extraction and template management.
     #[command(subcommand)]
     Metadata(MetadataCommands),
 
     /// Workflow Orchestration (v3.2): durable multi-step runtime, templates,
     /// triggers, human obligations, signed audit, webhooks, and pools. This is
-    /// the new orchestration surface — distinct from the `[legacy]` task /
-    /// approval / todo primitives.
+    /// the orchestration surface — distinct from the Tasks API (`fastio task`).
     #[command(subcommand, visible_alias = "wf")]
     Workflow(WorkflowCommands),
 
@@ -224,10 +267,6 @@ pub enum Commands {
     #[command(subcommand)]
     Fileshare(FileshareCommands),
 
-    /// AI instructions for user / org / workspace / share profiles.
-    #[command(subcommand)]
-    Instructions(InstructionsCommands),
-
     /// System health and status checks (no auth required).
     #[command(subcommand)]
     System(SystemCommands),
@@ -235,10 +274,11 @@ pub enum Commands {
     /// Inspect Fast.io identifiers offline (no auth, no network).
     ///
     /// Classifies an `OpaqueId` by its self-describing length and type prefix
-    /// (29-char = 1-char type; 30-char workflow-family = 2-char `w` type),
-    /// mapping it to its entity type and surfacing tier. Useful when an id
-    /// arrives in a webhook, event, or payload and you need to know what it
-    /// refers to before acting on it.
+    /// (29-char = 1-char type; 30-char = 2-char type — the workflow family
+    /// under `w` plus the non-workflow Task/Comment types), mapping it to its
+    /// entity type and surfacing tier. Useful when an id arrives in a webhook,
+    /// event, or payload and you need to know what it refers to before acting
+    /// on it.
     #[command(subcommand)]
     Id(IdCommands),
 
@@ -360,6 +400,11 @@ pub enum WorkflowCommands {
         /// Bind a published template revision at create time.
         #[arg(long)]
         template_id: Option<String>,
+        /// Inline one-off workflow definition as a JSON template-body string
+        /// (or `@file.json`). Mutually exclusive with `--template-id`; the
+        /// server validates → snapshots → publishes → binds it in one call.
+        #[arg(long, conflicts_with = "template_id")]
+        definition: Option<String>,
         /// Credit budget cap for the runtime.
         #[arg(long)]
         agent_credit_cap: Option<u64>,
@@ -367,7 +412,7 @@ pub enum WorkflowCommands {
         #[arg(long)]
         visibility: Option<String>,
     },
-    /// List workflow profiles in a workspace (offset-paginated).
+    /// List workflow profiles in a workspace (offset-paginated, filterable).
     List {
         /// Workspace ID.
         workspace_id: String,
@@ -377,6 +422,25 @@ pub enum WorkflowCommands {
         /// Pagination offset.
         #[arg(long)]
         offset: Option<u32>,
+        /// Narrow to a single template's runs (exact `template_id` match).
+        #[arg(long)]
+        template_id: Option<String>,
+        /// Filter by a single lifecycle state (e.g. active, paused, completed).
+        #[arg(long)]
+        state: Option<String>,
+        /// Archived filter: true, false, or all.
+        #[arg(long, value_parser = ["true", "false", "all"])]
+        archived: Option<String>,
+        /// Only runs you manually started (sends `created_by=me`).
+        #[arg(long)]
+        created_by_me: bool,
+        /// Only runs where you hold an actionable obligation
+        /// (sends `participant=me`).
+        #[arg(long)]
+        participant_me: bool,
+        /// Per-item enrichment, a CSV of `run_summary` / `run_meta`.
+        #[arg(long)]
+        include: Option<String>,
     },
     /// Get a single workflow profile.
     Get {
@@ -443,6 +507,13 @@ pub enum WorkflowCommands {
         /// Concurrency pool key to admit this run under.
         #[arg(long)]
         pool_key: Option<String>,
+        /// Run-start file seeds as a JSON object string (or `@file.json`):
+        /// `{"<step_id>":["<node_id>",...]}` to pre-seed `wait_for_files`
+        /// steps. Keys MUST be the workflow's reminted definition step ids
+        /// (from `from-system`'s `system_gallery.step_id_map`, or `state`) —
+        /// a seed keyed by a gallery-fixed id is silently dropped.
+        #[arg(long)]
+        step_seeds: Option<String>,
     },
     /// Get the runtime state snapshot.
     State {
@@ -703,6 +774,40 @@ pub enum WorkflowStepCommands {
         /// Step occurrence ID.
         step_occurrence_id: String,
     },
+    /// Provide existing file node ids to a WAITING `wait_for_files` step (in
+    /// place; no move/copy). The step is re-evaluated. Workflow admin. 409 if
+    /// the step is not waiting / not a `wait_for_files` step; 422 over the
+    /// per-step id limit.
+    Files {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Step occurrence ID.
+        step_occurrence_id: String,
+        /// One or more existing storage-node ids to provide (repeat the flag
+        /// or pass a comma-separated list).
+        #[arg(long = "node-ids", required = true, num_args = 1.., value_delimiter = ',')]
+        node_ids: Vec<String>,
+    },
+    /// Explicitly advance a manual-completion `wait_for_files` step once the
+    /// required file count has been provided (no body; returns the updated
+    /// occurrence). Workflow admin.
+    Complete {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Step occurrence ID.
+        step_occurrence_id: String,
+    },
+    /// Reassign a waiting `task` step to a new assignee. Workflow admin or the
+    /// current assignee; the new assignee must be a workspace member.
+    Reassign {
+        /// Workflow ID.
+        workflow_id: String,
+        /// Step occurrence ID.
+        step_occurrence_id: String,
+        /// New assignee user ID (19-digit).
+        #[arg(long)]
+        new_assignee_user_id: String,
+    },
 }
 
 /// Workflow template subcommands (immutable revisions — no `update`).
@@ -729,6 +834,9 @@ pub enum WorkflowTemplateCommands {
         /// Pagination offset.
         #[arg(long)]
         offset: Option<u32>,
+        /// Usage filter: library (non-one-off), `one_off`, or all (default).
+        #[arg(long, value_parser = ["library", "one_off", "all"])]
+        usage: Option<String>,
     },
     /// Get a single revision (`--include-body` inlines the body).
     Get {
@@ -1221,10 +1329,12 @@ pub enum WorkflowRedactionCommands {
         /// Target workflow id.
         #[arg(long)]
         target_workflow_id: String,
-        /// Redaction paths as a JSON-string array (or `@file.json`).
+        /// Redaction paths as a JSON-string array (or `@file.json`). OPTIONAL —
+        /// when omitted the server derives the scope from the redactable
+        /// identifiers present in the target event.
         #[arg(long)]
-        redaction_paths: String,
-        /// Reason for the redaction.
+        redaction_paths: Option<String>,
+        /// Reason for the redaction (required).
         #[arg(long)]
         reason: String,
     },
@@ -1450,6 +1560,198 @@ pub enum WorkflowReviewCommands {
         #[arg(long)]
         offset: Option<u32>,
     },
+    /// Add an existing workspace member as a reviewer (workspace admin).
+    ReviewerAddMember {
+        /// Surface ID.
+        surface_id: String,
+        /// Workspace-member user ID to add to the roster.
+        member_user_id: String,
+        /// Mark the reviewer as required (default true on the server).
+        #[arg(long)]
+        required: Option<bool>,
+    },
+    /// Add an external (by-email) reviewer (workspace admin; extended tier only).
+    ReviewerAddExternal {
+        /// Surface ID.
+        surface_id: String,
+        /// External reviewer email (must not match a workspace member).
+        #[arg(long)]
+        email: String,
+        /// External reviewer display name.
+        #[arg(long)]
+        name: String,
+        /// Optional note shown on the account-claim invite.
+        #[arg(long)]
+        invite_notes: Option<String>,
+    },
+    /// Remove a reviewer from a surface (workspace admin; soft-remove).
+    ///
+    /// Prior decisions are preserved for audit; pending obligations and any
+    /// live link-tokens for the reviewer are revoked. Idempotent (a second
+    /// call returns a conflict).
+    ReviewerRemove {
+        /// Surface ID.
+        surface_id: String,
+        /// Reviewer ID.
+        reviewer_id: String,
+    },
+    /// Set a reviewer's per-decision notification opt-out.
+    ///
+    /// Self-service for the reviewer's own row, or any roster row for a
+    /// workspace admin. `--opt-out true` suppresses the notification sent each
+    /// time another reviewer records a decision; `false` re-enables it.
+    /// Resolved / lock-override notifications are never suppressed.
+    ReviewerNotificationOptOut {
+        /// Surface ID.
+        surface_id: String,
+        /// Reviewer ID.
+        reviewer_id: String,
+        /// Opt out of per-decision notifications (true) or opt back in (false).
+        #[arg(long, action = clap::ArgAction::Set)]
+        opt_out: bool,
+    },
+    /// Revoke an external-reviewer link-token (workspace admin).
+    ///
+    /// The authored external path no longer issues link-tokens (claimed-
+    /// external auth replaced them); this revokes a legacy/live token still
+    /// outstanding. Idempotent (a second call returns a conflict).
+    LinkTokenRevoke {
+        /// Link-token ID.
+        link_token_id: String,
+        /// Optional revoke reason (1-60 chars; default "admin").
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// List review-scoped comments for an asset.
+    CommentsList {
+        /// Asset ID.
+        asset_id: String,
+        /// Pagination limit (default 50).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Pagination offset.
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Author a review-scoped comment on an asset.
+    ///
+    /// Attachments are not supported on review comments. Caller must be on the
+    /// reviewer roster or a workspace admin.
+    CommentAdd {
+        /// Asset ID.
+        asset_id: String,
+        /// Comment body (required, non-empty).
+        #[arg(long)]
+        body: String,
+        /// Optional anchor reference as a JSON object (or `@file.json`).
+        #[arg(long)]
+        anchor_json: Option<String>,
+    },
+    /// Update a review-scoped comment's body (author, or admin moderation).
+    CommentUpdate {
+        /// Asset ID.
+        asset_id: String,
+        /// Comment ID.
+        comment_id: String,
+        /// New comment body (required, non-empty).
+        #[arg(long)]
+        body: String,
+    },
+    /// Delete a review-scoped comment (author soft-delete; admin hard-delete).
+    CommentDelete {
+        /// Asset ID.
+        asset_id: String,
+        /// Comment ID.
+        comment_id: String,
+    },
+    /// Mint a review surface from an existing workflow + approval step.
+    ///
+    /// A higher-level shortcut over `create`: mints the surface and, for every
+    /// external reviewer, provisions an account-claim invite. Supply the roster
+    /// as EITHER `--reviewer-user-ids` (members) OR `--reviewers-json` (mixed),
+    /// and the files as EITHER `--assets-json` OR `--reviewed-node-ids` +
+    /// `--version-id`. Any external reviewer requires workspace admin + the
+    /// extended tier.
+    SendForReview {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Workflow runtime ID.
+        #[arg(long)]
+        workflow: String,
+        /// Approval step occurrence ID.
+        #[arg(long)]
+        step_occurrence_id: String,
+        /// Member reviewer ids (comma-separated). Exclusive with `--reviewers-json`.
+        #[arg(long, value_delimiter = ',')]
+        reviewer_user_ids: Option<Vec<String>>,
+        /// Mixed roster as a JSON array (or `@file.json`). Exclusive with
+        /// `--reviewer-user-ids`.
+        #[arg(long)]
+        reviewers_json: Option<String>,
+        /// Reviewed assets as a JSON array of `{node_id, version_id}` (or
+        /// `@file.json`).
+        #[arg(long)]
+        assets_json: Option<String>,
+        /// Reviewed node ids (comma-separated), paired with `--version-id`.
+        #[arg(long, value_delimiter = ',')]
+        reviewed_node_ids: Option<Vec<String>>,
+        /// Single version id applied to every `--reviewed-node-ids` entry.
+        #[arg(long)]
+        version_id: Option<String>,
+        /// Approval policy mode (default single).
+        #[arg(long)]
+        policy_mode: Option<String>,
+        /// Quorum threshold (required when `--policy-mode quorum`).
+        #[arg(long)]
+        policy_quorum_n: Option<i64>,
+        /// Reviewer deadline (UTC "Y-m-d H:i:s").
+        #[arg(long)]
+        deadline_at: Option<String>,
+        /// Reviewer-facing request note.
+        #[arg(long)]
+        message: Option<String>,
+        /// Note shown on external-reviewer claim invites.
+        #[arg(long)]
+        external_invite_notes: Option<String>,
+    },
+    /// "Request approval" quick path — single-file in-place approval.
+    ///
+    /// One call provisions a private file share for the reviewers and starts a
+    /// single-step in-place approval run on one file. Supply the roster as
+    /// EITHER `--reviewer-user-ids` (members) OR `--reviewers-json` (mixed). The
+    /// surface is minted lazily, so the response `surface_id` is typically null
+    /// — poll the run at the returned `poll` path. REST-only (no MCP action).
+    QuickApproval {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// File node ID to request approval on.
+        #[arg(long)]
+        node_id: String,
+        /// Idempotency key (required; 1-128 chars; keys the run + dedup).
+        #[arg(long)]
+        idempotency_key: String,
+        /// Member reviewer ids (comma-separated). Exclusive with `--reviewers-json`.
+        #[arg(long, value_delimiter = ',')]
+        reviewer_user_ids: Option<Vec<String>>,
+        /// Mixed roster as a JSON array (or `@file.json`). Exclusive with
+        /// `--reviewer-user-ids`.
+        #[arg(long)]
+        reviewers_json: Option<String>,
+        /// Approval policy mode (default single; non-single requires extended tier).
+        #[arg(long)]
+        policy_mode: Option<String>,
+        /// Quorum threshold (required when `--policy-mode quorum`).
+        #[arg(long)]
+        policy_quorum_n: Option<i64>,
+        /// Approval SLA in seconds (60-7,776,000).
+        #[arg(long)]
+        approval_timeout_seconds: Option<i64>,
+        /// Reviewer-facing request note (shown in the request email).
+        #[arg(long)]
+        message: Option<String>,
+    },
 }
 
 // ─── Sign (E-Signature) ────────────────────────────────────────────────────────
@@ -1632,6 +1934,34 @@ pub enum SignEnvelopeCommands {
         /// Skip the interactive confirmation prompt.
         #[arg(long)]
         yes: bool,
+    },
+    /// Re-drive a STUCK envelope through self-healing recovery (admin).
+    ///
+    /// Idempotent with no-op success — re-driving a non-stuck or already-terminal
+    /// envelope succeeds without side effects. A permanent signing-pipeline
+    /// failure cascades the envelope to the terminal Failed state. Takes no body
+    /// and notifies no one, so no confirmation is required.
+    Retry {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Envelope ID.
+        envelope_id: String,
+    },
+    /// Mint YOUR (the calling member's) signing link for an envelope.
+    ///
+    /// The primary action for a dashboard `signature` card — the `envelope_id`
+    /// is the card's `target.id`. The response is structured: `sign_url` is
+    /// non-null only when you can sign now; `is_terminal` means the envelope is
+    /// completed/void/declined; `reauth_required` means re-authenticate first;
+    /// otherwise you are blocked by routing order (see `blocked_signers`).
+    /// Requires a write-scope token (a read-only token is rejected).
+    MySignLink {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Envelope ID (from a signature card's `target.id`).
+        envelope_id: String,
     },
 }
 
@@ -2128,8 +2458,15 @@ pub enum AuthCommands {
         #[arg(long)]
         password: Option<String>,
     },
-    /// Clear stored credentials for the current profile.
+    /// Clear stored credentials for the current profile (local only).
     Logout,
+    /// Sign out server-side: invalidate every revocable (browser) session token,
+    /// then clear local credentials.
+    Signout,
+    /// Invalidate ALL of your login sessions everywhere (strict superset of
+    /// sign-out), then clear local credentials.
+    #[command(name = "invalidate-all")]
+    InvalidateAll,
     /// Show current authentication status.
     Status,
     /// Create a new Fast.io account.
@@ -2146,6 +2483,10 @@ pub enum AuthCommands {
         /// Last name.
         #[arg(long)]
         last_name: Option<String>,
+        /// Create an AI-agent account (sets `account_type` to "agent"
+        /// permanently).
+        #[arg(long)]
+        agent: bool,
     },
     /// Send or confirm email verification.
     Verify {
@@ -2204,7 +2545,12 @@ pub enum AuthCommands {
 }
 
 /// 2FA subcommands.
-#[derive(Subcommand, Debug)]
+///
+/// `Debug` is implemented manually (see `impl fmt::Debug for TwoFaCommands`) so
+/// the one-time `token` / `code` auth secrets carried by `Disable`, `Verify`,
+/// and `VerifySetup` are redacted — including through the `AuthCommands` Debug
+/// tree, which delegates to this impl.
+#[derive(Subcommand)]
 #[non_exhaustive]
 pub enum TwoFaCommands {
     /// Enable 2FA on a channel (sms, totp, whatsapp).
@@ -2254,6 +2600,14 @@ pub enum ApiKeyCommands {
         /// Scopes as a JSON array string.
         #[arg(long)]
         scopes: Option<String>,
+        /// Agent or application name for tracking (max 128 chars).
+        #[arg(long = "agent-name")]
+        agent_name: Option<String>,
+        /// Expiration datetime (strtotime-compatible, e.g.
+        /// "2026-12-31 23:59:59 UTC"); must be in the future. Omit for no
+        /// expiration.
+        #[arg(long)]
+        expires: Option<String>,
     },
     /// List all API keys.
     List,
@@ -2278,6 +2632,13 @@ pub enum ApiKeyCommands {
         /// New scopes.
         #[arg(long)]
         scopes: Option<String>,
+        /// New agent or application name (max 128 chars; empty string clears).
+        #[arg(long = "agent-name")]
+        agent_name: Option<String>,
+        /// New expiration datetime (strtotime-compatible); empty string clears
+        /// an existing expiration.
+        #[arg(long)]
+        expires: Option<String>,
     },
 }
 
@@ -2292,6 +2653,17 @@ pub enum OauthCommands {
         /// Session ID.
         session_id: String,
     },
+    /// Rename a session's display labels (device name and/or agent name).
+    Rename {
+        /// Session ID.
+        session_id: String,
+        /// New device name (max 128 chars; empty string clears to null).
+        #[arg(long = "device-name")]
+        device_name: Option<String>,
+        /// New agent name (max 128 chars; empty string clears to null).
+        #[arg(long = "agent-name")]
+        agent_name: Option<String>,
+    },
     /// Revoke a single session.
     Revoke {
         /// Session ID.
@@ -2299,18 +2671,27 @@ pub enum OauthCommands {
     },
     /// Revoke all sessions.
     #[command(name = "revoke-all")]
-    RevokeAll,
+    RevokeAll {
+        /// Keep this session active while revoking all others (pass the session
+        /// ID to preserve, e.g. your current session).
+        #[arg(long = "exclude-current")]
+        exclude_current: Option<String>,
+    },
 }
 
 // ─── User ────────────────────────────────────────────────────────────────────
 
 /// User subcommands.
-#[derive(Subcommand, Debug)]
+///
+/// `Debug` is implemented manually (not derived) so the password-change
+/// `password` / `current_password` fields on `Update` are never rendered
+/// verbatim through the `Cli` Debug tree (CLAUDE.md coding-standard #9).
+#[derive(Subcommand)]
 #[non_exhaustive]
 pub enum UserCommands {
     /// Get current user profile.
     Info,
-    /// Update user profile.
+    /// Update user profile. Supports name, phone, and password changes.
     Update {
         /// First name.
         #[arg(long)]
@@ -2321,7 +2702,25 @@ pub enum UserCommands {
         /// Display name.
         #[arg(long)]
         display_name: Option<String>,
+        /// Numeric phone country code, e.g. "1" for US (requires 2FA disabled;
+        /// send with --phone-number).
+        #[arg(long = "phone-country")]
+        phone_country: Option<String>,
+        /// Numeric phone number (requires 2FA disabled; send with
+        /// --phone-country).
+        #[arg(long = "phone-number")]
+        phone_number: Option<String>,
+        /// New password (requires --current-password if the account already
+        /// has one).
+        #[arg(long)]
+        password: Option<String>,
+        /// Current password, required to change the password.
+        #[arg(long = "current-password")]
+        current_password: Option<String>,
     },
+    /// Change the account email address (request + confirm).
+    #[command(subcommand, name = "email-change")]
+    EmailChange(UserEmailChangeCommands),
     /// Manage user avatar.
     #[command(subcommand)]
     Avatar(UserAvatarCommands),
@@ -2374,6 +2773,33 @@ pub enum UserCommands {
         /// Phone number (e.g. "5551234567").
         #[arg(long)]
         phone_number: String,
+    },
+}
+
+/// Email-change subcommands.
+///
+/// `Debug` is implemented manually (not derived) so the `current_password`
+/// proof and the one-time confirmation `token` are never rendered verbatim
+/// through the `Cli` Debug tree (CLAUDE.md coding-standard #9).
+#[derive(Subcommand)]
+#[non_exhaustive]
+pub enum UserEmailChangeCommands {
+    /// Request an email-address change. Sends a confirmation link to the new
+    /// address; the change applies only after `confirm`.
+    Request {
+        /// New email address.
+        #[arg(long = "new-email")]
+        new_email: String,
+        /// Current password (required if the account already has one).
+        #[arg(long = "current-password")]
+        current_password: Option<String>,
+    },
+    /// Confirm a pending email-address change with the token from the
+    /// confirmation link.
+    Confirm {
+        /// The one-time confirmation token.
+        #[arg(long)]
+        token: String,
     },
 }
 
@@ -2465,7 +2891,15 @@ pub enum UserSettingsCommands {
 // ─── Org ─────────────────────────────────────────────────────────────────────
 
 /// Organization subcommands.
-#[derive(Subcommand, Debug)]
+///
+/// `Update` carries the full documented org-settings surface, so that variant
+/// is large; boxing a clap subcommand payload is non-idiomatic here.
+///
+/// `Debug` is implemented manually (not derived) so the `transfer-claim` bearer
+/// `token` (a capability that grants org-ownership claim) is never rendered
+/// verbatim through the `Cli` Debug tree (CLAUDE.md coding-standard #9).
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
 #[non_exhaustive]
 pub enum OrgCommands {
     /// List your organizations.
@@ -2503,13 +2937,13 @@ pub enum OrgCommands {
     Update {
         /// Organization ID.
         org_id: String,
-        /// New display name.
+        /// New display name (pass `null` to clear).
         #[arg(long)]
         name: Option<String>,
         /// New domain.
         #[arg(long)]
         domain: Option<String>,
-        /// New description.
+        /// New description (pass `null` or empty to clear).
         #[arg(long)]
         description: Option<String>,
         /// New industry.
@@ -2521,6 +2955,39 @@ pub enum OrgCommands {
         /// Homepage URL.
         #[arg(long)]
         homepage_url: Option<String>,
+        /// Brand accent color as a JSON string (pass `null` to clear).
+        #[arg(long)]
+        accent_color: Option<String>,
+        /// Background color as a JSON string (pass `null` to clear).
+        #[arg(long)]
+        background_color: Option<String>,
+        /// Background display mode.
+        #[arg(long)]
+        background_mode: Option<String>,
+        /// Enable or disable the brand background.
+        #[arg(long)]
+        use_background: Option<bool>,
+        /// Facebook profile URL.
+        #[arg(long)]
+        facebook_url: Option<String>,
+        /// Twitter/X profile URL.
+        #[arg(long)]
+        twitter_url: Option<String>,
+        /// Instagram profile URL.
+        #[arg(long)]
+        instagram_url: Option<String>,
+        /// `YouTube` channel URL.
+        #[arg(long)]
+        youtube_url: Option<String>,
+        /// Member-management permission level.
+        #[arg(long)]
+        perm_member_manage: Option<String>,
+        /// Authorized email domain for auto-join.
+        #[arg(long)]
+        perm_authorized_domains: Option<String>,
+        /// Custom owner-defined properties as a JSON string (`null` clears).
+        #[arg(long)]
+        owner_defined: Option<String>,
     },
     /// Delete (close) an organization. Permanent and irreversible.
     Delete {
@@ -2654,7 +3121,187 @@ pub enum OrgCommands {
         /// Description.
         #[arg(long)]
         description: Option<String>,
+        /// Join permission (server has no default).
+        #[arg(
+            long,
+            default_value = "Member or above",
+            value_parser = ["Member or above", "Admin or above", "Only Org Owners"],
+        )]
+        perm_join: String,
+        /// Member-management permission (server has no default).
+        #[arg(
+            long,
+            default_value = "Admin or above",
+            value_parser = ["Member or above", "Admin or above"],
+        )]
+        perm_member_manage: String,
+        /// Enable AI intelligence (indexing) on the new workspace.
+        #[arg(long)]
+        intelligence: bool,
+        /// Enable workflow features on the new workspace.
+        #[arg(long)]
+        workflow: bool,
     },
+}
+
+impl fmt::Debug for OrgCommands {
+    #[allow(clippy::too_many_lines)] // a flat field-by-field render over every variant
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::List { limit, offset } => f
+                .debug_struct("List")
+                .field("limit", limit)
+                .field("offset", offset)
+                .finish(),
+            Self::Create {
+                name,
+                domain,
+                description,
+                industry,
+                billing_email,
+            } => f
+                .debug_struct("Create")
+                .field("name", name)
+                .field("domain", domain)
+                .field("description", description)
+                .field("industry", industry)
+                .field("billing_email", billing_email)
+                .finish(),
+            Self::Info { org_id } => f.debug_struct("Info").field("org_id", org_id).finish(),
+            Self::Update {
+                org_id,
+                name,
+                domain,
+                description,
+                industry,
+                billing_email,
+                homepage_url,
+                accent_color,
+                background_color,
+                background_mode,
+                use_background,
+                facebook_url,
+                twitter_url,
+                instagram_url,
+                youtube_url,
+                perm_member_manage,
+                perm_authorized_domains,
+                owner_defined,
+            } => f
+                .debug_struct("Update")
+                .field("org_id", org_id)
+                .field("name", name)
+                .field("domain", domain)
+                .field("description", description)
+                .field("industry", industry)
+                .field("billing_email", billing_email)
+                .field("homepage_url", homepage_url)
+                .field("accent_color", accent_color)
+                .field("background_color", background_color)
+                .field("background_mode", background_mode)
+                .field("use_background", use_background)
+                .field("facebook_url", facebook_url)
+                .field("twitter_url", twitter_url)
+                .field("instagram_url", instagram_url)
+                .field("youtube_url", youtube_url)
+                .field("perm_member_manage", perm_member_manage)
+                .field("perm_authorized_domains", perm_authorized_domains)
+                .field("owner_defined", owner_defined)
+                .finish(),
+            Self::Delete { org_id, confirm } => f
+                .debug_struct("Delete")
+                .field("org_id", org_id)
+                .field("confirm", confirm)
+                .finish(),
+            Self::Billing(c) => f.debug_tuple("Billing").field(c).finish(),
+            Self::Members(c) => f.debug_tuple("Members").field(c).finish(),
+            Self::Transfer {
+                org_id,
+                new_owner_id,
+            } => f
+                .debug_struct("Transfer")
+                .field("org_id", org_id)
+                .field("new_owner_id", new_owner_id)
+                .finish(),
+            Self::Discover { limit, offset } => f
+                .debug_struct("Discover")
+                .field("limit", limit)
+                .field("offset", offset)
+                .finish(),
+            Self::PublicDetails { org_id } => f
+                .debug_struct("PublicDetails")
+                .field("org_id", org_id)
+                .finish(),
+            Self::Limits { org_id } => f.debug_struct("Limits").field("org_id", org_id).finish(),
+            Self::Invitations(c) => f.debug_tuple("Invitations").field(c).finish(),
+            Self::TransferToken(c) => f.debug_tuple("TransferToken").field(c).finish(),
+            // Redact the bearer transfer-claim token (CLAUDE.md #9).
+            Self::TransferClaim { token: _ } => f
+                .debug_struct("TransferClaim")
+                .field("token", &format_args!("<redacted>"))
+                .finish(),
+            Self::DiscoverAll { limit, offset } => f
+                .debug_struct("DiscoverAll")
+                .field("limit", limit)
+                .field("offset", offset)
+                .finish(),
+            Self::DiscoverAvailable { limit, offset } => f
+                .debug_struct("DiscoverAvailable")
+                .field("limit", limit)
+                .field("offset", offset)
+                .finish(),
+            Self::DiscoverCheckDomain { domain } => f
+                .debug_struct("DiscoverCheckDomain")
+                .field("domain", domain)
+                .finish(),
+            Self::DiscoverExternal { limit, offset } => f
+                .debug_struct("DiscoverExternal")
+                .field("limit", limit)
+                .field("offset", offset)
+                .finish(),
+            Self::Workspaces {
+                org_id,
+                limit,
+                offset,
+            } => f
+                .debug_struct("Workspaces")
+                .field("org_id", org_id)
+                .field("limit", limit)
+                .field("offset", offset)
+                .finish(),
+            Self::Shares {
+                org_id,
+                limit,
+                offset,
+            } => f
+                .debug_struct("Shares")
+                .field("org_id", org_id)
+                .field("limit", limit)
+                .field("offset", offset)
+                .finish(),
+            Self::OrgAsset(c) => f.debug_tuple("OrgAsset").field(c).finish(),
+            Self::CreateWorkspace {
+                org_id,
+                name,
+                folder_name,
+                description,
+                perm_join,
+                perm_member_manage,
+                intelligence,
+                workflow,
+            } => f
+                .debug_struct("CreateWorkspace")
+                .field("org_id", org_id)
+                .field("name", name)
+                .field("folder_name", folder_name)
+                .field("description", description)
+                .field("perm_join", perm_join)
+                .field("perm_member_manage", perm_member_manage)
+                .field("intelligence", intelligence)
+                .field("workflow", workflow)
+                .finish(),
+        }
+    }
 }
 
 /// Org billing subcommands.
@@ -2784,7 +3431,7 @@ pub enum OrgMembersCommands {
         org_id: String,
         /// Email address to invite.
         email: String,
-        /// Role: admin, member, or guest.
+        /// Role: admin or member.
         #[arg(long)]
         role: Option<String>,
     },
@@ -2802,7 +3449,7 @@ pub enum OrgMembersCommands {
         org_id: String,
         /// Member user ID to update.
         member_id: String,
-        /// New role: admin, member, or guest.
+        /// New role: admin or member.
         role: String,
     },
     /// Get member details.
@@ -2851,7 +3498,7 @@ pub enum OrgInvitationsCommands {
         /// New state.
         #[arg(long)]
         state: Option<String>,
-        /// New role.
+        /// New role: admin or member.
         #[arg(long)]
         role: Option<String>,
     },
@@ -2957,10 +3604,10 @@ pub enum WorkspaceCommands {
     Update {
         /// Workspace ID.
         workspace_id: String,
-        /// New display name.
+        /// New display name (pass `null` to clear).
         #[arg(long)]
         name: Option<String>,
-        /// New description.
+        /// New description (pass `null` or empty to clear).
         #[arg(long)]
         description: Option<String>,
         /// New folder name.
@@ -2971,6 +3618,33 @@ pub enum WorkspaceCommands {
         /// embeddings and re-enabling re-indexes (costs AI credits).
         #[arg(long)]
         intelligence: Option<bool>,
+        /// Who can self-join the workspace (permission phrase).
+        #[arg(long)]
+        perm_join: Option<String>,
+        /// Who can manage members (permission phrase).
+        #[arg(long)]
+        perm_member_manage: Option<String>,
+        /// Toggle AI obligation-summary enrichment.
+        #[arg(long)]
+        nl_summaries_enabled: Option<bool>,
+        /// AI enrichment daily cap (0-100000).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(0..=100_000))]
+        nl_summaries_daily_cap: Option<u32>,
+        /// Native workflow-review rollout tier (`null`/empty clears to disabled).
+        #[arg(long, value_parser = ["disabled", "mvs", "extended"])]
+        workflow_approval_native_enabled: Option<String>,
+        /// Brand accent color as a JSON string (pass `null` to clear).
+        #[arg(long)]
+        accent_color: Option<String>,
+        /// Primary background color as a JSON string (pass `null` to clear).
+        #[arg(long)]
+        background_color1: Option<String>,
+        /// Secondary background color as a JSON string (pass `null` to clear).
+        #[arg(long)]
+        background_color2: Option<String>,
+        /// Custom owner-defined properties as a JSON string (`null` clears).
+        #[arg(long)]
+        owner_defined: Option<String>,
     },
     /// Delete a workspace. Permanent and irreversible.
     Delete {
@@ -2980,17 +3654,15 @@ pub enum WorkspaceCommands {
         #[arg(long)]
         confirm: String,
     },
-    /// Enable the legacy workflow feature (tasks/worklogs/approvals/todos) on a
-    /// workspace. Does not affect AI indexing — use `workspace update
-    /// --intelligence` for that.
+    /// Enable the Tasks API on a workspace. Does not affect AI indexing — use
+    /// `workspace update --intelligence` for that.
     #[command(name = "enable-workflow")]
     EnableWorkflow {
         /// Workspace ID.
         workspace_id: String,
     },
-    /// Disable the legacy workflow feature on a workspace. Existing
-    /// tasks/worklogs/approvals/todos are preserved but inaccessible until
-    /// re-enabled.
+    /// Disable the Tasks API on a workspace. Existing task lists and tasks are
+    /// preserved but inaccessible until re-enabled.
     #[command(name = "disable-workflow")]
     DisableWorkflow {
         /// Workspace ID.
@@ -3182,6 +3854,10 @@ pub enum FilesCommands {
         /// Parent folder node ID (defaults to root).
         #[arg(long)]
         parent: Option<String>,
+        /// Always create a new folder (auto-renamed on a name collision)
+        /// instead of returning an existing same-named folder.
+        #[arg(long)]
+        force: bool,
     },
     /// Move a file or folder to another location.
     Move {
@@ -3214,6 +3890,57 @@ pub enum FilesCommands {
         node_id: String,
         /// New name.
         new_name: String,
+    },
+    /// Update a file or folder: rename, replace content, or set metadata
+    /// title/short overrides. At least one field must be provided.
+    Update {
+        /// Workspace ID (omit when targeting a share).
+        #[arg(long, required_unless_present = "share", conflicts_with = "share")]
+        workspace: Option<String>,
+        /// Share ID (alternative storage context to --workspace).
+        #[arg(long)]
+        share: Option<String>,
+        /// Node ID to update.
+        node_id: String,
+        /// New name.
+        #[arg(long)]
+        name: Option<String>,
+        /// JSON-encoded content source (same shape as add-file's `from`),
+        /// e.g. `{"type":"upload","upload":{"id":"<id>"}}`. Replacing content
+        /// creates a new version.
+        #[arg(long)]
+        from: Option<String>,
+        /// Custom title override (max 50 chars; pass `null` to clear).
+        #[arg(long)]
+        metadata_title: Option<String>,
+        /// Custom short description override (max 2048 chars; `null` clears).
+        #[arg(long)]
+        metadata_short: Option<String>,
+    },
+    /// Add a file to a folder from a completed upload or by content hash.
+    #[command(name = "add-file")]
+    AddFile {
+        /// Workspace ID (omit when targeting a share).
+        #[arg(long, required_unless_present = "share", conflicts_with = "share")]
+        workspace: Option<String>,
+        /// Share ID (alternative storage context to --workspace).
+        #[arg(long)]
+        share: Option<String>,
+        /// Filename for the new node.
+        name: String,
+        /// Parent folder node ID (defaults to root).
+        #[arg(long)]
+        parent: Option<String>,
+        /// Completed upload session ID to attach (mutually exclusive with --hash).
+        #[arg(long, conflicts_with_all = ["hash", "hash_type"])]
+        upload_id: Option<String>,
+        /// Content hash to deduplicate against (requires --hash-type).
+        /// Share context only — not supported with --workspace (use --upload-id there).
+        #[arg(long, requires = "hash_type")]
+        hash: Option<String>,
+        /// Hash algorithm for --hash.
+        #[arg(long, value_parser = ["md5", "sha1", "sha256", "sha384"], requires = "hash")]
+        hash_type: Option<String>,
     },
     /// Delete a file or folder (move to trash).
     Delete {
@@ -3310,6 +4037,9 @@ pub enum FilesCommands {
         /// Cursor for next page of results.
         #[arg(long)]
         cursor: Option<String>,
+        /// Filter by node type.
+        #[arg(long = "type", value_parser = ["file", "folder", "link", "note"])]
+        node_type: Option<String>,
     },
     /// Add a share link to a folder.
     #[command(name = "add-link")]
@@ -3358,7 +4088,11 @@ pub enum FilesCommands {
 }
 
 /// File lock subcommands.
-#[derive(Subcommand, Debug)]
+///
+/// `Debug` is implemented manually (not derived) so the capability `lock_token`
+/// and the free-form `client_info` are never rendered verbatim through the
+/// `Cli` Debug tree (CLAUDE.md coding-standard #9).
+#[derive(Subcommand)]
 #[non_exhaustive]
 pub enum FileLockCommands {
     /// Acquire a file lock.
@@ -3368,6 +4102,13 @@ pub enum FileLockCommands {
         workspace: String,
         /// Node ID.
         node_id: String,
+        /// Lock duration in seconds (60-3600).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(60..=3600))]
+        duration: Option<u32>,
+        /// Client metadata as a JSON object, e.g.
+        /// `{"device_name":"…","client_version":"…"}`.
+        #[arg(long)]
+        client_info: Option<String>,
     },
     /// Check lock status.
     Status {
@@ -3388,6 +4129,48 @@ pub enum FileLockCommands {
         #[arg(long)]
         lock_token: String,
     },
+}
+
+impl fmt::Debug for FileLockCommands {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Render an Option<client_info> as a redacted marker, preserving only
+        // whether a value was present.
+        fn ci(c: Option<&String>) -> &'static str {
+            match c {
+                Some(_) => "Some(<redacted>)",
+                None => "None",
+            }
+        }
+        match self {
+            Self::Acquire {
+                workspace,
+                node_id,
+                duration,
+                client_info,
+            } => f
+                .debug_struct("Acquire")
+                .field("workspace", workspace)
+                .field("node_id", node_id)
+                .field("duration", duration)
+                .field("client_info", &format_args!("{}", ci(client_info.as_ref())))
+                .finish(),
+            Self::Status { workspace, node_id } => f
+                .debug_struct("Status")
+                .field("workspace", workspace)
+                .field("node_id", node_id)
+                .finish(),
+            Self::Release {
+                workspace,
+                node_id,
+                lock_token: _,
+            } => f
+                .debug_struct("Release")
+                .field("workspace", workspace)
+                .field("node_id", node_id)
+                .field("lock_token", &format_args!("<redacted>"))
+                .finish(),
+        }
+    }
 }
 
 // ─── Upload ─────────────────────────────────────────────────────────────────
@@ -3429,9 +4212,12 @@ pub enum UploadCommands {
     },
     /// Upload text content as a file.
     Text {
-        /// Workspace ID.
+        /// Workspace ID (omit when targeting a share).
+        #[arg(long, required_unless_present = "share", conflicts_with = "share")]
+        workspace: Option<String>,
+        /// Share ID to upload into (alternative to --workspace).
         #[arg(long)]
-        workspace: String,
+        share: Option<String>,
         /// Filename for the uploaded file.
         #[arg(long)]
         name: String,
@@ -3458,9 +4244,12 @@ pub enum UploadCommands {
     /// Create an upload session manually.
     #[command(name = "create-session")]
     CreateSession {
-        /// Workspace ID.
+        /// Workspace ID (omit when targeting a share).
+        #[arg(long, required_unless_present = "share", conflicts_with = "share")]
+        workspace: Option<String>,
+        /// Share ID to upload into (alternative to --workspace).
         #[arg(long)]
-        workspace: String,
+        share: Option<String>,
         /// Filename.
         filename: String,
         /// File size in bytes.
@@ -3515,7 +4304,29 @@ pub enum UploadCommands {
     },
     /// List web imports.
     #[command(name = "web-list")]
-    WebList,
+    WebList {
+        /// Maximum number of jobs to return.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Offset for pagination.
+        #[arg(long)]
+        offset: Option<u32>,
+        /// Filter by job status (the server validates against this exact set;
+        /// upload.txt). Spelling is `canceled` (single `l`).
+        #[arg(
+            long,
+            value_parser = [
+                "pending",
+                "queued",
+                "downloading",
+                "uploading",
+                "complete",
+                "failed",
+                "canceled",
+            ]
+        )]
+        status: Option<String>,
+    },
     /// Cancel a web import.
     #[command(name = "web-cancel")]
     WebCancel {
@@ -3528,15 +4339,40 @@ pub enum UploadCommands {
         /// Upload ID.
         upload_id: String,
     },
-    /// Get upload limits.
-    Limits,
+    /// Get upload limits (optionally resolved in a target context).
+    Limits {
+        /// Limit-resolution action context: create or update.
+        #[arg(long, value_parser = ["create", "update"])]
+        action: Option<String>,
+        /// Organization ID for limit resolution (used when no --action).
+        #[arg(long)]
+        org: Option<String>,
+        /// Target workspace or share ID (required when --action is create or update).
+        #[arg(long)]
+        instance_id: Option<String>,
+        /// Target folder `OpaqueId` or `root`.
+        #[arg(long)]
+        folder_id: Option<String>,
+        /// File ID for update context (required when --action update, alongside --instance-id).
+        #[arg(long)]
+        file_id: Option<String>,
+    },
+    /// List supported upload hash algorithms.
+    Algos,
     /// Get restricted file extensions.
-    Extensions,
+    Extensions {
+        /// Plan whose extension limits to return (defaults to the caller's plan).
+        #[arg(long)]
+        plan: Option<String>,
+    },
     /// Upload a file via streaming (no exact size required upfront).
     Stream {
-        /// Workspace ID.
+        /// Workspace ID (omit when targeting a share).
+        #[arg(long, required_unless_present = "share", conflicts_with = "share")]
+        workspace: Option<String>,
+        /// Share ID to upload into (alternative to --workspace).
         #[arg(long)]
-        workspace: String,
+        share: Option<String>,
         /// Path to the local file (use - for stdin).
         file_path: String,
         /// Destination folder node ID (defaults to root).
@@ -3558,9 +4394,12 @@ pub enum UploadCommands {
     /// Create a streaming upload session manually.
     #[command(name = "create-stream-session")]
     CreateStreamSession {
-        /// Workspace ID.
+        /// Workspace ID (omit when targeting a share).
+        #[arg(long, required_unless_present = "share", conflicts_with = "share")]
+        workspace: Option<String>,
+        /// Share ID to upload into (alternative to --workspace).
         #[arg(long)]
-        workspace: String,
+        share: Option<String>,
         /// Filename.
         filename: String,
         /// Destination folder node ID (defaults to root).
@@ -3597,20 +4436,29 @@ pub enum UploadCommands {
 pub enum DownloadCommands {
     /// Download a single file.
     File {
-        /// Workspace ID.
+        /// Workspace ID (omit when downloading via a share).
+        #[arg(long, required_unless_present = "share", conflicts_with = "share")]
+        workspace: Option<String>,
+        /// Share ID to download through (alternative to --workspace).
         #[arg(long)]
-        workspace: String,
+        share: Option<String>,
         /// Node ID of the file to download.
         node_id: String,
         /// Output file path (auto-determined if omitted).
         #[arg(long, short)]
         output: Option<String>,
+        /// Download a specific version (version `OpaqueId`) instead of the latest.
+        #[arg(long)]
+        version: Option<String>,
     },
     /// Download a folder as a ZIP archive.
     Folder {
-        /// Workspace ID.
+        /// Workspace ID (omit when downloading via a share).
+        #[arg(long, required_unless_present = "share", conflicts_with = "share")]
+        workspace: Option<String>,
+        /// Share ID to download through (alternative to --workspace).
         #[arg(long)]
-        workspace: String,
+        share: Option<String>,
         /// Node ID of the folder to download.
         node_id: String,
         /// Output file path (auto-determined if omitted).
@@ -3633,7 +4481,15 @@ pub enum DownloadCommands {
 // ─── Share ──────────────────────────────────────────────────────────────────
 
 /// Share subcommands.
-#[derive(Subcommand, Debug)]
+///
+/// `Create`/`Update` carry the full documented share-settings surface, so those
+/// variants are large; boxing a clap subcommand payload is non-idiomatic here.
+///
+/// `Debug` is implemented MANUALLY (not derived) so plaintext `--password`
+/// values on `Create`/`Update`/`PasswordAuth` can never leak into a debug
+/// rendering (see the `impl fmt::Debug for ShareCommands` below).
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
 #[non_exhaustive]
 pub enum ShareCommands {
     /// List all shares.
@@ -3647,29 +4503,95 @@ pub enum ShareCommands {
     },
     /// Create a new share.
     Create {
-        /// Share name/title.
+        /// Share display title (2-80 chars).
         name: String,
         /// Workspace ID to create the share in.
         #[arg(long)]
         workspace: String,
-        /// Share description.
+        /// Share direction type (default: exchange). Note: the default
+        /// `independent` storage mode always uses a Send portal regardless;
+        /// the documented `exchange` default applies with
+        /// `--storage-mode workspace_folder`.
+        #[arg(long, value_parser = ["send", "receive", "exchange"])]
+        share_type: Option<String>,
+        /// Share description (10-500 chars).
         #[arg(long)]
         description: Option<String>,
         /// Access options.
         #[arg(long)]
         access_options: Option<String>,
-        /// Password for share access.
+        /// Who can manage invitations: owners or guests.
+        #[arg(long, value_parser = ["owners", "guests"])]
+        invite: Option<String>,
+        /// Storage mode: independent (portal, default) or `workspace_folder`.
+        #[arg(long, value_parser = ["independent", "workspace_folder"])]
+        storage_mode: Option<String>,
+        /// Backing workspace folder opaque ID (`workspace_folder` mode).
+        #[arg(long)]
+        folder_node_id: Option<String>,
+        /// Create a new backing folder (`workspace_folder` mode, with --folder-name).
+        #[arg(long)]
+        create_folder: Option<bool>,
+        /// Name for the new backing folder (with --create-folder).
+        #[arg(long)]
+        folder_name: Option<String>,
+        /// URL-friendly custom name (auto-generated when omitted).
+        #[arg(long)]
+        custom_name: Option<String>,
+        /// Password for share access (Send + 'Anyone with the link' only).
         #[arg(long)]
         password: Option<String>,
+        /// Expiration datetime "YYYY-MM-DD HH:MM:SS" (portal mode only).
+        #[arg(long)]
+        expires: Option<String>,
+        /// Notification preference.
+        #[arg(long, value_parser = ["never", "notify_on_file_received", "notify_on_file_sent_or_received"])]
+        notify: Option<String>,
+        /// Enable comments.
+        #[arg(long)]
+        comments_enabled: Option<bool>,
+        /// Enable guest AI chat.
+        #[arg(long)]
+        guest_chat_enabled: Option<bool>,
+        /// Visual display mode: grid or list.
+        #[arg(long, value_parser = ["grid", "list"])]
+        display_type: Option<String>,
+        /// Workspace visual style.
+        #[arg(long)]
+        workspace_style: Option<String>,
         /// Enable anonymous uploads.
         #[arg(long)]
         anonymous_uploads: Option<bool>,
-        /// Enable AI intelligence features.
+        /// Enable AI intelligence features (default: false).
         #[arg(long)]
         intelligence: Option<bool>,
         /// Download security level (high, medium, or off).
         #[arg(long, value_parser = ["high", "medium", "off"])]
         download_security: Option<String>,
+        /// Accent color (JSON color object).
+        #[arg(long)]
+        accent_color: Option<String>,
+        /// Primary background color (JSON color object).
+        #[arg(long)]
+        background_color1: Option<String>,
+        /// Secondary background color (JSON color object).
+        #[arg(long)]
+        background_color2: Option<String>,
+        /// Background image selection (numeric).
+        #[arg(long)]
+        background_image: Option<i64>,
+        /// Custom link #1 (JSON link object).
+        #[arg(long)]
+        link_1: Option<String>,
+        /// Custom link #2 (JSON link object).
+        #[arg(long)]
+        link_2: Option<String>,
+        /// Custom link #3 (JSON link object).
+        #[arg(long)]
+        link_3: Option<String>,
+        /// Custom owner-defined properties (JSON or "null").
+        #[arg(long)]
+        owner_defined: Option<String>,
     },
     /// Get share details.
     Info {
@@ -3680,27 +4602,88 @@ pub enum ShareCommands {
     Update {
         /// Share ID.
         share_id: String,
-        /// New name.
+        /// New share display name.
         #[arg(long)]
         name: Option<String>,
-        /// New description.
+        /// New display title (2-80 chars), or "null" to clear.
+        #[arg(long)]
+        title: Option<String>,
+        /// New URL-friendly custom name, or "null" to clear.
+        #[arg(long)]
+        custom_name: Option<String>,
+        /// New description, or "null"/"" to clear.
         #[arg(long)]
         description: Option<String>,
+        /// Share direction type.
+        #[arg(long, value_parser = ["send", "receive", "exchange"])]
+        share_type: Option<String>,
         /// New access options.
         #[arg(long)]
         access_options: Option<String>,
+        /// Who can manage invitations: owners or guests.
+        #[arg(long, value_parser = ["owners", "guests"])]
+        invite: Option<String>,
+        /// Password (Send + 'Anyone with the link'); "null"/"" to clear.
+        #[arg(long)]
+        password: Option<String>,
+        /// Expiration datetime (portal mode only), or "null" to clear.
+        #[arg(long)]
+        expires: Option<String>,
+        /// Notification preference.
+        #[arg(long, value_parser = ["never", "notify_on_file_received", "notify_on_file_sent_or_received"])]
+        notify: Option<String>,
         /// Enable or disable downloads (legacy — prefer --download-security).
         #[arg(long)]
         download_enabled: Option<bool>,
         /// Enable or disable comments.
         #[arg(long)]
         comments_enabled: Option<bool>,
-        /// Enable or disable anonymous uploads.
-        #[arg(long)]
-        anonymous_uploads: Option<bool>,
         /// Download security level (high, medium, or off).
         #[arg(long, value_parser = ["high", "medium", "off"])]
         download_security: Option<String>,
+        /// Visual display mode: grid or list.
+        #[arg(long, value_parser = ["grid", "list"])]
+        display_type: Option<String>,
+        /// Workspace visual style.
+        #[arg(long)]
+        workspace_style: Option<String>,
+        /// Enable or disable guest AI chat.
+        #[arg(long)]
+        guest_chat_enabled: Option<bool>,
+        /// Toggle AI indexing (intelligence).
+        #[arg(long)]
+        intelligence: Option<bool>,
+        /// Enable or disable anonymous uploads.
+        #[arg(long)]
+        anonymous_uploads: Option<bool>,
+        /// Accent color (JSON color object), or "null".
+        #[arg(long)]
+        accent_color: Option<String>,
+        /// Primary background color (JSON color object), or "null".
+        #[arg(long)]
+        background_color1: Option<String>,
+        /// Secondary background color (JSON color object), or "null".
+        #[arg(long)]
+        background_color2: Option<String>,
+        /// Background image selection (numeric).
+        #[arg(long)]
+        background_image: Option<i64>,
+        /// Custom link #1 (JSON link object), or "null".
+        #[arg(long)]
+        link_1: Option<String>,
+        /// Custom link #2 (JSON link object), or "null".
+        #[arg(long)]
+        link_2: Option<String>,
+        /// Custom link #3 (JSON link object), or "null".
+        #[arg(long)]
+        link_3: Option<String>,
+        /// Custom owner-defined properties (JSON or "null").
+        #[arg(long)]
+        owner_defined: Option<String>,
+        /// Remove the workspace share-link node (pass `null` — the only
+        /// accepted value).
+        #[arg(long)]
+        share_link_node_id: Option<String>,
     },
     /// Delete a share. Permanent and irreversible.
     Delete {
@@ -3760,6 +4743,201 @@ pub enum ShareCommands {
     /// Share member operations.
     #[command(subcommand)]
     Members(ShareMembersCommands),
+    /// Share invitation operations.
+    #[command(subcommand)]
+    Invitation(ShareInvitationCommands),
+}
+
+/// Manual `Debug` for [`ShareCommands`] that REDACTS every `--password` value so
+/// a secret can never leak into a debug rendering (logs, panics). `Create` and
+/// `Update` carry an `Option<String>` password; `PasswordAuth` carries a plain
+/// `String` password.
+///
+/// `#[derive(Debug)]` would print these passwords verbatim, and `Cli`'s manual
+/// `Debug` recurses into the active command — so the derive is removed and each
+/// variant is rendered field-by-field with the `password` field replaced by a
+/// fixed redaction marker; all other fields are shown as-is.
+impl fmt::Debug for ShareCommands {
+    #[allow(clippy::too_many_lines)] // a flat field-by-field render over every variant
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Render an Option<password> as a redacted marker, preserving only
+        // whether a value was present.
+        fn pw(p: Option<&String>) -> &'static str {
+            match p {
+                Some(_) => "Some(<redacted>)",
+                None => "None",
+            }
+        }
+        match self {
+            Self::List { limit, offset } => f
+                .debug_struct("List")
+                .field("limit", limit)
+                .field("offset", offset)
+                .finish(),
+            Self::Create {
+                name,
+                workspace,
+                share_type,
+                description,
+                access_options,
+                invite,
+                storage_mode,
+                folder_node_id,
+                create_folder,
+                folder_name,
+                custom_name,
+                password,
+                expires,
+                notify,
+                comments_enabled,
+                guest_chat_enabled,
+                display_type,
+                workspace_style,
+                anonymous_uploads,
+                intelligence,
+                download_security,
+                accent_color,
+                background_color1,
+                background_color2,
+                background_image,
+                link_1,
+                link_2,
+                link_3,
+                owner_defined,
+            } => f
+                .debug_struct("Create")
+                .field("name", name)
+                .field("workspace", workspace)
+                .field("share_type", share_type)
+                .field("description", description)
+                .field("access_options", access_options)
+                .field("invite", invite)
+                .field("storage_mode", storage_mode)
+                .field("folder_node_id", folder_node_id)
+                .field("create_folder", create_folder)
+                .field("folder_name", folder_name)
+                .field("custom_name", custom_name)
+                .field("password", &format_args!("{}", pw(password.as_ref())))
+                .field("expires", expires)
+                .field("notify", notify)
+                .field("comments_enabled", comments_enabled)
+                .field("guest_chat_enabled", guest_chat_enabled)
+                .field("display_type", display_type)
+                .field("workspace_style", workspace_style)
+                .field("anonymous_uploads", anonymous_uploads)
+                .field("intelligence", intelligence)
+                .field("download_security", download_security)
+                .field("accent_color", accent_color)
+                .field("background_color1", background_color1)
+                .field("background_color2", background_color2)
+                .field("background_image", background_image)
+                .field("link_1", link_1)
+                .field("link_2", link_2)
+                .field("link_3", link_3)
+                .field("owner_defined", owner_defined)
+                .finish(),
+            Self::Info { share_id } => f.debug_struct("Info").field("share_id", share_id).finish(),
+            Self::Update {
+                share_id,
+                name,
+                title,
+                custom_name,
+                description,
+                share_type,
+                access_options,
+                invite,
+                password,
+                expires,
+                notify,
+                download_enabled,
+                comments_enabled,
+                download_security,
+                display_type,
+                workspace_style,
+                guest_chat_enabled,
+                intelligence,
+                anonymous_uploads,
+                accent_color,
+                background_color1,
+                background_color2,
+                background_image,
+                link_1,
+                link_2,
+                link_3,
+                owner_defined,
+                share_link_node_id,
+            } => f
+                .debug_struct("Update")
+                .field("share_id", share_id)
+                .field("name", name)
+                .field("title", title)
+                .field("custom_name", custom_name)
+                .field("description", description)
+                .field("share_type", share_type)
+                .field("access_options", access_options)
+                .field("invite", invite)
+                .field("password", &format_args!("{}", pw(password.as_ref())))
+                .field("expires", expires)
+                .field("notify", notify)
+                .field("download_enabled", download_enabled)
+                .field("comments_enabled", comments_enabled)
+                .field("download_security", download_security)
+                .field("display_type", display_type)
+                .field("workspace_style", workspace_style)
+                .field("guest_chat_enabled", guest_chat_enabled)
+                .field("intelligence", intelligence)
+                .field("anonymous_uploads", anonymous_uploads)
+                .field("accent_color", accent_color)
+                .field("background_color1", background_color1)
+                .field("background_color2", background_color2)
+                .field("background_image", background_image)
+                .field("link_1", link_1)
+                .field("link_2", link_2)
+                .field("link_3", link_3)
+                .field("owner_defined", owner_defined)
+                .field("share_link_node_id", share_link_node_id)
+                .finish(),
+            Self::Delete { share_id, confirm } => f
+                .debug_struct("Delete")
+                .field("share_id", share_id)
+                .field("confirm", confirm)
+                .finish(),
+            Self::Archive { share_id } => f
+                .debug_struct("Archive")
+                .field("share_id", share_id)
+                .finish(),
+            Self::Unarchive { share_id } => f
+                .debug_struct("Unarchive")
+                .field("share_id", share_id)
+                .finish(),
+            Self::PasswordAuth { share_id, .. } => f
+                .debug_struct("PasswordAuth")
+                .field("share_id", share_id)
+                .field("password", &format_args!("<redacted>"))
+                .finish(),
+            Self::GuestAuth { share_id } => f
+                .debug_struct("GuestAuth")
+                .field("share_id", share_id)
+                .finish(),
+            Self::PublicInfo { share_id } => f
+                .debug_struct("PublicInfo")
+                .field("share_id", share_id)
+                .finish(),
+            Self::Available => write!(f, "Available"),
+            Self::CheckName { name } => f.debug_struct("CheckName").field("name", name).finish(),
+            Self::WorkflowEnable { share_id } => f
+                .debug_struct("WorkflowEnable")
+                .field("share_id", share_id)
+                .finish(),
+            Self::WorkflowDisable { share_id } => f
+                .debug_struct("WorkflowDisable")
+                .field("share_id", share_id)
+                .finish(),
+            Self::Files(c) => f.debug_tuple("Files").field(c).finish(),
+            Self::Members(c) => f.debug_tuple("Members").field(c).finish(),
+            Self::Invitation(c) => f.debug_tuple("Invitation").field(c).finish(),
+        }
+    }
 }
 
 /// Share file subcommands.
@@ -3803,15 +4981,70 @@ pub enum ShareMembersCommands {
         #[arg(long)]
         offset: Option<u32>,
     },
-    /// Add a member to a share.
+    /// Add a member (19-digit user ID) or send an invitation (email) to a share.
     Add {
         /// Share ID.
         share_id: String,
-        /// Email address to add.
+        /// Email address (invite) or 19-digit user ID (add existing user).
         email: String,
-        /// Permission role: admin, member, or guest.
-        #[arg(long)]
+        /// Permission role: admin, member, guest, or view.
+        #[arg(long, value_parser = ["admin", "member", "guest", "view"])]
         role: Option<String>,
+        /// Notification preference (existing-user add).
+        #[arg(long)]
+        notify_options: Option<String>,
+        /// Membership expiration "YYYY-MM-DD HH:MM:SS UTC"; "null"/"" to clear.
+        #[arg(long)]
+        expires: Option<String>,
+        /// Resend notification email (60s cooldown after initial add).
+        #[arg(long)]
+        force_notification: Option<bool>,
+        /// Custom message for the invitation email (email invite).
+        #[arg(long)]
+        message: Option<String>,
+        /// Invitation expiration datetime (email invite).
+        #[arg(long)]
+        invitation_expires: Option<String>,
+    },
+    /// Update a member's permissions, notification preference, or expiration.
+    Update {
+        /// Share ID.
+        share_id: String,
+        /// Member user ID.
+        member_id: String,
+        /// New permission role: admin, member, guest, or view.
+        #[arg(long, value_parser = ["admin", "member", "guest", "view"])]
+        role: Option<String>,
+        /// Notification preference.
+        #[arg(long)]
+        notify_options: Option<String>,
+        /// Membership expiration "YYYY-MM-DD HH:MM:SS"; "null"/"" to clear.
+        #[arg(long)]
+        expires: Option<String>,
+    },
+    /// Get member details.
+    Info {
+        /// Share ID.
+        share_id: String,
+        /// Member user ID.
+        member_id: String,
+    },
+    /// Transfer share ownership to another member (current owner → admin).
+    Transfer {
+        /// Share ID.
+        share_id: String,
+        /// Member user ID to transfer ownership to.
+        member_id: String,
+    },
+    /// Leave a share (self-removal). Owners must transfer ownership first.
+    Leave {
+        /// Share ID.
+        share_id: String,
+    },
+    /// Self-join a share (where the access option permits).
+    Join {
+        /// Share ID.
+        share_id: String,
     },
     /// Remove a member from a share.
     Remove {
@@ -3819,6 +5052,46 @@ pub enum ShareMembersCommands {
         share_id: String,
         /// Member ID to remove.
         member_id: String,
+    },
+}
+
+/// Share invitation subcommands.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum ShareInvitationCommands {
+    /// List a share's invitations (optionally filtered by state).
+    List {
+        /// Share ID.
+        share_id: String,
+        /// Filter by state: pending, accepted, declined.
+        #[arg(long, value_parser = ["pending", "accepted", "declined"])]
+        state: Option<String>,
+    },
+    /// Update a share invitation (state, role, notification, or expiration).
+    Update {
+        /// Share ID.
+        share_id: String,
+        /// Invitation ID (numeric) or email address.
+        invitation_id: String,
+        /// New state: pending, accepted, declined.
+        #[arg(long, value_parser = ["pending", "accepted", "declined"])]
+        state: Option<String>,
+        /// New permission role: admin, member, guest, or view.
+        #[arg(long, value_parser = ["admin", "member", "guest", "view"])]
+        role: Option<String>,
+        /// Notification preference.
+        #[arg(long)]
+        notify_options: Option<String>,
+        /// Membership expiration datetime.
+        #[arg(long)]
+        expires: Option<String>,
+    },
+    /// Revoke (delete) a share invitation.
+    Delete {
+        /// Share ID.
+        share_id: String,
+        /// Invitation ID (numeric) or email address.
+        invitation_id: String,
     },
 }
 
@@ -3838,8 +5111,8 @@ pub enum CommentCommands {
         /// Entity ID (workspace or share ID).
         #[arg(long)]
         entity_id: String,
-        /// Sort order: created or -created.
-        #[arg(long, value_parser = ["created", "-created"])]
+        /// Sort order: asc or desc (default asc).
+        #[arg(long, value_parser = ["asc", "desc"])]
         sort: Option<String>,
         /// Maximum number of results.
         #[arg(long)]
@@ -3860,6 +5133,21 @@ pub enum CommentCommands {
         /// Entity ID (workspace or share ID).
         #[arg(long)]
         entity_id: String,
+        /// Anchoring reference as a JSON object string (or `@file.json`), e.g.
+        /// `{"type":"page","page":3}`.
+        #[arg(long)]
+        reference: Option<String>,
+        /// Arbitrary metadata as a JSON object string (or `@file.json`).
+        #[arg(long)]
+        properties: Option<String>,
+        /// Inline-attach a single object to the new comment (object ID).
+        /// Mutually exclusive with `--target-ids`.
+        #[arg(long, conflicts_with = "target_ids")]
+        target_id: Option<String>,
+        /// Inline-attach multiple objects to the new comment (comma-separated
+        /// object IDs, ≤25). Mutually exclusive with `--target-id`.
+        #[arg(long, value_delimiter = ',')]
+        target_ids: Vec<String>,
     },
     /// Reply to an existing comment.
     Reply {
@@ -3898,8 +5186,8 @@ pub enum CommentCommands {
         /// Entity ID (workspace or share ID).
         #[arg(long)]
         entity_id: String,
-        /// Sort order: created or -created.
-        #[arg(long, value_parser = ["created", "-created"])]
+        /// Sort order: asc or desc (default asc).
+        #[arg(long, value_parser = ["asc", "desc"])]
         sort: Option<String>,
         /// Maximum number of results.
         #[arg(long)]
@@ -3932,14 +5220,14 @@ pub enum CommentCommands {
         #[arg(long, value_delimiter = ',', required = true)]
         comment_ids: Vec<String>,
     },
-    /// Link a comment to a workflow entity (task or approval).
+    /// Link a comment to a workflow entity (task or `workflow_review`).
     Link {
         /// Comment ID.
         comment_id: String,
         /// Workflow entity type to link to.
-        #[arg(long, value_parser = ["task", "approval"])]
+        #[arg(long, value_parser = ["task", "workflow_review"])]
         entity_type: String,
-        /// Workflow entity ID (task or approval ID).
+        /// Workflow entity ID (task or `workflow_review` ID).
         #[arg(long)]
         entity_id: String,
     },
@@ -3948,12 +5236,12 @@ pub enum CommentCommands {
         /// Comment ID.
         comment_id: String,
     },
-    /// List comments linked to a workflow entity (task or approval).
+    /// List comments linked to a workflow entity (task or `workflow_review`).
     Linked {
         /// Workflow entity type.
-        #[arg(long, value_parser = ["task", "approval"])]
+        #[arg(long, value_parser = ["task", "workflow_review"])]
         entity_type: String,
-        /// Workflow entity ID (task or approval ID).
+        /// Workflow entity ID (task or `workflow_review` ID).
         #[arg(long)]
         entity_id: String,
         /// Maximum number of results (1–200).
@@ -3962,6 +5250,34 @@ pub enum CommentCommands {
         /// Offset for pagination.
         #[arg(long)]
         offset: Option<u32>,
+    },
+    /// List the objects attached to a comment (hydrated, access-gated).
+    Attachments {
+        /// Comment ID.
+        comment_id: String,
+    },
+    /// Attach one or more objects to a comment (atomic; idempotent; ≤25 total;
+    /// author-only; rejected on workflow-review comments).
+    Attach {
+        /// Comment ID.
+        comment_id: String,
+        /// Attach a single object (object ID). Mutually exclusive with
+        /// `--target-ids`.
+        #[arg(long, conflicts_with = "target_ids")]
+        target_id: Option<String>,
+        /// Attach multiple objects (comma-separated object IDs, ≤25). Mutually
+        /// exclusive with `--target-id`.
+        #[arg(long, value_delimiter = ',')]
+        target_ids: Vec<String>,
+    },
+    /// Detach a single object from a comment (no batch detach — call once per
+    /// object; author-only).
+    Detach {
+        /// Comment ID.
+        comment_id: String,
+        /// Object ID to detach.
+        #[arg(long)]
+        target_id: String,
     },
 }
 
@@ -3972,6 +5288,11 @@ pub enum CommentCommands {
 #[non_exhaustive]
 pub enum EventCommands {
     /// List/search activity events.
+    ///
+    /// One of `--workspace` / `--share` / `--user-id` / `--org-id` /
+    /// `--parent-event-id` is required by the server. `--parent-event-id`
+    /// cannot be combined with filters other than `--acknowledged` / `--limit`
+    /// / `--offset` (the server enforces this).
     List {
         /// Filter by workspace ID.
         #[arg(long)]
@@ -3979,12 +5300,45 @@ pub enum EventCommands {
         /// Filter by share ID.
         #[arg(long)]
         share: Option<String>,
+        /// Filter by acting user profile ID (19-digit).
+        #[arg(long)]
+        user_id: Option<String>,
+        /// Filter by organization ID (19-digit).
+        #[arg(long)]
+        org_id: Option<String>,
         /// Filter by event name.
         #[arg(long)]
         event: Option<String>,
         /// Filter by category.
         #[arg(long)]
         category: Option<String>,
+        /// Filter by subcategory.
+        #[arg(long)]
+        subcategory: Option<String>,
+        /// Drill into a serial/batch parent event's children (parent event ID).
+        #[arg(long)]
+        parent_event_id: Option<String>,
+        /// Filter by the user who triggered the event (19-digit; distinct from
+        /// `--user-id`).
+        #[arg(long)]
+        calling_user_id: Option<String>,
+        /// Filter by related object (file/folder) ID.
+        #[arg(long)]
+        object_id: Option<String>,
+        /// Audit-log read filter: `external_audit_log` or `external`.
+        #[arg(long, value_parser = ["external_audit_log", "external"])]
+        visibility: Option<String>,
+        /// Filter by acknowledgment status (true or false).
+        #[arg(long)]
+        acknowledged: Option<bool>,
+        /// Lower bound for event creation time (ISO-8601 or
+        /// `YYYY-MM-DD HH:MM:SS`).
+        #[arg(long)]
+        created_min: Option<String>,
+        /// Upper bound for event creation time (same format as `--created-min`;
+        /// must be greater than `--created-min`).
+        #[arg(long)]
+        created_max: Option<String>,
         /// Maximum number of results.
         #[arg(long)]
         limit: Option<u32>,
@@ -4014,6 +5368,11 @@ pub enum EventCommands {
         event_id: String,
     },
     /// Get an AI-powered summary of events.
+    ///
+    /// Accepts every filter `event list` does (the summarize endpoint shares the
+    /// search filter set) plus the summarize-only `--user-context`. As with
+    /// `list`, one of `--workspace` / `--share` / `--user-id` / `--org-id` /
+    /// `--parent-event-id` is required by the server.
     Summarize {
         /// Filter by workspace ID.
         #[arg(long)]
@@ -4021,6 +5380,12 @@ pub enum EventCommands {
         /// Filter by share ID.
         #[arg(long)]
         share: Option<String>,
+        /// Filter by acting user profile ID (19-digit).
+        #[arg(long)]
+        user_id: Option<String>,
+        /// Filter by organization ID (19-digit).
+        #[arg(long)]
+        org_id: Option<String>,
         /// Filter by event name.
         #[arg(long)]
         event: Option<String>,
@@ -4030,6 +5395,30 @@ pub enum EventCommands {
         /// Filter by subcategory.
         #[arg(long)]
         subcategory: Option<String>,
+        /// Drill into a serial/batch parent event's children (parent event ID).
+        #[arg(long)]
+        parent_event_id: Option<String>,
+        /// Filter by the user who triggered the event (19-digit; distinct from
+        /// `--user-id`).
+        #[arg(long)]
+        calling_user_id: Option<String>,
+        /// Filter by related object (file/folder) ID.
+        #[arg(long)]
+        object_id: Option<String>,
+        /// Audit-log read filter: `external_audit_log` or `external`.
+        #[arg(long, value_parser = ["external_audit_log", "external"])]
+        visibility: Option<String>,
+        /// Filter by acknowledgment status (true or false).
+        #[arg(long)]
+        acknowledged: Option<bool>,
+        /// Lower bound for event creation time (ISO-8601 or
+        /// `YYYY-MM-DD HH:MM:SS`).
+        #[arg(long)]
+        created_min: Option<String>,
+        /// Upper bound for event creation time (same format as `--created-min`;
+        /// must be greater than `--created-min`).
+        #[arg(long)]
+        created_max: Option<String>,
         /// Free-text context for the AI summarizer.
         #[arg(long)]
         user_context: Option<String>,
@@ -4039,6 +5428,55 @@ pub enum EventCommands {
         /// Offset for pagination.
         #[arg(long)]
         offset: Option<u32>,
+    },
+}
+
+// ─── Dashboard ──────────────────────────────────────────────────────────────
+
+/// Dashboard subcommands (per-workspace actionable card feed).
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum DashboardCommands {
+    /// Get the calling member's ranked, paginated card feed for a workspace.
+    Get {
+        /// Workspace ID (19-digit) or folder name.
+        #[arg(long)]
+        workspace: String,
+        /// Cards per page (1–200; server default 50).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Cards to skip for pagination (server default 0).
+        #[arg(long)]
+        offset: Option<u32>,
+    },
+    /// Dismiss a card permanently, or snooze it until a future time.
+    ///
+    /// Per-member and out-of-band: this only hides the card from your own feed
+    /// — it never advances, resolves, or changes the underlying obligation,
+    /// workflow, or signature. Pass `--snooze-until` to snooze instead of
+    /// permanently dismissing.
+    Dismiss {
+        /// Card key from the feed (e.g. `obligation:123…`). URL-encoding is
+        /// handled for you.
+        card_key: String,
+        /// Workspace ID (19-digit).
+        #[arg(long)]
+        workspace: String,
+        /// Snooze the card until this UTC time (`YYYY-MM-DD HH:MM:SS UTC`); must
+        /// be in the future. Omit for a permanent dismiss.
+        #[arg(long)]
+        snooze_until: Option<String>,
+    },
+    /// Undismiss (or un-snooze) a card, restoring it to your feed.
+    ///
+    /// Idempotent — undismissing a card that was never dismissed succeeds
+    /// silently. Reverses `dashboard dismiss`.
+    Undismiss {
+        /// Card key to restore (URL-encoding is handled for you).
+        card_key: String,
+        /// Workspace ID (19-digit).
+        #[arg(long)]
+        workspace: String,
     },
 }
 
@@ -4053,7 +5491,7 @@ pub enum PreviewCommands {
         /// Storage node ID.
         node_id: String,
         /// Preview type.
-        #[arg(long, value_parser = ["binary", "thumbnail", "image", "pdf", "hlsstream", "audio", "spreadsheet"])]
+        #[arg(long, value_parser = ["bin", "thumbnail", "image", "hlsstream", "pdf", "spreadsheet", "audio", "mp4"])]
         preview_type: String,
         /// Context type: workspace or share.
         #[arg(long, value_parser = ["workspace", "share"])]
@@ -4073,12 +5511,16 @@ pub enum PreviewCommands {
         #[arg(long)]
         context_id: String,
     },
-    /// Request a file transformation URL (resize, crop, format conversion).
+    /// Request an image transformation URL (resize, crop, format conversion).
+    ///
+    /// Returns `{transform_name, token, read_url}` (the two-step model): fetch
+    /// `read_url` to get the transformed bytes. `read_url` and `token` are
+    /// secret-bearing read capabilities — do not log or share them.
     Transform {
         /// Storage node ID.
         node_id: String,
-        /// Transform name (e.g. "image").
-        #[arg(long)]
+        /// Transform name (must be "image", the only valid value).
+        #[arg(long, default_value = "image", value_parser = ["image"])]
         transform_name: String,
         /// Context type: workspace or share.
         #[arg(long, value_parser = ["workspace", "share"])]
@@ -4092,12 +5534,28 @@ pub enum PreviewCommands {
         /// Target height in pixels.
         #[arg(long)]
         height: Option<u32>,
-        /// Output format: png, jpg, webp.
-        #[arg(long)]
+        /// Output format: png, jpg, or jpeg.
+        #[arg(long, value_parser = ["png", "jpg", "jpeg"])]
         output_format: Option<String>,
-        /// Size preset: `IconSmall`, `IconMedium`, Preview.
-        #[arg(long)]
+        /// Size preset: `IconTiny`, `IconSmall`, `IconMedium`, or Preview
+        /// (case-insensitive).
+        #[arg(long, value_parser = parse_preview_size)]
         size: Option<String>,
+        /// Crop rectangle width (all four crop flags required together).
+        #[arg(long)]
+        crop_width: Option<u32>,
+        /// Crop rectangle height.
+        #[arg(long)]
+        crop_height: Option<u32>,
+        /// Crop rectangle x offset.
+        #[arg(long)]
+        crop_x: Option<u32>,
+        /// Crop rectangle y offset.
+        #[arg(long)]
+        crop_y: Option<u32>,
+        /// Rotation in degrees: 0, 90, 180, or 270.
+        #[arg(long, value_parser = parse_preview_rotate)]
+        rotate: Option<u32>,
     },
 }
 
@@ -4760,414 +6218,6 @@ pub enum TaskListCommands {
     },
 }
 
-// ─── Worklog ────────────────────────────────────────────────────────────────
-
-/// Worklog subcommands.
-#[derive(Subcommand, Debug)]
-#[non_exhaustive]
-pub enum WorklogCommands {
-    /// List worklog entries.
-    List {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace: String,
-        /// Entity type (profile, task, `task_list`, node). Defaults to "profile".
-        #[arg(long, value_parser = ["profile", "task", "task_list", "node"])]
-        entity_type: Option<String>,
-        /// Entity ID (defaults to workspace ID).
-        #[arg(long)]
-        entity_id: Option<String>,
-        /// Maximum number of results.
-        #[arg(long)]
-        limit: Option<u32>,
-        /// Offset for pagination.
-        #[arg(long)]
-        offset: Option<u32>,
-    },
-    /// Append a worklog entry.
-    Append {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace: String,
-        /// Message content.
-        message: String,
-        /// Entity type (profile, task, `task_list`, node). Defaults to "profile".
-        #[arg(long, value_parser = ["profile", "task", "task_list", "node"])]
-        entity_type: Option<String>,
-        /// Entity ID (defaults to workspace ID).
-        #[arg(long)]
-        entity_id: Option<String>,
-    },
-    /// Create an interjection (urgent entry requiring acknowledgement).
-    Interject {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace: String,
-        /// Message content.
-        message: String,
-        /// Entity type (profile, task, `task_list`, node). Defaults to "profile".
-        #[arg(long, value_parser = ["profile", "task", "task_list", "node"])]
-        entity_type: Option<String>,
-        /// Entity ID (defaults to workspace ID).
-        #[arg(long)]
-        entity_id: Option<String>,
-    },
-    /// Get worklog entry details.
-    Details {
-        /// Worklog entry ID.
-        entry_id: String,
-    },
-    /// List unacknowledged interjections for an entity.
-    #[command(name = "list-interjections")]
-    ListInterjections {
-        /// Entity type (profile, task, `task_list`, node).
-        #[arg(long, value_parser = ["profile", "task", "task_list", "node"])]
-        entity_type: String,
-        /// Entity ID.
-        #[arg(long)]
-        entity_id: String,
-        /// Maximum number of results.
-        #[arg(long)]
-        limit: Option<u32>,
-        /// Offset for pagination.
-        #[arg(long)]
-        offset: Option<u32>,
-    },
-    /// Acknowledge a worklog interjection.
-    Acknowledge {
-        /// Worklog entry ID to acknowledge.
-        entry_id: String,
-    },
-    /// List all worklog entries in a workspace or share.
-    #[command(name = "list-all")]
-    ListAll {
-        /// Profile type: workspace or share.
-        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
-        profile_type: String,
-        /// Workspace or share ID (alias: --workspace).
-        #[arg(long, alias = "workspace")]
-        profile_id: String,
-        /// Maximum number of results.
-        #[arg(long)]
-        limit: Option<u32>,
-        /// Offset for pagination.
-        #[arg(long)]
-        offset: Option<u32>,
-    },
-    /// Filtered worklog list (personal view on a workspace, group view on a share).
-    Filter {
-        /// Profile type: workspace or share.
-        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
-        profile_type: String,
-        /// Workspace or share ID (alias: --workspace).
-        #[arg(long, alias = "workspace")]
-        profile_id: String,
-        /// Filter: authored, interjections.
-        #[arg(value_parser = ["authored", "interjections"])]
-        filter: String,
-        /// Entry type (authored filter only).
-        #[arg(long, value_parser = ["info", "decision", "error", "status_change", "request", "interjection"])]
-        entry_type: Option<String>,
-        /// Maximum number of results.
-        #[arg(long)]
-        limit: Option<u32>,
-        /// Offset for pagination.
-        #[arg(long)]
-        offset: Option<u32>,
-    },
-    /// Worklog entry summary for a workspace or share.
-    Summary {
-        /// Profile type: workspace or share.
-        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
-        profile_type: String,
-        /// Workspace or share ID (alias: --workspace).
-        #[arg(long, alias = "workspace")]
-        profile_id: String,
-    },
-}
-
-// ─── Approval ───────────────────────────────────────────────────────────────
-
-/// Approval subcommands.
-#[derive(Subcommand, Debug)]
-#[non_exhaustive]
-pub enum ApprovalCommands {
-    /// List approvals in a workspace.
-    List {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace: String,
-        /// Filter by status: pending, approved, rejected.
-        #[arg(long, value_parser = ["pending", "approved", "rejected"])]
-        status: Option<String>,
-        /// Maximum number of results.
-        #[arg(long)]
-        limit: Option<u32>,
-        /// Offset for pagination.
-        #[arg(long)]
-        offset: Option<u32>,
-    },
-    /// Request an approval.
-    Request {
-        /// Profile type the approval is scoped to: workspace or share.
-        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
-        profile_type: String,
-        /// Workspace or share profile ID (alias: --workspace).
-        #[arg(long, alias = "workspace")]
-        profile_id: String,
-        /// Entity type: task, node, `worklog_entry`, or share.
-        #[arg(long, value_parser = ["task", "node", "worklog_entry", "share"])]
-        entity_type: String,
-        /// Entity ID.
-        entity_id: String,
-        /// Description of what needs approval.
-        #[arg(long)]
-        description: String,
-        /// Designated approver profile ID.
-        #[arg(long)]
-        approver_id: Option<String>,
-        /// Informational deadline (YYYY-MM-DD HH:MM:SS).
-        #[arg(long)]
-        deadline: Option<String>,
-        /// Associated artifact node ID.
-        #[arg(long)]
-        node_id: Option<String>,
-        /// Metadata properties as a JSON object string.
-        #[arg(long)]
-        properties: Option<String>,
-    },
-    /// Get approval details.
-    Info {
-        /// Profile type the approval is scoped to: workspace or share.
-        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
-        profile_type: String,
-        /// Workspace or share profile ID (alias: --workspace). Omit to use the
-        /// legacy unscoped route.
-        #[arg(long, alias = "workspace")]
-        profile_id: Option<String>,
-        /// Approval ID.
-        approval_id: String,
-    },
-    /// Approve an approval request.
-    Approve {
-        /// Profile type the approval is scoped to: workspace or share.
-        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
-        profile_type: String,
-        /// Workspace or share profile ID (alias: --workspace). Omit to use the
-        /// legacy unscoped route.
-        #[arg(long, alias = "workspace")]
-        profile_id: Option<String>,
-        /// Approval ID.
-        approval_id: String,
-        /// Optional comment.
-        #[arg(long)]
-        comment: Option<String>,
-    },
-    /// Reject an approval request.
-    Reject {
-        /// Profile type the approval is scoped to: workspace or share.
-        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
-        profile_type: String,
-        /// Workspace or share profile ID (alias: --workspace). Omit to use the
-        /// legacy unscoped route.
-        #[arg(long, alias = "workspace")]
-        profile_id: Option<String>,
-        /// Approval ID.
-        approval_id: String,
-        /// Optional comment.
-        #[arg(long)]
-        comment: Option<String>,
-    },
-    /// Update a pending approval (at least one field required).
-    Update {
-        /// Profile type the approval is scoped to: workspace or share.
-        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
-        profile_type: String,
-        /// Workspace or share profile ID (alias: --workspace). Omit to use the
-        /// legacy unscoped route.
-        #[arg(long, alias = "workspace")]
-        profile_id: Option<String>,
-        /// Approval ID.
-        approval_id: String,
-        /// Updated description.
-        #[arg(long)]
-        description: Option<String>,
-        /// Updated designated approver profile ID.
-        #[arg(long)]
-        approver_id: Option<String>,
-        /// Updated deadline (YYYY-MM-DD HH:MM:SS).
-        #[arg(long)]
-        deadline: Option<String>,
-        /// Updated associated node ID.
-        #[arg(long)]
-        node_id: Option<String>,
-        /// Updated metadata properties as a JSON object string.
-        #[arg(long)]
-        properties: Option<String>,
-    },
-    /// Delete an approval (pending or resolved).
-    Delete {
-        /// Profile type the approval is scoped to: workspace or share.
-        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
-        profile_type: String,
-        /// Workspace or share profile ID (alias: --workspace). Omit to use the
-        /// legacy unscoped route.
-        #[arg(long, alias = "workspace")]
-        profile_id: Option<String>,
-        /// Approval ID.
-        approval_id: String,
-    },
-    /// Filtered approval list (personal view on a workspace, group view on a share).
-    Filter {
-        /// Profile type: workspace or share.
-        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
-        profile_type: String,
-        /// Workspace or share profile ID (alias: --workspace).
-        #[arg(long, alias = "workspace")]
-        profile_id: String,
-        /// Filter: pending, created, assigned, resolved.
-        #[arg(value_parser = ["pending", "created", "assigned", "resolved"])]
-        filter: String,
-        /// Status filter (created/assigned only): pending, approved, rejected.
-        #[arg(long, value_parser = ["pending", "approved", "rejected"])]
-        status: Option<String>,
-        /// Maximum number of results.
-        #[arg(long)]
-        limit: Option<u32>,
-        /// Offset for pagination.
-        #[arg(long)]
-        offset: Option<u32>,
-    },
-    /// Approval count summary for a workspace or share.
-    Summary {
-        /// Profile type: workspace or share.
-        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
-        profile_type: String,
-        /// Workspace or share profile ID (alias: --workspace).
-        #[arg(long, alias = "workspace")]
-        profile_id: String,
-    },
-    /// List the authenticated user's approvals across all profiles.
-    Mine {
-        /// Filter: pending, created, resolved.
-        #[arg(value_parser = ["pending", "created", "resolved"])]
-        filter: String,
-        /// Status filter (created only): pending, approved, rejected.
-        #[arg(long, value_parser = ["pending", "approved", "rejected"])]
-        status: Option<String>,
-        /// Maximum number of results.
-        #[arg(long)]
-        limit: Option<u32>,
-        /// Offset for pagination.
-        #[arg(long)]
-        offset: Option<u32>,
-    },
-}
-
-// ─── Todo ───────────────────────────────────────────────────────────────────
-
-/// Todo subcommands.
-#[derive(Subcommand, Debug)]
-#[non_exhaustive]
-pub enum TodoCommands {
-    /// List todos in a workspace or share.
-    List {
-        /// Profile type: workspace or share.
-        #[arg(long, default_value = "workspace")]
-        profile_type: String,
-        /// Workspace or share ID (alias: --workspace).
-        #[arg(long, alias = "workspace")]
-        profile_id: String,
-        /// Maximum number of results.
-        #[arg(long)]
-        limit: Option<u32>,
-        /// Offset for pagination.
-        #[arg(long)]
-        offset: Option<u32>,
-    },
-    /// Create a new todo in a workspace or share.
-    Create {
-        /// Workspace ID.
-        #[arg(long, required_unless_present = "share")]
-        workspace: Option<String>,
-        /// Share ID (alternative to workspace).
-        #[arg(long, conflicts_with = "workspace")]
-        share: Option<String>,
-        /// Todo title.
-        title: String,
-        /// Assignee profile ID.
-        #[arg(long)]
-        assignee_id: Option<String>,
-    },
-    /// Update a todo.
-    Update {
-        /// Todo ID.
-        todo_id: String,
-        /// New title.
-        #[arg(long)]
-        title: Option<String>,
-        /// Mark as done or not done.
-        #[arg(long)]
-        done: Option<bool>,
-        /// New assignee profile ID.
-        #[arg(long)]
-        assignee_id: Option<String>,
-    },
-    /// Toggle a todo's completion state.
-    Toggle {
-        /// Todo ID.
-        todo_id: String,
-    },
-    /// Delete a todo.
-    Delete {
-        /// Todo ID.
-        todo_id: String,
-    },
-    /// Bulk toggle todo completion in a workspace or share.
-    #[command(name = "bulk-toggle")]
-    BulkToggle {
-        /// Workspace ID.
-        #[arg(long, required_unless_present = "share")]
-        workspace: Option<String>,
-        /// Share ID (alternative to workspace).
-        #[arg(long, conflicts_with = "workspace")]
-        share: Option<String>,
-        /// Comma-separated todo IDs.
-        #[arg(long)]
-        todo_ids: String,
-        /// Set completion state (true = done, false = not done).
-        #[arg(long, default_value = "true")]
-        done: bool,
-    },
-    /// Filtered todo list (personal view on a workspace, group view on a share).
-    Filter {
-        /// Profile type: workspace or share.
-        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
-        profile_type: String,
-        /// Workspace or share ID (alias: --workspace).
-        #[arg(long, alias = "workspace")]
-        profile_id: String,
-        /// Filter: assigned, created, done, pending.
-        #[arg(value_parser = ["assigned", "created", "done", "pending"])]
-        filter: String,
-        /// Maximum number of results.
-        #[arg(long)]
-        limit: Option<u32>,
-        /// Offset for pagination.
-        #[arg(long)]
-        offset: Option<u32>,
-    },
-    /// Todo count summary for a workspace or share.
-    Summary {
-        /// Profile type: workspace or share.
-        #[arg(long, default_value = "workspace", value_parser = ["workspace", "share"])]
-        profile_type: String,
-        /// Workspace or share ID (alias: --workspace).
-        #[arg(long, alias = "workspace")]
-        profile_id: String,
-    },
-}
-
 // ─── Completions ─────────────────────────────────────────────────────────────
 
 /// Supported shells for completion script generation.
@@ -5505,7 +6555,11 @@ pub enum ImportCommands {
 // ─── Lock ────────────────────────────────────────────────────────────────────
 
 /// File locking subcommands.
-#[derive(Subcommand, Debug)]
+///
+/// `Debug` is implemented manually (not derived) so the capability `lock_token`
+/// and the free-form `client_info` are never rendered verbatim through the
+/// `Cli` Debug tree (CLAUDE.md coding-standard #9).
+#[derive(Subcommand)]
 #[non_exhaustive]
 pub enum LockCommands {
     /// Acquire an exclusive lock on a file.
@@ -5518,6 +6572,13 @@ pub enum LockCommands {
         context_id: String,
         /// File node ID.
         node_id: String,
+        /// Lock duration in seconds (60-3600).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(60..=3600))]
+        duration: Option<u32>,
+        /// Client metadata as a JSON object, e.g.
+        /// `{"device_name":"…","client_version":"…"}`.
+        #[arg(long)]
+        client_info: Option<String>,
     },
     /// Check lock status for a file.
     Status {
@@ -5558,6 +6619,69 @@ pub enum LockCommands {
         #[arg(long)]
         lock_token: String,
     },
+}
+
+impl fmt::Debug for LockCommands {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Render an Option<client_info> as a redacted marker, preserving only
+        // whether a value was present.
+        fn ci(c: Option<&String>) -> &'static str {
+            match c {
+                Some(_) => "Some(<redacted>)",
+                None => "None",
+            }
+        }
+        match self {
+            Self::Acquire {
+                context_type,
+                context_id,
+                node_id,
+                duration,
+                client_info,
+            } => f
+                .debug_struct("Acquire")
+                .field("context_type", context_type)
+                .field("context_id", context_id)
+                .field("node_id", node_id)
+                .field("duration", duration)
+                .field("client_info", &format_args!("{}", ci(client_info.as_ref())))
+                .finish(),
+            Self::Status {
+                context_type,
+                context_id,
+                node_id,
+            } => f
+                .debug_struct("Status")
+                .field("context_type", context_type)
+                .field("context_id", context_id)
+                .field("node_id", node_id)
+                .finish(),
+            Self::Release {
+                context_type,
+                context_id,
+                node_id,
+                lock_token: _,
+            } => f
+                .debug_struct("Release")
+                .field("context_type", context_type)
+                .field("context_id", context_id)
+                .field("node_id", node_id)
+                .field("lock_token", &format_args!("<redacted>"))
+                .finish(),
+            Self::Heartbeat {
+                context_type,
+                context_id,
+                node_id,
+                lock_token: _,
+            } => f
+                .debug_struct("Heartbeat")
+                .field("context_type", context_type)
+                .field("context_id", context_id)
+                .field("node_id", node_id)
+                .field("lock_token", &format_args!("<redacted>"))
+                .finish(),
+        }
+    }
 }
 
 // ─── Metadata ─────────────────────────────────────────────────────────────────
@@ -5829,183 +6953,6 @@ pub enum MetadataCommands {
     },
 }
 
-// ─── Instructions ─────────────────────────────────────────────────────────────
-
-/// AI instructions subcommands.
-///
-/// `content` is a markdown blob up to 65,536 raw bytes (multibyte chars
-/// count for more than one). Setting an empty string is equivalent to
-/// `clear`. Profile-wide writes (`set-org`, `set-workspace`, `set-share`)
-/// require admin/owner privilege; the `*-user` variants write the
-/// caller's own per-user override.
-#[derive(Subcommand, Debug)]
-#[non_exhaustive]
-pub enum InstructionsCommands {
-    /// Get the calling user's self-scoped AI instructions.
-    #[command(name = "get-user")]
-    GetUser,
-    /// Set the calling user's self-scoped AI instructions.
-    #[command(name = "set-user")]
-    SetUser {
-        /// Markdown content (up to 65,536 raw bytes).
-        #[arg(long, allow_hyphen_values = true)]
-        content: String,
-    },
-    /// Clear the calling user's self-scoped AI instructions.
-    #[command(name = "clear-user")]
-    ClearUser,
-
-    /// Get the org-wide AI instructions.
-    #[command(name = "get-org")]
-    GetOrg {
-        /// Org ID.
-        #[arg(long)]
-        org_id: String,
-    },
-    /// Set the org-wide AI instructions (owner / admin only).
-    #[command(name = "set-org")]
-    SetOrg {
-        /// Org ID.
-        #[arg(long)]
-        org_id: String,
-        /// Markdown content (up to 65,536 raw bytes).
-        #[arg(long, allow_hyphen_values = true)]
-        content: String,
-    },
-    /// Clear the org-wide AI instructions (owner / admin only).
-    #[command(name = "clear-org")]
-    ClearOrg {
-        /// Org ID.
-        #[arg(long)]
-        org_id: String,
-    },
-    /// Get the calling user's per-user override of an org's instructions.
-    #[command(name = "get-org-user")]
-    GetOrgUser {
-        /// Org ID.
-        #[arg(long)]
-        org_id: String,
-    },
-    /// Set the calling user's per-user override of an org's instructions.
-    #[command(name = "set-org-user")]
-    SetOrgUser {
-        /// Org ID.
-        #[arg(long)]
-        org_id: String,
-        /// Markdown content (up to 65,536 raw bytes).
-        #[arg(long, allow_hyphen_values = true)]
-        content: String,
-    },
-    /// Clear the calling user's per-user override of an org's instructions.
-    #[command(name = "clear-org-user")]
-    ClearOrgUser {
-        /// Org ID.
-        #[arg(long)]
-        org_id: String,
-    },
-
-    /// Get the workspace-wide AI instructions.
-    #[command(name = "get-workspace")]
-    GetWorkspace {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace_id: String,
-    },
-    /// Set the workspace-wide AI instructions (owner / admin only).
-    #[command(name = "set-workspace")]
-    SetWorkspace {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace_id: String,
-        /// Markdown content (up to 65,536 raw bytes).
-        #[arg(long, allow_hyphen_values = true)]
-        content: String,
-    },
-    /// Clear the workspace-wide AI instructions (owner / admin only).
-    #[command(name = "clear-workspace")]
-    ClearWorkspace {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace_id: String,
-    },
-    /// Get the calling user's per-user override of a workspace's instructions.
-    #[command(name = "get-workspace-user")]
-    GetWorkspaceUser {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace_id: String,
-    },
-    /// Set the calling user's per-user override of a workspace's instructions.
-    /// Blocked for guests.
-    #[command(name = "set-workspace-user")]
-    SetWorkspaceUser {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace_id: String,
-        /// Markdown content (up to 65,536 raw bytes).
-        #[arg(long, allow_hyphen_values = true)]
-        content: String,
-    },
-    /// Clear the calling user's per-user override of a workspace's instructions.
-    #[command(name = "clear-workspace-user")]
-    ClearWorkspaceUser {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace_id: String,
-    },
-
-    /// Get the share-wide AI instructions.
-    #[command(name = "get-share")]
-    GetShare {
-        /// Share ID.
-        #[arg(long)]
-        share_id: String,
-    },
-    /// Set the share-wide AI instructions (owner / admin only).
-    #[command(name = "set-share")]
-    SetShare {
-        /// Share ID.
-        #[arg(long)]
-        share_id: String,
-        /// Markdown content (up to 65,536 raw bytes).
-        #[arg(long, allow_hyphen_values = true)]
-        content: String,
-    },
-    /// Clear the share-wide AI instructions (owner / admin only).
-    #[command(name = "clear-share")]
-    ClearShare {
-        /// Share ID.
-        #[arg(long)]
-        share_id: String,
-    },
-    /// Get the calling user's per-user override of a share's instructions.
-    /// Registered share members only — anonymous/link guests blocked.
-    #[command(name = "get-share-user")]
-    GetShareUser {
-        /// Share ID.
-        #[arg(long)]
-        share_id: String,
-    },
-    /// Set the calling user's per-user override of a share's instructions.
-    /// Registered share members only.
-    #[command(name = "set-share-user")]
-    SetShareUser {
-        /// Share ID.
-        #[arg(long)]
-        share_id: String,
-        /// Markdown content (up to 65,536 raw bytes).
-        #[arg(long, allow_hyphen_values = true)]
-        content: String,
-    },
-    /// Clear the calling user's per-user override of a share's instructions.
-    #[command(name = "clear-share-user")]
-    ClearShareUser {
-        /// Share ID.
-        #[arg(long)]
-        share_id: String,
-    },
-}
-
 // ─── System ───────────────────────────────────────────────────────────────────
 
 /// System health subcommands.
@@ -6069,29 +7016,33 @@ impl fmt::Debug for AuthCommands {
                 password: _,
                 first_name,
                 last_name,
+                agent,
             } => f
                 .debug_struct("Signup")
                 .field("email", email)
                 .field("password", &"[REDACTED]")
                 .field("first_name", first_name)
                 .field("last_name", last_name)
+                .field("agent", agent)
                 .finish(),
             Self::PasswordReset {
-                code,
+                code: _,
                 password1: _,
                 password2: _,
             } => f
                 .debug_struct("PasswordReset")
-                .field("code", code)
+                .field("code", &"[REDACTED]")
                 .field("password1", &"[REDACTED]")
                 .field("password2", &"[REDACTED]")
                 .finish(),
             Self::Logout => write!(f, "Logout"),
+            Self::Signout => write!(f, "Signout"),
+            Self::InvalidateAll => write!(f, "InvalidateAll"),
             Self::Status => write!(f, "Status"),
-            Self::Verify { email, code } => f
+            Self::Verify { email, code: _ } => f
                 .debug_struct("Verify")
                 .field("email", email)
-                .field("code", code)
+                .field("code", &"[REDACTED]")
                 .finish(),
             Self::TwoFa(cmds) => f.debug_tuple("TwoFa").field(cmds).finish(),
             Self::ApiKey(cmds) => f.debug_tuple("ApiKey").field(cmds).finish(),
@@ -6106,9 +7057,9 @@ impl fmt::Debug for AuthCommands {
                 .finish(),
             Self::Oauth(cmds) => f.debug_tuple("Oauth").field(cmds).finish(),
             Self::Scopes => write!(f, "Scopes"),
-            Self::PasswordResetCheck { code } => f
+            Self::PasswordResetCheck { code: _ } => f
                 .debug_struct("PasswordResetCheck")
-                .field("code", code)
+                .field("code", &"[REDACTED]")
                 .finish(),
             #[allow(unreachable_patterns)]
             _ => write!(f, "AuthCommands(<unknown variant>)"),
@@ -6116,12 +7067,111 @@ impl fmt::Debug for AuthCommands {
     }
 }
 
+impl fmt::Debug for TwoFaCommands {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Setup { channel } => f.debug_struct("Setup").field("channel", channel).finish(),
+            Self::Verify { code: _ } => f
+                .debug_struct("Verify")
+                .field("code", &"[REDACTED]")
+                .finish(),
+            Self::Disable { token: _ } => f
+                .debug_struct("Disable")
+                .field("token", &"[REDACTED]")
+                .finish(),
+            Self::Status => write!(f, "Status"),
+            Self::Send { channel } => f.debug_struct("Send").field("channel", channel).finish(),
+            Self::VerifySetup { token: _ } => f
+                .debug_struct("VerifySetup")
+                .field("token", &"[REDACTED]")
+                .finish(),
+            #[allow(unreachable_patterns)]
+            _ => write!(f, "TwoFaCommands(<unknown variant>)"),
+        }
+    }
+}
+
+impl fmt::Debug for UserCommands {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Info => write!(f, "Info"),
+            Self::Update {
+                first_name,
+                last_name,
+                display_name,
+                phone_country,
+                phone_number,
+                password: _,
+                current_password: _,
+            } => f
+                .debug_struct("Update")
+                .field("first_name", first_name)
+                .field("last_name", last_name)
+                .field("display_name", display_name)
+                .field("phone_country", phone_country)
+                .field("phone_number", phone_number)
+                .field("password", &"[REDACTED]")
+                .field("current_password", &"[REDACTED]")
+                .finish(),
+            Self::EmailChange(cmds) => f.debug_tuple("EmailChange").field(cmds).finish(),
+            Self::Avatar(cmds) => f.debug_tuple("Avatar").field(cmds).finish(),
+            Self::Settings(cmds) => f.debug_tuple("Settings").field(cmds).finish(),
+            Self::Search { query } => f.debug_struct("Search").field("query", query).finish(),
+            Self::Close { confirmation } => f
+                .debug_struct("Close")
+                .field("confirmation", confirmation)
+                .finish(),
+            Self::Details { user_id } => {
+                f.debug_struct("Details").field("user_id", user_id).finish()
+            }
+            Self::Profiles => write!(f, "Profiles"),
+            Self::Allowed => write!(f, "Allowed"),
+            Self::OrgLimits => write!(f, "OrgLimits"),
+            Self::Shares => write!(f, "Shares"),
+            Self::Invitations(cmds) => f.debug_tuple("Invitations").field(cmds).finish(),
+            Self::Asset(cmds) => f.debug_tuple("Asset").field(cmds).finish(),
+            Self::Autosync { state } => f.debug_struct("Autosync").field("state", state).finish(),
+            Self::Pin => write!(f, "Pin"),
+            Self::Phone {
+                country_code,
+                phone_number,
+            } => f
+                .debug_struct("Phone")
+                .field("country_code", country_code)
+                .field("phone_number", phone_number)
+                .finish(),
+            #[allow(unreachable_patterns)]
+            _ => write!(f, "UserCommands(<unknown variant>)"),
+        }
+    }
+}
+
+impl fmt::Debug for UserEmailChangeCommands {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Request {
+                new_email,
+                current_password: _,
+            } => f
+                .debug_struct("Request")
+                .field("new_email", new_email)
+                .field("current_password", &"[REDACTED]")
+                .finish(),
+            Self::Confirm { token: _ } => f
+                .debug_struct("Confirm")
+                .field("token", &"[REDACTED]")
+                .finish(),
+            #[allow(unreachable_patterns)]
+            _ => write!(f, "UserEmailChangeCommands(<unknown variant>)"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod ripley_alias_tests {
     use super::{
-        ApprovalCommands, Cli, Commands, OrgBillingCommands, OrgCommands, RipleyCommands,
-        SearchCommands, SignCommands, SignDocumentCommands, SignEnvelopeCommands, TaskCommands,
-        TodoCommands, WorklogCommands,
+        Cli, Commands, OrgBillingCommands, OrgCommands, RipleyCommands, SearchCommands,
+        SignCommands, SignDocumentCommands, SignEnvelopeCommands, TaskCommands,
     };
     use clap::{CommandFactory, Parser};
 
@@ -6469,6 +7519,35 @@ mod ripley_alias_tests {
     }
 
     #[test]
+    fn workflow_list_rejects_bad_archived() {
+        // The value_parser allowlist rejects anything outside {true,false,all}.
+        assert!(
+            Cli::try_parse_from(["fastio", "workflow", "list", "ws1", "--archived", "maybe"])
+                .is_err(),
+            "invalid --archived must be rejected"
+        );
+        Cli::try_parse_from(["fastio", "workflow", "list", "ws1", "--archived", "all"])
+            .expect("valid --archived should parse");
+    }
+
+    #[test]
+    fn workflow_template_list_rejects_bad_usage() {
+        // The value_parser allowlist rejects anything outside
+        // {library,one_off,all}.
+        assert!(
+            Cli::try_parse_from([
+                "fastio", "workflow", "template", "list", "ws1", "--usage", "bogus",
+            ])
+            .is_err(),
+            "invalid --usage must be rejected"
+        );
+        Cli::try_parse_from([
+            "fastio", "workflow", "template", "list", "ws1", "--usage", "library",
+        ])
+        .expect("valid --usage should parse");
+    }
+
+    #[test]
     fn transactions_is_workspace_only() {
         let cli = Cli::try_parse_from(["fastio", "ripley", "transactions", "--workspace", "ws1"])
             .expect("transactions should parse");
@@ -6548,135 +7627,6 @@ mod ripley_alias_tests {
     }
 
     #[test]
-    fn legacy_workflow_groups_marked_in_top_level_help() {
-        // Each legacy primitive group's about line must carry `[legacy]`.
-        let mut cmd = Cli::command();
-        let mut buf = Vec::new();
-        cmd.write_long_help(&mut buf).expect("render help");
-        let help = String::from_utf8(buf).expect("utf8 help");
-        for group in ["task", "worklog", "approval", "todo"] {
-            // Find the subcommand and inspect its about text directly (robust to
-            // help-layout wrapping).
-            let sub = Cli::command()
-                .get_subcommands()
-                .find(|c| c.get_name() == group)
-                .map(|c| {
-                    c.get_about()
-                        .map(std::string::ToString::to_string)
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
-            assert!(
-                sub.contains("[legacy]"),
-                "{group} about must contain [legacy], got: {sub}"
-            );
-        }
-        // Sanity: the rendered help is non-empty.
-        assert!(!help.is_empty());
-    }
-
-    #[test]
-    fn approval_request_parses_scope_and_optional_fields() {
-        let cli = Cli::try_parse_from([
-            "fastio",
-            "approval",
-            "request",
-            "--profile-type",
-            "share",
-            "--profile-id",
-            "sh1",
-            "--entity-type",
-            "task",
-            "abc",
-            "--description",
-            "review please",
-            "--approver-id",
-            "appr1",
-            "--deadline",
-            "2025-06-15 23:59:59",
-        ])
-        .expect("approval request should parse");
-        match cli.command {
-            Commands::Approval(ApprovalCommands::Request {
-                profile_type,
-                profile_id,
-                entity_type,
-                entity_id,
-                description,
-                approver_id,
-                deadline,
-                ..
-            }) => {
-                assert_eq!(profile_type, "share");
-                assert_eq!(profile_id, "sh1");
-                assert_eq!(entity_type, "task");
-                assert_eq!(entity_id, "abc");
-                assert_eq!(description, "review please");
-                assert_eq!(approver_id.as_deref(), Some("appr1"));
-                assert_eq!(deadline.as_deref(), Some("2025-06-15 23:59:59"));
-            }
-            other => panic!("expected approval request, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn approval_approve_defaults_profile_type_to_workspace() {
-        let cli = Cli::try_parse_from([
-            "fastio",
-            "approval",
-            "approve",
-            "--profile-id",
-            "ws1",
-            "appr1",
-        ])
-        .expect("approval approve should parse");
-        match cli.command {
-            Commands::Approval(ApprovalCommands::Approve {
-                profile_type,
-                profile_id,
-                approval_id,
-                ..
-            }) => {
-                assert_eq!(profile_type, "workspace");
-                assert_eq!(profile_id.as_deref(), Some("ws1"));
-                assert_eq!(approval_id, "appr1");
-            }
-            other => panic!("expected approval approve, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn approval_approve_works_without_scope() {
-        // Backward compat: the historical `approval approve <id>` syntax must
-        // parse without any scope flag (profile_id is then None → legacy route).
-        let cli = Cli::try_parse_from(["fastio", "approval", "approve", "appr1"])
-            .expect("approval approve should parse without a scope");
-        match cli.command {
-            Commands::Approval(ApprovalCommands::Approve {
-                profile_id,
-                approval_id,
-                ..
-            }) => {
-                assert!(profile_id.is_none());
-                assert_eq!(approval_id, "appr1");
-            }
-            other => panic!("expected approval approve, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn approval_mine_parses_filter() {
-        let cli = Cli::try_parse_from(["fastio", "approval", "mine", "pending"])
-            .expect("approval mine should parse");
-        match cli.command {
-            Commands::Approval(ApprovalCommands::Mine { filter, .. }) => {
-                assert_eq!(filter, "pending");
-            }
-            other => panic!("expected approval mine, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn task_filter_and_summary_parse() {
         let cli =
             Cli::try_parse_from(["fastio", "task", "filter", "--workspace", "ws1", "assigned"])
@@ -6690,78 +7640,6 @@ mod ripley_alias_tests {
         assert!(matches!(
             cli.command,
             Commands::Task(TaskCommands::Summary { .. })
-        ));
-    }
-
-    #[test]
-    fn worklog_list_accepts_node_entity_type() {
-        // workflow.txt lists `node` as a valid worklog entity type; the CLI
-        // value_parser must accept it (previously rejected).
-        let cli = Cli::try_parse_from([
-            "fastio",
-            "worklog",
-            "list",
-            "--workspace",
-            "ws1",
-            "--entity-type",
-            "node",
-            "--entity-id",
-            "n1",
-        ])
-        .expect("worklog list --entity-type node should parse");
-        match cli.command {
-            Commands::Worklog(WorklogCommands::List { entity_type, .. }) => {
-                assert_eq!(entity_type.as_deref(), Some("node"));
-            }
-            other => panic!("expected worklog list, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn worklog_filter_listall_summary_parse() {
-        for (args, ok) in [
-            (
-                vec!["fastio", "worklog", "list-all", "--workspace", "ws1"],
-                true,
-            ),
-            (
-                vec![
-                    "fastio",
-                    "worklog",
-                    "filter",
-                    "--workspace",
-                    "ws1",
-                    "authored",
-                ],
-                true,
-            ),
-            (
-                vec!["fastio", "worklog", "summary", "--workspace", "ws1"],
-                true,
-            ),
-        ] {
-            assert_eq!(
-                Cli::try_parse_from(args.clone()).is_ok(),
-                ok,
-                "parsing {args:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn todo_filter_and_summary_parse() {
-        let cli =
-            Cli::try_parse_from(["fastio", "todo", "filter", "--workspace", "ws1", "pending"])
-                .expect("todo filter should parse");
-        assert!(matches!(
-            cli.command,
-            Commands::Todo(TodoCommands::Filter { .. })
-        ));
-        let cli = Cli::try_parse_from(["fastio", "todo", "summary", "--workspace", "ws1"])
-            .expect("todo summary should parse");
-        assert!(matches!(
-            cli.command,
-            Commands::Todo(TodoCommands::Summary { .. })
         ));
     }
 
@@ -7364,5 +8242,500 @@ mod fileshare_parse_tests {
         // A present-vs-absent distinction is still legible.
         let none = parse(&["fastio", "fileshare", "info", "fs1"]);
         assert!(format!("{none:?}").contains("None"));
+    }
+}
+
+#[cfg(test)]
+mod share_debug_tests {
+    use super::{Cli, Commands, ShareCommands};
+    use clap::Parser;
+
+    /// Helper: parse argv into a [`ShareCommands`], panicking on a parse error
+    /// with the clap message (so the cause is visible).
+    fn parse(args: &[&str]) -> ShareCommands {
+        let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        match cli.command {
+            Commands::Share(c) => c,
+            other => panic!("expected Share, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn debug_redacts_password_values() {
+        // The manual Debug impl must NEVER render a password value, on any of
+        // the three password-bearing variants (Create/Update/PasswordAuth).
+        const SECRET: &str = "super-secret-pw";
+
+        let create = parse(&[
+            "fastio",
+            "share",
+            "create",
+            "My Share",
+            "--workspace",
+            "ws1",
+            "--password",
+            SECRET,
+        ]);
+        let dbg = format!("{create:?}");
+        assert!(
+            !dbg.contains(SECRET),
+            "Create Debug must not leak the password: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Create Debug must show the redaction marker: {dbg}"
+        );
+
+        let update = parse(&["fastio", "share", "update", "sh1", "--password", SECRET]);
+        let dbg = format!("{update:?}");
+        assert!(
+            !dbg.contains(SECRET),
+            "Update Debug must not leak the password: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Update Debug must show the redaction marker: {dbg}"
+        );
+
+        let auth = parse(&["fastio", "share", "password-auth", "sh1", SECRET]);
+        let dbg = format!("{auth:?}");
+        assert!(
+            !dbg.contains(SECRET),
+            "PasswordAuth Debug must not leak the password: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "PasswordAuth Debug must show the redaction marker: {dbg}"
+        );
+
+        // The leak path is `Cli` Debug → command: assert the full render is
+        // also clean (this is the surface a panic/log would actually print).
+        let cli = Cli::try_parse_from(["fastio", "share", "password-auth", "sh1", SECRET])
+            .expect("password-auth should parse");
+        assert!(
+            !format!("{cli:?}").contains(SECRET),
+            "Cli Debug must not leak the share password through the command field"
+        );
+
+        // A present-vs-absent distinction is still legible on the Options.
+        let none = parse(&["fastio", "share", "update", "sh1", "--title", "New"]);
+        assert!(format!("{none:?}").contains("None"));
+    }
+}
+
+#[cfg(test)]
+mod lock_org_debug_tests {
+    use super::{Cli, Commands, FilesCommands};
+    use clap::Parser;
+
+    /// Parse argv into a [`Cli`], panicking on a parse error with the clap
+    /// message (so the cause is visible).
+    fn cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).unwrap_or_else(|e| panic!("parse failed: {e}"))
+    }
+
+    #[test]
+    fn file_lock_release_debug_redacts_token() {
+        // The manual Debug must NEVER render the capability lock_token, on the
+        // enum directly OR through the full `Cli` Debug path (the surface a
+        // panic/log would actually print).
+        const SECRET: &str = "lock-tok-SECRET";
+        let parsed = cli(&[
+            "fastio",
+            "files",
+            "lock",
+            "release",
+            "--workspace",
+            "ws1",
+            "n1",
+            "--lock-token",
+            SECRET,
+        ]);
+        let inner = match &parsed.command {
+            Commands::Files(FilesCommands::Lock(c)) => c,
+            other => panic!("expected Files(Lock), got {other:?}"),
+        };
+        let dbg = format!("{inner:?}");
+        assert!(!dbg.contains(SECRET), "lock_token must not leak: {dbg}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "must show the redaction marker: {dbg}"
+        );
+        let full = format!("{parsed:?}");
+        assert!(
+            !full.contains(SECRET),
+            "Cli Debug must not leak the lock_token: {full}"
+        );
+        assert!(full.contains("<redacted>"));
+    }
+
+    #[test]
+    fn file_lock_acquire_debug_redacts_client_info() {
+        const INFO: &str = "device-fingerprint-SECRET";
+        let parsed = cli(&[
+            "fastio",
+            "files",
+            "lock",
+            "acquire",
+            "--workspace",
+            "ws1",
+            "n1",
+            "--client-info",
+            INFO,
+        ]);
+        let full = format!("{parsed:?}");
+        assert!(!full.contains(INFO), "client_info must not leak: {full}");
+        assert!(
+            full.contains("Some(<redacted>)"),
+            "a present client_info must show the redaction marker: {full}"
+        );
+        // A present-vs-absent distinction is still legible.
+        let none = cli(&[
+            "fastio",
+            "files",
+            "lock",
+            "acquire",
+            "--workspace",
+            "ws1",
+            "n1",
+        ]);
+        assert!(format!("{none:?}").contains("client_info: None"));
+    }
+
+    #[test]
+    fn lock_release_and_heartbeat_debug_redact_token() {
+        // Both the `lock release` and `lock heartbeat` variants carry the
+        // capability lock_token and must redact it.
+        const SECRET: &str = "lock-tok-SECRET";
+        for action in ["release", "heartbeat"] {
+            let parsed = cli(&[
+                "fastio",
+                "lock",
+                action,
+                "--context-id",
+                "ws1",
+                "n1",
+                "--lock-token",
+                SECRET,
+            ]);
+            let inner = match &parsed.command {
+                Commands::Lock(c) => c,
+                other => panic!("expected Lock, got {other:?}"),
+            };
+            let dbg = format!("{inner:?}");
+            assert!(
+                !dbg.contains(SECRET),
+                "{action} lock_token must not leak: {dbg}"
+            );
+            assert!(
+                dbg.contains("<redacted>"),
+                "{action} must show the redaction marker: {dbg}"
+            );
+            assert!(
+                !format!("{parsed:?}").contains(SECRET),
+                "Cli Debug must not leak the {action} lock_token"
+            );
+        }
+    }
+
+    #[test]
+    fn lock_acquire_debug_redacts_client_info() {
+        const INFO: &str = "device-fingerprint-SECRET";
+        let parsed = cli(&[
+            "fastio",
+            "lock",
+            "acquire",
+            "--context-id",
+            "ws1",
+            "n1",
+            "--client-info",
+            INFO,
+        ]);
+        let full = format!("{parsed:?}");
+        assert!(!full.contains(INFO), "client_info must not leak: {full}");
+        assert!(
+            full.contains("Some(<redacted>)"),
+            "a present client_info must show the redaction marker: {full}"
+        );
+        let none = cli(&["fastio", "lock", "acquire", "--context-id", "ws1", "n1"]);
+        assert!(format!("{none:?}").contains("client_info: None"));
+    }
+
+    #[test]
+    fn org_transfer_claim_debug_redacts_token() {
+        // The bearer transfer-claim token (grants org-ownership claim) must
+        // never render verbatim, on the enum or through the full Cli Debug path.
+        const SECRET: &str = "transfer-bearer-SECRET";
+        let parsed = cli(&["fastio", "org", "transfer-claim", SECRET]);
+        let inner = match &parsed.command {
+            Commands::Org(c) => c,
+            other => panic!("expected Org, got {other:?}"),
+        };
+        let dbg = format!("{inner:?}");
+        assert!(
+            !dbg.contains(SECRET),
+            "transfer-claim token must not leak: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "must show the redaction marker: {dbg}"
+        );
+        let full = format!("{parsed:?}");
+        assert!(
+            !full.contains(SECRET),
+            "Cli Debug must not leak the transfer-claim token: {full}"
+        );
+        assert!(full.contains("<redacted>"));
+
+        // A non-secret OrgCommands variant still renders its fields normally.
+        let listed = cli(&["fastio", "org", "info", "1234567890123456789"]);
+        assert!(format!("{listed:?}").contains("1234567890123456789"));
+    }
+
+    // `OrgCommands` is a large hand-written Debug; this guards against a
+    // formatting regression on a non-secret field while we are here.
+    #[test]
+    fn org_create_workspace_debug_renders_fields() {
+        let parsed = cli(&[
+            "fastio",
+            "org",
+            "create-workspace",
+            "1234567890123456789",
+            "My Workspace",
+        ]);
+        let dbg = format!("{parsed:?}");
+        assert!(dbg.contains("CreateWorkspace"));
+        assert!(dbg.contains("My Workspace"));
+    }
+}
+
+#[cfg(test)]
+mod auth_user_secret_debug_tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    /// Helper: parse argv into a [`Cli`], panicking on a parse error with the
+    /// clap message (so the cause is visible).
+    fn cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).unwrap_or_else(|e| panic!("parse failed: {e}"))
+    }
+
+    /// `auth signup --password` must never render the password verbatim — on the
+    /// `AuthCommands` enum or through the full `Cli` Debug tree — while the
+    /// non-secret `agent` flag still renders.
+    #[test]
+    fn auth_signup_debug_redacts_password_renders_agent() {
+        const SECRET: &str = "signup-pw-SECRET";
+        let parsed = cli(&[
+            "fastio",
+            "auth",
+            "signup",
+            "--email",
+            "a@b.c",
+            "--password",
+            SECRET,
+            "--agent",
+        ]);
+        let inner = match &parsed.command {
+            Commands::Auth(c) => format!("{c:?}"),
+            other => panic!("expected Auth, got {other:?}"),
+        };
+        assert!(!inner.contains(SECRET), "password must not leak: {inner}");
+        assert!(inner.contains("[REDACTED]"), "must redact: {inner}");
+        assert!(
+            inner.contains("agent: true"),
+            "non-secret agent flag must render: {inner}"
+        );
+        let full = format!("{parsed:?}");
+        assert!(
+            !full.contains(SECRET),
+            "Cli Debug must not leak the password: {full}"
+        );
+    }
+
+    /// `user update --password/--current-password` must redact both secrets on
+    /// the `UserCommands` enum and through the full `Cli` Debug tree, while a
+    /// non-secret field (phone) still renders.
+    #[test]
+    fn user_update_debug_redacts_password_secrets() {
+        const NEW_PW: &str = "new-pw-SECRET";
+        const CUR_PW: &str = "current-pw-SECRET";
+        let parsed = cli(&[
+            "fastio",
+            "user",
+            "update",
+            "--password",
+            NEW_PW,
+            "--current-password",
+            CUR_PW,
+            "--phone-country",
+            "1",
+            "--phone-number",
+            "5551234567",
+        ]);
+        let full = format!("{parsed:?}");
+        assert!(!full.contains(NEW_PW), "new password must not leak: {full}");
+        assert!(
+            !full.contains(CUR_PW),
+            "current password must not leak: {full}"
+        );
+        assert!(full.contains("[REDACTED]"), "must redact: {full}");
+        // Non-secret phone fields still render.
+        assert!(full.contains("5551234567"), "phone must render: {full}");
+    }
+
+    /// `user email-change request --current-password` and `... confirm --token`
+    /// must redact their secrets through the full `Cli` Debug tree.
+    #[test]
+    fn user_email_change_debug_redacts_secrets() {
+        const CUR_PW: &str = "ec-current-pw-SECRET";
+        const TOKEN: &str = "ec-confirm-token-SECRET";
+        let req = cli(&[
+            "fastio",
+            "user",
+            "email-change",
+            "request",
+            "--new-email",
+            "new@example.com",
+            "--current-password",
+            CUR_PW,
+        ]);
+        let req_dbg = format!("{req:?}");
+        assert!(
+            !req_dbg.contains(CUR_PW),
+            "current password must not leak: {req_dbg}"
+        );
+        assert!(req_dbg.contains("[REDACTED]"), "must redact: {req_dbg}");
+        // The non-secret new email still renders.
+        assert!(
+            req_dbg.contains("new@example.com"),
+            "new email must render: {req_dbg}"
+        );
+
+        let conf = cli(&[
+            "fastio",
+            "user",
+            "email-change",
+            "confirm",
+            "--token",
+            TOKEN,
+        ]);
+        let conf_dbg = format!("{conf:?}");
+        assert!(
+            !conf_dbg.contains(TOKEN),
+            "confirmation token must not leak: {conf_dbg}"
+        );
+        assert!(conf_dbg.contains("[REDACTED]"), "must redact: {conf_dbg}");
+    }
+
+    /// `auth 2fa disable --token` and `auth 2fa verify-setup --token` carry
+    /// one-time auth tokens that must be redacted through the full `Cli` Debug
+    /// tree (`AuthCommands` delegates to the manual `TwoFaCommands` Debug). The
+    /// non-secret `Setup --channel` flag must still render.
+    #[test]
+    fn two_fa_token_debug_redacts_through_full_cli() {
+        const DISABLE_TOKEN: &str = "2fa-disable-token-SECRET";
+        const SETUP_TOKEN: &str = "2fa-verify-setup-token-SECRET";
+        let disable = cli(&["fastio", "auth", "2fa", "disable", "--token", DISABLE_TOKEN]);
+        let disable_dbg = format!("{disable:?}");
+        assert!(
+            !disable_dbg.contains(DISABLE_TOKEN),
+            "2fa disable token must not leak: {disable_dbg}"
+        );
+        assert!(
+            disable_dbg.contains("[REDACTED]"),
+            "must redact: {disable_dbg}"
+        );
+
+        let verify_setup = cli(&[
+            "fastio",
+            "auth",
+            "2fa",
+            "verify-setup",
+            "--token",
+            SETUP_TOKEN,
+        ]);
+        let setup_dbg = format!("{verify_setup:?}");
+        assert!(
+            !setup_dbg.contains(SETUP_TOKEN),
+            "2fa verify-setup token must not leak: {setup_dbg}"
+        );
+        assert!(setup_dbg.contains("[REDACTED]"), "must redact: {setup_dbg}");
+
+        // Non-secret 2FA channel still renders.
+        let setup = cli(&["fastio", "auth", "2fa", "setup", "--channel", "totp"]);
+        let setup_chan_dbg = format!("{setup:?}");
+        assert!(
+            setup_chan_dbg.contains("totp"),
+            "non-secret 2fa channel must render: {setup_chan_dbg}"
+        );
+    }
+
+    /// `auth 2fa verify --code` carries a one-time 2FA code that must be redacted
+    /// through the full `Cli` Debug tree.
+    #[test]
+    fn two_fa_verify_code_debug_redacts_through_full_cli() {
+        const CODE: &str = "2fa-verify-code-SECRET";
+        let parsed = cli(&["fastio", "auth", "2fa", "verify", "--code", CODE]);
+        let dbg = format!("{parsed:?}");
+        assert!(!dbg.contains(CODE), "2fa verify code must not leak: {dbg}");
+        assert!(dbg.contains("[REDACTED]"), "must redact: {dbg}");
+    }
+
+    /// `auth password-reset <code>` and `auth password-reset-check <code>` carry
+    /// one-time reset codes that must be redacted through the full `Cli` Debug
+    /// tree.
+    #[test]
+    fn auth_password_reset_code_debug_redacts() {
+        const RESET_CODE: &str = "pw-reset-code-SECRET";
+        const CHECK_CODE: &str = "pw-reset-check-code-SECRET";
+        let reset = cli(&[
+            "fastio",
+            "auth",
+            "password-reset",
+            RESET_CODE,
+            "--new-password",
+            "np",
+            "--confirm-password",
+            "np",
+        ]);
+        let reset_dbg = format!("{reset:?}");
+        assert!(
+            !reset_dbg.contains(RESET_CODE),
+            "password-reset code must not leak: {reset_dbg}"
+        );
+        assert!(reset_dbg.contains("[REDACTED]"), "must redact: {reset_dbg}");
+
+        let check = cli(&["fastio", "auth", "password-reset-check", CHECK_CODE]);
+        let check_dbg = format!("{check:?}");
+        assert!(
+            !check_dbg.contains(CHECK_CODE),
+            "password-reset-check code must not leak: {check_dbg}"
+        );
+        assert!(check_dbg.contains("[REDACTED]"), "must redact: {check_dbg}");
+    }
+
+    /// `auth verify --email --code` carries a one-time verification code that
+    /// must be redacted through the full `Cli` Debug tree, while the non-secret
+    /// email still renders.
+    #[test]
+    fn auth_verify_code_debug_redacts_renders_email() {
+        const CODE: &str = "auth-verify-code-SECRET";
+        let parsed = cli(&[
+            "fastio",
+            "auth",
+            "verify",
+            "--email",
+            "v@example.com",
+            "--code",
+            CODE,
+        ]);
+        let dbg = format!("{parsed:?}");
+        assert!(!dbg.contains(CODE), "verify code must not leak: {dbg}");
+        assert!(dbg.contains("[REDACTED]"), "must redact: {dbg}");
+        assert!(
+            dbg.contains("v@example.com"),
+            "non-secret email must render: {dbg}"
+        );
     }
 }

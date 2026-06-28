@@ -107,10 +107,39 @@ impl CommandContext<'_> {
     }
 }
 
+/// Parse an optional JSON-object argument, supporting an `@path` form that reads
+/// the JSON from a file (`@@` escapes a literal leading `@`).
+///
+/// Shared by the command modules that accept inline `{json}` or `@file.json`
+/// object arguments (e.g. `comment create`'s `--reference` / `--properties` and
+/// `task comment post`), so the resolver stays in one place rather than being
+/// re-implemented per module. Returns `Ok(None)` when `raw` is absent.
+pub(crate) fn parse_json_object_arg(
+    raw: Option<&str>,
+    label: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let text = if let Some(path) = raw.strip_prefix('@') {
+        if let Some(literal) = path.strip_prefix('@') {
+            literal.to_owned()
+        } else {
+            std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read {label} from file '{path}'"))?
+        }
+    } else {
+        raw.to_owned()
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("{label} must be valid JSON"))?;
+    anyhow::ensure!(
+        value.is_object(),
+        "{label} must be a JSON object (e.g. {{\"key\":\"value\"}})"
+    );
+    Ok(Some(value))
+}
+
 /// AI chat and prompt commands.
 pub mod ai;
-/// Approval workflow commands.
-pub mod approval;
 /// Connected-app management commands.
 pub mod apps;
 /// Asset metadata and transformation commands.
@@ -121,6 +150,8 @@ pub mod auth;
 pub mod comment;
 /// CLI configuration commands (profiles, defaults).
 pub mod configure;
+/// Per-workspace dashboard (actionable card feed) commands.
+pub mod dashboard;
 /// File and folder download commands.
 pub mod download;
 /// Audit and activity event commands.
@@ -129,12 +160,12 @@ pub mod event;
 pub mod files;
 /// File Share (durable single-file link) commands.
 pub mod fileshare;
+/// How-To grounded product-guidance command (`fastio how-to`).
+pub mod howto;
 /// Offline OpaqueId classification command (`fastio id info`).
 pub mod id;
 /// External storage import commands.
 pub mod import;
-/// AI instructions commands (user / org / workspace / share).
-pub mod instructions;
 /// Workspace invitation commands.
 pub mod invitation;
 /// File locking commands.
@@ -159,8 +190,6 @@ pub mod sign;
 pub mod system;
 /// Task management commands.
 pub mod task;
-/// To-do item commands.
-pub mod todo;
 /// File upload commands.
 pub mod upload;
 /// User profile commands.
@@ -169,7 +198,5 @@ pub mod user;
 pub mod view;
 /// Workflow Orchestration (v3.2) commands.
 pub mod workflow;
-/// Work log commands.
-pub mod worklog;
 /// Workspace management commands.
 pub mod workspace;

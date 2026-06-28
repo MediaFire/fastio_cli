@@ -127,8 +127,8 @@ fastio workspace create --org ORG_ID --name "Knowledge Base" --intelligence true
 fastio workspace update WS_ID --intelligence true
 ```
 
-Note: `workspace enable-workflow` / `disable-workflow` gate the **legacy workflow
-feature**, not AI indexing. Use `--intelligence` (above) for indexing.
+Note: `workspace enable-workflow` / `disable-workflow` gate the **workflow
+orchestration feature**, not AI indexing. Use `--intelligence` (above) for indexing.
 
 ## Core Workflows
 
@@ -191,11 +191,9 @@ fastio search share SHARE_ID "query" --only files,comments
 
 ## Workflow Orchestration (the forward path)
 
-`fastio workflow` (alias `wf`) is the new durable multi-step orchestration
-surface — **distinct from, and the replacement for, the `[legacy]` task /
-worklog / approval / todo primitives**. Those legacy groups still work and are
-flagged `[legacy]`; they will be hard-deprecated in a later release. New work
-should use `fastio workflow`.
+`fastio workflow` (alias `wf`) is the durable multi-step orchestration
+surface. New work should use `fastio workflow` for orchestration and
+`fastio task` for the Tasks API (task lists, tasks, comments, attachments).
 
 Groups under `fastio workflow`:
 

@@ -104,6 +104,8 @@ const SECRET_LOG_KEYS: &[&str] = &[
     // Password-change/reset forms use numbered fields.
     "password1",
     "password2",
+    // Current-password proof on `/user/update/` (password-change + email-change).
+    "current_password",
     "private_key",
     "client_secret",
     // Billing: `public_key` is a Stripe *publishable* key (not strictly secret),
@@ -116,8 +118,15 @@ const SECRET_LOG_KEYS: &[&str] = &[
     // OAuth PKCE token-exchange form fields (one-time, but still credentials).
     "code",
     "code_verifier",
+    // Email-verification one-time code (`email_token` on `/user/email/validate/`);
+    // the same one-time-credential class as `code` (api/auth.rs `email_verify`).
+    "email_token",
     // Storage/file lock ownership token (form field).
     "lock_token",
+    // File-lock device fingerprint (`client_info` on the acquire-lock form): a
+    // JSON blob of client metadata. Already redacted in the CLI Debug impls, so
+    // redact it in form logs too for consistency (api/storage.rs `lock_acquire_form`).
+    "client_info",
     // Preview-access JWT returned by `get_preview_url` (`downloadToken` →
     // case-insensitive `downloadtoken`): a bearer-equivalent read token.
     "downloadtoken",
@@ -195,6 +204,63 @@ fn redact_form_for_log(form: &HashMap<String, String>) -> std::collections::BTre
             (k.as_str(), v)
         })
         .collect()
+}
+
+/// Whether a path segment at the 2FA enable/disable position is a known,
+/// NON-secret channel name rather than a disable verification token.
+///
+/// The enable (`POST /user/auth/2factor/{channel}/`) and disable
+/// (`DELETE /user/auth/2factor/{token}/`) routes share the same single-segment
+/// shape; only the HTTP method distinguishes them, which [`redact_path_for_log`]
+/// cannot see. A real disable token is a numeric/alphanumeric code that never
+/// equals one of these channel literals, so allowlisting the enable channels
+/// keeps them visible in traces while still masking every token. A future
+/// channel not on this list is masked too — harmless over-caution, never an
+/// under-mask of a real token.
+fn is_known_2fa_channel(segment: &str) -> bool {
+    matches!(segment, "sms" | "totp" | "whatsapp")
+}
+
+/// Mask the secret segment of a known secret-bearing request path before it is
+/// trace-logged.
+///
+/// A handful of auth endpoints embed a one-time credential directly in the URL
+/// PATH (not the body or query), so neither form nor query redaction can reach
+/// it. This masks ONLY those known templates, replacing the secret segment with
+/// [`REDACTED_PLACEHOLDER`] while leaving the route structure intact so the
+/// trace stays useful:
+///
+/// * `/user/password/<code>/` and `/user/password/<code>/details/` — the
+///   password-reset code (`password_reset_complete` / `password_reset_check`).
+/// * `/user/auth/2factor/auth/<code>/` — the post-sign-in 2FA code
+///   (`two_factor_verify`).
+/// * `/user/auth/2factor/verify/<token>/` — the TOTP-setup token
+///   (`two_factor_verify_setup`).
+/// * `/user/auth/2factor/<token>/` — the disable token (`two_factor_disable`),
+///   distinguished from the non-secret enable channel
+///   (`/user/auth/2factor/<channel>/`) via [`is_known_2fa_channel`].
+///
+/// Any path that does not match one of these templates is returned unchanged,
+/// so ordinary paths (e.g. `/workspace/<id>/...`, where the id is not a secret)
+/// are never altered. The code/token is a single URL-encoded segment, so
+/// splitting on `/` isolates it exactly.
+fn redact_path_for_log(path: &str) -> String {
+    let mut segments: Vec<&str> = path.split('/').collect();
+    // Slice patterns are length-specific, so the fixed-length 2FA `auth`/`verify`
+    // arms below never collide with the shorter disable/enable arm.
+    let mask_idx = match segments.as_slice() {
+        ["", "user", "password", _, ""] | ["", "user", "password", _, "details", ""] => Some(3),
+        ["", "user", "auth", "2factor", "auth" | "verify", _, ""] => Some(5),
+        ["", "user", "auth", "2factor", segment, ""] if !is_known_2fa_channel(segment) => Some(4),
+        _ => None,
+    };
+    match mask_idx {
+        Some(idx) => {
+            segments[idx] = REDACTED_PLACEHOLDER;
+            segments.join("/")
+        }
+        None => path.to_owned(),
+    }
 }
 
 /// Redact a JSON request/response body presented as text for trace logging.
@@ -490,6 +556,12 @@ impl ApiClient {
         self.token = Some(SecretString::from(token));
     }
 
+    /// Drop the bearer token so subsequent requests are sent unauthenticated.
+    #[allow(dead_code)]
+    pub fn clear_token(&mut self) {
+        self.token = None;
+    }
+
     /// Return the current bearer token as a plain string, if any.
     ///
     /// Callers should avoid logging or persisting the returned value.
@@ -619,7 +691,7 @@ impl ApiClient {
     /// [`Self::output_injectable`]); only genuine non-envelope binary/raw/oauth
     /// paths (read/content/download/oauth) are excluded.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, CliError> {
-        tracing::trace!(method = "GET", path, "api request");
+        tracing::trace!(method = "GET", path = %redact_path_for_log(path), "api request");
         self.send_with_retry(|| self.build_get(path)).await
     }
 
@@ -629,7 +701,12 @@ impl ApiClient {
         path: &str,
         params: &HashMap<String, String>,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "GET", path, ?params, "api request");
+        tracing::trace!(
+            method = "GET",
+            path,
+            params = ?redact_form_for_log(params),
+            "api request"
+        );
         let has_output = Self::params_have_output(params);
         self.send_with_retry(|| {
             let req = self.inner.get(self.url(path)).query(params);
@@ -665,7 +742,12 @@ impl ApiClient {
         auth_value: &str,
         params: &HashMap<String, String>,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "GET", path, ?params, "api request (custom auth)");
+        tracing::trace!(
+            method = "GET",
+            path,
+            params = ?redact_form_for_log(params),
+            "api request (custom auth)"
+        );
         let auth_owned = auth_value.to_owned();
         let has_output = Self::params_have_output(params);
         self.send_with_retry(|| {
@@ -685,7 +767,12 @@ impl ApiClient {
         path: &str,
         params: &HashMap<String, String>,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "GET", path, ?params, "api request (no auth)");
+        tracing::trace!(
+            method = "GET",
+            path,
+            params = ?redact_form_for_log(params),
+            "api request (no auth)"
+        );
         let has_output = Self::params_have_output(params);
         self.send_with_retry(|| {
             let req = self.inner.get(self.url(path)).query(params);
@@ -700,7 +787,12 @@ impl ApiClient {
         path: &str,
         form: &HashMap<String, String>,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "POST", path, form = ?redact_form_for_log(form), "api request");
+        tracing::trace!(
+            method = "POST",
+            path = %redact_path_for_log(path),
+            form = ?redact_form_for_log(form),
+            "api request"
+        );
         self.send_with_retry(|| {
             let mut req = self.inner.post(self.url(path)).form(form);
             if let Some(auth) = self.auth_header() {
@@ -717,7 +809,12 @@ impl ApiClient {
         path: &str,
         form: &HashMap<String, String>,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "POST", path, form = ?redact_form_for_log(form), "api request (no auth)");
+        tracing::trace!(
+            method = "POST",
+            path = %redact_path_for_log(path),
+            form = ?redact_form_for_log(form),
+            "api request (no auth)"
+        );
         self.send_with_retry(|| self.inner.post(self.url(path)).form(form))
             .await
     }
@@ -952,7 +1049,7 @@ impl ApiClient {
 
     /// Perform a DELETE request and unwrap the API envelope.
     pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T, CliError> {
-        tracing::trace!(method = "DELETE", path, "api request");
+        tracing::trace!(method = "DELETE", path = %redact_path_for_log(path), "api request");
         self.send_with_retry(|| {
             let mut req = self.inner.delete(self.url(path));
             if let Some(auth) = self.auth_header() {
@@ -969,7 +1066,12 @@ impl ApiClient {
         path: &str,
         params: &HashMap<String, String>,
     ) -> Result<T, CliError> {
-        tracing::trace!(method = "DELETE", path, ?params, "api request");
+        tracing::trace!(
+            method = "DELETE",
+            path,
+            params = ?redact_form_for_log(params),
+            "api request"
+        );
         self.send_with_retry(|| {
             let mut req = self.inner.delete(self.url(path)).query(params);
             if let Some(auth) = self.auth_header() {
@@ -2546,6 +2648,84 @@ mod tests {
         // `grant_type` carries the literal string "refresh_token" as a VALUE but
         // its KEY is not secret, so the value is preserved (we redact by key).
         assert_eq!(redacted.get("grant_type"), Some(&"refresh_token"));
+    }
+
+    #[test]
+    fn redact_form_masks_email_token_and_client_info() {
+        // `email_token` (email-verification one-time code) and `client_info`
+        // (file-lock device fingerprint) are sensitive form fields and must be
+        // masked by key name; a non-secret sibling (`email`) is preserved.
+        let mut form = HashMap::new();
+        form.insert("email".to_owned(), "user@example.test".to_owned());
+        form.insert("email_token".to_owned(), "evt_LIVE_secret".to_owned());
+        form.insert(
+            "client_info".to_owned(),
+            r#"{"device":"laptop"}"#.to_owned(),
+        );
+        let redacted = redact_form_for_log(&form);
+        assert_eq!(redacted.get("email_token"), Some(&REDACTED_PLACEHOLDER));
+        assert_eq!(redacted.get("client_info"), Some(&REDACTED_PLACEHOLDER));
+        assert_eq!(redacted.get("email"), Some(&"user@example.test"));
+    }
+
+    #[test]
+    fn redact_params_masks_invitation_key_query_value() {
+        // GET query maps are redacted via the same `redact_form_for_log` path
+        // (Fix 2): a sensitive query value such as `invitation_key` must not
+        // appear cleartext in a trace, while a non-secret param is preserved.
+        let mut params = HashMap::new();
+        params.insert("invitation_key".to_owned(), "ik_LIVE_secret".to_owned());
+        params.insert("page".to_owned(), "1".to_owned());
+        let redacted = redact_form_for_log(&params);
+        assert_eq!(redacted.get("invitation_key"), Some(&REDACTED_PLACEHOLDER));
+        assert_eq!(redacted.get("page"), Some(&"1"));
+    }
+
+    #[test]
+    fn redact_path_masks_password_reset_and_2factor_secrets() {
+        // Password-reset code in the path (both the complete and the
+        // `/details/` check variant).
+        assert_eq!(
+            redact_path_for_log("/user/password/RESETCODE/"),
+            "/user/password/[redacted]/"
+        );
+        assert_eq!(
+            redact_path_for_log("/user/password/RESETCODE/details/"),
+            "/user/password/[redacted]/details/"
+        );
+        // 2FA post-sign-in code and TOTP-setup token.
+        assert_eq!(
+            redact_path_for_log("/user/auth/2factor/auth/123456/"),
+            "/user/auth/2factor/auth/[redacted]/"
+        );
+        assert_eq!(
+            redact_path_for_log("/user/auth/2factor/verify/SETUPTOK/"),
+            "/user/auth/2factor/verify/[redacted]/"
+        );
+        // 2FA disable token (DELETE) is masked...
+        assert_eq!(
+            redact_path_for_log("/user/auth/2factor/987654/"),
+            "/user/auth/2factor/[redacted]/"
+        );
+        // ...but the non-secret enable channel at the same position is preserved.
+        assert_eq!(
+            redact_path_for_log("/user/auth/2factor/totp/"),
+            "/user/auth/2factor/totp/"
+        );
+        // The `send` channel route (one segment deeper) is left intact.
+        assert_eq!(
+            redact_path_for_log("/user/auth/2factor/send/sms/"),
+            "/user/auth/2factor/send/sms/"
+        );
+        // Ordinary paths whose ids are NOT secrets are never altered.
+        assert_eq!(
+            redact_path_for_log("/workspace/123/storage/abc/lock/"),
+            "/workspace/123/storage/abc/lock/"
+        );
+        assert_eq!(
+            redact_path_for_log("/user/auth/2factor/"),
+            "/user/auth/2factor/"
+        );
     }
 
     #[test]

@@ -302,15 +302,28 @@ pub async fn create_folder(
     workspace_id: &str,
     parent_id: &str,
     name: &str,
+    force: bool,
 ) -> Result<Value, CliError> {
-    let mut form = HashMap::new();
-    form.insert("name".to_owned(), name.to_owned());
+    let form = create_folder_form(name, force);
     let path = format!(
         "/workspace/{}/storage/{}/createfolder/",
         urlencoding::encode(workspace_id),
         urlencoding::encode(parent_id),
     );
     client.post(&path, &form).await
+}
+
+/// Build the form body for [`create_folder`].
+///
+/// `force=true` always creates a new folder (auto-renamed on a name
+/// collision); the default is idempotent (returns the existing folder).
+fn create_folder_form(name: &str, force: bool) -> HashMap<String, String> {
+    let mut form = HashMap::new();
+    form.insert("name".to_owned(), name.to_owned());
+    if force {
+        form.insert("force".to_owned(), "true".to_owned());
+    }
+    form
 }
 
 /// Move a storage node to a different parent folder.
@@ -351,7 +364,63 @@ pub async fn copy_node(
     client.post(&path, &form).await
 }
 
-/// Rename (update) a storage node.
+/// Update a storage node's name, content source, or metadata overrides.
+///
+/// `POST /{context_type}/{context_id}/storage/{node_id}/update/` (the
+/// `workspace` and `share` twins share one wire contract). All fields are
+/// optional, but the server requires at least one — callers should enforce
+/// that before invoking. `from` is a JSON-encoded source object (same shape
+/// as `addfile`: `{"type":"upload","upload":{"id":"…"}}` or
+/// `{"type":"hash","hash":{"hash":"…","hash_type":"sha256"}}`); supplying it
+/// replaces the file content and creates a new version. `metadata_title`
+/// (max 50) and `metadata_short` (max 2048) override the node's title and
+/// short description. Pass the literal string `"null"` (or `""`) in a field
+/// to clear it, per the server contract.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_node(
+    client: &ApiClient,
+    context_type: &str,
+    context_id: &str,
+    node_id: &str,
+    name: Option<&str>,
+    from: Option<&str>,
+    metadata_title: Option<&str>,
+    metadata_short: Option<&str>,
+) -> Result<Value, CliError> {
+    let form = update_node_form(name, from, metadata_title, metadata_short);
+    let path = format!(
+        "/{}/{}/storage/{}/update/",
+        urlencoding::encode(context_type),
+        urlencoding::encode(context_id),
+        urlencoding::encode(node_id),
+    );
+    client.post(&path, &form).await
+}
+
+/// Build the form body for [`update_node`] from the supplied `Some` fields.
+fn update_node_form(
+    name: Option<&str>,
+    from: Option<&str>,
+    metadata_title: Option<&str>,
+    metadata_short: Option<&str>,
+) -> HashMap<String, String> {
+    let mut form = HashMap::new();
+    if let Some(v) = name {
+        form.insert("name".to_owned(), v.to_owned());
+    }
+    if let Some(v) = from {
+        form.insert("from".to_owned(), v.to_owned());
+    }
+    if let Some(v) = metadata_title {
+        form.insert("metadata_title".to_owned(), v.to_owned());
+    }
+    if let Some(v) = metadata_short {
+        form.insert("metadata_short".to_owned(), v.to_owned());
+    }
+    form
+}
+
+/// Rename a storage node in a workspace (thin wrapper over [`update_node`]).
 ///
 /// `POST /workspace/{workspace_id}/storage/{node_id}/update/`
 pub async fn rename_node(
@@ -360,14 +429,17 @@ pub async fn rename_node(
     node_id: &str,
     new_name: &str,
 ) -> Result<Value, CliError> {
-    let mut form = HashMap::new();
-    form.insert("name".to_owned(), new_name.to_owned());
-    let path = format!(
-        "/workspace/{}/storage/{}/update/",
-        urlencoding::encode(workspace_id),
-        urlencoding::encode(node_id),
-    );
-    client.post(&path, &form).await
+    update_node(
+        client,
+        "workspace",
+        workspace_id,
+        node_id,
+        Some(new_name),
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Move a storage node to trash (soft delete).
@@ -675,14 +747,9 @@ pub async fn list_recent(
     workspace_id: &str,
     page_size: Option<u32>,
     cursor: Option<&str>,
+    node_type: Option<&str>,
 ) -> Result<Value, CliError> {
-    let mut params = HashMap::new();
-    if let Some(v) = page_size {
-        params.insert("page_size".to_owned(), v.to_string());
-    }
-    if let Some(v) = cursor {
-        params.insert("cursor".to_owned(), v.to_owned());
-    }
+    let params = recent_query(page_size, cursor, node_type);
     let path = format!(
         "/workspace/{}/storage/recent/",
         urlencoding::encode(workspace_id),
@@ -694,9 +761,33 @@ pub async fn list_recent(
     }
 }
 
+/// Build the query map for [`list_recent`]. `node_type` filters by node type
+/// (`file`, `folder`, `link`, `note`).
+fn recent_query(
+    page_size: Option<u32>,
+    cursor: Option<&str>,
+    node_type: Option<&str>,
+) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    if let Some(v) = page_size {
+        params.insert("page_size".to_owned(), v.to_string());
+    }
+    if let Some(v) = cursor {
+        params.insert("cursor".to_owned(), v.to_owned());
+    }
+    if let Some(v) = node_type {
+        params.insert("type".to_owned(), v.to_owned());
+    }
+    params
+}
+
 /// Add a share link to a folder.
 ///
-/// `POST /workspace/{workspace_id}/storage/{parent_id}/addlink/`
+/// `POST /workspace/{workspace_id}/storage/{parent_id}/addlink/` — the node id
+/// is the URL path part; the body carries `type=share` (the only accepted
+/// link-target type) and `share=<share_id>`. The server reads the link-target
+/// type under the wire key `type` (NOT `link_target_type`) and the target id
+/// under `share`.
 pub async fn add_link(
     client: &ApiClient,
     workspace_id: &str,
@@ -704,13 +795,49 @@ pub async fn add_link(
     share_id: &str,
 ) -> Result<Value, CliError> {
     let mut form = HashMap::new();
-    form.insert("share_id".to_owned(), share_id.to_owned());
+    form.insert("type".to_owned(), "share".to_owned());
+    form.insert("share".to_owned(), share_id.to_owned());
     let path = format!(
         "/workspace/{}/storage/{}/addlink/",
         urlencoding::encode(workspace_id),
         urlencoding::encode(parent_id),
     );
     client.post(&path, &form).await
+}
+
+/// Add a file to a folder from a completed upload or by content-hash dedup.
+///
+/// `POST /{context_type}/{context_id}/storage/{parent_id}/addfile/` (the
+/// `workspace` and `share` twins share one wire contract). `from` is a
+/// JSON-encoded source object: either
+/// `{"type":"upload","upload":{"id":"<upload_id>"}}` to attach a completed
+/// upload session, or `{"type":"hash","hash":{"hash":"<hash>","hash_type":"sha256"}}`
+/// to deduplicate against an existing object by content hash (instant add when
+/// the content already exists server-side).
+pub async fn add_file(
+    client: &ApiClient,
+    context_type: &str,
+    context_id: &str,
+    parent_id: &str,
+    name: &str,
+    from: &str,
+) -> Result<Value, CliError> {
+    let form = add_file_form(name, from);
+    let path = format!(
+        "/{}/{}/storage/{}/addfile/",
+        urlencoding::encode(context_type),
+        urlencoding::encode(context_id),
+        urlencoding::encode(parent_id),
+    );
+    client.post(&path, &form).await
+}
+
+/// Build the form body for [`add_file`] (`name` + the JSON-encoded `from`).
+fn add_file_form(name: &str, from: &str) -> HashMap<String, String> {
+    let mut form = HashMap::new();
+    form.insert("name".to_owned(), name.to_owned());
+    form.insert("from".to_owned(), from.to_owned());
+    form
 }
 
 /// Transfer a node to another workspace.
@@ -737,38 +864,61 @@ pub async fn transfer_node(
 
 /// Restore a specific version of a file.
 ///
-/// `POST /workspace/{workspace_id}/storage/{node_id}/versions/{version_id}/restore/`
+/// `POST /workspace/{workspace_id}/storage/{node_id}/restore-version/` — the
+/// node id is the URL path part and `version_id` is a POST **body** field (NOT
+/// a `/versions/{id}/restore/` path segment).
 pub async fn version_restore(
     client: &ApiClient,
     workspace_id: &str,
     node_id: &str,
     version_id: &str,
 ) -> Result<Value, CliError> {
-    let form = HashMap::new();
+    let mut form = HashMap::new();
+    form.insert("version_id".to_owned(), version_id.to_owned());
     let path = format!(
-        "/workspace/{}/storage/{}/versions/{}/restore/",
+        "/workspace/{}/storage/{}/restore-version/",
         urlencoding::encode(workspace_id),
         urlencoding::encode(node_id),
-        urlencoding::encode(version_id),
     );
     client.post(&path, &form).await
 }
 
 /// Acquire a file lock.
 ///
-/// `POST /workspace/{workspace_id}/storage/{node_id}/lock/`
+/// `POST /workspace/{workspace_id}/storage/{node_id}/lock/` — optional
+/// `duration` (60-3600 seconds) sets the lock lifetime and `client_info`
+/// (a JSON object, e.g. `{"device_name":"…","client_version":"…"}`) records
+/// client metadata.
 pub async fn lock_acquire(
     client: &ApiClient,
     workspace_id: &str,
     node_id: &str,
+    duration: Option<u32>,
+    client_info: Option<&str>,
 ) -> Result<Value, CliError> {
-    let form = HashMap::new();
+    let form = lock_acquire_form(duration, client_info);
     let path = format!(
         "/workspace/{}/storage/{}/lock/",
         urlencoding::encode(workspace_id),
         urlencoding::encode(node_id),
     );
     client.post(&path, &form).await
+}
+
+/// Build the form body for an acquire-lock request. `duration` (60-3600 s)
+/// sets the lock lifetime; `client_info` is a JSON object of client metadata.
+pub(crate) fn lock_acquire_form(
+    duration: Option<u32>,
+    client_info: Option<&str>,
+) -> HashMap<String, String> {
+    let mut form = HashMap::new();
+    if let Some(d) = duration {
+        form.insert("duration".to_owned(), d.to_string());
+    }
+    if let Some(ci) = client_info {
+        form.insert("client_info".to_owned(), ci.to_owned());
+    }
+    form
 }
 
 /// Check lock status.
@@ -856,12 +1006,86 @@ pub async fn read_raw(
 #[cfg(test)]
 mod tests {
     use super::{
-        BULK_DETAILS_MAX_IDS, BulkDetailsResponse, SearchFilesParams, normalize_search_response,
-        parse_bulk_details_response, sanitize_terminal_string,
+        BULK_DETAILS_MAX_IDS, BulkDetailsResponse, SearchFilesParams, add_file_form,
+        create_folder_form, lock_acquire_form, normalize_search_response,
+        parse_bulk_details_response, recent_query, sanitize_terminal_string, update_node_form,
     };
     use crate::error::CliError;
     use crate::output::flatten_response;
     use serde_json::{Value, json};
+
+    #[test]
+    fn create_folder_form_omits_force_by_default() {
+        let f = create_folder_form("docs", false);
+        assert_eq!(f.get("name").map(String::as_str), Some("docs"));
+        assert!(!f.contains_key("force"), "force omitted unless requested");
+    }
+
+    #[test]
+    fn create_folder_form_sets_force() {
+        let f = create_folder_form("docs", true);
+        assert_eq!(f.get("force").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn recent_query_filters_by_type() {
+        let q = recent_query(Some(250), Some("cur"), Some("file"));
+        assert_eq!(q.get("page_size").map(String::as_str), Some("250"));
+        assert_eq!(q.get("cursor").map(String::as_str), Some("cur"));
+        assert_eq!(q.get("type").map(String::as_str), Some("file"));
+    }
+
+    #[test]
+    fn recent_query_empty_when_no_args() {
+        assert!(recent_query(None, None, None).is_empty());
+    }
+
+    #[test]
+    fn update_node_form_sends_only_present_fields() {
+        let f = update_node_form(None, None, Some("My Title"), Some("Short desc"));
+        assert_eq!(
+            f.get("metadata_title").map(String::as_str),
+            Some("My Title")
+        );
+        assert_eq!(
+            f.get("metadata_short").map(String::as_str),
+            Some("Short desc")
+        );
+        assert!(!f.contains_key("name"));
+        assert!(!f.contains_key("from"));
+        assert_eq!(f.len(), 2);
+    }
+
+    #[test]
+    fn update_node_form_carries_content_source() {
+        let from = r#"{"type":"upload","upload":{"id":"u1"}}"#;
+        let f = update_node_form(Some("new.txt"), Some(from), None, None);
+        assert_eq!(f.get("name").map(String::as_str), Some("new.txt"));
+        assert_eq!(f.get("from").map(String::as_str), Some(from));
+    }
+
+    #[test]
+    fn add_file_form_carries_name_and_from() {
+        let from = r#"{"type":"hash","hash":{"hash":"abc","hash_type":"sha256"}}"#;
+        let f = add_file_form("photo.jpg", from);
+        assert_eq!(f.get("name").map(String::as_str), Some("photo.jpg"));
+        assert_eq!(f.get("from").map(String::as_str), Some(from));
+    }
+
+    #[test]
+    fn lock_acquire_form_emits_duration_and_client_info() {
+        let f = lock_acquire_form(Some(300), Some(r#"{"device_name":"Laptop"}"#));
+        assert_eq!(f.get("duration").map(String::as_str), Some("300"));
+        assert_eq!(
+            f.get("client_info").map(String::as_str),
+            Some(r#"{"device_name":"Laptop"}"#)
+        );
+    }
+
+    #[test]
+    fn lock_acquire_form_empty_by_default() {
+        assert!(lock_acquire_form(None, None).is_empty());
+    }
 
     #[test]
     fn normalize_search_files_map_to_rows() {

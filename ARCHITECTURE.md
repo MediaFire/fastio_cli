@@ -20,15 +20,15 @@ Both modes share a common API layer, ensuring zero code duplication.
         v                    v                         v
 +----------------+   +------------------+     +------------------+
 |  cli.rs        |   |  commands/       |     |  mcp/            |
-|  Clap derive   |   |  32 command      |     |  MCP server      |
-|  definitions   |   |  modules         |     |  28 tools        |
+|  Clap derive   |   |  29 command      |     |  MCP server      |
+|  definitions   |   |  modules         |     |  25 tools        |
 +----------------+   +------------------+     +------------------+
                           |         |               |
                     +-----+         +--------+      |
                     v                        v      |
             +-------------+          +------+------+
             |  api/       |          |  output/    |
-            |  27 endpoint|          |  JSON,Table,|
+            |  25 endpoint|          |  JSON,Table,|
             |  modules    |          |  CSV render |
             +-------------+          +-------------+
                     |
@@ -66,7 +66,7 @@ Both modes share a common API layer, ensuring zero code duplication.
 ### `cli.rs`
 - Defines `Cli` struct with `#[derive(Parser)]`
 - Global flags: `--format`, `--fields`, `--no-color`, `--quiet`, `--verbose`, `--profile`, `--token`, `--api-base`
-- `Commands` enum with 34 top-level subcommands (incl. hidden legacy aliases)
+- `Commands` enum with 31 top-level subcommands (incl. hidden legacy aliases)
 - Nested subcommand enums for complex groups (org billing, org members, share files, task lists, etc.)
 
 ### `error.rs`
@@ -116,7 +116,7 @@ Both modes share a common API layer, ensuring zero code duplication.
 
 ### `api/` — 27 Modules
 
-Count convention: **27 endpoint modules** = `src/api/*.rs` excluding `mod.rs` (declarations) and `types.rs` (shared structs; the `—` table row). The table below lists representative modules, not all 27.
+Count convention: **25 endpoint modules** = `src/api/*.rs` excluding `mod.rs` (declarations) and `types.rs` (shared structs; the `—` table row). The table below lists representative modules, not all 25.
 
 Each module contains typed functions mapping to Fast.io REST endpoints:
 
@@ -134,7 +134,7 @@ Each module contains typed functions mapping to Fast.io REST endpoints:
 | `comment.rs` | 12 functions | CRUD, reactions, linking |
 | `event.rs` | 5 functions | Search, summarize, details, polling |
 | `member.rs` | 9 functions | Add, remove, transfer, leave, join |
-| `workflow.rs` | 33 functions | Tasks, task lists, worklogs, approvals, todos |
+| `workflow.rs` | 25 functions | Tasks API: task lists, tasks, comments, attachments |
 | `apps.rs` | 4 functions | List, details, launch, tool-apps |
 | `import.rs` | 22 functions | Providers, identities, sources, jobs, writebacks |
 | `locking.rs` | 3 functions | Acquire, status, release |
@@ -144,7 +144,7 @@ Each module contains typed functions mapping to Fast.io REST endpoints:
 
 ### `commands/` — 32 Modules
 
-Count convention: **32 command modules** = `src/bin/fastio/commands/*.rs` excluding `mod.rs` (declarations); there is no `types.rs` here. (Note: `secret_output.rs` is a shared HELPER module, not a command group — it is counted here because the convention counts every `*.rs` under `commands/` except `mod.rs`.) The table below lists representative modules, not all 32.
+Count convention: **29 command modules** = `src/bin/fastio/commands/*.rs` excluding `mod.rs` (declarations); there is no `types.rs` here. (Note: `secret_output.rs` is a shared HELPER module, not a command group — it is counted here because the convention counts every `*.rs` under `commands/` except `mod.rs`.) The table below lists representative modules, not all 29.
 
 Each module handles one command group, orchestrating API calls and output rendering:
 
@@ -166,9 +166,6 @@ Each module handles one command group, orchestrating API calls and output render
 | `preview.rs` | 3 | Preview URLs and transforms |
 | `asset.rs` | 3 | Asset management |
 | `task.rs` | 16 | Tasks and task lists |
-| `worklog.rs` | 6 | Worklog entries |
-| `approval.rs` | 4 | Approval workflows |
-| `todo.rs` | 7 | Todo items |
 | `apps.rs` | 4 | App integration |
 | `import.rs` | 22 | Cloud import/sync |
 | `lock.rs` | 3 | File locking |
@@ -189,7 +186,7 @@ Each module handles one command group, orchestrating API calls and output render
 - Tracing disabled to keep stdout clean for JSON-RPC
 
 #### `tools.rs`
-- 28 action-routed tools (each multiplexes many actions via its `action` parameter)
+- 25 action-routed tools (each multiplexes many actions via its `action` parameter)
 - Each tool has an `action` parameter for routing (mirrors the remote MCP server pattern)
 - All handlers call existing `src/api/` functions — zero duplicated API logic
 - Returns MCP text content blocks with markdown-formatted data,
@@ -311,7 +308,7 @@ The `ApiClient::handle_response()` method:
 
 1. **Direct REST API** — calls `api.fast.io` directly, not through the MCP server, for single-hop latency
 2. **Shared API layer** — both CLI and MCP modes use `src/api/`, ensuring feature parity
-3. **Action-based MCP tools** — mirrors the remote MCP server's consolidated tool pattern (28 action-routed tools rather than one tool per individual action)
+3. **Action-based MCP tools** — mirrors the remote MCP server's consolidated tool pattern (25 action-routed tools rather than one tool per individual action)
 4. **Form-encoded POST bodies** — matches the Fast.io API convention (not JSON, unless specifically required)
 5. **Cursor-based pagination** — for storage endpoints; offset-based for other list endpoints
 6. **CSPRNG for PKCE** — `getrandom` crate, not `HashMap::RandomState`

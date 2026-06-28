@@ -1,10 +1,11 @@
-//! One-time legacy-command deprecation notices.
+//! One-time deprecation notices.
 //!
-//! Several command groups (`task`, `worklog`, `approval`, `todo`, and the
-//! `workspace`/`share` enable-workflow toggles) remain available but are
-//! superseded by the new Workflow Orchestration surface. To steer users
-//! toward the replacement without spamming a notice on every invocation,
-//! [`warn_legacy`] prints a single stderr line per legacy group per process.
+//! When a command group or individual command is superseded, these helpers
+//! steer users toward the replacement without spamming a notice on every
+//! invocation: [`warn_legacy`] prints a single `[legacy]` stderr line per
+//! group per process, and [`warn_once`] prints a single free-form notice per
+//! key per process (used for individually re-pointed commands such as
+//! `ripley search`).
 //!
 //! The registry lives in the library crate so the built-in MCP server can
 //! reuse the same de-duplication keys; MCP handlers append a one-line

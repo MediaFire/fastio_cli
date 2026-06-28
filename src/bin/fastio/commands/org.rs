@@ -9,6 +9,7 @@ use super::CommandContext;
 use fastio_cli::api;
 
 /// Org subcommand variants.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum OrgCommand {
@@ -53,6 +54,28 @@ pub enum OrgCommand {
         billing_email: Option<String>,
         /// Homepage URL.
         homepage_url: Option<String>,
+        /// Brand accent color (JSON-encoded string).
+        accent_color: Option<String>,
+        /// Background color (JSON-encoded string).
+        background_color: Option<String>,
+        /// Background display mode.
+        background_mode: Option<String>,
+        /// Enable/disable the brand background.
+        use_background: Option<bool>,
+        /// Facebook profile URL.
+        facebook_url: Option<String>,
+        /// Twitter/X profile URL.
+        twitter_url: Option<String>,
+        /// Instagram profile URL.
+        instagram_url: Option<String>,
+        /// `YouTube` channel URL.
+        youtube_url: Option<String>,
+        /// Member-management permission level.
+        perm_member_manage: Option<String>,
+        /// Authorized email domain for auto-join.
+        perm_authorized_domains: Option<String>,
+        /// Custom owner-defined properties (JSON-encoded string).
+        owner_defined: Option<String>,
     },
     /// Delete (close) an organization.
     Delete {
@@ -123,6 +146,14 @@ pub enum OrgCommand {
         folder_name: Option<String>,
         /// Description.
         description: Option<String>,
+        /// Join permission.
+        perm_join: String,
+        /// Member-management permission.
+        perm_member_manage: String,
+        /// Enable AI intelligence (indexing).
+        intelligence: bool,
+        /// Enable workflow features.
+        workflow: bool,
     },
 }
 
@@ -263,7 +294,7 @@ pub enum OrgMembersCommand {
         org_id: String,
         /// Email address to invite.
         email: String,
-        /// Role (admin, member, guest).
+        /// Role (admin, member).
         role: Option<String>,
     },
     /// Remove a member.
@@ -384,7 +415,13 @@ pub enum OrgAssetCommand {
 }
 
 /// Valid roles for org membership.
-const VALID_ORG_ROLES: &[&str] = &["admin", "member", "guest"];
+///
+/// Org roles are `admin` / `member` only — `guest` is a workspace/share role,
+/// not an org-membership role (org permission levels are owner/admin/member;
+/// `view` is a SHARE level, not an org one, and `owner` is set via ownership
+/// transfer, not this flag). `guest` was dropped on 2026-06-22 because it never
+/// settled as an org role server-side.
+const VALID_ORG_ROLES: &[&str] = &["admin", "member"];
 
 /// Validate that an org ID is not empty or whitespace-only.
 fn validate_org_id(org_id: &str) -> Result<()> {
@@ -406,12 +443,13 @@ fn validate_email(email: &str) -> Result<()> {
 fn validate_role(role: &str) -> Result<()> {
     anyhow::ensure!(
         VALID_ORG_ROLES.contains(&role),
-        "invalid role '{role}'. Must be one of: admin, member, guest"
+        "invalid role '{role}'. Must be one of: admin, member"
     );
     Ok(())
 }
 
 /// Execute an org subcommand.
+#[allow(clippy::too_many_lines)]
 pub async fn execute(command: &OrgCommand, ctx: &CommandContext<'_>) -> Result<()> {
     match command {
         OrgCommand::List { limit, offset } => list(ctx, *limit, *offset).await,
@@ -441,16 +479,40 @@ pub async fn execute(command: &OrgCommand, ctx: &CommandContext<'_>) -> Result<(
             industry,
             billing_email,
             homepage_url,
+            accent_color,
+            background_color,
+            background_mode,
+            use_background,
+            facebook_url,
+            twitter_url,
+            instagram_url,
+            youtube_url,
+            perm_member_manage,
+            perm_authorized_domains,
+            owner_defined,
         } => {
             update(
                 ctx,
-                org_id,
-                name.as_deref(),
-                domain.as_deref(),
-                description.as_deref(),
-                industry.as_deref(),
-                billing_email.as_deref(),
-                homepage_url.as_deref(),
+                &api::org::UpdateOrgParams {
+                    org_id,
+                    name: name.as_deref(),
+                    domain: domain.as_deref(),
+                    description: description.as_deref(),
+                    industry: industry.as_deref(),
+                    billing_email: billing_email.as_deref(),
+                    homepage_url: homepage_url.as_deref(),
+                    accent_color: accent_color.as_deref(),
+                    background_color: background_color.as_deref(),
+                    background_mode: background_mode.as_deref(),
+                    use_background: *use_background,
+                    facebook_url: facebook_url.as_deref(),
+                    twitter_url: twitter_url.as_deref(),
+                    instagram_url: instagram_url.as_deref(),
+                    youtube_url: youtube_url.as_deref(),
+                    perm_member_manage: perm_member_manage.as_deref(),
+                    perm_authorized_domains: perm_authorized_domains.as_deref(),
+                    owner_defined: owner_defined.as_deref(),
+                },
             )
             .await
         }
@@ -483,6 +545,10 @@ pub async fn execute(command: &OrgCommand, ctx: &CommandContext<'_>) -> Result<(
             name,
             folder_name,
             description,
+            perm_join,
+            perm_member_manage,
+            intelligence,
+            workflow,
         } => {
             create_workspace(
                 ctx,
@@ -490,6 +556,10 @@ pub async fn execute(command: &OrgCommand, ctx: &CommandContext<'_>) -> Result<(
                 name,
                 folder_name.as_deref(),
                 description.as_deref(),
+                perm_join,
+                perm_member_manage,
+                *intelligence,
+                *workflow,
             )
             .await
         }
@@ -535,45 +605,34 @@ async fn info(ctx: &CommandContext<'_>, org_id: &str) -> Result<()> {
 }
 
 /// Update organization settings.
-#[allow(clippy::too_many_arguments)]
-async fn update(
-    ctx: &CommandContext<'_>,
-    org_id: &str,
-    name: Option<&str>,
-    domain: Option<&str>,
-    description: Option<&str>,
-    industry: Option<&str>,
-    billing_email: Option<&str>,
-    homepage_url: Option<&str>,
-) -> Result<()> {
-    validate_org_id(org_id)?;
-    if name.is_none()
-        && domain.is_none()
-        && description.is_none()
-        && industry.is_none()
-        && billing_email.is_none()
-        && homepage_url.is_none()
-    {
-        anyhow::bail!(
-            "at least one update field is required (--name, --domain, --description, --industry, --billing-email, --homepage-url)"
-        );
-    }
+async fn update(ctx: &CommandContext<'_>, params: &api::org::UpdateOrgParams<'_>) -> Result<()> {
+    validate_org_id(params.org_id)?;
+    let has_field = params.name.is_some()
+        || params.domain.is_some()
+        || params.description.is_some()
+        || params.industry.is_some()
+        || params.billing_email.is_some()
+        || params.homepage_url.is_some()
+        || params.accent_color.is_some()
+        || params.background_color.is_some()
+        || params.background_mode.is_some()
+        || params.use_background.is_some()
+        || params.facebook_url.is_some()
+        || params.twitter_url.is_some()
+        || params.instagram_url.is_some()
+        || params.youtube_url.is_some()
+        || params.perm_member_manage.is_some()
+        || params.perm_authorized_domains.is_some()
+        || params.owner_defined.is_some();
+    anyhow::ensure!(
+        has_field,
+        "at least one update field is required (e.g. --name, --domain, --description, --accent-color, --perm-member-manage, …)"
+    );
 
     let client = ctx.build_client()?;
-    let value = api::org::update_org(
-        &client,
-        &api::org::UpdateOrgParams {
-            org_id,
-            name,
-            domain,
-            description,
-            industry,
-            billing_email,
-            homepage_url,
-        },
-    )
-    .await
-    .context("failed to update organization")?;
+    let value = api::org::update_org(&client, params)
+        .await
+        .context("failed to update organization")?;
     ctx.output.render(&value)?;
     Ok(())
 }
@@ -943,15 +1002,21 @@ mod billing_format {
 
         #[test]
         fn format_plans_converts_amount() {
+            // The three current plan tiers are Solo / Business / Growth (the old
+            // Free/Agent/Pro names were retired 2026-06-22; there is no free
+            // plan). Growth is included so the fixture exercises the full tier
+            // set the public surface now exposes.
             let mut v = json!({
                 "plans": [
                     {"id": "solo_monthly", "name": "Solo", "amount": 2900},
-                    {"id": "business_v2_monthly", "name": "Business", "amount": 9900}
+                    {"id": "business_v2_monthly", "name": "Business", "amount": 9900},
+                    {"id": "growth_monthly", "name": "Growth", "amount": 29900}
                 ]
             });
             format_plans(&mut v);
             assert_eq!(v["plans"][0]["amount"], "$29.00");
             assert_eq!(v["plans"][1]["amount"], "$99.00");
+            assert_eq!(v["plans"][2]["amount"], "$299.00");
         }
 
         #[test]
@@ -1188,6 +1253,11 @@ async fn org_invitations(cmd: &OrgInvitationsCommand, ctx: &CommandContext<'_>) 
             state,
             role,
         } => {
+            // Validate the optional role client-side (org roles are admin/member
+            // only — reject `guest`, a share level, before the server does).
+            if let Some(r) = role {
+                validate_role(r)?;
+            }
             let value = api::org::update_invitation(
                 &client,
                 org_id,
@@ -1397,17 +1467,34 @@ async fn list_shares(
 }
 
 /// Create workspace in org.
+#[allow(clippy::too_many_arguments)]
 async fn create_workspace(
     ctx: &CommandContext<'_>,
     org_id: &str,
     name: &str,
     folder_name: Option<&str>,
     description: Option<&str>,
+    perm_join: &str,
+    perm_member_manage: &str,
+    intelligence: bool,
+    workflow: bool,
 ) -> Result<()> {
     validate_org_id(org_id)?;
     let client = ctx.build_client()?;
     let fname = folder_name.unwrap_or(name);
-    let value = api::org::create_workspace(&client, org_id, fname, name, description)
+    let params = api::org::CreateWorkspaceParams {
+        folder_name: fname,
+        name,
+        perm_join,
+        perm_member_manage,
+        intelligence,
+        description,
+        workflow: workflow.then_some(true),
+        accent_color: None,
+        background_color1: None,
+        background_color2: None,
+    };
+    let value = api::org::create_workspace(&client, org_id, &params)
         .await
         .context("failed to create workspace")?;
     ctx.output.render(&value)?;

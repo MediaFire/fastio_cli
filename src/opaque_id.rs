@@ -3,12 +3,16 @@
 //! A Fast.io `OpaqueId` has the shape `<type><KSUID(26)><CRC(2)>`. The id is
 //! **self-describing by length**:
 //!
-//! - **Non-workflow** ids carry a **1-character** type prefix → **29 chars**.
-//! - **Workflow-family** ids carry a **2-character** prefix (a master `w` plus a
-//!   sub-type) → **30 chars**.
+//! - **1-character** type prefix → **29 chars** (the original non-workflow
+//!   types).
+//! - **2-character** type prefix → **30 chars**. This space is shared by the
+//!   **workflow family** (a master `w` plus a sub-type) AND the newer
+//!   **non-workflow** 30-char types — Task (`ta`/`tb`/`tc`) and Comment
+//!   (`ca`/`cb`). A length-30 id is therefore classified by looking its 2-char
+//!   prefix up in a combined map, NOT by assuming it must be workflow.
 //!
 //! A formatted (display) id inserts a `-` every 5 characters, so the hyphenated
-//! forms are 34 (legacy) and 35 (workflow) chars; the raw, dash-free form is
+//! forms are 34 (29-char) and 35 (30-char) chars; the raw, dash-free form is
 //! canonical for length checks and type reads.
 //!
 //! This module is a **pure, offline** classifier: it strips hyphens, reads the
@@ -18,13 +22,14 @@
 //!
 //! ## The §4 contract (load-bearing)
 //!
-//! The workflow family is detected **only** by length-30 / leading-`w`. The old
-//! single-character workflow codes (`g`, `h`, `j`, …) are **transitional** and
-//! will be **reassigned to new, non-workflow types** in a later cleanup. A
-//! 29-char id whose 1-char code is not in the documented non-workflow map is
-//! therefore reported as `unknown` (not guessed as workflow) — a future entity
-//! could legitimately claim that code. New workflow ids are always 30-char
-//! under `w`.
+//! A length-30 id is classified by its 2-char prefix against a combined map:
+//! the workflow family (`w*`) plus the non-workflow 30-char Task (`ta`/`tb`/
+//! `tc`) and Comment (`ca`/`cb`) types. An unmapped 2-char prefix is `unknown`.
+//! The old single-character workflow codes (`g`, `h`, `j`, …) are
+//! **transitional** and will be **reassigned to new, non-workflow types** in a
+//! later cleanup. A 29-char id whose 1-char code is not in the documented
+//! non-workflow map is therefore reported as `unknown` (not guessed as
+//! workflow) — a future entity could legitimately claim that code.
 //!
 //! Source of truth: `~/vividengine/docs/integration/
 //! workflow-webhook-opaque-id-30char.md` (§5 type map, §4 caveat).
@@ -73,8 +78,9 @@ pub struct Classification {
     /// Length of [`raw`](Self::raw) — 29 or 30 for an `OpaqueId`; some other
     /// value for non-`OpaqueId` input.
     pub length: usize,
-    /// The type code read from the prefix: 2 chars for the workflow family
-    /// (length 30), 1 char otherwise. `None` when the input is not
+    /// The type code read from the prefix: 2 chars for the shared 30-char family
+    /// (the workflow `w*` types plus the non-workflow Task `ta`/`tb`/`tc` and
+    /// Comment `ca`/`cb` types), 1 char otherwise. `None` when the input is not
     /// `OpaqueId`-shaped.
     pub type_code: Option<String>,
     /// The mapped entity type, or `"Unknown"` when unrecognized.
@@ -100,10 +106,11 @@ pub struct Classification {
 /// Crockford base32 alphabet — being stricter than the server would reject ids
 /// the server accepts).
 ///
-/// Per the §4 contract, the workflow family is detected ONLY by length-30 /
-/// leading-`w`; a 29-char id whose single-char code is unmapped is reported
-/// `unknown` (it may be a transitional workflow code pending reassignment)
-/// rather than guessed.
+/// Per the §4 contract, a length-30 id is classified by its 2-char prefix
+/// against the combined workflow (`w*`) + non-workflow 30-char (Task `ta`/`tb`/
+/// `tc`, Comment `ca`/`cb`) map; an unmapped 2-char prefix is `unknown`. A
+/// 29-char id whose single-char code is unmapped is reported `unknown` (it may
+/// be a transitional workflow code pending reassignment) rather than guessed.
 #[must_use]
 pub fn classify(id: &str) -> Classification {
     let input = id.trim();
@@ -144,15 +151,17 @@ pub fn classify(id: &str) -> Classification {
         .to_ascii_lowercase();
 
     if length == 30 {
-        // Workflow family — must lead with `w` AND have a mapped subtype.
-        if let Some((entity_type, surfacing, note)) = lookup_workflow(&code) {
+        // Length-30 family: a 2-char type prefix. This is the workflow family
+        // (`w*`) PLUS the newer non-workflow 30-char Task (`ta`/`tb`/`tc`) and
+        // Comment (`ca`/`cb`) types. An unmapped 2-char prefix is unknown.
+        if let Some((entity_type, family, surfacing, note)) = lookup_len30(&code) {
             Classification {
                 input: input.to_owned(),
                 raw,
                 length,
                 type_code: Some(code),
                 entity_type,
-                family: "workflow",
+                family,
                 surfacing: Some(surfacing),
                 recognized: true,
                 note,
@@ -161,7 +170,7 @@ pub fn classify(id: &str) -> Classification {
             let note = if code.starts_with('w') {
                 "unrecognized workflow subtype code (length-30, leads with 'w')"
             } else {
-                "length-30 but does not lead with 'w' — not a Fast.io workflow OpaqueId"
+                "length-30 with an unmapped 2-char type prefix — not a recognized Fast.io OpaqueId"
             };
             Classification {
                 input: input.to_owned(),
@@ -238,6 +247,26 @@ pub fn to_json(c: &Classification) -> Value {
         "recognized": c.recognized,
         "note": c.note,
     })
+}
+
+/// Resolve a length-30 (2-char prefix) id to `(entity, family, surfacing,
+/// note)`. The length-30 space is shared by the workflow family (`w*`, looked
+/// up via [`lookup_workflow`]) and the newer NON-workflow 30-char types: Task
+/// (`ta`/`tb`/`tc`) and Comment (`ca`/`cb`). An unmapped 2-char prefix returns
+/// `None` (classified as unknown).
+fn lookup_len30(code: &str) -> Option<(&'static str, &'static str, Surfacing, &'static str)> {
+    // Non-workflow 30-char types take precedence over the `w*` family lookup;
+    // their prefixes never start with `w`, so there is no overlap, but listing
+    // them first keeps the family assignment explicit.
+    let non_workflow = match code {
+        "ta" | "tb" | "tc" => Some(("Task", Surfacing::Surfaced, "a task record")),
+        "ca" | "cb" => Some(("Comment", Surfacing::Surfaced, "a comment record")),
+        _ => None,
+    };
+    if let Some((entity, surfacing, note)) = non_workflow {
+        return Some((entity, "non-workflow", surfacing, note));
+    }
+    lookup_workflow(code).map(|(entity, surfacing, note)| (entity, "workflow", surfacing, note))
 }
 
 /// The §5 workflow-family map: 2-char `w`-prefixed code → (entity, surfacing,
@@ -485,11 +514,50 @@ mod tests {
     }
 
     #[test]
-    fn length_30_not_leading_w_is_unknown() {
+    fn length_30_unmapped_prefix_is_unknown() {
+        // A length-30 id whose 2-char prefix is in neither the workflow map nor
+        // the non-workflow 30-char map (Task/Comment) is unknown.
         let c = classify(&id_of("xa", 30));
         assert!(!c.recognized);
         assert_eq!(c.family, "unknown");
-        assert!(c.note.contains("does not lead with 'w'"));
+        assert!(c.note.contains("unmapped 2-char type prefix"));
+    }
+
+    #[test]
+    fn length_30_task_prefixes_are_non_workflow_tasks() {
+        for code in ["ta", "tb", "tc"] {
+            let c = classify(&id_of(code, 30));
+            assert!(c.recognized, "{code} should be recognized");
+            assert_eq!(c.family, "non-workflow", "{code}");
+            assert_eq!(c.entity_type, "Task", "{code}");
+            assert_eq!(c.type_code.as_deref(), Some(code));
+            assert_eq!(c.length, 30);
+            assert_eq!(c.surfacing, Some(Surfacing::Surfaced));
+        }
+    }
+
+    #[test]
+    fn length_30_comment_prefixes_are_non_workflow_comments() {
+        for code in ["ca", "cb"] {
+            let c = classify(&id_of(code, 30));
+            assert!(c.recognized, "{code} should be recognized");
+            assert_eq!(c.family, "non-workflow", "{code}");
+            assert_eq!(c.entity_type, "Comment", "{code}");
+            assert_eq!(c.type_code.as_deref(), Some(code));
+            assert_eq!(c.length, 30);
+        }
+    }
+
+    #[test]
+    fn length_30_unmapped_t_or_c_prefix_is_unknown() {
+        // Only the specific Task/Comment subtypes are mapped; a sibling like
+        // `td` / `cz` stays unknown rather than being guessed.
+        for code in ["td", "cz"] {
+            let c = classify(&id_of(code, 30));
+            assert!(!c.recognized, "{code} should be unknown");
+            assert_eq!(c.family, "unknown", "{code}");
+            assert_eq!(c.entity_type, "Unknown", "{code}");
+        }
     }
 
     #[test]

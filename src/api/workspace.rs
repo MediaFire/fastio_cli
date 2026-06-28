@@ -52,9 +52,21 @@ pub struct CreateWorkspaceParams<'a> {
     pub intelligence: Option<bool>,
 }
 
+/// Default join permission when the `workspace create` command does not expose
+/// a flag for it (the server has no default and hard-requires the field).
+const DEFAULT_PERM_JOIN: &str = "Member or above";
+/// Default member-management permission (see [`DEFAULT_PERM_JOIN`]).
+const DEFAULT_PERM_MEMBER_MANAGE: &str = "Admin or above";
+
 /// Create a workspace in an organization.
 ///
-/// `POST /org/{org_id}/create/workspace/`
+/// `POST /org/{org_id}/create/workspace/` — `org_id` is the URL path part. The
+/// server hard-requires `folder_name`, `name`, `perm_join`,
+/// `perm_member_manage`, and `intelligence` (no server defaults), so this
+/// builder always sends `perm_join` / `perm_member_manage` (defaulted, since the
+/// `workspace create` command does not expose flags for them) and `intelligence`
+/// (defaulting to `false` when unset). The fully-flagged variant is
+/// [`crate::api::org::create_workspace`].
 pub async fn create_workspace(
     client: &ApiClient,
     params: &CreateWorkspaceParams<'_>,
@@ -62,11 +74,17 @@ pub async fn create_workspace(
     let mut form = HashMap::new();
     form.insert("folder_name".to_owned(), params.folder_name.to_owned());
     form.insert("name".to_owned(), params.name.to_owned());
+    form.insert("perm_join".to_owned(), DEFAULT_PERM_JOIN.to_owned());
+    form.insert(
+        "perm_member_manage".to_owned(),
+        DEFAULT_PERM_MEMBER_MANAGE.to_owned(),
+    );
+    form.insert(
+        "intelligence".to_owned(),
+        params.intelligence.unwrap_or(false).to_string(),
+    );
     if let Some(v) = params.description {
         form.insert("description".to_owned(), v.to_owned());
-    }
-    if let Some(v) = params.intelligence {
-        form.insert("intelligence".to_owned(), v.to_string());
     }
     let path = format!(
         "/org/{}/create/workspace/",
@@ -111,10 +129,10 @@ pub async fn delete_workspace(
 }
 
 // `search_workspace` (`GET /workspace/{id}/storage/search/`) was removed in
-// Phase 3: it duplicated `api::storage::search_files`. The CLI
-// `workspace search` command now forwards to `api::search::unified_search_workspace`
-// (`/search/`, grouped buckets), and the MCP `workspace search` action routes
-// to the single `api::storage::search_files` builder. See `api/search.rs`.
+// Phase 3: it duplicated `api::storage::search_files`. Both the CLI
+// `workspace search` command and the MCP `workspace search` action now forward
+// to `api::search::unified_search_workspace` (`/search/`, grouped buckets) so
+// they share the same API/shape/semantics. See `api/search.rs`.
 
 /// Get workspace limits/usage.
 ///
@@ -166,7 +184,7 @@ fn workflow_toggle_path(workspace_id: &str, action: &str) -> String {
 ///
 /// `POST /workspace/{workspace_id}/workflow/enable/`
 ///
-/// Gates the legacy task/worklog/approval/todo primitives on the workspace.
+/// Gates the Tasks API (task lists and tasks) on the workspace.
 /// This does **not** touch AI indexing (`intelligence`) — see
 /// [`update_workspace`] / `workspace update --intelligence` for that.
 pub async fn enable_workflow(client: &ApiClient, workspace_id: &str) -> Result<Value, CliError> {

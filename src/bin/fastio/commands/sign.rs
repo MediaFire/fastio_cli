@@ -663,6 +663,40 @@ async fn execute_envelope(command: SignEnvelopeCommands, ctx: &CommandContext<'_
             ctx.output.render(&v)?;
             Ok(())
         }
+        SignEnvelopeCommands::Retry {
+            workspace,
+            envelope_id,
+        } => {
+            // `retry` re-drives a stuck envelope through self-healing recovery.
+            // It is idempotent + no-op-success and notifies no one, so — unlike
+            // `send`/`void` — it needs no destructive confirmation. A `404`/`1609`
+            // here is a genuine not-found (typo'd id / wrong workspace), so the
+            // call uses `SignOp::General` (NOT an artifact-fetch "not ready" frame).
+            let client = ctx.build_client()?;
+            let v = signing::retry_envelope(&client, &workspace, &envelope_id)
+                .await
+                .map_err(|e| {
+                    map_signing_error(e, "failed to retry sign envelope", SignOp::General)
+                })?;
+            ctx.output.render(&v)?;
+            Ok(())
+        }
+        SignEnvelopeCommands::MySignLink {
+            workspace,
+            envelope_id,
+        } => {
+            // Mints the CALLER's own signing link (the dashboard signature-card
+            // primary action). Reversible/idempotent and notifies no one, so —
+            // like `retry` — it needs no destructive confirmation. A read-only
+            // scoped token is rejected server-side (10754); a `404`/`1609` is a
+            // genuine not-found, so the call uses `SignOp::General`.
+            let client = ctx.build_client()?;
+            let v = signing::my_sign_link(&client, &workspace, &envelope_id)
+                .await
+                .map_err(|e| map_signing_error(e, "failed to mint sign link", SignOp::General))?;
+            ctx.output.render(&v)?;
+            Ok(())
+        }
     }
 }
 

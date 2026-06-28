@@ -1183,7 +1183,7 @@ fast.io
     #[test]
     fn byte_regression_ping_success() {
         // Pinned against a live response from
-        // http://data1.dev1.iah1.veng.tech/api/v1.0/ping/?output=markdown
+        // https://api.fast.io/current/ping/?output=markdown
         // at 2026-04-15. Key shape: bool result, three scalar top-level
         // keys in insertion order.
         let v = json!({
@@ -1202,7 +1202,7 @@ fast.io
     #[test]
     fn byte_regression_orgs_list_auth_error() {
         // Pinned against a live error response from
-        // http://data1.dev1.iah1.veng.tech/api/v1.0/orgs/list/?output=markdown
+        // https://api.fast.io/current/orgs/list/?output=markdown
         // at 2026-04-15. Key shape: result=false, object-valued error.
         let v = json!({
             "result": false,

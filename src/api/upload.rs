@@ -95,7 +95,8 @@ pub const SINGLE_CALL_MAX_SIZE: u64 = 4 * 1024 * 1024;
 pub async fn single_call_upload(
     token: &str,
     api_base: &str,
-    workspace_id: &str,
+    instance_id: &str,
+    profile_type: &str,
     folder_id: &str,
     filename: &str,
     file_data: Vec<u8>,
@@ -118,9 +119,9 @@ pub async fn single_call_upload(
             .text("name", filename.to_owned())
             .text("size", file_size.to_string())
             .text("action", "create")
-            .text("instance_id", workspace_id.to_owned())
+            .text("instance_id", instance_id.to_owned())
             .text("folder_id", folder_id.to_owned())
-            .text("profile_type", "workspace")
+            .text("profile_type", profile_type.to_owned())
             .part("chunk", part);
 
         let send_result = http_client
@@ -225,19 +226,33 @@ pub async fn single_call_upload(
 /// `POST /upload/`
 pub async fn create_upload_session(
     client: &ApiClient,
-    workspace_id: &str,
+    instance_id: &str,
+    profile_type: &str,
     folder_id: &str,
     filename: &str,
     filesize: u64,
 ) -> Result<Value, CliError> {
+    let form = create_upload_session_form(instance_id, profile_type, folder_id, filename, filesize);
+    client.post("/upload/", &form).await
+}
+
+/// Build the form body for [`create_upload_session`]. `profile_type` is
+/// `workspace` or `share` and `instance_id` is the target workspace/share id.
+fn create_upload_session_form(
+    instance_id: &str,
+    profile_type: &str,
+    folder_id: &str,
+    filename: &str,
+    filesize: u64,
+) -> HashMap<String, String> {
     let mut form = HashMap::new();
     form.insert("name".to_owned(), filename.to_owned());
     form.insert("size".to_owned(), filesize.to_string());
     form.insert("action".to_owned(), "create".to_owned());
-    form.insert("instance_id".to_owned(), workspace_id.to_owned());
+    form.insert("instance_id".to_owned(), instance_id.to_owned());
     form.insert("folder_id".to_owned(), folder_id.to_owned());
-    form.insert("profile_type".to_owned(), "workspace".to_owned());
-    client.post("/upload/", &form).await
+    form.insert("profile_type".to_owned(), profile_type.to_owned());
+    form
 }
 
 // ─── File Share write-back (external edit) ─────────────────────────────────
@@ -982,31 +997,114 @@ pub async fn chunk_delete(
 
 /// List web import jobs.
 ///
-/// `GET /web_upload/list/`
-pub async fn web_list(client: &ApiClient) -> Result<Value, CliError> {
-    client.get("/web_upload/list/").await
+/// `GET /web_upload/` (the root handler serves the list — there is no
+/// `/web_upload/list/` subpath). Optional `limit` / `offset` / `status` are
+/// forwarded as query params.
+pub async fn web_list(
+    client: &ApiClient,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    status: Option<&str>,
+) -> Result<Value, CliError> {
+    let mut params = HashMap::new();
+    if let Some(l) = limit {
+        params.insert("limit".to_owned(), l.to_string());
+    }
+    if let Some(o) = offset {
+        params.insert("offset".to_owned(), o.to_string());
+    }
+    if let Some(s) = status {
+        params.insert("status".to_owned(), s.to_owned());
+    }
+    if params.is_empty() {
+        client.get("/web_upload/").await
+    } else {
+        client.get_with_params("/web_upload/", &params).await
+    }
 }
 
 /// Cancel a web import job.
 ///
-/// `DELETE /web_upload/{upload_id}/`
+/// `DELETE /web_upload/?id=<upload_id>` — the id is a QUERY param on the root
+/// handler (NOT a `/web_upload/{id}/` path segment).
 pub async fn web_cancel(client: &ApiClient, upload_id: &str) -> Result<Value, CliError> {
-    let path = format!("/web_upload/{}/", urlencoding::encode(upload_id));
-    client.delete(&path).await
+    let mut params = HashMap::new();
+    params.insert("id".to_owned(), upload_id.to_owned());
+    client.delete_with_params("/web_upload/", &params).await
 }
 
-/// Get upload limits for the user's plan.
+/// Get upload limits for the user's plan, optionally in a target context.
 ///
-/// `GET /upload/limits/`
-pub async fn upload_limits(client: &ApiClient) -> Result<Value, CliError> {
-    client.get("/upload/limits/").await
+/// `GET /upload/limits/` — the optional query params resolve limits in the
+/// context of a specific operation: `action` (`create` or `update`), `org`
+/// (organization id, used when no `action` is given), `instance_id` (target
+/// workspace or share id; required when `action` is `create` or `update`,
+/// since the handler derives the profile type from it), `folder_id` (target
+/// folder `OpaqueId` or `root`), and `file_id` (required when `action=update`).
+pub async fn upload_limits(
+    client: &ApiClient,
+    action: Option<&str>,
+    org: Option<&str>,
+    instance_id: Option<&str>,
+    folder_id: Option<&str>,
+    file_id: Option<&str>,
+) -> Result<Value, CliError> {
+    let params = upload_limits_query(action, org, instance_id, folder_id, file_id);
+    if params.is_empty() {
+        client.get("/upload/limits/").await
+    } else {
+        client.get_with_params("/upload/limits/", &params).await
+    }
+}
+
+/// Build the optional context query map for [`upload_limits`].
+fn upload_limits_query(
+    action: Option<&str>,
+    org: Option<&str>,
+    instance_id: Option<&str>,
+    folder_id: Option<&str>,
+    file_id: Option<&str>,
+) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    if let Some(v) = action {
+        params.insert("action".to_owned(), v.to_owned());
+    }
+    if let Some(v) = org {
+        params.insert("org".to_owned(), v.to_owned());
+    }
+    if let Some(v) = instance_id {
+        params.insert("instance_id".to_owned(), v.to_owned());
+    }
+    if let Some(v) = folder_id {
+        params.insert("folder_id".to_owned(), v.to_owned());
+    }
+    if let Some(v) = file_id {
+        params.insert("file_id".to_owned(), v.to_owned());
+    }
+    params
+}
+
+/// List the hash algorithms supported by the upload integrity-check flow.
+///
+/// `GET /upload/algos/` — returns `{ "algos": ["md5", "sha1", …] }`.
+pub async fn algos(client: &ApiClient) -> Result<Value, CliError> {
+    client.get("/upload/algos/").await
 }
 
 /// Get restricted file extensions.
 ///
-/// `GET /upload/extensions/`
-pub async fn upload_extensions(client: &ApiClient) -> Result<Value, CliError> {
-    client.get("/upload/extensions/").await
+/// `GET /upload/limits/extensions/` — optional `plan` query selects the plan
+/// whose extension limits to return.
+pub async fn upload_extensions(client: &ApiClient, plan: Option<&str>) -> Result<Value, CliError> {
+    if let Some(p) = plan {
+        let mut params = HashMap::new();
+        params.insert("plan".to_owned(), p.to_owned());
+        client
+            .get_with_params("/upload/limits/extensions/", &params)
+            .await
+    } else {
+        client.get("/upload/limits/extensions/").await
+    }
 }
 
 // ─── Streaming Upload ──────────────────────────────────────────────────────
@@ -1023,7 +1121,8 @@ const STREAM_UPLOAD_TIMEOUT_SECS: u64 = 600;
 /// bound on the stream payload; if omitted, the plan's file-size limit applies.
 pub async fn create_stream_session(
     client: &ApiClient,
-    workspace_id: &str,
+    instance_id: &str,
+    profile_type: &str,
     folder_id: &str,
     filename: &str,
     max_size: Option<u64>,
@@ -1032,9 +1131,9 @@ pub async fn create_stream_session(
     form.insert("name".to_owned(), filename.to_owned());
     form.insert("stream".to_owned(), "true".to_owned());
     form.insert("action".to_owned(), "create".to_owned());
-    form.insert("instance_id".to_owned(), workspace_id.to_owned());
+    form.insert("instance_id".to_owned(), instance_id.to_owned());
     form.insert("folder_id".to_owned(), folder_id.to_owned());
-    form.insert("profile_type".to_owned(), "workspace".to_owned());
+    form.insert("profile_type".to_owned(), profile_type.to_owned());
     if let Some(max) = max_size {
         form.insert("max_size".to_owned(), max.to_string());
     }
@@ -1720,6 +1819,49 @@ mod tests {
             hash: None,
             hash_algo: None,
         }
+    }
+
+    #[test]
+    fn create_session_form_workspace_profile() {
+        let f = create_upload_session_form("19", "workspace", "root", "a.txt", 1024);
+        assert_eq!(f.get("instance_id").map(String::as_str), Some("19"));
+        assert_eq!(f.get("profile_type").map(String::as_str), Some("workspace"));
+        assert_eq!(f.get("folder_id").map(String::as_str), Some("root"));
+        assert_eq!(f.get("size").map(String::as_str), Some("1024"));
+        assert_eq!(f.get("action").map(String::as_str), Some("create"));
+    }
+
+    #[test]
+    fn create_session_form_share_profile() {
+        // Share-context upload: profile_type=share, instance_id=<share id>.
+        let f = create_upload_session_form("55", "share", "fold1", "b.bin", 42);
+        assert_eq!(f.get("instance_id").map(String::as_str), Some("55"));
+        assert_eq!(f.get("profile_type").map(String::as_str), Some("share"));
+    }
+
+    #[test]
+    fn upload_limits_query_empty_by_default() {
+        assert!(upload_limits_query(None, None, None, None, None).is_empty());
+    }
+
+    #[test]
+    fn upload_limits_query_create_context() {
+        let q = upload_limits_query(Some("create"), None, Some("19"), Some("root"), None);
+        assert_eq!(q.get("action").map(String::as_str), Some("create"));
+        assert_eq!(q.get("instance_id").map(String::as_str), Some("19"));
+        assert_eq!(q.get("folder_id").map(String::as_str), Some("root"));
+        assert!(!q.contains_key("org"));
+        assert!(!q.contains_key("file_id"));
+    }
+
+    #[test]
+    fn upload_limits_query_update_context() {
+        // The update context requires instance_id (profile-type source) plus
+        // file_id; both must be forwarded as query params.
+        let q = upload_limits_query(Some("update"), None, Some("19"), None, Some("file9"));
+        assert_eq!(q.get("action").map(String::as_str), Some("update"));
+        assert_eq!(q.get("instance_id").map(String::as_str), Some("19"));
+        assert_eq!(q.get("file_id").map(String::as_str), Some("file9"));
     }
 
     #[test]

@@ -330,13 +330,13 @@ pub async fn list_eligible(
 
 /// Add files to a metadata template.
 ///
-/// The server enforces a per-template node cap that varies by plan tier
-/// (Free/Agent/Pro: 10, Business: 1000). If `current + nodes_to_add` would
-/// exceed the cap, the call returns `400` with API error code `1605` and
-/// a message naming the cap, the attempted count, and the remaining slots.
-/// Callers that bulk-add should pre-flight by reading the template details
-/// (for `plan_node_limit` / `total_count_unfiltered`) and only send what
-/// fits.
+/// The server enforces a per-template node cap that varies by the workspace's
+/// plan tier (read the exact value from `plan_node_limit`; `-1` is unlimited /
+/// unresolved). If `current + nodes_to_add` would exceed the cap, the call
+/// returns `400` with API error code `1605` and a message naming the cap, the
+/// attempted count, and the remaining slots. Callers that bulk-add should
+/// pre-flight by reading the template details (for `plan_node_limit` /
+/// `total_count_unfiltered`) and only send what fits.
 ///
 /// `POST /workspace/{workspace_id}/metadata/templates/{template_id}/nodes/add/`
 pub async fn add_nodes_to_template(
@@ -728,9 +728,10 @@ pub async fn suggest_fields(
 /// (or omit the key); the server rejects an all-opted-out template with
 /// API error `1605`. [`validate_fields`] mirrors this check client-side.
 ///
-/// Available on every plan (Free/Agent: 1 template per workspace, Pro: 2,
-/// Business: 10). The server enforces the per-workspace template count and
-/// rejects with a plan-tier error if the cap is exceeded.
+/// Available on every plan; the per-workspace template count is capped by plan
+/// tier (Solo / Business / Growth, each higher than the last). The server
+/// enforces the per-workspace template count and rejects with a plan-tier error
+/// if the cap is exceeded.
 ///
 /// `POST /workspace/{workspace_id}/metadata/templates/`
 pub async fn create_template(

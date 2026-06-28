@@ -18,7 +18,7 @@ pub enum PreviewCommand {
         context_id: String,
         /// Storage node ID.
         node_id: String,
-        /// Preview type: binary, thumbnail, image, pdf, hlsstream, audio, spreadsheet.
+        /// Preview type: bin, thumbnail, image, hlsstream, pdf, spreadsheet, audio, mp4.
         preview_type: String,
     },
     /// Get a thumbnail preview URL.
@@ -30,7 +30,10 @@ pub enum PreviewCommand {
         /// Storage node ID.
         node_id: String,
     },
-    /// Request a file transformation URL.
+    /// Request an image transformation URL.
+    ///
+    /// Returns `{transform_name, token, read_url}` (the two-step model): fetch
+    /// `read_url` to get the transformed bytes.
     Transform {
         /// Context type: workspace or share.
         context_type: String,
@@ -38,16 +41,26 @@ pub enum PreviewCommand {
         context_id: String,
         /// Storage node ID.
         node_id: String,
-        /// Transform name (e.g. "image").
+        /// Transform name (must be "image").
         transform_name: String,
         /// Target width in pixels.
         width: Option<u32>,
         /// Target height in pixels.
         height: Option<u32>,
-        /// Output format: png, jpg, webp.
+        /// Output format: png, jpg, or jpeg.
         output_format: Option<String>,
         /// Size preset.
         size: Option<String>,
+        /// Crop rectangle width.
+        crop_width: Option<u32>,
+        /// Crop rectangle height.
+        crop_height: Option<u32>,
+        /// Crop rectangle x offset.
+        crop_x: Option<u32>,
+        /// Crop rectangle y offset.
+        crop_y: Option<u32>,
+        /// Rotation in degrees (0, 90, 180, 270).
+        rotate: Option<u32>,
     },
 }
 
@@ -74,6 +87,11 @@ pub async fn execute(command: &PreviewCommand, ctx: &CommandContext<'_>) -> Resu
             height,
             output_format,
             size,
+            crop_width,
+            crop_height,
+            crop_x,
+            crop_y,
+            rotate,
         } => {
             let client = ctx.build_client()?;
             let value = api::preview::get_transform_url(
@@ -87,6 +105,11 @@ pub async fn execute(command: &PreviewCommand, ctx: &CommandContext<'_>) -> Resu
                     height: *height,
                     output_format: output_format.as_deref(),
                     size: size.as_deref(),
+                    crop_width: *crop_width,
+                    crop_height: *crop_height,
+                    crop_x: *crop_x,
+                    crop_y: *crop_y,
+                    rotate: *rotate,
                 },
             )
             .await

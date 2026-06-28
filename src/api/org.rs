@@ -67,6 +67,12 @@ pub async fn get_org(client: &ApiClient, org_id: &str) -> Result<Value, CliError
 }
 
 /// Parameters for [`update_org`].
+///
+/// Every field is optional; only `Some` values are sent. To clear a clearable
+/// field, pass the literal string `"null"` (or `""` where the contract allows),
+/// matching the server's clear-to-null convention. The brand-color and
+/// `owner_defined` fields are JSON-encoded strings forwarded to the server
+/// verbatim.
 pub struct UpdateOrgParams<'a> {
     /// Organization to update.
     pub org_id: &'a str,
@@ -82,6 +88,28 @@ pub struct UpdateOrgParams<'a> {
     pub billing_email: Option<&'a str>,
     /// Organization homepage URL.
     pub homepage_url: Option<&'a str>,
+    /// Brand accent color as a JSON-encoded string.
+    pub accent_color: Option<&'a str>,
+    /// Background color as a JSON-encoded string.
+    pub background_color: Option<&'a str>,
+    /// Background display mode (server-validated against its closed set).
+    pub background_mode: Option<&'a str>,
+    /// Enable/disable the brand background.
+    pub use_background: Option<bool>,
+    /// Facebook profile URL.
+    pub facebook_url: Option<&'a str>,
+    /// Twitter/X profile URL.
+    pub twitter_url: Option<&'a str>,
+    /// Instagram profile URL.
+    pub instagram_url: Option<&'a str>,
+    /// `YouTube` channel URL.
+    pub youtube_url: Option<&'a str>,
+    /// Member-management permission level.
+    pub perm_member_manage: Option<&'a str>,
+    /// Authorized email domain for auto-join.
+    pub perm_authorized_domains: Option<&'a str>,
+    /// Custom owner-defined properties as a JSON-encoded string.
+    pub owner_defined: Option<&'a str>,
 }
 
 /// Update organization settings.
@@ -91,6 +119,13 @@ pub async fn update_org(
     client: &ApiClient,
     params: &UpdateOrgParams<'_>,
 ) -> Result<Value, CliError> {
+    let form = update_org_form(params);
+    let path = format!("/org/{}/update/", urlencoding::encode(params.org_id));
+    client.post(&path, &form).await
+}
+
+/// Build the form body for [`update_org`] from the supplied `Some` fields.
+fn update_org_form(params: &UpdateOrgParams<'_>) -> HashMap<String, String> {
     let mut form = HashMap::new();
     if let Some(v) = params.name {
         form.insert("name".to_owned(), v.to_owned());
@@ -108,10 +143,45 @@ pub async fn update_org(
         form.insert("billing_email".to_owned(), v.to_owned());
     }
     if let Some(v) = params.homepage_url {
-        form.insert("homepage_url".to_owned(), v.to_owned());
+        form.insert("homepage".to_owned(), v.to_owned());
     }
-    let path = format!("/org/{}/update/", urlencoding::encode(params.org_id));
-    client.post(&path, &form).await
+    if let Some(v) = params.accent_color {
+        form.insert("accent_color".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.background_color {
+        form.insert("background_color".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.background_mode {
+        form.insert("background_mode".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.use_background {
+        form.insert(
+            "use_background".to_owned(),
+            if v { "true" } else { "false" }.to_owned(),
+        );
+    }
+    if let Some(v) = params.facebook_url {
+        form.insert("facebook".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.twitter_url {
+        form.insert("twitter".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.instagram_url {
+        form.insert("instagram".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.youtube_url {
+        form.insert("youtube".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.perm_member_manage {
+        form.insert("perm_member_manage".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.perm_authorized_domains {
+        form.insert("perm_auth_domains".to_owned(), v.to_owned());
+    }
+    if let Some(v) = params.owner_defined {
+        form.insert("owner_defined".to_owned(), v.to_owned());
+    }
+    form
 }
 
 /// Close (delete) an organization.
@@ -296,7 +366,10 @@ pub async fn update_org_member_role(
 
 /// Transfer organization ownership.
 ///
-/// `GET /org/{org_id}/member/{user_id}/transfer_ownership/`
+/// `POST /org/{org_id}/member/{user_id}/transfer_ownership/` — POST is the
+/// canonical (mutating) verb; the body is empty and the target user is a URL
+/// path part. (The server still accepts GET for backward compatibility, but
+/// the CLI uses the canonical POST.)
 pub async fn transfer_org_ownership(
     client: &ApiClient,
     org_id: &str,
@@ -307,7 +380,7 @@ pub async fn transfer_org_ownership(
         urlencoding::encode(org_id),
         urlencoding::encode(user_id),
     );
-    client.get(&path).await
+    client.post(&path, &HashMap::new()).await
 }
 
 /// Discover available organizations (ones the user can join).
@@ -804,34 +877,197 @@ pub async fn billing_invoices(
     }
 }
 
+/// Parameters for [`create_workspace`].
+///
+/// `POST /org/{org_id}/create/workspace/` — `org_id` is the URL path part; the
+/// rest are form-body fields. The server has NO defaults for `perm_join`,
+/// `perm_member_manage`, or `intelligence`: all three are hard-required, so the
+/// CLI/MCP layers supply sensible defaults before building this struct.
+#[derive(Debug, Clone)]
+pub struct CreateWorkspaceParams<'a> {
+    /// Workspace folder name (must pass `Workspace::isValidName`).
+    pub folder_name: &'a str,
+    /// Workspace display name.
+    pub name: &'a str,
+    /// Join permission: `Member or above` / `Admin or above` / `Only Org Owners`.
+    pub perm_join: &'a str,
+    /// Member-management permission: `Member or above` / `Admin or above`.
+    pub perm_member_manage: &'a str,
+    /// AI intelligence enabled (sent as the `BooleanString` `"true"`/`"false"`).
+    pub intelligence: bool,
+    /// Optional workspace description.
+    pub description: Option<&'a str>,
+    /// Optional `BooleanString` workflow toggle (`"true"`/`"false"`).
+    pub workflow: Option<bool>,
+    /// Optional accent color.
+    pub accent_color: Option<&'a str>,
+    /// Optional background color 1.
+    pub background_color1: Option<&'a str>,
+    /// Optional background color 2.
+    pub background_color2: Option<&'a str>,
+}
+
 /// Create a workspace in an org.
 ///
-/// `POST /workspace/create/`
+/// `POST /org/{org_id}/create/workspace/` — `org_id` is a URL **path** segment
+/// (not a body field). The required body fields are `folder_name`, `name`,
+/// `perm_join`, `perm_member_manage`, and `intelligence`; `description`,
+/// `workflow`, and the three color fields are optional. (The legacy flat
+/// `POST /workspace/create/` route is gone.)
 pub async fn create_workspace(
     client: &ApiClient,
     org_id: &str,
-    folder_name: &str,
-    name: &str,
-    description: Option<&str>,
+    params: &CreateWorkspaceParams<'_>,
 ) -> Result<Value, CliError> {
     let mut form = HashMap::new();
-    form.insert("org_id".to_owned(), org_id.to_owned());
-    form.insert("folder_name".to_owned(), folder_name.to_owned());
-    form.insert("name".to_owned(), name.to_owned());
-    if let Some(d) = description {
+    form.insert("folder_name".to_owned(), params.folder_name.to_owned());
+    form.insert("name".to_owned(), params.name.to_owned());
+    form.insert("perm_join".to_owned(), params.perm_join.to_owned());
+    form.insert(
+        "perm_member_manage".to_owned(),
+        params.perm_member_manage.to_owned(),
+    );
+    form.insert("intelligence".to_owned(), params.intelligence.to_string());
+    if let Some(d) = params.description {
         form.insert("description".to_owned(), d.to_owned());
     }
-    client.post("/workspace/create/", &form).await
+    if let Some(w) = params.workflow {
+        form.insert("workflow".to_owned(), w.to_string());
+    }
+    if let Some(c) = params.accent_color {
+        form.insert("accent_color".to_owned(), c.to_owned());
+    }
+    if let Some(c) = params.background_color1 {
+        form.insert("background_color1".to_owned(), c.to_owned());
+    }
+    if let Some(c) = params.background_color2 {
+        form.insert("background_color2".to_owned(), c.to_owned());
+    }
+    let path = format!("/org/{}/create/workspace/", urlencoding::encode(org_id));
+    client.post(&path, &form).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BillingMetersParams, billing_credit_usage_path, billing_details_path,
+        BillingMetersParams, UpdateOrgParams, billing_credit_usage_path, billing_details_path,
         billing_invoices_path, billing_invoices_query, billing_members_path, billing_meters_path,
-        billing_meters_query, billing_root_path,
+        billing_meters_query, billing_root_path, update_org_form,
     };
     use crate::error::CliError;
+
+    // ─── org update form (wire-key coverage) ───────────────────────────────
+
+    /// A params struct with every optional field `None`, for selective tests.
+    fn empty_update_params(org_id: &str) -> UpdateOrgParams<'_> {
+        UpdateOrgParams {
+            org_id,
+            name: None,
+            domain: None,
+            description: None,
+            industry: None,
+            billing_email: None,
+            homepage_url: None,
+            accent_color: None,
+            background_color: None,
+            background_mode: None,
+            use_background: None,
+            facebook_url: None,
+            twitter_url: None,
+            instagram_url: None,
+            youtube_url: None,
+            perm_member_manage: None,
+            perm_authorized_domains: None,
+            owner_defined: None,
+        }
+    }
+
+    #[test]
+    fn update_org_form_empty_when_no_fields() {
+        assert!(update_org_form(&empty_update_params("19")).is_empty());
+    }
+
+    #[test]
+    fn update_org_form_branding_and_social_wire_keys() {
+        let mut p = empty_update_params("19");
+        p.accent_color = Some(r#"{"r":1}"#);
+        p.background_color = Some(r#"{"g":2}"#);
+        p.background_mode = Some("cover");
+        p.use_background = Some(true);
+        p.homepage_url = Some("https://example.com");
+        p.facebook_url = Some("https://fb.com/x");
+        p.twitter_url = Some("https://x.com/x");
+        p.instagram_url = Some("https://ig.com/x");
+        p.youtube_url = Some("https://yt.com/x");
+        let f = update_org_form(&p);
+        assert_eq!(
+            f.get("accent_color").map(String::as_str),
+            Some(r#"{"r":1}"#)
+        );
+        // Homepage wire key is the SHORT backend constant
+        // (`Org\KEY_HOMEPAGE_URL = 'homepage'`), not `homepage_url`.
+        assert_eq!(
+            f.get("homepage").map(String::as_str),
+            Some("https://example.com")
+        );
+        assert!(!f.contains_key("homepage_url"));
+        assert_eq!(
+            f.get("background_color").map(String::as_str),
+            Some(r#"{"g":2}"#)
+        );
+        assert_eq!(f.get("background_mode").map(String::as_str), Some("cover"));
+        // bool → "true"/"false" string.
+        assert_eq!(f.get("use_background").map(String::as_str), Some("true"));
+        // Social wire keys are the SHORT backend `Org\KEY_*` constant values
+        // (`facebook`/`twitter`/`instagram`/`youtube`), not the `*_url` flag names.
+        assert_eq!(
+            f.get("facebook").map(String::as_str),
+            Some("https://fb.com/x")
+        );
+        assert_eq!(
+            f.get("twitter").map(String::as_str),
+            Some("https://x.com/x")
+        );
+        assert_eq!(
+            f.get("instagram").map(String::as_str),
+            Some("https://ig.com/x")
+        );
+        assert_eq!(
+            f.get("youtube").map(String::as_str),
+            Some("https://yt.com/x")
+        );
+        // Long flag-style keys must NOT be sent (would be a silent no-op).
+        assert!(!f.contains_key("facebook_url"));
+        assert!(!f.contains_key("twitter_url"));
+        assert!(!f.contains_key("instagram_url"));
+        assert!(!f.contains_key("youtube_url"));
+    }
+
+    #[test]
+    fn update_org_form_perm_and_owner_defined_wire_keys() {
+        let mut p = empty_update_params("19");
+        p.perm_member_manage = Some("Admin or above");
+        p.perm_authorized_domains = Some("example.com");
+        p.owner_defined = Some(r#"{"k":"v"}"#);
+        p.use_background = Some(false);
+        let f = update_org_form(&p);
+        assert_eq!(
+            f.get("perm_member_manage").map(String::as_str),
+            Some("Admin or above")
+        );
+        // Authorized-domains wire key is the SHORT backend constant
+        // (`Org\KEY_PERM_AUTHORIZED_DOMAINS = 'perm_auth_domains'`).
+        assert_eq!(
+            f.get("perm_auth_domains").map(String::as_str),
+            Some("example.com")
+        );
+        assert!(!f.contains_key("perm_authorized_domains"));
+        assert_eq!(
+            f.get("owner_defined").map(String::as_str),
+            Some(r#"{"k":"v"}"#)
+        );
+        assert_eq!(f.get("use_background").map(String::as_str), Some("false"));
+    }
 
     // ─── path builders ──────────────────────────────────────────────────────
 

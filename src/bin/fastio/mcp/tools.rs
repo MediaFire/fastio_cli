@@ -83,6 +83,55 @@ fn optional_bool(args: &Map<String, Value>, key: &str) -> Option<bool> {
     })
 }
 
+/// Strict variant of [`optional_u32`]: distinguishes ABSENT from
+/// PRESENT-but-unparseable.
+///
+/// The lenient [`optional_u32`] collapses both "key omitted" and "key present
+/// but not a valid u32" to `None`, which silently drops a malformed value (e.g.
+/// `rotate: "90deg"` becomes "no rotation" rather than an error). For the
+/// constrained Phase-3 transform params, a caller who *supplied* a value but
+/// got it wrong should get a clear error, not silent default behavior. Returns
+/// `Ok(None)` when the key is absent, `Ok(Some(v))` when present and a valid
+/// u32, and `Err(error_text(...))` when present but not a valid u32.
+fn optional_u32_strict(
+    args: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<u32>, CallToolResult> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            .map(Some)
+            .ok_or_else(|| error_text(&format!("{key} must be a non-negative integer"))),
+    }
+}
+
+/// Strict variant of [`optional_bool`]: distinguishes ABSENT from
+/// PRESENT-but-unparseable.
+///
+/// The lenient [`optional_bool`] collapses "key omitted" and "key present but
+/// not a valid bool" to `None`, so a typo like `intelligence: "tru"` silently
+/// becomes the default rather than an error. For the constrained Phase-3
+/// boolean params, a present-but-invalid value should error. Returns
+/// `Ok(None)` when absent, `Ok(Some(v))` when present and a valid bool
+/// (native bool or the strings `"true"`/`"false"`), and
+/// `Err(error_text(...))` when present but not a valid bool.
+fn optional_bool_strict(
+    args: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<bool>, CallToolResult> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_bool()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            .map(Some)
+            .ok_or_else(|| error_text(&format!("{key} must be a boolean (true or false)"))),
+    }
+}
+
 /// Extract an optional u64 parameter (number or string-encoded).
 fn optional_u64(args: &Map<String, Value>, key: &str) -> Option<u64> {
     args.get(key).and_then(|v| {
@@ -130,6 +179,70 @@ fn require_ai_spend_confirmation(args: &Map<String, Value>) -> Option<CallToolRe
 /// without an explicit `confirm_ai_spend=true`.
 const AI_SPEND_REJECTION: &str =
     "this action spends AI credits; pass confirm_ai_spend=true to proceed";
+
+/// Valid `preview_type` values for the `preview` tool's `get` action. The
+/// server 400s on anything outside this set, so MCP validates the same way
+/// the CLI does (which requires `preview_type` for `get`).
+const PREVIEW_TYPES: &[&str] = &[
+    "bin",
+    "thumbnail",
+    "image",
+    "hlsstream",
+    "pdf",
+    "spreadsheet",
+    "audio",
+    "mp4",
+];
+
+/// Valid `linked_entity_type` values for `comment` link/linked actions. The
+/// CLI restricts this via a clap `value_parser`; MCP enforces the same set so
+/// the old, now-invalid `approval` value never reaches the server.
+const LINKED_ENTITY_TYPES: &[&str] = &["task", "workflow_review"];
+
+/// Valid `sort` values for the `comment` list / list-all actions. The CLI
+/// restricts this via a clap `value_parser = ["asc", "desc"]`; MCP enforces the
+/// same set so a bad sort gets a clear error instead of reaching the server.
+const COMMENT_SORT_ORDERS: &[&str] = &["asc", "desc"];
+
+/// Validate the optional `sort` arg for the `comment` list actions against
+/// [`COMMENT_SORT_ORDERS`], mirroring the CLI's clap `value_parser`. Returns the
+/// validated value (or `None`) on success, or an `error_text` result to return.
+fn validate_comment_sort(args: &Map<String, Value>) -> Result<Option<&str>, CallToolResult> {
+    match optional_str(args, "sort") {
+        Some(s) if COMMENT_SORT_ORDERS.contains(&s) => Ok(Some(s)),
+        Some(s) => Err(error_text(&format!(
+            "Invalid sort '{s}' (one of: asc, desc)"
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// Valid `status` filter values for the `upload web-list` action. The
+/// `/web_upload/` list endpoint validates the filter against this exact set
+/// (upload.txt:1050, :1156), so MCP enforces the same set the CLI's clap
+/// `value_parser` does — a bad value gets a clear error instead of reaching the
+/// server. Note: the spelling is `canceled` (single `l`), per the contract.
+const WEB_UPLOAD_STATUSES: &[&str] = &[
+    "pending",
+    "queued",
+    "downloading",
+    "uploading",
+    "complete",
+    "failed",
+    "canceled",
+];
+
+/// Valid `archived` filter values for the `workflow list` action. The CLI
+/// restricts this via a clap `value_parser`; MCP enforces the same set so a
+/// present-but-invalid value (e.g. `archived: "maybe"`) gets a clear error
+/// instead of silently forwarding to the server.
+const WORKFLOW_ARCHIVED_FILTERS: &[&str] = &["true", "false", "all"];
+
+/// Valid `usage` filter values for the `workflow template-list` action. The
+/// CLI restricts this via a clap `value_parser`; MCP enforces the same set so a
+/// present-but-invalid value gets a clear error instead of silently forwarding
+/// to the server.
+const WORKFLOW_TEMPLATE_USAGE_FILTERS: &[&str] = &["library", "one_off", "all"];
 
 /// Pure predicate: has the caller explicitly opted into AI credit spend via
 /// `confirm_ai_spend=true`? Accepts a native bool or the string `"true"`.
@@ -262,7 +375,7 @@ struct ToolDef {
 const TOOL_DEFS: &[ToolDef] = &[
     ToolDef {
         name: "auth",
-        description: "Authentication: sign in, sign out, check status, manage API keys, 2FA, OAuth sessions, email/password management, token introspection.",
+        description: "Authentication: sign in, sign out, check status, manage API keys, 2FA, OAuth sessions, email/password management, token introspection. NOTE: 'signout' is LOCAL-ONLY — it clears this MCP session's in-memory token and the locally stored credential but does NOT revoke the server-side session or API key (run `fastio auth signout` in a terminal to revoke a revocable server session; use 'api-key-delete' to revoke an API key).",
         actions: &[
             "signin",
             "signout",
@@ -285,6 +398,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             "2fa-verify-setup",
             "oauth-list",
             "oauth-details",
+            "oauth-rename",
             "oauth-revoke",
             "oauth-revoke-all",
         ],
@@ -307,6 +421,16 @@ const TOOL_DEFS: &[ToolDef] = &[
                 false,
             ),
             (
+                "agent_name",
+                "Agent/app name (api-key-create, api-key-update, oauth-rename)",
+                false,
+            ),
+            (
+                "expires",
+                "Expiration datetime, strtotime-compatible e.g. \"2026-12-31 23:59:59 UTC\" (api-key-create, api-key-update)",
+                false,
+            ),
+            (
                 "key_id",
                 "API key ID (api-key-delete, api-key-get, api-key-update)",
                 false,
@@ -326,7 +450,17 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("token", "2FA token (2fa-verify-setup)", false),
             (
                 "session_id",
-                "OAuth session ID (oauth-details, oauth-revoke)",
+                "OAuth session ID (oauth-details, oauth-rename, oauth-revoke)",
+                false,
+            ),
+            (
+                "device_name",
+                "New device label (oauth-rename; empty string clears)",
+                false,
+            ),
+            (
+                "current_session_id",
+                "Session ID to keep active when revoking all others (oauth-revoke-all)",
                 false,
             ),
         ],
@@ -338,7 +472,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             "info",
             "update",
             "search",
-            "close",
             "details",
             "profiles",
             "allowed",
@@ -361,7 +494,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("last_name", "Last name (update)", false),
             ("display_name", "Display name (update)", false),
             ("query", "Search query (search)", false),
-            ("confirmation", "Confirmation string (close)", false),
             (
                 "user_id",
                 "User ID (details, asset-list, asset-read)",
@@ -385,7 +517,16 @@ const TOOL_DEFS: &[ToolDef] = &[
                 false,
             ),
             ("country_code", "Country code e.g. 1 for US (phone)", false),
-            ("phone_number", "Phone number (phone)", false),
+            (
+                "phone_number",
+                "Phone number (phone validate, and update to set the account phone)",
+                false,
+            ),
+            (
+                "phone_country",
+                "Numeric phone country code to set on the account (update; send with phone_number, requires 2FA disabled)",
+                false,
+            ),
         ],
     },
     ToolDef {
@@ -443,6 +584,35 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("industry", "Industry", false),
             ("billing_email", "Billing email", false),
             ("homepage_url", "Homepage URL", false),
+            (
+                "background_color",
+                "Org background color as JSON string (update)",
+                false,
+            ),
+            (
+                "background_mode",
+                "Org background display mode (update)",
+                false,
+            ),
+            (
+                "use_background",
+                "Enable/disable the org brand background — boolean (update)",
+                false,
+            ),
+            ("facebook_url", "Facebook profile URL (update)", false),
+            ("twitter_url", "Twitter/X profile URL (update)", false),
+            ("instagram_url", "Instagram profile URL (update)", false),
+            ("youtube_url", "YouTube channel URL (update)", false),
+            (
+                "perm_authorized_domains",
+                "Authorized email domain for auto-join (update)",
+                false,
+            ),
+            (
+                "owner_defined",
+                "Custom owner-defined properties as JSON string (update)",
+                false,
+            ),
             ("confirm", "Confirmation string (delete)", false),
             (
                 "confirm_cancel",
@@ -470,8 +640,8 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "Filter meters by share; XOR with workspace_id (billing-meters)",
                 false,
             ),
-            ("limit", "Pagination limit", false),
-            ("offset", "Pagination offset", false),
+            ("limit", "Pagination limit (integer)", false),
+            ("offset", "Pagination offset (integer)", false),
             (
                 "starting_after",
                 "Invoice-ID cursor for the next page (billing-invoices)",
@@ -503,6 +673,37 @@ const TOOL_DEFS: &[ToolDef] = &[
             (
                 "folder_name",
                 "Workspace folder name (create-workspace)",
+                false,
+            ),
+            (
+                "perm_join",
+                "Join permission (create-workspace): 'Member or above' | 'Admin or above' | 'Only Org Owners' (default 'Member or above')",
+                false,
+            ),
+            (
+                "perm_member_manage",
+                "Member-management permission (create-workspace): 'Member or above' | 'Admin or above' (default 'Admin or above')",
+                false,
+            ),
+            (
+                "intelligence",
+                "Enable AI intelligence on the new workspace (create-workspace; default false) — boolean (true/false)",
+                false,
+            ),
+            (
+                "workflow",
+                "Enable workflow features on the new workspace (create-workspace) — boolean (true/false)",
+                false,
+            ),
+            ("accent_color", "Accent color (create-workspace)", false),
+            (
+                "background_color1",
+                "Background color 1 (create-workspace)",
+                false,
+            ),
+            (
+                "background_color2",
+                "Background color 2 (create-workspace)",
                 false,
             ),
             ("user_id", "User ID (members-details)", false),
@@ -563,6 +764,51 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("folder_name", "Folder name / slug (create)", false),
             ("description", "Description", false),
             ("intelligence", "Enable AI (true/false)", false),
+            (
+                "perm_join",
+                "Who can self-join — permission phrase (update)",
+                false,
+            ),
+            (
+                "perm_member_manage",
+                "Who can manage members — permission phrase (update)",
+                false,
+            ),
+            (
+                "nl_summaries_enabled",
+                "Toggle AI obligation-summary enrichment — boolean (update)",
+                false,
+            ),
+            (
+                "nl_summaries_daily_cap",
+                "AI enrichment daily cap, 0-100000 (update)",
+                false,
+            ),
+            (
+                "workflow_approval_native_enabled",
+                "Native workflow-review tier: disabled/mvs/extended (update)",
+                false,
+            ),
+            (
+                "accent_color",
+                "Accent color as JSON string (update)",
+                false,
+            ),
+            (
+                "background_color1",
+                "Primary background color as JSON string (update)",
+                false,
+            ),
+            (
+                "background_color2",
+                "Secondary background color as JSON string (update)",
+                false,
+            ),
+            (
+                "owner_defined",
+                "Custom owner-defined properties as JSON string (update)",
+                false,
+            ),
             ("query", "Search query", false),
             ("confirm", "Confirmation string (delete)", false),
             ("share_id", "Share ID (import-share)", false),
@@ -652,13 +898,13 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "REQUIRED to proceed (true/false) for the AI-credit-spending actions metadata-template-preview-match, metadata-template-suggest-fields, metadata-extract, metadata-extract-and-wait. These actions are rejected unless confirm_ai_spend=true. Ignored by read-only metadata actions.",
                 false,
             ),
-            ("limit", "Pagination limit", false),
-            ("offset", "Pagination offset", false),
+            ("limit", "Pagination limit (integer)", false),
+            ("offset", "Pagination offset (integer)", false),
         ],
     },
     ToolDef {
         name: "files",
-        description: "File operations: list, details, create folders, move, copy, rename, delete, restore, purge, trash, versions, search, recent, lock, transfer, read content.",
+        description: "File operations: list, details, create folders, move, copy, rename, update (metadata/content), add-file, delete, restore, purge, trash, versions, search, recent, lock, transfer, read content.",
         actions: &[
             "list",
             "info",
@@ -666,6 +912,8 @@ const TOOL_DEFS: &[ToolDef] = &[
             "move",
             "copy",
             "rename",
+            "update",
+            "add-file",
             "delete",
             "restore",
             "purge",
@@ -686,12 +934,47 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("node_id", "File/folder node ID", false),
             (
                 "folder",
-                "Parent folder ID (list, create-folder); defaults to root",
+                "Parent folder ID (list, create-folder, add-file); defaults to root",
                 false,
             ),
-            ("name", "Folder name (create-folder)", false),
+            ("name", "Folder/file name (create-folder, add-file)", false),
+            (
+                "force",
+                "create-folder: always create (auto-rename on collision) instead of returning the existing folder",
+                false,
+            ),
             ("to", "Target parent folder ID (move, copy)", false),
             ("new_name", "New name (rename)", false),
+            (
+                "from",
+                "JSON content source for update: {\"type\":\"upload\",\"upload\":{\"id\":\"…\"}} or {\"type\":\"hash\",\"hash\":{\"hash\":\"…\",\"hash_type\":\"sha256\"}}. add-file is workspace-scoped and supports ONLY an upload source — use upload_id; the hash form is for update only",
+                false,
+            ),
+            (
+                "metadata_title",
+                "Title override, max 50 chars (update)",
+                false,
+            ),
+            (
+                "metadata_short",
+                "Short-description override, max 2048 chars (update)",
+                false,
+            ),
+            (
+                "upload_id",
+                "Completed upload session ID to attach (add-file) — the ONLY supported add-file source",
+                false,
+            ),
+            (
+                "hash",
+                "Content hash to dedup against. NOT supported by workspace add-file (use upload_id); to dedup by hash use update with from={type:hash}",
+                false,
+            ),
+            (
+                "hash_type",
+                "Hash algorithm (md5/sha1/sha256/sha384) paired with hash; see hash — not supported by workspace add-file",
+                false,
+            ),
             ("query", "Search query (search)", false),
             ("limit", "Max results (search)", false),
             ("offset", "Result offset (search)", false),
@@ -719,9 +1002,24 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("sort_dir", "Sort direction: asc/desc", false),
             ("page_size", "Page size (list, trash)", false),
             ("cursor", "Pagination cursor (list, trash)", false),
+            (
+                "type",
+                "Filter by node type: file/folder/link/note (recent)",
+                false,
+            ),
             ("share_id", "Share ID (add-link)", false),
             ("to_workspace", "Target workspace ID (transfer)", false),
             ("version_id", "Version ID (version-restore)", false),
+            (
+                "duration",
+                "Lock duration in seconds, 60-3600 (lock-acquire)",
+                false,
+            ),
+            (
+                "client_info",
+                "Lock client metadata as a JSON object (lock-acquire)",
+                false,
+            ),
         ],
     },
     ToolDef {
@@ -742,6 +1040,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             "web-cancel",
             "web-status",
             "limits",
+            "algos",
             "extensions",
             "stream",
             "create-stream-session",
@@ -784,6 +1083,49 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "Hash algorithm e.g. sha256 (stream, stream-send)",
                 false,
             ),
+            (
+                "limit",
+                "Maximum number of jobs to return (web-list)",
+                false,
+            ),
+            ("offset", "Offset for pagination (web-list)", false),
+            (
+                "status",
+                "Filter web-import jobs by status (web-list)",
+                false,
+            ),
+            (
+                "plan",
+                "Plan whose extension limits to return (extensions)",
+                false,
+            ),
+            (
+                "limit_action",
+                "limits context selector: create or update (limits). NOTE: distinct \
+                 from the tool's routing `action` (always 'limits' here). instance_id \
+                 is required for both create and update; file_id is also required for update.",
+                false,
+            ),
+            (
+                "org",
+                "Organization ID for limit resolution (limits, no limit_action)",
+                false,
+            ),
+            (
+                "instance_id",
+                "Target workspace/share ID for limits (limits, limit_action=create or update)",
+                false,
+            ),
+            (
+                "folder_id",
+                "Target folder OpaqueId or root (limits)",
+                false,
+            ),
+            (
+                "file_id",
+                "File ID for update-context limits (limits, limit_action=update)",
+                false,
+            ),
         ],
     },
     ToolDef {
@@ -822,10 +1164,60 @@ const TOOL_DEFS: &[ToolDef] = &[
         params: &[
             ("share_id", "Share ID", false),
             ("workspace_id", "Workspace ID (create)", false),
-            ("name", "Share name", false),
+            (
+                "name",
+                "Share display title (create) / display name (update)",
+                false,
+            ),
+            ("title", "Display title (update); \"null\" to clear", false),
+            (
+                "custom_name",
+                "URL-friendly custom name (create/update); \"null\" to clear",
+                false,
+            ),
+            (
+                "share_type",
+                "Direction: send, receive, exchange (create default exchange)",
+                false,
+            ),
             ("description", "Description", false),
             ("access_options", "Access options", false),
-            ("password", "Share password", false),
+            (
+                "invite",
+                "Who can manage invitations: owners, guests",
+                false,
+            ),
+            (
+                "storage_mode",
+                "Storage mode: independent (portal, default) or workspace_folder (create)",
+                false,
+            ),
+            (
+                "folder_node_id",
+                "Backing workspace folder opaque ID (workspace_folder mode)",
+                false,
+            ),
+            (
+                "create_folder",
+                "Create a new backing folder (true/false, with folder_name)",
+                false,
+            ),
+            ("folder_name", "Name for the new backing folder", false),
+            (
+                "password",
+                "Share password (Send + 'Anyone with the link')",
+                false,
+            ),
+            (
+                "expires",
+                "Expiration datetime YYYY-MM-DD HH:MM:SS (portal mode); \"null\" to clear",
+                false,
+            ),
+            (
+                "notify",
+                "Notification: never, notify_on_file_received, notify_on_file_sent_or_received",
+                false,
+            ),
             (
                 "download_enabled",
                 "Allow downloads (true/false, legacy — prefer download_security)",
@@ -838,21 +1230,101 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             ("comments_enabled", "Allow comments (true/false)", false),
             (
+                "guest_chat_enabled",
+                "Enable guest AI chat (true/false)",
+                false,
+            ),
+            ("display_type", "Visual display mode: grid, list", false),
+            ("workspace_style", "Workspace visual style", false),
+            (
                 "anonymous_uploads_enabled",
                 "Allow anonymous uploads (true/false)",
                 false,
             ),
-            ("intelligence", "Enable AI intelligence (true/false)", false),
+            (
+                "intelligence",
+                "Enable AI intelligence (true/false; create defaults to false — required server-side)",
+                false,
+            ),
+            (
+                "accent_color",
+                "Accent color (JSON color object), or \"null\"",
+                false,
+            ),
+            (
+                "background_color1",
+                "Primary background color (JSON), or \"null\"",
+                false,
+            ),
+            (
+                "background_color2",
+                "Secondary background color (JSON), or \"null\"",
+                false,
+            ),
+            (
+                "background_image",
+                "Background image selection (numeric)",
+                false,
+            ),
+            (
+                "link_1",
+                "Custom link #1 (JSON link object), or \"null\"",
+                false,
+            ),
+            (
+                "link_2",
+                "Custom link #2 (JSON link object), or \"null\"",
+                false,
+            ),
+            (
+                "link_3",
+                "Custom link #3 (JSON link object), or \"null\"",
+                false,
+            ),
+            (
+                "owner_defined",
+                "Custom owner-defined properties (JSON or \"null\")",
+                false,
+            ),
+            (
+                "share_link_node_id",
+                "Remove the workspace share-link node (update; pass \"null\" — the only accepted value)",
+                false,
+            ),
             ("confirm", "Confirmation (delete)", false),
             ("folder", "Folder ID (files-list)", false),
-            ("email", "Member email (members-add)", false),
-            ("role", "Member role", false),
+            (
+                "email",
+                "Member email (invite) or 19-digit user ID (members-add)",
+                false,
+            ),
+            ("role", "Member role: admin, member, guest, view", false),
+            (
+                "notify_options",
+                "Member notification preference (members-add)",
+                false,
+            ),
+            (
+                "force_notification",
+                "Resend notification email (true/false, members-add)",
+                false,
+            ),
+            (
+                "message",
+                "Invitation email message (members-add by email)",
+                false,
+            ),
+            (
+                "invitation_expires",
+                "Invitation expiration datetime (members-add by email)",
+                false,
+            ),
             ("sort_by", "Sort field (files-list)", false),
             ("sort_dir", "Sort direction (files-list)", false),
             ("page_size", "Page size", false),
             ("cursor", "Pagination cursor", false),
-            ("limit", "Pagination limit", false),
-            ("offset", "Pagination offset", false),
+            ("limit", "Pagination limit (integer)", false),
+            ("offset", "Pagination offset (integer)", false),
         ],
     },
     ToolDef {
@@ -944,8 +1416,8 @@ const TOOL_DEFS: &[ToolDef] = &[
                 false,
             ),
             ("context", "Hint for autotitle", false),
-            ("limit", "Pagination limit", false),
-            ("offset", "Pagination offset", false),
+            ("limit", "Pagination limit (integer)", false),
+            ("offset", "Pagination offset (integer)", false),
         ],
     },
     ToolDef {
@@ -974,13 +1446,13 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "accept or decline (join-invitation)",
                 false,
             ),
-            ("limit", "Pagination limit", false),
-            ("offset", "Pagination offset", false),
+            ("limit", "Pagination limit (integer)", false),
+            ("offset", "Pagination offset (integer)", false),
         ],
     },
     ToolDef {
         name: "comment",
-        description: "Comments: list, list-all, create, reply, update, delete, bulk-delete, details, reaction-add, reaction-remove, link, unlink, linked. This generic tool also edits/deletes/reacts to TASK comments by comment_id (use the `task` tool to post/list them).",
+        description: "Comments: list, list-all, create, reply, update, delete, bulk-delete, details, reaction-add, reaction-remove, link, unlink, linked, list-attachments, attach, detach. create accepts an optional anchoring reference + properties metadata and inline attachment(s) (target_id / target_ids, ≤25). attach/detach/list-attachments are author-only and rejected on workflow-review comments (the server enforces). This generic tool also edits/deletes/reacts to TASK comments by comment_id (use the `task` tool to post/list them).",
         actions: &[
             "list",
             "list-all",
@@ -995,6 +1467,9 @@ const TOOL_DEFS: &[ToolDef] = &[
             "link",
             "unlink",
             "linked",
+            "list-attachments",
+            "attach",
+            "detach",
         ],
         params: &[
             ("entity_type", "Entity type: workspace or share", false),
@@ -1010,18 +1485,42 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("emoji", "Emoji character (reaction-add)", false),
             (
                 "linked_entity_type",
-                "Linked entity type: task or approval",
+                "Linked entity type: task or workflow_review",
                 false,
             ),
             ("linked_entity_id", "Linked entity ID", false),
-            ("sort", "Sort order (list)", false),
-            ("limit", "Pagination limit", false),
-            ("offset", "Pagination offset", false),
+            (
+                "reference",
+                "Anchoring reference as a JSON object (create)",
+                false,
+            ),
+            (
+                "properties",
+                "Arbitrary metadata as a JSON object (create)",
+                false,
+            ),
+            (
+                "target_id",
+                "Single attachment object ID (create inline / attach / detach)",
+                false,
+            ),
+            (
+                "target_ids",
+                "Comma-separated attachment object IDs, ≤25 (create inline / attach)",
+                false,
+            ),
+            (
+                "sort",
+                "Sort order (list): asc or desc (default asc)",
+                false,
+            ),
+            ("limit", "Pagination limit (integer)", false),
+            ("offset", "Pagination offset (integer)", false),
         ],
     },
     ToolDef {
         name: "event",
-        description: "Events: search, summarize, details, ack, activity-list, activity-poll.",
+        description: "Events & audit log: search, summarize, details, ack, activity-list, activity-poll. search AND summarize forward the same audit-log filters — visibility (external_audit_log|external), created_min/created_max time bounds, parent_event_id (serial/batch drill; cannot combine with filters other than acknowledged/limit/offset), acknowledged, calling_user_id (distinct from user_id), object_id, and subcategory; summarize additionally takes user_context. Pass the global --detail (terse|standard|full) on the CLI to select the server output verbosity.",
         actions: &[
             "search",
             "summarize",
@@ -1040,6 +1539,41 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("category", "Category filter", false),
             ("subcategory", "Subcategory filter", false),
             (
+                "parent_event_id",
+                "Parent event ID for serial/batch drill (search, summarize)",
+                false,
+            ),
+            (
+                "calling_user_id",
+                "Triggering user ID; distinct from user_id (search, summarize)",
+                false,
+            ),
+            (
+                "object_id",
+                "Related object ID filter (search, summarize)",
+                false,
+            ),
+            (
+                "visibility",
+                "Audit-log filter: external_audit_log or external (search, summarize)",
+                false,
+            ),
+            (
+                "acknowledged",
+                "Acknowledgment status: true or false (search, summarize)",
+                false,
+            ),
+            (
+                "created_min",
+                "Lower bound for event creation time (search, summarize)",
+                false,
+            ),
+            (
+                "created_max",
+                "Upper bound for event creation time (search, summarize)",
+                false,
+            ),
+            (
                 "user_context",
                 "Focus guidance for summary (summarize)",
                 false,
@@ -1049,34 +1583,138 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("lastactivity", "Last activity timestamp", false),
             ("wait", "Long-poll seconds (activity-poll)", false),
             ("cursor", "Cursor (activity-list)", false),
-            ("limit", "Pagination limit", false),
-            ("offset", "Pagination offset", false),
+            ("limit", "Pagination limit (integer)", false),
+            ("offset", "Pagination offset (integer)", false),
+        ],
+    },
+    ToolDef {
+        name: "dashboard",
+        description: "Per-workspace dashboard: the calling member's ranked, paginated feed of ACTIONABLE cards (approvals, tasks, reviews, confirmations, @mentions, file activity, pending signatures). Actions: get (read the feed; paginate with limit 1-200 / offset), dismiss (hide a card from YOUR feed — permanently, or snooze it until a future time via snooze_until 'YYYY-MM-DD HH:MM:SS UTC'), undismiss (restore a card; idempotent). Dismiss / snooze / undismiss are PER-MEMBER and OUT-OF-BAND — they change only YOUR view and never advance, resolve, or modify the underlying obligation, workflow, or signature. card_key comes from a card's card_key field (URL-encoding is handled for you). A signature card's primary action — minting YOUR own signing link — is the `sign` tool's envelope-my-sign-link action (envelope_id = the signature card's target.id).",
+        actions: &["get", "dismiss", "undismiss"],
+        params: &[
+            (
+                "workspace_id",
+                "Workspace ID (19-digit) or folder name",
+                false,
+            ),
+            (
+                "card_key",
+                "Card key from the feed (dismiss / undismiss), e.g. obligation:123…",
+                false,
+            ),
+            (
+                "snooze_until",
+                "Snooze expiry 'YYYY-MM-DD HH:MM:SS UTC' (dismiss; must be in the future). Omit for a permanent dismiss.",
+                false,
+            ),
+            ("limit", "Cards per page, 1-200 (get)", false),
+            ("offset", "Cards to skip for pagination (get)", false),
         ],
     },
     ToolDef {
         name: "invitation",
-        description: "Invitations: list, accept, decline, delete invitations.",
-        actions: &["list", "accept", "decline", "delete"],
+        description: "Invitations: list user invitations, list-entity (a workspace/share's invitations by optional state), accept, decline, update (state/role/notification/expiration), delete.",
+        actions: &[
+            "list",
+            "list-entity",
+            "accept",
+            "decline",
+            "update",
+            "delete",
+        ],
         params: &[
-            ("invitation_id", "Invitation ID", false),
-            ("entity_type", "Entity type (decline, delete)", false),
-            ("entity_id", "Entity ID (decline, delete)", false),
+            (
+                "invitation_id",
+                "Invitation ID or email (accept/decline/update/delete)",
+                false,
+            ),
+            (
+                "entity_type",
+                "Entity type: workspace or share (list-entity/accept/decline/update/delete)",
+                false,
+            ),
+            (
+                "entity_id",
+                "Entity ID (list-entity/accept/decline/update/delete)",
+                false,
+            ),
+            (
+                "state",
+                "State filter (list-entity) or new state (update): pending, accepted, declined",
+                false,
+            ),
+            (
+                "role",
+                "Updated permission role (update): admin, member, guest, view",
+                false,
+            ),
+            (
+                "notify_options",
+                "Updated notification preference (update)",
+                false,
+            ),
+            (
+                "expires",
+                "Updated membership expiration datetime (update)",
+                false,
+            ),
         ],
     },
     ToolDef {
         name: "preview",
-        description: "Previews: get preview URLs and transform URLs for files. The returned `path`/url is a secret-bearing read capability (carries a short-lived embedded token) — do not log or share it.",
+        description: "Previews: get preview URLs and image transform URLs for files. For transform, the response is {transform_name, token, read_url}; read_url is the /read/ URL carrying the token AND the image params (so they actually apply when fetched). Both read_url and token are secret-bearing read capabilities — do not log or share them.",
         actions: &["get", "thumbnail", "transform"],
         params: &[
             ("context_type", "Context: workspace or share", false),
             ("context_id", "Workspace or share ID", false),
             ("node_id", "File node ID", false),
-            ("preview_type", "Preview type (get)", false),
-            ("transform_name", "Transform name (transform)", false),
-            ("width", "Width (transform)", false),
-            ("height", "Height (transform)", false),
-            ("output_format", "Output format (transform)", false),
-            ("size", "Size preset (transform)", false),
+            (
+                "preview_type",
+                "Preview type (get; REQUIRED for get): bin, thumbnail, image, hlsstream, pdf, spreadsheet, audio, mp4",
+                false,
+            ),
+            (
+                "transform_name",
+                "Transform name (transform) — must be 'image' (the only valid value; default 'image')",
+                false,
+            ),
+            ("width", "Target width in px (transform; integer)", false),
+            ("height", "Target height in px (transform; integer)", false),
+            (
+                "output_format",
+                "Output format (transform): png, jpg, or jpeg (NOT webp)",
+                false,
+            ),
+            (
+                "size",
+                "Size preset (transform): IconTiny, IconSmall, IconMedium, or Preview",
+                false,
+            ),
+            (
+                "crop_width",
+                "Crop rectangle width (transform; integer; all four crop_* required together)",
+                false,
+            ),
+            (
+                "crop_height",
+                "Crop rectangle height (transform; integer)",
+                false,
+            ),
+            (
+                "crop_x",
+                "Crop rectangle x offset (transform; integer)",
+                false,
+            ),
+            (
+                "crop_y",
+                "Crop rectangle y offset (transform; integer)",
+                false,
+            ),
+            (
+                "rotate",
+                "Rotation in degrees (transform; integer): 0, 90, 180, or 270",
+                false,
+            ),
         ],
     },
     ToolDef {
@@ -1095,7 +1733,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "task",
-        description: "[legacy] Tasks: manage task lists and tasks. Legacy workflow primitive, superseded by the `workflow` orchestration tool; remains functional for now. list-lists, create-list, list-details, update-list, delete-list, list-tasks, create-task, task-details, update-task, delete-task, change-status, assign-task, bulk-status, move-task, reorder-tasks, reorder-lists, filter, summary, list-comments, post-comment, list-attachments, attach, detach. Task comments are private to the task; to EDIT, DELETE, or REACT to a task comment use the generic `comment` tool by comment_id.",
+        description: "Tasks API: manage task lists and tasks. list-lists, create-list, list-details, update-list, delete-list, list-tasks, create-task, task-details, update-task, delete-task, change-status, assign-task, bulk-status, move-task, reorder-tasks, reorder-lists, filter, summary, list-comments, post-comment, list-attachments, attach, detach. Task comments are private to the task; to EDIT, DELETE, or REACT to a task comment use the generic `comment` tool by comment_id.",
         actions: &[
             "list-lists",
             "create-list",
@@ -1185,152 +1823,8 @@ const TOOL_DEFS: &[ToolDef] = &[
                 false,
             ),
             ("target_id", "Single object ID to detach (detach)", false),
-            ("limit", "Pagination limit", false),
-            ("offset", "Pagination offset", false),
-        ],
-    },
-    ToolDef {
-        name: "worklog",
-        description: "[legacy] Worklogs: list, append, interject, details, acknowledge, unacknowledged, list-all, filter, summary. Legacy workflow primitive, superseded by the `workflow` orchestration tool; remains functional for now.",
-        actions: &[
-            "list",
-            "append",
-            "interject",
-            "details",
-            "acknowledge",
-            "unacknowledged",
-            "list-all",
-            "filter",
-            "summary",
-        ],
-        params: &[
-            (
-                "entity_type",
-                "Entity type: profile (default), task, task_list, or node",
-                false,
-            ),
-            ("entity_id", "Entity ID", false),
-            ("entry_id", "Worklog entry ID (details, acknowledge)", false),
-            ("message", "Worklog content", false),
-            (
-                "profile_type",
-                "Profile type: workspace or share (list-all, filter, summary)",
-                false,
-            ),
-            (
-                "profile_id",
-                "Profile ID (list-all, filter, summary)",
-                false,
-            ),
-            (
-                "filter",
-                "Filter: authored, interjections (filter action)",
-                false,
-            ),
-            ("entry_type", "Entry type filter (authored filter)", false),
-            ("limit", "Pagination limit", false),
-            ("offset", "Pagination offset", false),
-        ],
-    },
-    ToolDef {
-        name: "approval",
-        description: "[legacy] Approvals: list, request, details, approve, reject, update, delete, filter, summary, user-approvals. Legacy workflow primitive, superseded by the `workflow` orchestration tool; remains functional for now.",
-        actions: &[
-            "list",
-            "request",
-            "details",
-            "approve",
-            "reject",
-            "update",
-            "delete",
-            "filter",
-            "summary",
-            "user-approvals",
-        ],
-        params: &[
-            ("workspace_id", "Workspace ID (list)", false),
-            (
-                "profile_type",
-                "Profile type: workspace or share (request, details, approve, reject, update, delete, filter, summary)",
-                false,
-            ),
-            (
-                "profile_id",
-                "Profile ID. Required for request/filter/summary; for details/approve/reject/update/delete, omit to use the legacy unscoped route",
-                false,
-            ),
-            (
-                "approval_id",
-                "Approval ID (details, approve, reject, update, delete)",
-                false,
-            ),
-            (
-                "entity_type",
-                "Entity type: task, node, worklog_entry, share (request)",
-                false,
-            ),
-            ("entity_id", "Entity ID (request)", false),
-            ("description", "Description (request, update)", false),
-            ("approver_id", "Approver user ID (request, update)", false),
-            (
-                "deadline",
-                "Deadline YYYY-MM-DD HH:MM:SS (request, update)",
-                false,
-            ),
-            ("node_id", "Artifact node ID (request, update)", false),
-            (
-                "properties",
-                "Metadata properties as a JSON object (request, update)",
-                false,
-            ),
-            ("comment", "Comment (approve, reject)", false),
-            (
-                "filter",
-                "Filter (filter: pending/created/assigned/resolved; user-approvals: pending/created/resolved)",
-                false,
-            ),
-            (
-                "status",
-                "Status filter (list, filter, user-approvals)",
-                false,
-            ),
-            ("limit", "Pagination limit", false),
-            ("offset", "Pagination offset", false),
-        ],
-    },
-    ToolDef {
-        name: "todo",
-        description: "[legacy] Todos: list, create, details, update, delete, toggle, bulk-toggle, filter, summary. Legacy workflow primitive, superseded by the `workflow` orchestration tool; remains functional for now.",
-        actions: &[
-            "list",
-            "create",
-            "details",
-            "update",
-            "toggle",
-            "delete",
-            "bulk-toggle",
-            "filter",
-            "summary",
-        ],
-        params: &[
-            ("profile_type", "Profile type: workspace or share", false),
-            (
-                "profile_id",
-                "Profile ID (list, create, bulk-toggle)",
-                false,
-            ),
-            ("todo_id", "Todo ID", false),
-            ("title", "Todo title", false),
-            ("assignee_id", "Assignee user ID", false),
-            ("done", "Completion state (true/false)", false),
-            ("todo_ids", "Comma-separated todo IDs (bulk-toggle)", false),
-            (
-                "filter",
-                "Filter: assigned, created, done, pending (filter action)",
-                false,
-            ),
-            ("limit", "Pagination limit", false),
-            ("offset", "Pagination offset", false),
+            ("limit", "Pagination limit (integer)", false),
+            ("offset", "Pagination offset (integer)", false),
         ],
     },
     ToolDef {
@@ -1414,8 +1908,8 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "Resolution: keep_local or keep_remote",
                 false,
             ),
-            ("limit", "Pagination limit", false),
-            ("offset", "Pagination offset", false),
+            ("limit", "Pagination limit (integer)", false),
+            ("offset", "Pagination offset (integer)", false),
         ],
     },
     ToolDef {
@@ -1427,11 +1921,21 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("context_id", "Workspace or share ID", false),
             ("node_id", "File node ID", false),
             ("lock_token", "Lock token (release, heartbeat)", false),
+            (
+                "duration",
+                "Lock duration in seconds, 60-3600 (acquire)",
+                false,
+            ),
+            (
+                "client_info",
+                "Client metadata as a JSON object (acquire)",
+                false,
+            ),
         ],
     },
     ToolDef {
         name: "metadata",
-        description: "Metadata extraction: list eligible files, manage template-file mappings, AI-based matching, batch extraction, async single-file extraction (returns job_id; poll via workspace jobs-status), lexical keyword search over metadata values, and async TSV export of the caller's saved view. SIDE EFFECTS — these actions SPEND AI CREDITS: 'suggest-fields', 'auto-match', 'extract-all', 'extract', 'extract-and-wait'. The 'extract-and-wait' action enqueues a single-file extraction and polls workspace jobs-status to a terminal state before returning (the offload-friendly compound).",
+        description: "Metadata extraction: list eligible files, manage template-file mappings, AI-based matching, batch extraction, async single-file extraction (returns job_id; poll via workspace jobs-status), lexical keyword search over metadata values, and async TSV export of the caller's saved view. SIDE EFFECTS — these actions SPEND AI CREDITS: 'auto-match', 'extract-all', 'extract', 'extract-and-wait'. The 'extract-and-wait' action enqueues a single-file extraction and polls workspace jobs-status to a terminal state before returning (the offload-friendly compound).",
         actions: &[
             "eligible",
             "add-nodes",
@@ -1457,8 +1961,8 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "JSON-encoded array of node IDs (add-nodes, remove-nodes)",
                 false,
             ),
-            ("limit", "Pagination limit", false),
-            ("offset", "Pagination offset", false),
+            ("limit", "Pagination limit (integer)", false),
+            ("offset", "Pagination offset (integer)", false),
             (
                 "sort_field",
                 "Template field name to sort by (list-nodes)",
@@ -1504,7 +2008,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "workflow",
-        description: "Workflow Orchestration (v3.2): the durable multi-step runtime — distinct from the legacy task/approval/todo primitives. OFFLOAD multi-step orchestration here instead of hand-driving primitives: the compound actions 'instantiate-and-wait', 'trigger-fire-and-wait', and 'audit-export-and-download' do the full fire→poll→download loop for you. This tool exposes READ + DRIVE actions only; admin/destructive/crypto operations (workflow cancel + purge, template/pool/trigger create+lifecycle, outbound subscription management, secret/key rotation, dual-control redaction, schema set/derive, realtime token mint) are intentionally CLI-binary-only (`fastio workflow …`) — including the terminal 'cancel' lifecycle mutation, which is NOT available over MCP. Mid-run editing is exposed (modification-propose/-list/-get/-apply/-cancel: propose AUTO-PAUSES the run, apply finalizes + resumes; needs workflow ADMIN + the workflow_mid_run_edit plan capability). The built-in system template gallery is browsable over MCP (template-gallery, template-gallery-get); instantiating a gallery template (from_system, a template-create) is CLI-only (`fastio workflow template from-system`), consistent with the template-create boundary above. 'step-agent-trace' is the read-only reasoning+commentary companion to 'step-agent-activity' (never the final answer/citations). Call action='describe' for the authoritative action/param reference. Idempotency keys for instantiate/fire are REQUIRED for replay safety and have no MCP auto-generate. CAS step output/advance surfaces 409 conflicts by default. The audit 'check-integrity' is integrity-only (chunk SHA-256 + content-hash chain + completeness), NOT HMAC authenticity. The v3.5b review surface is otherwise CLI-binary-only, but its workspace hydration READ is exposed here as 'review-active' (lists active arming/open review surfaces + their asset node_ids so you can badge files as under review without per-file fetches; not flag-gated). The mutating review actions (create/decision/admin-resolve) and the by-id review reads remain CLI-only.",
+        description: "Workflow Orchestration (v3.2): the durable multi-step runtime — distinct from the Tasks API (the `task` tool). OFFLOAD multi-step orchestration here instead of hand-driving primitives: the compound actions 'instantiate-and-wait', 'trigger-fire-and-wait', and 'audit-export-and-download' do the full fire→poll→download loop for you. This tool exposes READ + DRIVE actions only; admin/destructive/crypto operations (workflow cancel + purge, template/pool/trigger create+lifecycle, outbound subscription management, secret/key rotation, dual-control redaction, schema set/derive, realtime token mint) are intentionally CLI-binary-only (`fastio workflow …`) — including the terminal 'cancel' lifecycle mutation, which is NOT available over MCP. Mid-run editing is exposed (modification-propose/-list/-get/-apply/-cancel: propose AUTO-PAUSES the run, apply finalizes + resumes; needs workflow ADMIN + the workflow_mid_run_edit plan capability). The built-in system template gallery is browsable over MCP (template-gallery, template-gallery-get); instantiating a gallery template (from_system, a template-create) is CLI-only (`fastio workflow template from-system`), consistent with the template-create boundary above. 'step-agent-trace' is the read-only reasoning+commentary companion to 'step-agent-activity' (never the final answer/citations). Call action='describe' for the authoritative action/param reference. Idempotency keys for instantiate/fire are REQUIRED for replay safety and have no MCP auto-generate. CAS step output/advance surfaces 409 conflicts by default. The audit 'check-integrity' is integrity-only (chunk SHA-256 + content-hash chain + completeness), NOT HMAC authenticity. The v3.5b review surface is otherwise CLI-binary-only, but its workspace hydration READ is exposed here as 'review-active' (lists active arming/open review surfaces + their asset node_ids so you can badge files as under review without per-file fetches; not flag-gated). The mutating review actions (create/decision/admin-resolve) and the by-id review reads remain CLI-only.",
         actions: &[
             "describe",
             "get",
@@ -1521,6 +2025,9 @@ const TOOL_DEFS: &[ToolDef] = &[
             "step-occurrences",
             "step-agent-activity",
             "step-agent-trace",
+            "step-files",
+            "step-complete",
+            "step-reassign",
             "modification-propose",
             "modification-list",
             "modification-get",
@@ -1661,8 +2168,8 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "Seconds between polls, 1-60, default 3 (instantiate-and-wait / trigger-fire-and-wait)",
                 false,
             ),
-            ("limit", "Pagination limit", false),
-            ("offset", "Pagination offset", false),
+            ("limit", "Pagination limit (integer)", false),
+            ("offset", "Pagination offset (integer)", false),
             ("cursor", "Cursor for grant-list pagination", false),
             (
                 "modification_id",
@@ -1695,17 +2202,60 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "System gallery template handle (template-gallery-get)",
                 false,
             ),
+            (
+                "node_ids",
+                "Existing storage-node ids to provide to a waiting wait_for_files step (step-files); a JSON array of strings or a comma-separated string",
+                false,
+            ),
+            (
+                "new_assignee_user_id",
+                "New assignee user id, 19-digit string (step-reassign)",
+                false,
+            ),
+            (
+                "step_seeds",
+                "Run-start file seeds as a JSON object string {\"<reminted_step_id>\":[\"<node_id>\",...]} to pre-seed wait_for_files steps (instantiate / instantiate-and-wait)",
+                false,
+            ),
+            ("state", "Filter by a single lifecycle state (list)", false),
+            (
+                "archived",
+                "Archived filter: true / false / all (list)",
+                false,
+            ),
+            (
+                "created_by_me",
+                "Only runs you manually started — sends created_by=me (list)",
+                false,
+            ),
+            (
+                "participant_me",
+                "Only runs where you hold an actionable obligation — sends participant=me (list)",
+                false,
+            ),
+            (
+                "include",
+                "Per-item enrichment CSV: run_summary / run_meta (list)",
+                false,
+            ),
+            (
+                "usage",
+                "Template usage filter: library / one_off / all (template-list)",
+                false,
+            ),
         ],
     },
     ToolDef {
         name: "sign",
-        description: "E-signature (SignEnvelope): draft and drive electronic-signature envelopes (PDFs sent to recipients). Every envelope is parented to a workspace (workspace_id; the former org surface was removed). This tool exposes READ + reversible-DRAFT-drive actions ONLY: envelope-create (creates a DRAFT — reversible), envelope-update (draft-only; recipients are a full replacement; expires_at/policy_json are DECLARATIVE — omitting them CLEARS those fields, re-send to retain), envelope-list (filter via envelope_status / created_after / created_before), envelope-get, document-download (covers preview needs — the download bytes ARE the source/preview PDF, so there is no separate MCP preview action), signed-download, audit-download, describe. The OUTWARD-FACING / TERMINAL actions — send (EMAILS REAL RECIPIENTS) and void (terminal) — are intentionally CLI-binary-only (`fastio sign envelope send|void …`) and are NOT routable over MCP (mirrors how the workflow tool keeps cancel CLI-only). Envelopes are voided, not deleted — there is no delete action. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Signing is a paid-plan feature (a non-entitled org returns 1670; access also requires workspace membership). Call action='describe' for the authoritative per-action reference.",
+        description: "E-signature (SignEnvelope): draft and drive electronic-signature envelopes (PDFs sent to recipients). Every envelope is parented to a workspace (workspace_id; the former org surface was removed). This tool exposes READ, reversible-DRAFT-drive, and idempotent-RECOVERY actions: envelope-create (creates a DRAFT — reversible), envelope-update (draft-only; recipients are a full replacement; expires_at/policy_json are DECLARATIVE — omitting them CLEARS those fields, re-send to retain), envelope-list (filter via envelope_status / created_after / created_before), envelope-get, envelope-retry (re-drives a STUCK envelope through self-healing recovery — admin; idempotent + no-op-success; notifies no one; a permanent failure cascades to Failed), envelope-my-sign-link (mints YOUR OWN signing link for an envelope — the dashboard signature-card primary action; reversible/idempotent and notifies no one; requires a WRITE-scope token, so a read-only token is rejected with 10754; the structured result tells you the state — sign_url non-null = sign now, is_terminal = completed/void/declined, reauth_required = re-authenticate first, else you are blocked by routing order per blocked_signers), document-download (covers preview needs — the download bytes ARE the source/preview PDF, so there is no separate MCP preview action), signed-download, audit-download, describe. The OUTWARD-FACING / TERMINAL actions — send (EMAILS REAL RECIPIENTS) and void (terminal) — are intentionally CLI-binary-only (`fastio sign envelope send|void …`) and are NOT routable over MCP (mirrors how the workflow tool keeps cancel CLI-only). Envelopes are voided, not deleted — there is no delete action. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Signing is a paid-plan feature (a non-entitled org returns 1670; access also requires workspace membership). Call action='describe' for the authoritative per-action reference.",
         actions: &[
             "describe",
             "envelope-create",
             "envelope-update",
             "envelope-list",
             "envelope-get",
+            "envelope-retry",
+            "envelope-my-sign-link",
             "document-download",
             "signed-download",
             "audit-download",
@@ -1935,47 +2485,6 @@ const TOOL_DEFS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "instructions",
-        description: "AI instructions (markdown blob, max 65,536 raw bytes) per profile. Scopes: user (self only), org/workspace/share (profile-wide admin slot + per-user override at /me/). User has no /me/ variant. clear-* maps to DELETE; setting empty content is equivalent.",
-        actions: &[
-            "get-user",
-            "set-user",
-            "clear-user",
-            "get-org",
-            "set-org",
-            "clear-org",
-            "get-org-user",
-            "set-org-user",
-            "clear-org-user",
-            "get-workspace",
-            "set-workspace",
-            "clear-workspace",
-            "get-workspace-user",
-            "set-workspace-user",
-            "clear-workspace-user",
-            "get-share",
-            "set-share",
-            "clear-share",
-            "get-share-user",
-            "set-share-user",
-            "clear-share-user",
-        ],
-        params: &[
-            ("org_id", "Org ID (org / org-user actions)", false),
-            (
-                "workspace_id",
-                "Workspace ID (workspace / workspace-user actions)",
-                false,
-            ),
-            ("share_id", "Share ID (share / share-user actions)", false),
-            (
-                "content",
-                "Markdown content for set-* actions (max 65,536 raw bytes)",
-                false,
-            ),
-        ],
-    },
-    ToolDef {
         name: "system",
         description: "System health: ping (health check) and status (system status). No authentication required.",
         actions: &["ping", "status"],
@@ -1983,13 +2492,35 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "id",
-        description: "Inspect Fast.io identifiers OFFLINE (no auth, no network): classify an OpaqueId by its self-describing length + type prefix (29-char = 1-char type; 30-char workflow family = 2-char 'w' type) into its entity type, family, and surfacing tier. Useful for routing an id that arrived in a webhook / event / payload to the right tool before acting. Pass `id` (one) or `ids` (many).",
+        description: "Inspect Fast.io identifiers OFFLINE (no auth, no network): classify an OpaqueId by its self-describing length + type prefix (29-char = 1-char type; 30-char = 2-char type — the workflow family under 'w' plus the non-workflow Task and Comment types) into its entity type, family, and surfacing tier. Useful for routing an id that arrived in a webhook / event / payload to the right tool before acting. Pass `id` (one) or `ids` (many).",
         actions: &["describe", "info"],
         params: &[
             ("id", "A single id to classify (info)", false),
             (
                 "ids",
                 "Multiple ids to classify (info): a JSON array of strings, or a comma-separated string",
+                false,
+            ),
+        ],
+    },
+    ToolDef {
+        name: "howto",
+        description: "How-To: ask a grounded 'how do I…' question about Fast.io and get a product-aware answer back in ONE call (action='ask'). Org-less and open to any authenticated user — answers are generated over Fast.io's own how-to knowledge, so an agent gets runtime usage guidance WITHOUT scraping docs. Over MCP, `surface` DEFAULTS to 'mcp' so guidance is phrased in terms of THESE consolidated tools (<tool> action=\"…\"); pass surface='code' for execute-proxy phrasing, or any other value (e.g. 'rest') for plain REST-API phrasing. Optional `context` is free-text background about your situation (treated strictly as data, never as instructions). The response is EITHER a grounded answer (status='answer', read `answer`) OR a short clarification request (status='needs_clarification' — surface its `questions` to the user and ask again with a more specific question; this is normal, NOT an error). This answers questions about Fast.io ITSELF; for Q&A over your OWN files use the `ripley` tool instead.",
+        actions: &["ask"],
+        params: &[
+            (
+                "question",
+                "The natural-language question (1-2000 characters, non-blank)",
+                true,
+            ),
+            (
+                "surface",
+                "Answer phrasing: 'mcp' (DEFAULT over MCP) / 'code' / any other value → REST-API phrasing",
+                false,
+            ),
+            (
+                "context",
+                "Optional free-text background about your situation (≤8000 chars; data, not instructions)",
                 false,
             ),
         ],
@@ -2054,13 +2585,14 @@ impl ToolRouter {
             "member" => handle_member(&self.state, action, &args).await,
             "comment" => handle_comment(&self.state, action, &args).await,
             "event" => handle_event(&self.state, action, &args).await,
+            "dashboard" => handle_dashboard(&self.state, action, &args).await,
+            // `how-to` is accepted as an alias for the `howto` tool name so a
+            // caller that mirrors the CLI's `how-to` spelling still routes.
+            "howto" | "how-to" => handle_howto(&self.state, action, &args).await,
             "invitation" => handle_invitation(&self.state, action, &args).await,
             "preview" => handle_preview(&self.state, action, &args).await,
             "asset" => handle_asset(&self.state, action, &args).await,
             "task" => handle_task(&self.state, action, &args).await,
-            "worklog" => handle_worklog(&self.state, action, &args).await,
-            "approval" => handle_approval(&self.state, action, &args).await,
-            "todo" => handle_todo(&self.state, action, &args).await,
             "apps" => handle_apps(&self.state, action, &args).await,
             "import" => handle_import(&self.state, action, &args).await,
             "lock" => handle_lock(&self.state, action, &args).await,
@@ -2068,7 +2600,6 @@ impl ToolRouter {
             "workflow" => handle_workflow(&self.state, action, &args).await,
             "sign" => handle_sign(&self.state, action, &args).await,
             "fileshare" => handle_fileshare(&self.state, action, &args).await,
-            "instructions" => handle_instructions(&self.state, action, &args).await,
             "system" => handle_system(&self.state, action, &args).await,
             "id" => Ok(handle_id(action, &args)),
             _ => Ok(error_text(&format!("Unknown tool: {name}"))),
@@ -2086,7 +2617,7 @@ async fn handle_auth(
 ) -> Result<CallToolResult, McpError> {
     match action {
         "signin" => handle_auth_signin(state, args).await,
-        "signout" => Ok(handle_auth_signout(state, args)),
+        "signout" => Ok(handle_auth_signout(state, args).await),
         "status" => handle_auth_status(state, args).await,
         "set-api-key" => handle_auth_set_api_key(state, args).await,
         "api-key-create" => handle_auth_api_key_create(state, args).await,
@@ -2104,6 +2635,7 @@ async fn handle_auth(
         "2fa-verify-setup" => handle_auth_2fa_verify_setup(state, args).await,
         "oauth-list" => handle_auth_oauth_list(state, args).await,
         "oauth-details" => handle_auth_oauth_details(state, args).await,
+        "oauth-rename" => handle_auth_oauth_rename(state, args).await,
         "oauth-revoke" => handle_auth_oauth_revoke(state, args).await,
         "oauth-revoke-all" => handle_auth_oauth_revoke_all(state, args).await,
         "scopes" => handle_auth_scopes(state, args).await,
@@ -2158,15 +2690,38 @@ async fn handle_auth_signin(
     }
 }
 
-fn handle_auth_signout(state: &McpState, _args: &Map<String, Value>) -> CallToolResult {
-    let _ = state;
+/// Sign out of the LOCAL MCP session only.
+///
+/// The MCP server holds a single ambiguous bearer token (resolved at startup
+/// from `--token` / env / stored creds, or set live via `signin` / `set-api-key`)
+/// that is most commonly an **API key** — the documented MCP auth path
+/// (`FASTIO_MCP_API_KEY` → `set-api-key`). The server-side sign-out
+/// (`POST /user/auth/sign-out/`) is the WRONG operation for that model: per
+/// `auth.txt` it does NOT revoke API keys (so it would not touch the dominant
+/// MCP credential) yet it invalidates EVERY revocable browser JWT for the user
+/// (a broad, surprising side effect an agent calling "signout" would not expect).
+/// So this action is deliberately local-only: it clears this session's in-memory
+/// token (genuinely de-authenticating the live MCP session) and removes the
+/// locally stored `default` credential. Server-side revocation has dedicated
+/// paths — `fastio auth signout` (revocable session) and `api-key-delete`.
+async fn handle_auth_signout(state: &McpState, _args: &Map<String, Value>) -> CallToolResult {
+    // Genuinely de-authenticate the live MCP session (the previous behavior left
+    // the in-memory token in place, so the session stayed authenticated).
+    state.clear_token().await;
     if let Ok(dir) = fastio_cli::config::Config::default_dir()
         && let Ok(mut creds_file) = CredentialsFile::load(&dir)
         && let Err(e) = creds_file.remove("default", &dir)
     {
-        tracing::warn!("failed to persist credentials: {e}");
+        tracing::warn!("failed to clear stored credentials: {e}");
     }
-    success_json(&json!({ "status": "signed_out" }))
+    success_json(&json!({
+        "status": "local_session_cleared",
+        "note": "Cleared this MCP session's in-memory token and removed the locally \
+                 stored 'default' credential. This does NOT revoke the server-side \
+                 session or API key. To revoke a revocable server session, run \
+                 `fastio auth signout` in a terminal; to revoke an API key, use \
+                 action=api-key-delete.",
+    }))
 }
 
 async fn handle_auth_status(
@@ -2228,7 +2783,8 @@ async fn handle_auth_api_key_create(
         &client,
         optional_str(args, "name"),
         optional_str(args, "scopes"),
-        None,
+        optional_str(args, "agent_name"),
+        optional_str(args, "expires"),
     )
     .await
     {
@@ -2301,15 +2857,17 @@ async fn handle_auth_api_key_update(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let name = optional_str(args, "name");
+    let scopes = optional_str(args, "scopes");
+    let agent_name = optional_str(args, "agent_name");
+    let expires = optional_str(args, "expires");
+    if name.is_none() && scopes.is_none() && agent_name.is_none() && expires.is_none() {
+        return Ok(error_text(
+            "at least one update field is required (name, scopes, agent_name, expires)",
+        ));
+    }
     let client = state.client().read().await;
-    match api::auth::api_key_update(
-        &client,
-        key_id,
-        optional_str(args, "name"),
-        optional_str(args, "scopes"),
-    )
-    .await
-    {
+    match api::auth::api_key_update(&client, key_id, name, scopes, agent_name, expires).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -2500,15 +3058,40 @@ async fn handle_auth_oauth_revoke(
     }
 }
 
+async fn handle_auth_oauth_rename(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    if let Err(e) = require_auth(state).await {
+        return Ok(e);
+    }
+    let session_id = match required_str(args, "session_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let device_name = optional_str(args, "device_name");
+    let agent_name = optional_str(args, "agent_name");
+    if device_name.is_none() && agent_name.is_none() {
+        return Ok(error_text(
+            "at least one of device_name or agent_name is required",
+        ));
+    }
+    let client = state.client().read().await;
+    match api::auth::oauth_rename(&client, session_id, device_name, agent_name).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
 async fn handle_auth_oauth_revoke_all(
     state: &McpState,
-    _args: &Map<String, Value>,
+    args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
     if let Err(e) = require_auth(state).await {
         return Ok(e);
     }
     let client = state.client().read().await;
-    match api::auth::oauth_revoke_all(&client).await {
+    match api::auth::oauth_revoke_all(&client, optional_str(args, "current_session_id")).await {
         Ok(_) => Ok(success_json(&json!({ "status": "all_revoked" }))),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -2550,6 +3133,16 @@ async fn handle_user(
     action: &str,
     args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
+    // Account `close` PERMANENTLY closes the user's account (irreversible). Like
+    // the credential mutations (password / email change, invalidate-all) it is
+    // CLI-binary-only by policy — an agent must not be able to trigger it. Guard
+    // FIRST (before auth) so the intent is clear regardless of auth state.
+    if action == "close" {
+        return Ok(error_text(
+            "user account close is CLI-binary-only: it PERMANENTLY closes your account \
+             (irreversible). Run it via the CLI — `fastio user close …`.",
+        ));
+    }
     if let Err(e) = require_auth(state).await {
         return Ok(e);
     }
@@ -2557,7 +3150,6 @@ async fn handle_user(
         "info" => handle_user_info(state, args).await,
         "update" => handle_user_update(state, args).await,
         "search" => handle_user_search(state, args).await,
-        "close" => handle_user_close(state, args).await,
         "details" => handle_user_details(state, args).await,
         "profiles" => handle_user_profiles(state, args).await,
         "allowed" => handle_user_allowed(state, args).await,
@@ -2594,14 +3186,28 @@ async fn handle_user_update(
     args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
     let client = state.client().read().await;
-    // display_name is an alias for first_name; merge them
+    // display_name is an alias for first_name; merge them.
     let effective_first =
         optional_str(args, "first_name").or_else(|| optional_str(args, "display_name"));
+    // Phone country and number must be sent together (server requires the pair).
+    let phone_country = optional_str(args, "phone_country");
+    let phone_number = optional_str(args, "phone_number");
+    if phone_country.is_some() != phone_number.is_some() {
+        return Ok(error_text(
+            "phone_country and phone_number must be provided together",
+        ));
+    }
+    // Password / email changes are credential mutations — CLI-only by policy,
+    // so this MCP surface intentionally omits password and current_password.
     match api::user::update_user(
         &client,
-        effective_first,
-        optional_str(args, "last_name"),
-        None,
+        &api::user::UserUpdate {
+            first_name: effective_first,
+            last_name: optional_str(args, "last_name"),
+            phone_country,
+            phone_number,
+            ..Default::default()
+        },
     )
     .await
     {
@@ -2620,21 +3226,6 @@ async fn handle_user_search(
         Err(e) => return Ok(e),
     };
     match api::user::search_users(&client, query).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_user_close(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let confirmation = match required_str(args, "confirmation") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::user::close_account(&client, confirmation).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -3031,6 +3622,17 @@ async fn handle_org_update(
             industry: optional_str(args, "industry"),
             billing_email: optional_str(args, "billing_email"),
             homepage_url: optional_str(args, "homepage_url"),
+            accent_color: optional_str(args, "accent_color"),
+            background_color: optional_str(args, "background_color"),
+            background_mode: optional_str(args, "background_mode"),
+            use_background: optional_bool(args, "use_background"),
+            facebook_url: optional_str(args, "facebook_url"),
+            twitter_url: optional_str(args, "twitter_url"),
+            instagram_url: optional_str(args, "instagram_url"),
+            youtube_url: optional_str(args, "youtube_url"),
+            perm_member_manage: optional_str(args, "perm_member_manage"),
+            perm_authorized_domains: optional_str(args, "perm_authorized_domains"),
+            owner_defined: optional_str(args, "owner_defined"),
         },
     )
     .await
@@ -3742,15 +4344,35 @@ async fn handle_org_create_workspace(
         Err(e) => return Ok(e),
     };
     let folder_name = optional_str(args, "folder_name").unwrap_or(name);
-    match api::org::create_workspace(
-        &client,
-        org_id,
+    // The server has no defaults for these three required fields; mirror the
+    // CLI defaults so MCP workspace-create succeeds without forcing the caller
+    // to supply them.
+    let perm_join = optional_str(args, "perm_join").unwrap_or("Member or above");
+    let perm_member_manage = optional_str(args, "perm_member_manage").unwrap_or("Admin or above");
+    // Parse the boolean toggles strictly: a PRESENT-but-invalid value (e.g.
+    // `intelligence: "tru"`) must surface a clear error rather than silently
+    // default to `false`/omitted. ABSENT stays None → default/omit.
+    let intelligence = match optional_bool_strict(args, "intelligence") {
+        Ok(v) => v.unwrap_or(false),
+        Err(e) => return Ok(e),
+    };
+    let workflow = match optional_bool_strict(args, "workflow") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let params = api::org::CreateWorkspaceParams {
         folder_name,
         name,
-        optional_str(args, "description"),
-    )
-    .await
-    {
+        perm_join,
+        perm_member_manage,
+        intelligence,
+        description: optional_str(args, "description"),
+        workflow,
+        accent_color: optional_str(args, "accent_color"),
+        background_color1: optional_str(args, "background_color1"),
+        background_color2: optional_str(args, "background_color2"),
+    };
+    match api::org::create_workspace(&client, org_id, &params).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -3784,6 +4406,33 @@ fn build_workspace_update_fields(
     }
     if let Some(v) = optional_bool(args, "intelligence") {
         fields.insert("intelligence".to_owned(), v.to_string());
+    }
+    if let Some(v) = optional_str(args, "perm_join") {
+        fields.insert("perm_join".to_owned(), v.to_owned());
+    }
+    if let Some(v) = optional_str(args, "perm_member_manage") {
+        fields.insert("perm_member_manage".to_owned(), v.to_owned());
+    }
+    if let Some(v) = optional_bool(args, "nl_summaries_enabled") {
+        fields.insert("nl_summaries_enabled".to_owned(), v.to_string());
+    }
+    if let Some(v) = optional_u32(args, "nl_summaries_daily_cap") {
+        fields.insert("nl_summaries_daily_cap".to_owned(), v.to_string());
+    }
+    if let Some(v) = optional_str(args, "workflow_approval_native_enabled") {
+        fields.insert("workflow_approval_native_enabled".to_owned(), v.to_owned());
+    }
+    if let Some(v) = optional_str(args, "accent_color") {
+        fields.insert("accent_color".to_owned(), v.to_owned());
+    }
+    if let Some(v) = optional_str(args, "background_color1") {
+        fields.insert("background_color1".to_owned(), v.to_owned());
+    }
+    if let Some(v) = optional_str(args, "background_color2") {
+        fields.insert("background_color2".to_owned(), v.to_owned());
+    }
+    if let Some(v) = optional_str(args, "owner_defined") {
+        fields.insert("owner_defined".to_owned(), v.to_owned());
     }
     fields
 }
@@ -3891,17 +4540,14 @@ async fn handle_workspace(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            // Decoupled (Phase 3) from `api::workspace::search_workspace`
-            // (removed): route through the single `search_files` builder so
-            // the action keeps the standard file-search shape.
-            let params = api::storage::SearchFilesParams::new()
-                .limit(optional_u32(args, "limit"))
-                .offset(optional_u32(args, "offset"));
-            match api::storage::search_files(&client, ws_id, query, params).await {
-                // Normalize the node-id-keyed `files` MAP into a one-row-per-file
-                // ARRAY so MCP renders the search result the same way the CLI
-                // does (CLI/MCP parity).
-                Ok(v) => Ok(success_json(&api::storage::normalize_search_response(v))),
+            // Route through the unified grouped-bucket search
+            // (`/workspace/{id}/search/`) with the same `files`-bucket paging the
+            // CLI `workspace search` uses (commands/workspace.rs), so MCP and CLI
+            // return the identical API/shape/semantics (CLI/MCP parity).
+            let params = api::search::UnifiedSearchParams::new()
+                .files(optional_u32(args, "offset"), optional_u32(args, "limit"));
+            match api::search::unified_search_workspace(&client, ws_id, query, params).await {
+                Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
@@ -3910,8 +4556,10 @@ async fn handle_workspace(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            // Limits are part of workspace details
-            match api::workspace::get_workspace(&client, ws_id).await {
+            // Limits come from the dedicated `/workspace/{id}/limits/` endpoint
+            // (distinct payload from `details`), matching the CLI
+            // `workspace limits` command (CLI/MCP parity).
+            match api::workspace::get_workspace_limits(&client, ws_id).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -4764,6 +5412,8 @@ async fn handle_files(
         "move" => handle_files_move(state, args).await,
         "copy" => handle_files_copy(state, args).await,
         "rename" => handle_files_rename(state, args).await,
+        "update" => handle_files_update(state, args).await,
+        "add-file" => handle_files_add_file(state, args).await,
         "delete" => handle_files_delete(state, args).await,
         "restore" => handle_files_restore(state, args).await,
         "purge" => handle_files_purge(state, args).await,
@@ -4840,7 +5490,8 @@ async fn handle_files_create_folder(
         Err(e) => return Ok(e),
     };
     let parent = optional_str(args, "folder").unwrap_or("root");
-    match api::storage::create_folder(&client, ws_id, parent, name).await {
+    let force = optional_bool(args, "force").unwrap_or(false);
+    match api::storage::create_folder(&client, ws_id, parent, name, force).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -4909,6 +5560,89 @@ async fn handle_files_rename(
         Err(e) => return Ok(e),
     };
     match api::storage::rename_node(&client, ws_id, node_id, new_name).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// Update a node: rename, replace content (`from`), or set metadata overrides.
+///
+/// Workspace-scoped (mirrors the rest of the files tool). At least one of
+/// `name`, `from`, `metadata_title`, or `metadata_short` must be provided.
+async fn handle_files_update(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let ws_id = match required_str(args, "workspace_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let node_id = match required_str(args, "node_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let name = optional_str(args, "name");
+    let from = optional_str(args, "from");
+    let metadata_title = optional_str(args, "metadata_title");
+    let metadata_short = optional_str(args, "metadata_short");
+    if name.is_none() && from.is_none() && metadata_title.is_none() && metadata_short.is_none() {
+        return Ok(error_text(
+            "Provide at least one of: name, from, metadata_title, metadata_short",
+        ));
+    }
+    match api::storage::update_node(
+        &client,
+        "workspace",
+        ws_id,
+        node_id,
+        name,
+        from,
+        metadata_title,
+        metadata_short,
+    )
+    .await
+    {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// Add a file to a folder from a completed upload or by content-hash dedup.
+///
+/// Workspace-scoped. Provide either `upload_id`, or `hash` with `hash_type`.
+async fn handle_files_add_file(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let ws_id = match required_str(args, "workspace_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let name = match required_str(args, "name") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let parent = optional_str(args, "folder").unwrap_or("root");
+    // MCP add-file is workspace-scoped, and the workspace add-file handler does
+    // not support a hash source (only `update` does). Reject a hash arg with the
+    // same guard/message the CLI uses, BEFORE building or sending the request.
+    if let Err(e) = crate::commands::files::validate_addfile_hash_context(
+        "workspace",
+        optional_str(args, "hash"),
+    ) {
+        return Ok(error_text(&e.to_string()));
+    }
+    let from = match crate::commands::files::build_addfile_from(
+        optional_str(args, "upload_id"),
+        optional_str(args, "hash"),
+        optional_str(args, "hash_type"),
+    ) {
+        Ok(f) => f,
+        Err(e) => return Ok(error_text(&e.to_string())),
+    };
+    match api::storage::add_file(&client, "workspace", ws_id, parent, name, &from).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5058,7 +5792,7 @@ async fn handle_files_recent(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    match api::storage::list_recent(&client, ws_id, None, None).await {
+    match api::storage::list_recent(&client, ws_id, None, None, optional_str(args, "type")).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5146,7 +5880,15 @@ async fn handle_files_lock_acquire(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    match api::storage::lock_acquire(&client, ws_id, node_id).await {
+    match api::storage::lock_acquire(
+        &client,
+        ws_id,
+        node_id,
+        optional_u32(args, "duration"),
+        optional_str(args, "client_info"),
+    )
+    .await
+    {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5238,6 +5980,7 @@ async fn handle_upload(
         "web-cancel" => handle_upload_web_cancel(state, args).await,
         "web-status" => handle_upload_web_status(state, args).await,
         "limits" => handle_upload_limits(state, args).await,
+        "algos" => handle_upload_algos(state, args).await,
         "extensions" => handle_upload_extensions(state, args).await,
         "stream" => handle_upload_stream(state, args).await,
         "create-stream-session" => handle_upload_create_stream_session(state, args).await,
@@ -5267,7 +6010,8 @@ async fn handle_upload_text(
     // Create session, upload as single chunk, complete
     let content_bytes = content.as_bytes().to_vec();
     let size = u64::try_from(content_bytes.len()).unwrap_or(u64::MAX);
-    match api::upload::create_upload_session(&client, ws_id, folder, name, size).await {
+    match api::upload::create_upload_session(&client, ws_id, "workspace", folder, name, size).await
+    {
         Ok(session) => {
             let upload_id = session.get("id").and_then(Value::as_str).unwrap_or("");
             if upload_id.is_empty() {
@@ -5329,7 +6073,9 @@ async fn handle_upload_create_session(
     };
     let filesize = filesize_str.parse::<u64>().unwrap_or(0);
     let folder = optional_str(args, "folder").unwrap_or("root");
-    match api::upload::create_upload_session(&client, ws_id, folder, name, filesize).await {
+    match api::upload::create_upload_session(&client, ws_id, "workspace", folder, name, filesize)
+        .await
+    {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5435,10 +6181,29 @@ async fn handle_upload_chunk_delete(
 
 async fn handle_upload_web_list(
     state: &McpState,
-    _args: &Map<String, Value>,
+    args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
     let client = state.client().read().await;
-    match api::upload::web_list(&client).await {
+    // Validate the optional `status` filter against the set the server accepts
+    // (the CLI enforces the same set via a clap `value_parser`) so a bad value
+    // gets a clear error instead of a server 400.
+    let status = optional_str(args, "status");
+    if let Some(s) = status
+        && !WEB_UPLOAD_STATUSES.contains(&s)
+    {
+        return Ok(error_text(&format!(
+            "Invalid status '{s}' (one of: {})",
+            WEB_UPLOAD_STATUSES.join(", ")
+        )));
+    }
+    match api::upload::web_list(
+        &client,
+        optional_u32(args, "limit"),
+        optional_u32(args, "offset"),
+        status,
+    )
+    .await
+    {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5476,10 +6241,41 @@ async fn handle_upload_web_status(
 
 async fn handle_upload_limits(
     state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    // `args["action"]` is the MCP routing action (always "limits" here), NOT the
+    // API's create/update selector. Read that selector from `limit_action` so we
+    // never forward `action=limits` (invalid) to `/upload/limits/`.
+    let limit_action = optional_str(args, "limit_action");
+    let instance_id = optional_str(args, "instance_id");
+    let file_id = optional_str(args, "file_id");
+    if let Err(e) =
+        crate::commands::upload::validate_limits_action_context(limit_action, instance_id, file_id)
+    {
+        return Ok(error_text(&e.to_string()));
+    }
+    let client = state.client().read().await;
+    match api::upload::upload_limits(
+        &client,
+        limit_action,
+        optional_str(args, "org"),
+        instance_id,
+        optional_str(args, "folder_id"),
+        file_id,
+    )
+    .await
+    {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+async fn handle_upload_algos(
+    state: &McpState,
     _args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
     let client = state.client().read().await;
-    match api::upload::upload_limits(&client).await {
+    match api::upload::algos(&client).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5487,10 +6283,10 @@ async fn handle_upload_limits(
 
 async fn handle_upload_extensions(
     state: &McpState,
-    _args: &Map<String, Value>,
+    args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
     let client = state.client().read().await;
-    match api::upload::upload_extensions(&client).await {
+    match api::upload::upload_extensions(&client, optional_str(args, "plan")).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5527,7 +6323,8 @@ async fn handle_upload_stream(
             None => return Ok(error_text("No authentication token available")),
         };
         let result =
-            api::upload::create_stream_session(&client, ws_id, folder, name, max_size).await;
+            api::upload::create_stream_session(&client, ws_id, "workspace", folder, name, max_size)
+                .await;
         (token, result)
     };
 
@@ -5580,7 +6377,9 @@ async fn handle_upload_create_stream_session(
     };
     let folder = optional_str(args, "folder").unwrap_or("root");
     let max_size = optional_str(args, "max_size").and_then(|s| s.parse::<u64>().ok());
-    match api::upload::create_stream_session(&client, ws_id, folder, name, max_size).await {
+    match api::upload::create_stream_session(&client, ws_id, "workspace", folder, name, max_size)
+        .await
+    {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -5649,15 +6448,7 @@ async fn handle_download(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            match api::download::get_download_url_ctx(
-                &client,
-                ctx_type,
-                ctx_id,
-                node_id,
-                optional_str(args, "version_id"),
-            )
-            .await
-            {
+            match api::download::get_download_url_ctx(&client, ctx_type, ctx_id, node_id).await {
                 Ok(resp) => {
                     let token = api::download::extract_download_token(&resp).unwrap_or_default();
                     let url = api::download::build_download_url_ctx(
@@ -5666,6 +6457,7 @@ async fn handle_download(
                         ctx_id,
                         node_id,
                         &token,
+                        optional_str(args, "version_id"),
                     );
                     // The URL already embeds the scoped read token in its
                     // `?token=` query param; surfacing the raw token separately
@@ -5770,12 +6562,34 @@ async fn handle_share_create(
         &api::share::CreateShareParams {
             workspace_id: ws_id,
             title: name,
+            share_type: optional_str(args, "share_type"),
             description: optional_str(args, "description"),
             access_options: optional_str(args, "access_options"),
+            invite: optional_str(args, "invite"),
+            storage_mode: optional_str(args, "storage_mode"),
+            folder_node_id: optional_str(args, "folder_node_id"),
+            create_folder: optional_bool(args, "create_folder"),
+            folder_name: optional_str(args, "folder_name"),
+            custom_name: optional_str(args, "custom_name"),
             password: optional_str(args, "password"),
-            anonymous_uploads_enabled: optional_bool(args, "anonymous_uploads_enabled"),
-            intelligence: optional_bool(args, "intelligence"),
+            expires: optional_str(args, "expires"),
+            notify: optional_str(args, "notify"),
+            comments_enabled: optional_bool(args, "comments_enabled"),
             download_security,
+            guest_chat_enabled: optional_bool(args, "guest_chat_enabled"),
+            display_type: optional_str(args, "display_type"),
+            workspace_style: optional_str(args, "workspace_style"),
+            anonymous_uploads_enabled: optional_bool(args, "anonymous_uploads_enabled"),
+            // `intelligence` is required server-side; default to false (AI off).
+            intelligence: optional_bool(args, "intelligence").unwrap_or(false),
+            accent_color: optional_str(args, "accent_color"),
+            background_color1: optional_str(args, "background_color1"),
+            background_color2: optional_str(args, "background_color2"),
+            background_image: optional_u32(args, "background_image").map(i64::from),
+            link_1: optional_str(args, "link_1"),
+            link_2: optional_str(args, "link_2"),
+            link_3: optional_str(args, "link_3"),
+            owner_defined: optional_str(args, "owner_defined"),
         },
     )
     .await
@@ -5822,12 +6636,33 @@ async fn handle_share_update(
         &api::share::UpdateShareParams {
             share_id,
             name: optional_str(args, "name"),
+            title: optional_str(args, "title"),
+            custom_name: optional_str(args, "custom_name"),
             description: optional_str(args, "description"),
+            share_type: optional_str(args, "share_type"),
             access_options: optional_str(args, "access_options"),
+            invite: optional_str(args, "invite"),
+            password: optional_str(args, "password"),
+            expires: optional_str(args, "expires"),
+            notify: optional_str(args, "notify"),
             download_enabled: optional_bool(args, "download_enabled"),
             comments_enabled: optional_bool(args, "comments_enabled"),
-            anonymous_uploads_enabled: optional_bool(args, "anonymous_uploads_enabled"),
             download_security,
+            display_type: optional_str(args, "display_type"),
+            workspace_style: optional_str(args, "workspace_style"),
+            guest_chat_enabled: optional_bool(args, "guest_chat_enabled"),
+            intelligence: optional_bool(args, "intelligence"),
+            anonymous_uploads_enabled: optional_bool(args, "anonymous_uploads_enabled"),
+            accent_color: optional_str(args, "accent_color"),
+            background_color1: optional_str(args, "background_color1"),
+            background_color2: optional_str(args, "background_color2"),
+            background_image: optional_u32(args, "background_image").map(i64::from),
+            link_1: optional_str(args, "link_1"),
+            link_2: optional_str(args, "link_2"),
+            link_3: optional_str(args, "link_3"),
+            owner_defined: optional_str(args, "owner_defined"),
+            // `"null"` (the only accepted value) is passed through verbatim.
+            share_link_node_id: optional_str(args, "share_link_node_id"),
         },
     )
     .await
@@ -5919,7 +6754,21 @@ async fn handle_share_members_add(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    match api::share::add_share_member(&client, share_id, email, optional_str(args, "role")).await {
+    match api::share::add_share_member(
+        &client,
+        &api::share::AddShareMemberParams {
+            share_id,
+            email_or_user_id: email,
+            permissions: optional_str(args, "role"),
+            notify_options: optional_str(args, "notify_options"),
+            expires: optional_str(args, "expires"),
+            force_notification: optional_bool(args, "force_notification"),
+            message: optional_str(args, "message"),
+            invitation_expires: optional_str(args, "invitation_expires"),
+        },
+    )
+    .await
+    {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -6107,6 +6956,64 @@ fn check_files_attach_exclusion(args: &Map<String, Value>) -> Option<CallToolRes
     }
 }
 
+/// Build the prominent note attached to a `needs_input` MCP `ask` result.
+///
+/// A `needs_input` turn (ai.txt:849) answered with a clarifying question instead
+/// of a full response, so surface the question (and how to reply) so the calling
+/// agent treats this as "needs more info" and answers in the SAME chat rather
+/// than reading an empty answer. Mirrors the CLI `render_answer` `needs_input`
+/// branch; reuses the shared `extract_clarification_question`.
+fn mcp_needs_input_note(msg_data: &Value, chat_id: &str) -> String {
+    match api::ai::extract_clarification_question(msg_data) {
+        Some(q) => format!(
+            "Ripley needs more information to continue: {q} Reply by sending your answer as a \
+             new message in this same chat (action=message-send, chat_id={chat_id})."
+        ),
+        None => format!(
+            "Ripley needs more information to continue (no question text was included). Reply by \
+             sending a new message in this same chat (action=message-send, chat_id={chat_id})."
+        ),
+    }
+}
+
+/// Map an AI chat publish error for MCP. A 403 means publishing is disabled
+/// platform-wide (ai.txt:266,872-887) — surface that clearly rather than a raw
+/// 403. Mirrors the CLI `map_publish_error`; everything else defers to
+/// `cli_err_to_result`.
+fn ai_publish_err_to_result(err: &fastio_cli::error::CliError) -> CallToolResult {
+    if let fastio_cli::error::CliError::Api(api) = err
+        && api.http_status == 403
+    {
+        return error_text(&format!(
+            "publishing chats publicly is currently disabled platform-wide (403). Chats published \
+             before this change remain public. ({err})"
+        ));
+    }
+    cli_err_to_result(err)
+}
+
+/// Map an AI chat send/create error for MCP. A conversation-too-large 409
+/// (`STATE_TOO_LARGE`, identified by its per-call-site code) is PERMANENT:
+/// surface a clear "start a new chat" message rather than the raw error.
+/// Matches the SPECIFIC too-large codes ONLY — the create/message endpoints
+/// also return 409 (`APP_CONFLICT`) for a RETRYABLE `SEQUENCE_FAILURE`
+/// (retry the same idempotency key, do NOT start a new chat), so a bare 409
+/// would mislabel it. Mirrors the CLI `map_ai_send_error`; everything else
+/// (incl. other 409s) defers to `cli_err_to_result`.
+fn ai_send_err_to_result(err: &fastio_cli::error::CliError) -> CallToolResult {
+    // `api` shadows the `api` module here, so reference the shared const by its
+    // fully-qualified path — the single source of truth shared with the CLI.
+    if let fastio_cli::error::CliError::Api(api) = err
+        && fastio_cli::api::ai::CONVERSATION_TOO_LARGE_CODES.contains(&api.code)
+    {
+        return error_text(&format!(
+            "this conversation is too large to continue (409) — start a new chat (action=ask or \
+             action=chat-create) to keep going. Retrying the same chat will not help. ({err})"
+        ));
+    }
+    cli_err_to_result(err)
+}
+
 async fn handle_ai_chat_create(
     state: &McpState,
     args: &Map<String, Value>,
@@ -6177,7 +7084,7 @@ async fn handle_ai_chat_create(
             }
             Ok(success_json(&v))
         }
-        Err(e) => Ok(cli_err_to_result(&e)),
+        Err(e) => Ok(ai_send_err_to_result(&e)),
     }
 }
 
@@ -6305,7 +7212,7 @@ async fn handle_ai_chat_publish(
     let sub = format!("agent/{}/publish/", urlencoding::encode(chat_id));
     match api::ai::ai_api(&client, ctx_type, ctx_id, &sub, "POST", None, None).await {
         Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
+        Err(e) => Ok(ai_publish_err_to_result(&e)),
     }
 }
 
@@ -6368,7 +7275,7 @@ async fn handle_ai_message_send(
     let sub = format!("agent/{}/message/", urlencoding::encode(chat_id));
     match api::ai::ai_api_form(&client, ctx_type, ctx_id, &sub, &form).await {
         Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
+        Err(e) => Ok(ai_send_err_to_result(&e)),
     }
 }
 
@@ -6645,7 +7552,7 @@ async fn handle_ai_ask(
 
     let resp = match api::ai::ai_api_form(&client, ctx_type, ctx_id, "agent/", &form).await {
         Ok(v) => v,
-        Err(e) => return Ok(cli_err_to_result(&e)),
+        Err(e) => return Ok(ai_send_err_to_result(&e)),
     };
 
     let chat_id = resp
@@ -6780,12 +7687,29 @@ async fn mcp_ask_wait(
         }
         match api::ai::ai_api(client, ctx_type, ctx_id, &details_sub, "GET", None, None).await {
             Ok(msg_data) => {
-                let msg = msg_data.get("message").unwrap_or(&msg_data);
+                // Unwrap the workspace `message` OR share `turn` detail wrapper
+                // (ai.txt:771) — a share `needs_input` turn has no `message` key,
+                // so without this its `state` is missed and the loop polls to a
+                // misleading timeout. Shared helper keeps CLI + MCP in lockstep.
+                let msg = api::ai::message_detail(&msg_data);
                 // `state` may be a string OR a numeric JSON value; normalise via
                 // the same string-or-numeric extraction the CLI wait loop uses.
                 let state_str = json_value_field_to_string(msg, "state").unwrap_or_default();
-                if state_str == "complete" || state_str == "errored" {
+                // Terminal states: complete / errored / needs_input. A
+                // `needs_input` turn (ai.txt:849) answered with a clarifying
+                // question is terminal too — without it the loop polls to a
+                // misleading timeout. Reuses the shared classifier so the CLI
+                // and MCP stay in lockstep.
+                if api::ai::is_terminal_state(&state_str) {
                     let mut msg_data = msg_data;
+                    // For needs_input, surface the clarifying question
+                    // prominently so the calling agent treats this as "needs
+                    // more info" (terminal) and replies in the same chat,
+                    // rather than reading an empty answer.
+                    if state_str == "needs_input" {
+                        let note = mcp_needs_input_note(&msg_data, chat_id);
+                        attach_warning(&mut msg_data, Some(&note));
+                    }
                     attach_warning(&mut msg_data, warning);
                     return success_json(&msg_data);
                 }
@@ -7115,6 +8039,9 @@ async fn handle_comment(
         "link" => handle_comment_link(state, args).await,
         "unlink" => handle_comment_unlink(state, args).await,
         "linked" => handle_comment_linked(state, args).await,
+        "list-attachments" => handle_comment_list_attachments(state, args).await,
+        "attach" => handle_comment_attach(state, args).await,
+        "detach" => handle_comment_detach(state, args).await,
         _ => Ok(error_text(&format!("Unknown comment action: {action}"))),
     }
 }
@@ -7136,13 +8063,17 @@ async fn handle_comment_list(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let sort = match validate_comment_sort(args) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     match api::comment::list_comments(
         &client,
         &api::comment::ListCommentsParams {
             entity_type,
             entity_id,
             node_id,
-            sort: optional_str(args, "sort"),
+            sort,
             limit: optional_u32(args, "limit"),
             offset: optional_u32(args, "offset"),
         },
@@ -7154,6 +8085,9 @@ async fn handle_comment_list(
     }
 }
 
+/// `comment` create action: add a comment, optionally with an anchoring
+/// `reference`, arbitrary `properties`, and inline attachment(s)
+/// (`target_id` single OR `target_ids` batch, ≤25 — mutually exclusive).
 async fn handle_comment_create(
     state: &McpState,
     args: &Map<String, Value>,
@@ -7175,7 +8109,46 @@ async fn handle_comment_create(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    match api::comment::add_comment(&client, entity_type, entity_id, node_id, text, None).await {
+    let reference = match json_object_arg(args, "reference") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let properties = match json_object_arg(args, "properties") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let target_id = optional_str(args, "target_id");
+    let target_ids = match string_list_arg(args, "target_ids") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    if target_id.is_some() && !target_ids.is_empty() {
+        return Ok(error_text(
+            "target_id and target_ids are mutually exclusive",
+        ));
+    }
+    if target_ids.len() > 25 {
+        return Ok(error_text(&format!(
+            "a comment accepts at most 25 attachments (got {})",
+            target_ids.len()
+        )));
+    }
+    match api::comment::add_comment(
+        &client,
+        &api::comment::AddCommentParams {
+            entity_type,
+            entity_id,
+            node_id,
+            body: text,
+            parent_id: None,
+            reference: reference.as_ref(),
+            properties: properties.as_ref(),
+            target_id,
+            target_ids: (!target_ids.is_empty()).then_some(target_ids.as_slice()),
+        },
+    )
+    .await
+    {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -7208,11 +8181,17 @@ async fn handle_comment_reply(
     };
     match api::comment::add_comment(
         &client,
-        entity_type,
-        entity_id,
-        node_id,
-        text,
-        Some(comment_id),
+        &api::comment::AddCommentParams {
+            entity_type,
+            entity_id,
+            node_id,
+            body: text,
+            parent_id: Some(comment_id),
+            reference: None,
+            properties: None,
+            target_id: None,
+            target_ids: None,
+        },
     )
     .await
     {
@@ -7272,11 +8251,15 @@ async fn handle_comment_list_all(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let sort = match validate_comment_sort(args) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     match api::comment::list_all_comments(
         &client,
         entity_type,
         entity_id,
-        optional_str(args, "sort"),
+        sort,
         optional_u32(args, "limit"),
         optional_u32(args, "offset"),
     )
@@ -7375,6 +8358,11 @@ async fn handle_comment_link(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    if !LINKED_ENTITY_TYPES.contains(&etype) {
+        return Ok(error_text(&format!(
+            "Invalid linked_entity_type '{etype}' (one of: task, workflow_review)"
+        )));
+    }
     let eid = match required_str(args, "linked_entity_id") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -7409,6 +8397,11 @@ async fn handle_comment_linked(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    if !LINKED_ENTITY_TYPES.contains(&etype) {
+        return Ok(error_text(&format!(
+            "Invalid linked_entity_type '{etype}' (one of: task, workflow_review)"
+        )));
+    }
     let eid = match required_str(args, "linked_entity_id") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -7427,6 +8420,86 @@ async fn handle_comment_linked(
     }
 }
 
+/// `comment` list-attachments action: list a comment's attachments (hydrated,
+/// access-gated).
+async fn handle_comment_list_attachments(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let comment_id = match required_str(args, "comment_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::comment::list_comment_attachments(&client, comment_id).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// `comment` attach action: attach one object (`target_id`) or many
+/// (`target_ids`, ≤25) to a comment. The two are mutually exclusive; exactly one
+/// must be supplied. Author-only and rejected on workflow-review comments — the
+/// server enforces both.
+async fn handle_comment_attach(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let comment_id = match required_str(args, "comment_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let target_id = optional_str(args, "target_id");
+    let target_ids = match string_list_arg(args, "target_ids") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let targets = match (target_id, target_ids.is_empty()) {
+        (Some(id), true) => api::comment::CommentAttachTargets::Single(id),
+        (None, false) => api::comment::CommentAttachTargets::Multiple(target_ids.as_slice()),
+        (Some(_), false) => {
+            return Ok(error_text(
+                "target_id and target_ids are mutually exclusive",
+            ));
+        }
+        (None, true) => {
+            return Ok(error_text("one of target_id or target_ids is required"));
+        }
+    };
+    if target_ids.len() > 25 {
+        return Ok(error_text(&format!(
+            "a comment accepts at most 25 attachments (got {})",
+            target_ids.len()
+        )));
+    }
+    match api::comment::attach_comment(&client, comment_id, &targets).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// `comment` detach action: detach a single object from a comment (single only —
+/// there is no batch detach).
+async fn handle_comment_detach(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let comment_id = match required_str(args, "comment_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let target_id = match required_str(args, "target_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    match api::comment::detach_comment(&client, comment_id, target_id).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
 /// Event tool handler.
 #[allow(clippy::too_many_lines)]
 async fn handle_event(
@@ -7440,6 +8513,13 @@ async fn handle_event(
     let client = state.client().read().await;
     match action {
         "search" => {
+            // Strict bool: a present-but-malformed `acknowledged` errors rather
+            // than silently widening the query (Phase-7 parity with the CLI's
+            // typed `Option<bool>`).
+            let acknowledged = match optional_bool_strict(args, "acknowledged") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
             match api::event::search_events(
                 &client,
                 &api::event::SearchEventsParams {
@@ -7450,6 +8530,13 @@ async fn handle_event(
                     event: optional_str(args, "event"),
                     category: optional_str(args, "category"),
                     subcategory: optional_str(args, "subcategory"),
+                    parent_event_id: optional_str(args, "parent_event_id"),
+                    calling_user_id: optional_str(args, "calling_user_id"),
+                    object_id: optional_str(args, "object_id"),
+                    visibility: optional_str(args, "visibility"),
+                    acknowledged,
+                    created_min: optional_str(args, "created_min"),
+                    created_max: optional_str(args, "created_max"),
                     limit: optional_u32(args, "limit"),
                     offset: optional_u32(args, "offset"),
                 },
@@ -7461,6 +8548,13 @@ async fn handle_event(
             }
         }
         "summarize" => {
+            // summarize accepts every search filter plus `user_context`
+            // (events.txt), so forward the same audit filters — including the
+            // strict `acknowledged` — that `search` does.
+            let acknowledged = match optional_bool_strict(args, "acknowledged") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
             match api::event::summarize_events(
                 &client,
                 &api::event::SummarizeEventsParams {
@@ -7471,6 +8565,13 @@ async fn handle_event(
                     event: optional_str(args, "event"),
                     category: optional_str(args, "category"),
                     subcategory: optional_str(args, "subcategory"),
+                    parent_event_id: optional_str(args, "parent_event_id"),
+                    calling_user_id: optional_str(args, "calling_user_id"),
+                    object_id: optional_str(args, "object_id"),
+                    visibility: optional_str(args, "visibility"),
+                    acknowledged,
+                    created_min: optional_str(args, "created_min"),
+                    created_max: optional_str(args, "created_max"),
                     user_context: optional_str(args, "user_context"),
                     limit: optional_u32(args, "limit"),
                     offset: optional_u32(args, "offset"),
@@ -7536,7 +8637,113 @@ async fn handle_event(
     }
 }
 
+/// Dashboard tool handler.
+///
+/// Reads the calling member's per-workspace actionable card feed (`get`) and
+/// dismisses / snoozes / undismisses a card. All three are read or reversible
+/// (undismiss reverses dismiss; dismiss/snooze only change the caller's own
+/// view), so all are exposed over MCP.
+async fn handle_dashboard(
+    state: &McpState,
+    action: &str,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    if let Err(e) = require_auth(state).await {
+        return Ok(e);
+    }
+    let client = state.client().read().await;
+    match action {
+        "get" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::dashboard::get_dashboard(
+                &client,
+                workspace_id,
+                optional_u32(args, "limit"),
+                optional_u32(args, "offset"),
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "dismiss" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let card_key = match required_str(args, "card_key") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::dashboard::dismiss_card(
+                &client,
+                workspace_id,
+                card_key,
+                optional_str(args, "snooze_until"),
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "undismiss" => {
+            let workspace_id = match required_str(args, "workspace_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let card_key = match required_str(args, "card_key") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::dashboard::undismiss_card(&client, workspace_id, card_key).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        _ => Ok(error_text(&format!("Unknown dashboard action: {action}"))),
+    }
+}
+
+/// How-To tool handler.
+///
+/// A read-only, grounded product-guidance call — ideal for agents needing
+/// runtime "how do I…" answers. When invoked over MCP, `surface` DEFAULTS to
+/// `mcp` so the answer is phrased in terms of the consolidated MCP tools, unless
+/// the caller overrides it (e.g. `code`, or any other value for REST phrasing).
+async fn handle_howto(
+    state: &McpState,
+    action: &str,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    if let Err(e) = require_auth(state).await {
+        return Ok(e);
+    }
+    let client = state.client().read().await;
+    match action {
+        "ask" => {
+            let question = match required_str(args, "question") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            // Default the MCP surface to `mcp` so guidance is phrased for these
+            // tools; an explicit `surface` arg (code / rest / …) overrides.
+            let surface = optional_str(args, "surface").or(Some("mcp"));
+            match api::howto::ask(&client, question, optional_str(args, "context"), surface).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        _ => Ok(error_text(&format!("Unknown howto action: {action}"))),
+    }
+}
+
 /// Invitation tool handler.
+#[allow(clippy::too_many_lines)]
 async fn handle_invitation(
     state: &McpState,
     action: &str,
@@ -7551,6 +8758,58 @@ async fn handle_invitation(
             Ok(v) => Ok(success_json(&v)),
             Err(e) => Ok(cli_err_to_result(&e)),
         },
+        "list-entity" => {
+            let entity_type = match required_str(args, "entity_type") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let entity_id = match required_str(args, "entity_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::invitation::list_invitations(
+                &client,
+                entity_type,
+                entity_id,
+                optional_str(args, "state"),
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "update" => {
+            let entity_type = match required_str(args, "entity_type") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let entity_id = match required_str(args, "entity_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let invitation_id = match required_str(args, "invitation_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match api::invitation::update_invitation(
+                &client,
+                entity_type,
+                entity_id,
+                invitation_id,
+                &api::invitation::UpdateInvitationParams {
+                    new_state: optional_str(args, "state"),
+                    permissions: optional_str(args, "role"),
+                    notify_options: optional_str(args, "notify_options"),
+                    expires: optional_str(args, "expires"),
+                },
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
         "accept" => {
             let entity_type = match required_str(args, "entity_type") {
                 Ok(v) => v,
@@ -7569,8 +8828,10 @@ async fn handle_invitation(
                 entity_type,
                 entity_id,
                 invitation_id,
-                Some("accepted"),
-                None,
+                &api::invitation::UpdateInvitationParams {
+                    new_state: Some("accepted"),
+                    ..Default::default()
+                },
             )
             .await
             {
@@ -7596,8 +8857,10 @@ async fn handle_invitation(
                 entity_type,
                 entity_id,
                 invitation_id,
-                Some("declined"),
-                None,
+                &api::invitation::UpdateInvitationParams {
+                    new_state: Some("declined"),
+                    ..Default::default()
+                },
             )
             .await
             {
@@ -7676,10 +8939,28 @@ async fn handle_preview(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
+            // `thumbnail` hardcodes its (always-valid) type; `get` REQUIRES a
+            // `preview_type` from the valid set — matching the CLI, which makes
+            // `preview_type` mandatory for `get`. An absent or out-of-set value
+            // is rejected here rather than 400ing at the server.
             let preview_type = if action == "thumbnail" {
                 "thumbnail"
             } else {
-                optional_str(args, "preview_type").unwrap_or("document")
+                match optional_str(args, "preview_type") {
+                    None => {
+                        return Ok(error_text(
+                            "Missing required parameter: preview_type \
+                             (one of: bin, thumbnail, image, hlsstream, pdf, spreadsheet, audio, mp4)",
+                        ));
+                    }
+                    Some(v) if !PREVIEW_TYPES.contains(&v) => {
+                        return Ok(error_text(&format!(
+                            "Invalid preview_type '{v}' \
+                             (one of: bin, thumbnail, image, hlsstream, pdf, spreadsheet, audio, mp4)"
+                        )));
+                    }
+                    Some(v) => v,
+                }
             };
             match api::preview::get_preview_url(&client, ctx_type, ctx_id, node_id, preview_type)
                 .await
@@ -7691,49 +8972,84 @@ async fn handle_preview(
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
-        "transform" => {
-            let ctx_type = match required_str(args, "context_type") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let ctx_id = match required_str(args, "context_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let node_id = match required_str(args, "node_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let transform = match required_str(args, "transform_name") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::preview::get_transform_url(
-                &client,
-                &api::preview::TransformUrlParams {
-                    context_type: ctx_type,
-                    context_id: ctx_id,
-                    node_id,
-                    transform_name: transform,
-                    width: optional_u32(args, "width"),
-                    height: optional_u32(args, "height"),
-                    output_format: optional_str(args, "output_format"),
-                    size: optional_str(args, "size"),
-                },
-            )
-            .await
-            {
-                // The `transform` requestread response (storage.txt:2503) is
-                // `{result, token}` with NO tokenized `path`/url — the bare
-                // `token` IS the sole deliverable the agent uses to build the
-                // read URL. Stripping it would break the tool, so it is kept
-                // (an accepted secret deliverable; redaction is handled by
-                // SECRET_LOG_KEYS on the trace side).
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
+        "transform" => handle_preview_transform(&client, args).await,
         _ => Ok(error_text(&format!("Unknown preview action: {action}"))),
+    }
+}
+
+/// `preview` tool `transform` action handler.
+///
+/// Split out of [`handle_preview`] to keep that dispatcher under the line
+/// limit and to give the strict integer parsing a focused home.
+async fn handle_preview_transform(
+    client: &fastio_cli::client::ApiClient,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let ctx_type = match required_str(args, "context_type") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let ctx_id = match required_str(args, "context_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let node_id = match required_str(args, "node_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    // The transform name defaults to `image` (the only valid value);
+    // the builder validates it.
+    let transform =
+        optional_str(args, "transform_name").unwrap_or(api::preview::IMAGE_TRANSFORM_NAME);
+    // Parse the integer params strictly: a PRESENT-but-non-integer value
+    // (e.g. `rotate: "90deg"`) must surface a clear error rather than be
+    // silently dropped. Range/set validation still happens later in
+    // `validate_transform_params`. The `?`-style early-return uses a
+    // `match` because the handler returns `Result<_, McpError>`, not the
+    // helper's `Result<_, CallToolResult>`.
+    macro_rules! parse_u32_strict {
+        ($key:literal) => {
+            match optional_u32_strict(args, $key) {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            }
+        };
+    }
+    let width = parse_u32_strict!("width");
+    let height = parse_u32_strict!("height");
+    let crop_width = parse_u32_strict!("crop_width");
+    let crop_height = parse_u32_strict!("crop_height");
+    let crop_x = parse_u32_strict!("crop_x");
+    let crop_y = parse_u32_strict!("crop_y");
+    let rotate = parse_u32_strict!("rotate");
+    match api::preview::get_transform_url(
+        client,
+        &api::preview::TransformUrlParams {
+            context_type: ctx_type,
+            context_id: ctx_id,
+            node_id,
+            transform_name: transform,
+            width,
+            height,
+            output_format: optional_str(args, "output_format"),
+            size: optional_str(args, "size"),
+            crop_width,
+            crop_height,
+            crop_x,
+            crop_y,
+            rotate,
+        },
+    )
+    .await
+    {
+        // The transform response is `{transform_name, token, read_url}`:
+        // `read_url` is the `/read/` URL carrying the token AND the image
+        // params (so they actually apply when fetched), and `token` is
+        // the bare download token. Both are secret-bearing deliverables —
+        // kept intact (redaction is handled by SECRET_LOG_KEYS on the
+        // trace side), not stripped.
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
     }
 }
 
@@ -7850,7 +9166,6 @@ async fn handle_task_filter(
         limit: optional_u32(args, "limit"),
         offset: optional_u32(args, "offset"),
         status: optional_str(args, "status"),
-        entry_type: None,
     };
     match api::workflow::list_tasks_filtered(&client, profile_type, profile_id, filter, &query)
         .await
@@ -8405,407 +9720,6 @@ async fn handle_task_detach(
     }
 }
 
-/// Resolve the worklog `entity_type`, defaulting to `profile` (NOT
-/// `workspace`, which is not a valid worklog entity type). The accepted set is
-/// `profile`, `task`, `task_list`, and `node`; the value passes through to the
-/// API unchanged so `node` is honored.
-fn worklog_entity_type(args: &Map<String, Value>) -> &str {
-    optional_str(args, "entity_type").unwrap_or("profile")
-}
-
-/// Worklog tool handler.
-#[allow(clippy::too_many_lines)]
-async fn handle_worklog(
-    state: &McpState,
-    action: &str,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    if let Err(e) = require_auth(state).await {
-        return Ok(e);
-    }
-    let client = state.client().read().await;
-    // Per the worklog contract the entity-scoped endpoints accept
-    // `profile` (default), `task`, `task_list`, and `node`.
-    let entity_type = worklog_entity_type(args);
-    match action {
-        "list" => {
-            let entity_id = match required_str(args, "entity_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workflow::list_worklogs(
-                &client,
-                entity_type,
-                entity_id,
-                optional_u32(args, "limit"),
-                optional_u32(args, "offset"),
-            )
-            .await
-            {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "append" => {
-            let entity_id = match required_str(args, "entity_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let message = match required_str(args, "message") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workflow::append_worklog(&client, entity_type, entity_id, message).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "interject" => {
-            let entity_id = match required_str(args, "entity_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let message = match required_str(args, "message") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workflow::interject_worklog(&client, entity_type, entity_id, message).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "details" => {
-            let entry_id = match required_str(args, "entry_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workflow::worklog_details(&client, entry_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "acknowledge" => {
-            let entry_id = match required_str(args, "entry_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workflow::acknowledge_worklog(&client, entry_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "unacknowledged" => {
-            let entity_id = match required_str(args, "entity_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workflow::unacknowledged_worklogs(
-                &client,
-                entity_type,
-                entity_id,
-                optional_u32(args, "limit"),
-                optional_u32(args, "offset"),
-            )
-            .await
-            {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "list-all" => {
-            let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
-            let profile_id = match required_str(args, "profile_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let query = api::workflow::FilterQuery {
-                limit: optional_u32(args, "limit"),
-                offset: optional_u32(args, "offset"),
-                status: None,
-                entry_type: None,
-            };
-            match api::workflow::list_worklogs_ctx(&client, profile_type, profile_id, &query).await
-            {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "filter" => {
-            let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
-            let profile_id = match required_str(args, "profile_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let filter = match required_str(args, "filter") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let query = api::workflow::FilterQuery {
-                limit: optional_u32(args, "limit"),
-                offset: optional_u32(args, "offset"),
-                status: None,
-                entry_type: optional_str(args, "entry_type"),
-            };
-            match api::workflow::list_worklogs_filtered(
-                &client,
-                profile_type,
-                profile_id,
-                filter,
-                &query,
-            )
-            .await
-            {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "summary" => {
-            let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
-            let profile_id = match required_str(args, "profile_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workflow::worklogs_summary(&client, profile_type, profile_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        _ => Ok(error_text(&format!("Unknown worklog action: {action}"))),
-    }
-}
-
-/// Approval tool handler.
-#[allow(clippy::too_many_lines)]
-async fn handle_approval(
-    state: &McpState,
-    action: &str,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    if let Err(e) = require_auth(state).await {
-        return Ok(e);
-    }
-    let client = state.client().read().await;
-    match action {
-        "list" => {
-            let ws_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workflow::list_approvals(
-                &client,
-                ws_id,
-                optional_str(args, "status"),
-                optional_u32(args, "limit"),
-                optional_u32(args, "offset"),
-            )
-            .await
-            {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "request" => {
-            let entity_type = match required_str(args, "entity_type") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let entity_id = match required_str(args, "entity_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let description = match required_str(args, "description") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            // Accept `profile_id` (scoped) and fall back to the legacy
-            // `workspace_id` arg name; default the type to workspace.
-            let profile_id = match approval_profile_id(args) {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
-            let properties = match approval_properties(args) {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let params = api::workflow::CreateApprovalParams {
-                profile_type,
-                profile_id,
-                entity_type,
-                entity_id,
-                description,
-                approver_id: optional_str(args, "approver_id"),
-                deadline: optional_str(args, "deadline"),
-                node_id: optional_str(args, "node_id"),
-                properties: properties.as_ref(),
-            };
-            match api::workflow::create_approval(&client, &params).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "details" => {
-            let scope = approval_scope_opt(args);
-            let approval_id = match required_str(args, "approval_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workflow::get_approval(&client, scope, approval_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "approve" | "reject" => {
-            let scope = approval_scope_opt(args);
-            let approval_id = match required_str(args, "approval_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workflow::resolve_approval(
-                &client,
-                scope,
-                approval_id,
-                action,
-                optional_str(args, "comment"),
-            )
-            .await
-            {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "update" => {
-            let scope = approval_scope_opt(args);
-            let approval_id = match required_str(args, "approval_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let properties = match approval_properties(args) {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let params = api::workflow::UpdateApprovalParams {
-                scope,
-                approval_id,
-                description: optional_str(args, "description"),
-                approver_id: optional_str(args, "approver_id"),
-                deadline: optional_str(args, "deadline"),
-                node_id: optional_str(args, "node_id"),
-                properties: properties.as_ref(),
-            };
-            if params.description.is_none()
-                && params.approver_id.is_none()
-                && params.deadline.is_none()
-                && params.node_id.is_none()
-                && params.properties.is_none()
-            {
-                return Ok(error_text(
-                    "approval update requires at least one of: description, approver_id, \
-                     deadline, node_id, properties",
-                ));
-            }
-            match api::workflow::update_approval(&client, &params).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "delete" => {
-            let scope = approval_scope_opt(args);
-            let approval_id = match required_str(args, "approval_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workflow::delete_approval(&client, scope, approval_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "filter" => {
-            let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
-            let profile_id = match approval_profile_id(args) {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let filter = match required_str(args, "filter") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let query = api::workflow::FilterQuery {
-                limit: optional_u32(args, "limit"),
-                offset: optional_u32(args, "offset"),
-                status: optional_str(args, "status"),
-                entry_type: None,
-            };
-            match api::workflow::list_approvals_filtered(
-                &client,
-                profile_type,
-                profile_id,
-                filter,
-                &query,
-            )
-            .await
-            {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "summary" => {
-            let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
-            let profile_id = match approval_profile_id(args) {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workflow::approvals_summary(&client, profile_type, profile_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "user-approvals" => {
-            let filter = match required_str(args, "filter") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let query = api::workflow::FilterQuery {
-                limit: optional_u32(args, "limit"),
-                offset: optional_u32(args, "offset"),
-                status: optional_str(args, "status"),
-                entry_type: None,
-            };
-            match api::workflow::user_approvals(&client, filter, &query).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        _ => Ok(error_text(&format!("Unknown approval action: {action}"))),
-    }
-}
-
-/// Resolve the scoped approval profile ID, accepting `profile_id` (preferred)
-/// or the legacy `workspace_id` arg name.
-fn approval_profile_id(args: &Map<String, Value>) -> Result<&str, CallToolResult> {
-    optional_str(args, "profile_id")
-        .or_else(|| optional_str(args, "workspace_id"))
-        .ok_or_else(|| error_text("Missing required parameter: profile_id"))
-}
-
-/// Resolve an optional approval scope for per-approval action routes
-/// (details/approve/reject/update/delete). Returns `Some((profile_type,
-/// profile_id))` when a profile ID is supplied (preferred `profile_id`, legacy
-/// `workspace_id`), or `None` to use the legacy unscoped route.
-fn approval_scope_opt(args: &Map<String, Value>) -> Option<(&str, &str)> {
-    let profile_id =
-        optional_str(args, "profile_id").or_else(|| optional_str(args, "workspace_id"))?;
-    let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
-    Some((profile_type, profile_id))
-}
-
-/// Parse an optional `properties` MCP arg into a JSON object value. Accepts
-/// either a JSON object passed directly or a JSON-object string; returns an
-/// error result if it is neither a JSON object nor a string encoding one.
-fn approval_properties(args: &Map<String, Value>) -> Result<Option<Value>, CallToolResult> {
-    json_object_arg(args, "properties")
-}
-
 /// Read an optional JSON-object argument that may arrive either as a JSON object
 /// directly (the common MCP-client shape) or as a serialized JSON-object string.
 /// A missing/null key is `None`; any value that is not (or does not parse to) a
@@ -8901,211 +9815,6 @@ fn string_list_arg(args: &Map<String, Value>, key: &str) -> Result<Vec<String>, 
         Some(_) => Err(error_text(&format!(
             "{key} must be a JSON array of strings or a comma-separated string"
         ))),
-    }
-}
-
-/// Todo tool handler.
-async fn handle_todo(
-    state: &McpState,
-    action: &str,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    if let Err(e) = require_auth(state).await {
-        return Ok(e);
-    }
-    match action {
-        "list" => handle_todo_list(state, args).await,
-        "create" => handle_todo_create(state, args).await,
-        "details" => handle_todo_details(state, args).await,
-        "update" => handle_todo_update(state, args).await,
-        "toggle" => handle_todo_toggle(state, args).await,
-        "delete" => handle_todo_delete(state, args).await,
-        "bulk-toggle" => handle_todo_bulk_toggle(state, args).await,
-        "filter" => handle_todo_filter(state, args).await,
-        "summary" => handle_todo_summary(state, args).await,
-        _ => Ok(error_text(&format!("Unknown todo action: {action}"))),
-    }
-}
-
-async fn handle_todo_list(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let pt = optional_str(args, "profile_type").unwrap_or("workspace");
-    let pid = match required_str(args, "profile_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::list_todos_ctx(
-        &client,
-        pt,
-        pid,
-        optional_u32(args, "limit"),
-        optional_u32(args, "offset"),
-    )
-    .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_todo_create(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let pt = optional_str(args, "profile_type").unwrap_or("workspace");
-    let pid = match required_str(args, "profile_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let title = match required_str(args, "title") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::create_todo_ctx(&client, pt, pid, title, optional_str(args, "assignee_id"))
-        .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_todo_details(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let todo_id = match required_str(args, "todo_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::get_todo_details(&client, todo_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_todo_update(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let todo_id = match required_str(args, "todo_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::update_todo(
-        &client,
-        todo_id,
-        optional_str(args, "title"),
-        optional_bool(args, "done"),
-        optional_str(args, "assignee_id"),
-    )
-    .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_todo_toggle(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let todo_id = match required_str(args, "todo_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::toggle_todo(&client, todo_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_todo_delete(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let todo_id = match required_str(args, "todo_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::delete_todo(&client, todo_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_todo_bulk_toggle(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let pt = optional_str(args, "profile_type").unwrap_or("workspace");
-    let pid = match required_str(args, "profile_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let ids_str = match required_str(args, "todo_ids") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let done = optional_bool(args, "done").unwrap_or(true);
-    let ids: Vec<String> = ids_str.split(',').map(|s| s.trim().to_owned()).collect();
-    match api::workflow::bulk_toggle_todos(&client, pt, pid, &ids, done).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-/// `todo` filter action: filtered todo list for a workspace or share.
-async fn handle_todo_filter(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
-    let profile_id = match required_str(args, "profile_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let filter = match required_str(args, "filter") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let query = api::workflow::FilterQuery {
-        limit: optional_u32(args, "limit"),
-        offset: optional_u32(args, "offset"),
-        status: None,
-        entry_type: None,
-    };
-    match api::workflow::list_todos_filtered(&client, profile_type, profile_id, filter, &query)
-        .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-/// `todo` summary action: todo count summary for a workspace or share.
-async fn handle_todo_summary(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
-    let profile_id = match required_str(args, "profile_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::todos_summary(&client, profile_type, profile_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
     }
 }
 
@@ -9643,7 +10352,16 @@ async fn handle_lock(
         Err(e) => return Ok(e),
     };
     match action {
-        "acquire" => match api::locking::lock_acquire(&client, ctx_type, ctx_id, node_id).await {
+        "acquire" => match api::locking::lock_acquire(
+            &client,
+            ctx_type,
+            ctx_id,
+            node_id,
+            optional_u32(args, "duration"),
+            optional_str(args, "client_info"),
+        )
+        .await
+        {
             Ok(v) => Ok(success_json(&v)),
             Err(e) => Ok(cli_err_to_result(&e)),
         },
@@ -10091,13 +10809,35 @@ fn workflow_describe() -> CallToolResult {
     let actions: &[(&str, &[&str], &[&str], &str)] = &[
         ("describe", &[], &[], ""),
         ("get", &["workflow_id"], &[], ""),
-        ("list", &["workspace_id"], &["limit", "offset"], ""),
+        (
+            "list",
+            &["workspace_id"],
+            &[
+                "limit",
+                "offset",
+                "template_id",
+                "state",
+                "archived",
+                "created_by_me",
+                "participant_me",
+                "include",
+            ],
+            "filters narrow BEFORE pagination and compose (AND). created_by_me → created_by=me; \
+             participant_me → participant=me. include is a CSV of run_summary / run_meta.",
+        ),
         ("state", &["workflow_id"], &[], ""),
         (
             "instantiate",
             &["workflow_id", "idempotency_key"],
-            &["trigger_payload", "external_subject_id", "pool_key"],
-            "",
+            &[
+                "trigger_payload",
+                "external_subject_id",
+                "pool_key",
+                "step_seeds",
+            ],
+            "step_seeds is a JSON OBJECT string keyed by the workflow's reminted DEFINITION step \
+             ids (from from_system's system_gallery.step_id_map, or /state/) → arrays of node ids; \
+             a seed keyed by a gallery-fixed step id is silently dropped.",
         ),
         (
             "instantiate-and-wait",
@@ -10106,6 +10846,7 @@ fn workflow_describe() -> CallToolResult {
                 "trigger_payload",
                 "external_subject_id",
                 "pool_key",
+                "step_seeds",
                 "poll_interval",
             ],
             "fires then polls to a terminal lifecycle",
@@ -10160,6 +10901,33 @@ fn workflow_describe() -> CallToolResult {
              an error); a non-agent occurrence returns 404.",
         ),
         (
+            "step-files",
+            &["workflow_id", "step_occurrence_id", "node_ids"],
+            &[],
+            "provide EXISTING file node ids (in place; no move/copy) to a WAITING wait_for_files \
+             step, then re-evaluate it. node_ids is a JSON array of strings or a comma-separated \
+             string. Workflow admin. 409 if the step is not waiting / not a wait_for_files step; \
+             422 over the per-step submitted-id limit.",
+        ),
+        (
+            "step-complete",
+            &["workflow_id", "step_occurrence_id"],
+            &[],
+            "explicitly advance a manual-completion (manual_completion:true) ad-hoc wait_for_files \
+             step once the required file count has been provided (no body; returns the updated \
+             occurrence). Workflow admin. 422 until the minimum is reached; a retryable 409 right \
+             after a step-files submit; 409 if the step is not a manual ad-hoc wait_for_files in \
+             the waiting state.",
+        ),
+        (
+            "step-reassign",
+            &["workflow_id", "step_occurrence_id", "new_assignee_user_id"],
+            &[],
+            "reassign a WAITING task step to a new assignee. Workflow admin OR the current \
+             assignee; the new assignee must be a workspace member. Rejected 409 while a \
+             modification proposal is open.",
+        ),
+        (
             "modification-propose",
             &["workflow_id", "ops"],
             &["reason", "expires_in_seconds"],
@@ -10195,7 +10963,12 @@ fn workflow_describe() -> CallToolResult {
             &[],
             "cancels the proposal and resumes the run unchanged. Workflow ADMIN.",
         ),
-        ("template-list", &["workspace_id"], &["limit", "offset"], ""),
+        (
+            "template-list",
+            &["workspace_id"],
+            &["limit", "offset", "usage"],
+            "usage filter: library (non-one-off) / one_off / all (default)",
+        ),
         ("template-get", &["template_id"], &["include_body"], ""),
         (
             "template-gallery",
@@ -10443,15 +11216,34 @@ async fn handle_workflow(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            wf_render(
-                wf::list_workflows(
-                    &client,
-                    ws,
-                    optional_u32(args, "limit"),
-                    optional_u32(args, "offset"),
-                )
-                .await,
-            )
+            let archived = optional_str(args, "archived").map(str::to_owned);
+            if let Some(v) = archived.as_deref()
+                && !WORKFLOW_ARCHIVED_FILTERS.contains(&v)
+            {
+                return Ok(error_text(&format!(
+                    "Invalid archived '{v}' (one of: true, false, all)"
+                )));
+            }
+            // Strict bools: a present-but-malformed value (e.g. "me", "yes")
+            // errors rather than being silently dropped to an unfiltered list.
+            let created_by_me = match optional_bool_strict(args, "created_by_me") {
+                Ok(v) => v == Some(true),
+                Err(e) => return Ok(e),
+            };
+            let participant_me = match optional_bool_strict(args, "participant_me") {
+                Ok(v) => v == Some(true),
+                Err(e) => return Ok(e),
+            };
+            let params = wf::ListWorkflowsParams::new()
+                .limit(optional_u32(args, "limit"))
+                .offset(optional_u32(args, "offset"))
+                .template_id(optional_str(args, "template_id").map(str::to_owned))
+                .state(optional_str(args, "state").map(str::to_owned))
+                .archived(archived)
+                .created_by_me(created_by_me)
+                .participant_me(participant_me)
+                .include(optional_str(args, "include").map(str::to_owned));
+            wf_render(wf::list_workflows(&client, ws, &params).await)
         }
         "state" => {
             let id = match required_str(args, "workflow_id") {
@@ -10492,7 +11284,8 @@ async fn handle_workflow(
             let params = wf::InstantiateParams::new(key.to_owned())
                 .trigger_payload(optional_str(args, "trigger_payload").map(str::to_owned))
                 .external_subject_id(optional_str(args, "external_subject_id").map(str::to_owned))
-                .pool_key(optional_str(args, "pool_key").map(str::to_owned));
+                .pool_key(optional_str(args, "pool_key").map(str::to_owned))
+                .step_seeds(optional_str(args, "step_seeds").map(str::to_owned));
             wf_render(wf::instantiate_workflow(&client, id, &params).await)
         }
         "instantiate-and-wait" => {
@@ -10507,7 +11300,8 @@ async fn handle_workflow(
             let params = wf::InstantiateParams::new(key.to_owned())
                 .trigger_payload(optional_str(args, "trigger_payload").map(str::to_owned))
                 .external_subject_id(optional_str(args, "external_subject_id").map(str::to_owned))
-                .pool_key(optional_str(args, "pool_key").map(str::to_owned));
+                .pool_key(optional_str(args, "pool_key").map(str::to_owned))
+                .step_seeds(optional_str(args, "step_seeds").map(str::to_owned));
             if let Err(e) = wf::instantiate_workflow(&client, id, &params).await {
                 return Ok(cli_err_to_result(&e));
             }
@@ -10627,6 +11421,49 @@ async fn handle_workflow(
             };
             wf_render(wf::get_step_agent_trace(&client, wid, oid).await)
         }
+        "step-files" => {
+            let (wid, oid) = match (
+                required_str(args, "workflow_id"),
+                required_str(args, "step_occurrence_id"),
+            ) {
+                (Ok(w), Ok(o)) => (w, o),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            let node_ids = match string_list_arg(args, "node_ids") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            if node_ids.is_empty() {
+                return Ok(error_text(
+                    "node_ids is required and must contain at least one node id (step-files)",
+                ));
+            }
+            wf_render(wf::submit_step_files(&client, wid, oid, &node_ids).await)
+        }
+        "step-complete" => {
+            let (wid, oid) = match (
+                required_str(args, "workflow_id"),
+                required_str(args, "step_occurrence_id"),
+            ) {
+                (Ok(w), Ok(o)) => (w, o),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            wf_render(wf::complete_step(&client, wid, oid).await)
+        }
+        "step-reassign" => {
+            let (wid, oid) = match (
+                required_str(args, "workflow_id"),
+                required_str(args, "step_occurrence_id"),
+            ) {
+                (Ok(w), Ok(o)) => (w, o),
+                (Err(e), _) | (_, Err(e)) => return Ok(e),
+            };
+            let new_assignee = match required_str(args, "new_assignee_user_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            wf_render(wf::reassign_step(&client, wid, oid, new_assignee).await)
+        }
         "modification-propose" => {
             let wid = match required_str(args, "workflow_id") {
                 Ok(v) => v,
@@ -10705,12 +11542,21 @@ async fn handle_workflow(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
+            let usage = optional_str(args, "usage");
+            if let Some(v) = usage
+                && !WORKFLOW_TEMPLATE_USAGE_FILTERS.contains(&v)
+            {
+                return Ok(error_text(&format!(
+                    "Invalid usage '{v}' (one of: library, one_off, all)"
+                )));
+            }
             wf_render(
                 wf::list_templates(
                     &client,
                     ws,
                     optional_u32(args, "limit"),
                     optional_u32(args, "offset"),
+                    usage,
                 )
                 .await,
             )
@@ -11721,6 +12567,26 @@ fn sign_describe() -> CallToolResult {
             "inlines documents/recipients/fields",
         ),
         (
+            "envelope-retry",
+            &["workspace_id", "envelope_id"],
+            &[],
+            "re-drives a STUCK envelope through self-healing recovery (admin). Idempotent + \
+             no-op-success — re-driving a non-stuck or already-terminal envelope succeeds without \
+             side effects, and it notifies no one (so it is exposed over MCP, unlike send/void). A \
+             permanent signing-pipeline failure cascades the envelope to the terminal Failed state.",
+        ),
+        (
+            "envelope-my-sign-link",
+            &["workspace_id", "envelope_id"],
+            &[],
+            "mints YOUR (the caller's) own signing link — the dashboard signature-card primary \
+             action (envelope_id = the card's target.id). Reversible/idempotent and notifies no \
+             one. Requires a WRITE-scope token (a read-only token is rejected with 10754). The \
+             structured result is NOT just a URL: sign_url non-null = you can sign now; \
+             is_terminal = completed/void/declined; reauth_required = re-authenticate first; else \
+             you are blocked by routing order (see blocked_signers).",
+        ),
+        (
             "document-download",
             &["workspace_id", "envelope_id", "document_id"],
             &["output_path"],
@@ -11778,16 +12644,20 @@ fn sign_describe() -> CallToolResult {
 
     let payload = serde_json::json!({
         "tool": "sign",
-        "summary": "E-signature SignEnvelopes (workspace-parented) — READ + reversible-DRAFT-drive \
-                    only. Drafting and downloads are exposed over MCP; the outward-facing send/void \
-                    are CLI-binary-only. Envelopes are voided, not deleted (no delete action).",
+        "summary": "E-signature SignEnvelopes (workspace-parented) — READ, reversible-DRAFT-drive, \
+                    and idempotent-RECOVERY (envelope-retry). Drafting, recovery, and downloads are \
+                    exposed over MCP; the outward-facing send/void are CLI-binary-only. Envelopes \
+                    are voided, not deleted (no delete action).",
         "common_required": ["workspace_id"],
         "destructive_actions": [],
         "side_effects": "envelope-create makes a DRAFT (reversible; no recipient is notified and \
-                         no credits are reserved until a CLI `send`). Downloads write files to the \
-                         agent's local filesystem. The outward-facing send / void actions are \
-                         CLI-binary-only (see cli_only_actions) and are NOT exposed over MCP. \
-                         There is no delete — envelopes are voided.",
+                         no credits are reserved until a CLI `send`). envelope-retry re-drives a \
+                         stuck envelope's signing pipeline — idempotent + no-op-success and \
+                         notifies no one (a permanent failure cascades to the terminal Failed \
+                         state). Downloads write files to the agent's local filesystem. The \
+                         outward-facing send / void actions are CLI-binary-only (see \
+                         cli_only_actions) and are NOT exposed over MCP. There is no delete — \
+                         envelopes are voided.",
         "guidance": {
             "workspace": "workspace_id is the 19-digit owner workspace; every envelope is \
                           workspace-parented (the former org surface was removed).",
@@ -11929,6 +12799,45 @@ async fn handle_sign(
                 Err(e) => Ok(sign_err_to_result(
                     &e,
                     "failed to get sign envelope",
+                    SignOp::General,
+                )),
+            }
+        }
+        "envelope-retry" => {
+            // `retry` re-drives a stuck envelope through self-healing recovery.
+            // It is idempotent + no-op-success and notifies no one, so — unlike
+            // the CLI-only send/void — it IS exposed over MCP (its safety profile
+            // matches the read/draft-drive surface, not the gated outward/terminal
+            // actions). A `404`/`1609` is a genuine not-found → `SignOp::General`.
+            let envelope_id = match required_str(args, "envelope_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match signing::retry_envelope(&client, workspace_id, envelope_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(sign_err_to_result(
+                    &e,
+                    "failed to retry sign envelope",
+                    SignOp::General,
+                )),
+            }
+        }
+        "envelope-my-sign-link" => {
+            // Mints the CALLER's own signing link (the dashboard signature-card
+            // primary action). Reversible/idempotent and notifies no one, so —
+            // like envelope-retry — its safety profile matches the read/draft
+            // surface, not the gated outward/terminal send/void. A read-only
+            // scoped token is rejected server-side (10754); a `404`/`1609` is a
+            // genuine not-found → `SignOp::General`.
+            let envelope_id = match required_str(args, "envelope_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match signing::my_sign_link(&client, workspace_id, envelope_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(sign_err_to_result(
+                    &e,
+                    "failed to mint sign link",
                     SignOp::General,
                 )),
             }
@@ -13240,255 +14149,6 @@ fn fileshare_download_result(
     }))
 }
 
-/// AI instructions tool handler.
-#[allow(clippy::too_many_lines)]
-async fn handle_instructions(
-    state: &McpState,
-    action: &str,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    if let Err(e) = require_auth(state).await {
-        return Ok(e);
-    }
-    let client = state.client().read().await;
-    match action {
-        "get-user" => match api::instructions::get_user_instructions(&client).await {
-            Ok(v) => Ok(success_json(&v)),
-            Err(e) => Ok(cli_err_to_result(&e)),
-        },
-        "set-user" => {
-            let content = match required_str(args, "content") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::set_user_instructions(&client, content).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "clear-user" => match api::instructions::delete_user_instructions(&client).await {
-            Ok(v) => Ok(success_json(&v)),
-            Err(e) => Ok(cli_err_to_result(&e)),
-        },
-
-        "get-org" => {
-            let org_id = match required_str(args, "org_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::get_org_instructions(&client, org_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "set-org" => {
-            let org_id = match required_str(args, "org_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let content = match required_str(args, "content") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::set_org_instructions(&client, org_id, content).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "clear-org" => {
-            let org_id = match required_str(args, "org_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::delete_org_instructions(&client, org_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "get-org-user" => {
-            let org_id = match required_str(args, "org_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::get_org_user_instructions(&client, org_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "set-org-user" => {
-            let org_id = match required_str(args, "org_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let content = match required_str(args, "content") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::set_org_user_instructions(&client, org_id, content).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "clear-org-user" => {
-            let org_id = match required_str(args, "org_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::delete_org_user_instructions(&client, org_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-
-        "get-workspace" => {
-            let workspace_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::get_workspace_instructions(&client, workspace_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "set-workspace" => {
-            let workspace_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let content = match required_str(args, "content") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::set_workspace_instructions(&client, workspace_id, content)
-                .await
-            {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "clear-workspace" => {
-            let workspace_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::delete_workspace_instructions(&client, workspace_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "get-workspace-user" => {
-            let workspace_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::get_workspace_user_instructions(&client, workspace_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "set-workspace-user" => {
-            let workspace_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let content = match required_str(args, "content") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::set_workspace_user_instructions(&client, workspace_id, content)
-                .await
-            {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "clear-workspace-user" => {
-            let workspace_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::delete_workspace_user_instructions(&client, workspace_id).await
-            {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-
-        "get-share" => {
-            let share_id = match required_str(args, "share_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::get_share_instructions(&client, share_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "set-share" => {
-            let share_id = match required_str(args, "share_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let content = match required_str(args, "content") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::set_share_instructions(&client, share_id, content).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "clear-share" => {
-            let share_id = match required_str(args, "share_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::delete_share_instructions(&client, share_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "get-share-user" => {
-            let share_id = match required_str(args, "share_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::get_share_user_instructions(&client, share_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "set-share-user" => {
-            let share_id = match required_str(args, "share_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let content = match required_str(args, "content") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::set_share_user_instructions(&client, share_id, content).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "clear-share-user" => {
-            let share_id = match required_str(args, "share_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::instructions::delete_share_user_instructions(&client, share_id).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-
-        _ => Ok(error_text(&format!(
-            "Unknown instructions action: {action}"
-        ))),
-    }
-}
-
 /// System health tool handler.
 ///
 /// System tools do not require authentication.
@@ -13628,15 +14288,18 @@ fn id_describe() -> CallToolResult {
         "tool": "id",
         "summary": "Offline OpaqueId classifier — maps a Fast.io id to its entity type by its \
                     self-describing length + type prefix (29-char carries a 1-char type; 30-char \
-                    workflow-family carries a 2-char 'w' type). No auth, no network.",
+                    carries a 2-char type — the workflow family under 'w' plus the non-workflow \
+                    Task and Comment types). No auth, no network.",
         "destructive_actions": [],
         "side_effects": "none — pure local classification; no network calls and no credentials.",
         "guidance": {
             "one_of_required_body": ["id", "ids"],
-            "classification": "Workflow-family ids are detected ONLY by length-30 / leading-'w'. \
-                               A 29-char id whose 1-char code is unmapped is reported \
+            "classification": "A 30-char id is classified by its 2-char prefix against the combined \
+                               workflow ('w*') + non-workflow 30-char (Task 'ta'/'tb'/'tc', Comment \
+                               'ca'/'cb') map; an unmapped 2-char prefix is family='unknown'. A \
+                               29-char id whose 1-char code is unmapped is reported \
                                family='unknown' (it may be a transitional workflow code pending \
-                               reassignment), NEVER guessed as workflow.",
+                               reassignment), NEVER guessed.",
         },
         "actions": Value::Object(action_map),
     });
@@ -13707,6 +14370,116 @@ mod ripley_tool_tests {
         );
     }
 
+    fn user_tool_actions() -> Vec<&'static str> {
+        super::TOOL_DEFS
+            .iter()
+            .find(|d| d.name == "user")
+            .expect("user tool registered")
+            .actions
+            .to_vec()
+    }
+
+    #[test]
+    fn user_tool_omits_irreversible_account_close() {
+        // Account `close` permanently closes the user's account (irreversible),
+        // so it is CLI-binary-only and MUST NOT be advertised over MCP — like the
+        // workflow `cancel` / sign `send` carve-outs.
+        let actions = user_tool_actions();
+        assert!(
+            !actions.contains(&"close"),
+            "user MCP tool must NOT advertise the irreversible account-close action 'close'"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_close_is_cli_only_over_mcp() {
+        // `action=close` is gated BEFORE the auth check, so even an
+        // unauthenticated router returns the CLI-only guidance (not the auth
+        // error and not the unknown-action arm) — proving close is never routed
+        // to the real handler over MCP.
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("close".to_owned()));
+        let res = router.call_tool("user", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("CLI-binary-only") && text.contains("PERMANENTLY"),
+            "user close must return the CLI-only guidance, got: {text}"
+        );
+        assert!(
+            !text.contains("Not authenticated"),
+            "user close must be gated before the auth check, got: {text}"
+        );
+        assert!(
+            !text.contains("Unknown user action"),
+            "user close must hit the CLI-only guard, not the unknown-action arm, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_search_routes_through_unified_search() {
+        // The CLI `workspace search` and the MCP `workspace search` action now
+        // share `api::search::unified_search_workspace`, which validates the
+        // query BEFORE any network call. A blank query therefore returns the
+        // unified-search validation error pre-network — proving MCP no longer
+        // uses the un-validated `search_files` path (CLI/MCP parity).
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("search".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("query".to_owned(), Value::String("   ".to_owned()));
+        let res = router.call_tool("workspace", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("search query must not be empty"),
+            "workspace search must route through unified_search_workspace \
+             (pre-network query validation), got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_list_rejects_invalid_sort() {
+        // The CLI restricts comment-list `sort` to asc/desc via a clap
+        // value_parser; MCP enforces the same set pre-network, so a bogus sort
+        // returns a clear error instead of reaching the server (CLI/MCP parity).
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("list".to_owned()));
+        args.insert(
+            "entity_type".to_owned(),
+            Value::String("workspace".to_owned()),
+        );
+        args.insert("entity_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("node_id".to_owned(), Value::String("n1".to_owned()));
+        args.insert("sort".to_owned(), Value::String("bogus".to_owned()));
+        let res = router.call_tool("comment", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("Invalid sort 'bogus'") && text.contains("asc, desc"),
+            "comment list must reject a non-asc/desc sort pre-network, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_list_all_rejects_invalid_sort() {
+        // Same asc/desc enforcement on the `list-all` action.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("list-all".to_owned()));
+        args.insert(
+            "entity_type".to_owned(),
+            Value::String("workspace".to_owned()),
+        );
+        args.insert("entity_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("sort".to_owned(), Value::String("sideways".to_owned()));
+        let res = router.call_tool("comment", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("Invalid sort 'sideways'") && text.contains("asc, desc"),
+            "comment list-all must reject a non-asc/desc sort pre-network, got: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn ripley_name_routes_to_ripley_handler() {
         let router = unauthed_router();
@@ -13729,6 +14502,69 @@ mod ripley_tool_tests {
             .expect("call_tool ok");
         let text = result_to_string(&res);
         assert!(text.contains("Unknown tool"), "got: {text}");
+    }
+
+    #[test]
+    fn dashboard_and_howto_tools_are_advertised() {
+        let tools = ToolRouter::list_tools().tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(
+            names.contains(&"dashboard"),
+            "dashboard tool must be advertised"
+        );
+        assert!(names.contains(&"howto"), "howto tool must be advertised");
+    }
+
+    #[tokio::test]
+    async fn dashboard_get_reaches_auth_gate() {
+        // An unauthenticated dashboard call short-circuits at require_auth inside
+        // handle_dashboard; reaching that (vs the unknown-tool arm) proves the
+        // `dashboard` name routed to its handler.
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("get".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        let res = router
+            .call_tool("dashboard", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(text.contains("Not authenticated"), "got: {text}");
+        assert!(!text.contains("Unknown tool"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn howto_name_and_hyphen_alias_route_to_handler() {
+        // Both `howto` and the `how-to` alias must route to handle_howto and hit
+        // the auth gate, not the unknown-tool arm.
+        for name in ["howto", "how-to"] {
+            let router = unauthed_router();
+            let mut args = Map::new();
+            args.insert("action".to_owned(), Value::String("ask".to_owned()));
+            args.insert(
+                "question".to_owned(),
+                Value::String("How do I create a share?".to_owned()),
+            );
+            let res = router.call_tool(name, args).await.expect("call_tool ok");
+            let text = result_to_string(&res);
+            assert!(
+                text.contains("Not authenticated"),
+                "tool '{name}' should reach handle_howto auth gate, got: {text}"
+            );
+            assert!(
+                !text.contains("Unknown tool"),
+                "tool '{name}' must not fall through to the unknown-tool arm, got: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_tool_advertises_my_sign_link_action() {
+        let actions = sign_tool_actions();
+        assert!(
+            actions.contains(&"envelope-my-sign-link"),
+            "sign tool must advertise envelope-my-sign-link, got: {actions:?}"
+        );
     }
 
     #[tokio::test]
@@ -13913,6 +14749,26 @@ mod ripley_tool_tests {
         assert!(
             !text.contains("failed to parse") && !text.contains("at least one file ID"),
             "JSON-array files should parse cleanly, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_api_key_update_rejects_empty_update() {
+        // Parity with the CLI `api-key update` guard: an update with no mutable
+        // field (name/scopes/agent_name/expires) is rejected client-side before
+        // the wire call, rather than forwarding an empty form to the server.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("api-key-update".to_owned()),
+        );
+        args.insert("key_id".to_owned(), Value::String("key-123".to_owned()));
+        let res = router.call_tool("auth", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("at least one update field is required"),
+            "empty api-key-update must be rejected client-side, got: {text}"
         );
     }
 
@@ -14583,149 +15439,6 @@ mod ripley_tool_tests {
     }
 
     #[test]
-    fn legacy_workflow_tools_are_flagged() {
-        // The four legacy workflow primitive tools must advertise `[legacy]`.
-        let tools = ToolRouter::list_tools().tools;
-        for name in ["task", "worklog", "approval", "todo"] {
-            let tool = tools
-                .iter()
-                .find(|t| t.name.as_ref() == name)
-                .unwrap_or_else(|| panic!("{name} tool present"));
-            let desc = tool.description.as_deref().unwrap_or_default();
-            assert!(
-                desc.contains("[legacy]"),
-                "{name} tool description must contain [legacy], got: {desc}"
-            );
-        }
-    }
-
-    #[test]
-    fn worklog_entity_type_defaults_to_profile() {
-        // Regression: the MCP worklog default was `workspace` (invalid); it
-        // must default to `profile`.
-        let empty = Map::new();
-        assert_eq!(super::worklog_entity_type(&empty), "profile");
-    }
-
-    #[test]
-    fn worklog_entity_type_accepts_node() {
-        // `node` is a documented worklog entity type and must pass through.
-        let mut args = Map::new();
-        args.insert("entity_type".to_owned(), Value::String("node".to_owned()));
-        assert_eq!(super::worklog_entity_type(&args), "node");
-    }
-
-    #[test]
-    fn approval_profile_id_prefers_profile_id_then_workspace_id() {
-        let mut with_profile = Map::new();
-        with_profile.insert("profile_id".to_owned(), Value::String("p1".to_owned()));
-        assert_eq!(super::approval_profile_id(&with_profile).ok(), Some("p1"));
-
-        // Legacy fallback to workspace_id.
-        let mut with_ws = Map::new();
-        with_ws.insert("workspace_id".to_owned(), Value::String("w1".to_owned()));
-        assert_eq!(super::approval_profile_id(&with_ws).ok(), Some("w1"));
-
-        // Neither → error.
-        assert!(super::approval_profile_id(&Map::new()).is_err());
-    }
-
-    #[tokio::test]
-    async fn approval_update_requires_a_field() {
-        // The MCP approval `update` action must reject when no mutable field is
-        // supplied (mirrors the CLI guard) before any network call.
-        let router = authed_router().await;
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("update".to_owned()));
-        args.insert("profile_id".to_owned(), Value::String("w1".to_owned()));
-        args.insert("approval_id".to_owned(), Value::String("a1".to_owned()));
-        let res = router
-            .call_tool("approval", args)
-            .await
-            .expect("call_tool ok");
-        let text = result_to_string(&res);
-        assert!(
-            text.contains("at least one of"),
-            "empty approval update must be rejected, got: {text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn approval_details_without_profile_id_uses_legacy_unscoped_route() {
-        // FIX 2: per-approval action routes (details/approve/reject/update/
-        // delete) no longer hard-require a scope. With no profile_id the legacy
-        // unscoped route is used, so the call must NOT short-circuit with a
-        // missing-profile_id error — it proceeds past validation (and only the
-        // unroutable test network fails it). Backward compat for the historical
-        // `approval details <id>` syntax.
-        let router = authed_router().await;
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("details".to_owned()));
-        args.insert("approval_id".to_owned(), Value::String("a1".to_owned()));
-        let res = router
-            .call_tool("approval", args)
-            .await
-            .expect("call_tool ok");
-        let text = result_to_string(&res);
-        assert!(
-            !text.contains("Missing required parameter: profile_id"),
-            "details without scope must not demand profile_id, got: {text}"
-        );
-    }
-
-    #[test]
-    fn approval_scope_opt_some_when_profile_id_present() {
-        let mut args = Map::new();
-        args.insert("profile_id".to_owned(), Value::String("p1".to_owned()));
-        args.insert("profile_type".to_owned(), Value::String("share".to_owned()));
-        assert_eq!(super::approval_scope_opt(&args), Some(("share", "p1")));
-
-        // Default profile_type is workspace; legacy workspace_id is accepted.
-        let mut legacy = Map::new();
-        legacy.insert("workspace_id".to_owned(), Value::String("w1".to_owned()));
-        assert_eq!(
-            super::approval_scope_opt(&legacy),
-            Some(("workspace", "w1"))
-        );
-    }
-
-    #[test]
-    fn approval_scope_opt_none_when_no_profile() {
-        // No profile_id and no workspace_id → legacy unscoped route.
-        assert_eq!(super::approval_scope_opt(&Map::new()), None);
-    }
-
-    #[test]
-    fn approval_properties_parses_object_and_string_and_rejects_scalar() {
-        // Object passed directly.
-        let mut obj = Map::new();
-        obj.insert("properties".to_owned(), json!({"k": "v"}));
-        let parsed = super::approval_properties(&obj).expect("object ok");
-        assert_eq!(parsed.expect("some")["k"], "v");
-
-        // JSON-object string is parsed.
-        let mut s = Map::new();
-        s.insert(
-            "properties".to_owned(),
-            Value::String(r#"{"k":1}"#.to_owned()),
-        );
-        let parsed = super::approval_properties(&s).expect("string ok");
-        assert_eq!(parsed.expect("some")["k"], 1);
-
-        // A non-object scalar is rejected.
-        let mut bad = Map::new();
-        bad.insert("properties".to_owned(), json!(42));
-        assert!(super::approval_properties(&bad).is_err());
-
-        // Absent → None.
-        assert!(
-            super::approval_properties(&Map::new())
-                .expect("absent ok")
-                .is_none()
-        );
-    }
-
-    #[test]
     fn json_array_string_arg_accepts_array_or_string_rejects_empty_and_nonarray() {
         // Native JSON array → serialized form preserved.
         let mut a = Map::new();
@@ -14751,7 +15464,10 @@ mod ripley_tool_tests {
         empty.insert("apply_change_ids".to_owned(), json!([]));
         assert!(super::json_array_string_arg(&empty, "apply_change_ids").is_err());
         let mut empty_s = Map::new();
-        empty_s.insert("apply_change_ids".to_owned(), Value::String("[]".to_owned()));
+        empty_s.insert(
+            "apply_change_ids".to_owned(),
+            Value::String("[]".to_owned()),
+        );
         assert!(super::json_array_string_arg(&empty_s, "apply_change_ids").is_err());
 
         // A non-array (object / scalar / non-array string) is rejected.
@@ -15196,6 +15912,76 @@ mod ripley_tool_tests {
         );
     }
 
+    #[test]
+    fn upload_limits_schema_uses_limit_action_selector() {
+        // The create/update selector for `limits` must be a DISTINCT param
+        // (`limit_action`), never the tool's routing `action` (always "limits"
+        // here). The routing `action` is auto-injected by `action_schema`, so it
+        // must NOT also appear as a documented tool param.
+        let upload = TOOL_DEFS
+            .iter()
+            .find(|d| d.name == "upload")
+            .expect("upload tool registered");
+        let names: Vec<&str> = upload.params.iter().map(|(n, _, _)| *n).collect();
+        assert!(
+            names.contains(&"limit_action"),
+            "upload tool must declare the limit_action selector param"
+        );
+        assert!(
+            !names.contains(&"action"),
+            "upload tool must NOT declare a bare `action` param (routing action is \
+             auto-injected; the limits selector is `limit_action`)"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_limits_reads_limit_action_not_routing_action() {
+        // Route to the limits handler (routing action="limits") and ask for the
+        // `update` context via `limit_action`, omitting instance_id/file_id. The
+        // pre-network validator must reject on the MISSING update fields — which
+        // proves the handler read `limit_action="update"`. If it had read the
+        // routing `action="limits"` (the old bug), the selector would be neither
+        // create nor update, validation would pass, and the call would instead
+        // fail at the network layer.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("limits".to_owned()));
+        args.insert(
+            "limit_action".to_owned(),
+            Value::String("update".to_owned()),
+        );
+        let res = router
+            .call_tool("upload", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("instance-id") && text.contains("update"),
+            "expected the update-context validation error (proving limit_action was \
+             read as the selector), got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_limits_create_requires_instance_id_via_limit_action() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("limits".to_owned()));
+        args.insert(
+            "limit_action".to_owned(),
+            Value::String("create".to_owned()),
+        );
+        let res = router
+            .call_tool("upload", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("instance-id") && text.contains("create"),
+            "expected the create-context validation error, got: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn sign_describe_communicates_workspace_id_requirement() {
         // The describe payload (rendered markdown) is the authoritative
@@ -15334,6 +16120,38 @@ mod ripley_tool_tests {
         assert!(
             text.contains("Missing required parameter: envelope_id"),
             "envelope-get must require envelope_id, got: {text}"
+        );
+    }
+
+    #[test]
+    fn sign_tool_advertises_envelope_retry() {
+        // retry is idempotent + no-op-success and notifies no one, so it IS
+        // exposed over MCP (unlike the CLI-only send/void). It must be advertised
+        // and must NOT be in the forbidden outward/terminal set.
+        let actions = sign_tool_actions();
+        assert!(
+            actions.contains(&"envelope-retry"),
+            "sign MCP tool must advertise the idempotent-recovery action 'envelope-retry'"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_envelope_retry_requires_envelope_id() {
+        // retry is routed through the real handler (NOT the CLI-only guidance),
+        // so a call with workspace_id but no envelope_id surfaces the missing
+        // envelope_id — proving retry is exposed, not gated like send/void.
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("envelope-retry".to_owned()),
+        );
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        let res = router.call_tool("sign", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("Missing required parameter: envelope_id"),
+            "envelope-retry must require envelope_id (and not be CLI-only-gated), got: {text}"
         );
     }
 
@@ -15805,6 +16623,114 @@ mod ripley_tool_tests {
         );
     }
 
+    // ─── Phase 8 Ripley: needs_input + publish-403 + 409-too-large ───────────
+
+    /// Build a `CliError::Api` for the Ripley MCP error-mapping tests.
+    fn ai_api_err(code: u32, http_status: u16) -> fastio_cli::error::CliError {
+        fastio_cli::error::CliError::Api(fastio_cli::error::ApiError::new(
+            code,
+            None,
+            "boom".to_owned(),
+            http_status,
+        ))
+    }
+
+    #[test]
+    fn mcp_needs_input_note_surfaces_clarification() {
+        use super::mcp_needs_input_note;
+        let body = serde_json::json!({
+            "message": {"state": "needs_input"},
+            "clarification": {"type": "clarification", "question": "Which workspace?"},
+        });
+        let note = mcp_needs_input_note(&body, "C1");
+        assert!(
+            note.contains("Which workspace?"),
+            "must restate the question: {note}"
+        );
+        assert!(note.contains("chat_id=C1"), "must say how to reply: {note}");
+    }
+
+    #[test]
+    fn mcp_needs_input_note_without_question_still_guides_reply() {
+        use super::mcp_needs_input_note;
+        let body = serde_json::json!({"message": {"state": "needs_input"}});
+        let note = mcp_needs_input_note(&body, "C2");
+        assert!(
+            note.contains("more information") && note.contains("chat_id=C2"),
+            "must still guide a reply: {note}"
+        );
+    }
+
+    #[test]
+    fn mcp_needs_input_note_surfaces_share_turn_clarification() {
+        // A SHARE ask wraps the detail under `turn`, not `message` (ai.txt:771).
+        // The shared `extract_clarification_question` (via `message_detail`) must
+        // still find the clarification so the MCP note restates it.
+        use super::mcp_needs_input_note;
+        let body = serde_json::json!({
+            "turn": {"state": "needs_input"},
+            "clarification": {"type": "clarification", "question": "Which share folder?"},
+        });
+        let note = mcp_needs_input_note(&body, "CS");
+        assert!(
+            note.contains("Which share folder?") && note.contains("chat_id=CS"),
+            "share turn clarification must be surfaced: {note}"
+        );
+    }
+
+    #[test]
+    fn ai_publish_403_maps_to_disabled_message() {
+        use super::ai_publish_err_to_result;
+        let m = result_to_string(&ai_publish_err_to_result(&ai_api_err(0, 403)));
+        assert!(
+            m.to_lowercase().contains("disabled"),
+            "must say disabled: {m}"
+        );
+    }
+
+    #[test]
+    fn ai_publish_non_403_not_mislabeled() {
+        use super::ai_publish_err_to_result;
+        let m = result_to_string(&ai_publish_err_to_result(&ai_api_err(1658, 406)));
+        assert!(
+            !m.to_lowercase().contains("disabled"),
+            "a non-403 must not claim publishing is disabled: {m}"
+        );
+    }
+
+    #[test]
+    fn ai_send_too_large_codes_map_but_bare_409_does_not() {
+        use super::ai_send_err_to_result;
+        // The specific per-call-site STATE_TOO_LARGE codes map to the too-large
+        // "start a new chat" guidance regardless of the reported HTTP status.
+        for code in [168_116u32, 153_795, 148_135, 144_657] {
+            let m = result_to_string(&ai_send_err_to_result(&ai_api_err(code, 409)));
+            assert!(
+                m.to_lowercase().contains("too large") && m.to_lowercase().contains("new chat"),
+                "code {code} must map to too large + new chat: {m}"
+            );
+        }
+        // A bare 409 WITHOUT a too-large code (e.g. the retryable
+        // SEQUENCE_FAILURE the create/message endpoints also return) must NOT be
+        // mislabeled "too large" — that would tell the agent to start a new chat
+        // when it should retry the same idempotency key.
+        let m = result_to_string(&ai_send_err_to_result(&ai_api_err(0, 409)));
+        assert!(
+            !m.to_lowercase().contains("too large"),
+            "a bare 409 (SEQUENCE_FAILURE) must NOT be labeled too large: {m}"
+        );
+    }
+
+    #[test]
+    fn ai_send_unrelated_error_not_mislabeled() {
+        use super::ai_send_err_to_result;
+        let m = result_to_string(&ai_send_err_to_result(&ai_api_err(0, 402)));
+        assert!(
+            !m.to_lowercase().contains("too large"),
+            "a non-409 must not claim the conversation is too large: {m}"
+        );
+    }
+
     // ─── Phase 7 billing: org tool action surface + subscribe onboarding ─────
 
     #[test]
@@ -16259,6 +17185,40 @@ mod ripley_tool_tests {
         assert!(
             text.contains("`password` must be a string"),
             "a non-string password must be rejected with a type error, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn files_add_file_rejects_hash_in_workspace_context() {
+        // MCP add-file is workspace-scoped, and the workspace add-file handler
+        // does not accept a hash source (only `update` does). Passing `hash`
+        // must be rejected with the SAME guard the CLI uses, BEFORE any network
+        // call — so an agent doesn't build a request the server would 400.
+        //
+        // The router is authenticated (to clear require_auth) but pointed at an
+        // unroutable base, so a regression that skipped the guard would surface
+        // as a refused connection here, never a real API request.
+        let state = Arc::new(McpState::new_unauthenticated_for_test(
+            "http://127.0.0.1:1/current",
+        ));
+        state.set_token("test-token".to_owned()).await;
+        let router = ToolRouter::new(state);
+
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("add-file".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("name".to_owned(), Value::String("dedup.bin".to_owned()));
+        args.insert("hash".to_owned(), Value::String("abc123".to_owned()));
+        args.insert("hash_type".to_owned(), Value::String("sha256".to_owned()));
+
+        let res = router.call_tool("files", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        // The exact guard message proves the workspace hash-context guard fired
+        // (a network call to the bogus base could never produce this string).
+        assert!(
+            text.contains("only supported in a share context") && text.contains("use --upload-id"),
+            "MCP add-file with a hash arg must be rejected by the workspace guard \
+             before any request, got: {text}"
         );
     }
 
@@ -17010,6 +17970,268 @@ mod ripley_tool_tests {
         assert!(
             m.contains("Re-fetch") && m.contains("re-apply") && m.contains("current version id"),
             "a VersionConflict must carry the rebase suggestion: {m}"
+        );
+    }
+
+    // ─── Strict optional-param parsers (Phase-3 constrained params) ──────────
+
+    /// `optional_u32_strict` must reject a PRESENT-but-non-integer value
+    /// (e.g. `rotate: "90deg"`) instead of silently dropping it, while passing
+    /// through valid and absent values.
+    #[test]
+    fn optional_u32_strict_rejects_malformed_passes_valid_and_absent() {
+        use super::optional_u32_strict;
+        // Absent → Ok(None).
+        let empty = Map::new();
+        assert_eq!(
+            optional_u32_strict(&empty, "rotate").ok().flatten(),
+            None,
+            "an absent param must resolve to None"
+        );
+        // Valid numeric → Ok(Some(v)).
+        let mut num = Map::new();
+        num.insert("rotate".to_owned(), json!(90));
+        assert_eq!(
+            optional_u32_strict(&num, "rotate").ok().flatten(),
+            Some(90),
+            "a valid integer must parse"
+        );
+        // Valid numeric string → Ok(Some(v)).
+        let mut numstr = Map::new();
+        numstr.insert("rotate".to_owned(), json!("90"));
+        assert_eq!(
+            optional_u32_strict(&numstr, "rotate").ok().flatten(),
+            Some(90),
+            "a valid integer string must parse"
+        );
+        // Present-but-malformed → Err with a param-named message.
+        let mut bad = Map::new();
+        bad.insert("rotate".to_owned(), json!("90deg"));
+        let err = optional_u32_strict(&bad, "rotate")
+            .expect_err("a present-but-non-integer value must error");
+        let text = result_to_string(&err);
+        assert!(
+            text.contains("rotate") && text.contains("integer"),
+            "the error must name the bad param and say it must be an integer: {text}"
+        );
+        // Null is treated as absent (parity with the lenient helper).
+        let mut null = Map::new();
+        null.insert("rotate".to_owned(), Value::Null);
+        assert_eq!(
+            optional_u32_strict(&null, "rotate").ok().flatten(),
+            None,
+            "an explicit null must resolve to None, not an error"
+        );
+    }
+
+    /// `optional_bool_strict` must reject a PRESENT-but-invalid value
+    /// (e.g. `intelligence: "tru"`) instead of silently defaulting to `false`,
+    /// while passing through valid and absent values.
+    #[test]
+    fn optional_bool_strict_rejects_malformed_passes_valid_and_absent() {
+        use super::optional_bool_strict;
+        // Absent → Ok(None).
+        let empty = Map::new();
+        assert_eq!(
+            optional_bool_strict(&empty, "intelligence").ok().flatten(),
+            None,
+            "an absent param must resolve to None"
+        );
+        // Native bool → Ok(Some(v)).
+        let mut native = Map::new();
+        native.insert("intelligence".to_owned(), json!(true));
+        assert_eq!(
+            optional_bool_strict(&native, "intelligence").ok().flatten(),
+            Some(true),
+            "a native bool must parse"
+        );
+        // String "false" → Ok(Some(false)).
+        let mut boolstr = Map::new();
+        boolstr.insert("intelligence".to_owned(), json!("false"));
+        assert_eq!(
+            optional_bool_strict(&boolstr, "intelligence")
+                .ok()
+                .flatten(),
+            Some(false),
+            "a valid bool string must parse"
+        );
+        // Present-but-malformed → Err with a param-named message.
+        let mut bad = Map::new();
+        bad.insert("intelligence".to_owned(), json!("tru"));
+        let err = optional_bool_strict(&bad, "intelligence")
+            .expect_err("a present-but-invalid bool must error");
+        let text = result_to_string(&err);
+        assert!(
+            text.contains("intelligence") && text.contains("boolean"),
+            "the error must name the bad param and say it must be a boolean: {text}"
+        );
+    }
+
+    /// The MCP `upload web-list` handler validates `status` against the same
+    /// set the CLI's clap `value_parser` enforces — a bad value must error
+    /// before reaching the server, and every valid value must be accepted.
+    #[tokio::test]
+    async fn upload_web_list_rejects_invalid_status() {
+        use super::WEB_UPLOAD_STATUSES;
+        // The valid set is the contract set (upload.txt), `canceled` spelling.
+        assert_eq!(
+            WEB_UPLOAD_STATUSES,
+            &[
+                "pending",
+                "queued",
+                "downloading",
+                "uploading",
+                "complete",
+                "failed",
+                "canceled",
+            ]
+        );
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("web-list".to_owned()));
+        args.insert("status".to_owned(), json!("cancelled")); // double-l typo
+        let result = router
+            .call_tool("upload", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&result);
+        assert!(
+            text.contains("Invalid status") && text.contains("cancelled"),
+            "an invalid web-list status must be rejected before the call: {text}"
+        );
+    }
+
+    /// The MCP `workflow list` handler uses the strict bool helper for
+    /// `created_by_me` — a present-but-malformed value (e.g. `"me"`) must error
+    /// rather than be silently dropped to an unfiltered list.
+    #[tokio::test]
+    async fn workflow_list_rejects_malformed_created_by_me() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("list".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("created_by_me".to_owned(), json!("me")); // not a bool
+        let result = router
+            .call_tool("workflow", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&result);
+        assert!(
+            text.contains("created_by_me") && text.contains("boolean"),
+            "a malformed created_by_me must be rejected, not silently dropped: {text}"
+        );
+    }
+
+    /// The MCP `workflow list` handler validates `archived` against the same
+    /// closed set the CLI's clap `value_parser` enforces — a present-but-invalid
+    /// value must error before reaching the server.
+    #[tokio::test]
+    async fn workflow_list_rejects_invalid_archived() {
+        use super::WORKFLOW_ARCHIVED_FILTERS;
+        assert_eq!(WORKFLOW_ARCHIVED_FILTERS, &["true", "false", "all"]);
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("list".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("archived".to_owned(), json!("maybe"));
+        let result = router
+            .call_tool("workflow", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&result);
+        assert!(
+            text.contains("Invalid archived") && text.contains("maybe"),
+            "an invalid archived filter must be rejected before the call: {text}"
+        );
+    }
+
+    /// The MCP `workflow template-list` handler validates `usage` against the
+    /// same closed set the CLI's clap `value_parser` enforces — a
+    /// present-but-invalid value must error before reaching the server.
+    #[tokio::test]
+    async fn workflow_template_list_rejects_invalid_usage() {
+        use super::WORKFLOW_TEMPLATE_USAGE_FILTERS;
+        assert_eq!(
+            WORKFLOW_TEMPLATE_USAGE_FILTERS,
+            &["library", "one_off", "all"]
+        );
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("template-list".to_owned()),
+        );
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("usage".to_owned(), json!("bogus"));
+        let result = router
+            .call_tool("workflow", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&result);
+        assert!(
+            text.contains("Invalid usage") && text.contains("bogus"),
+            "an invalid usage filter must be rejected before the call: {text}"
+        );
+    }
+
+    /// The MCP `event search` handler reads `acknowledged` with the strict
+    /// boolean parser, so a present-but-malformed value errors before the
+    /// network round-trip instead of silently widening the query.
+    #[tokio::test]
+    async fn event_search_rejects_malformed_acknowledged() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("search".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("acknowledged".to_owned(), json!("yep"));
+        let result = router.call_tool("event", args).await.expect("call_tool ok");
+        let text = result_to_string(&result);
+        assert!(
+            text.contains("acknowledged") && text.contains("boolean"),
+            "a malformed acknowledged must be rejected before the call: {text}"
+        );
+    }
+
+    /// `event summarize` mirrors `search`'s strict `acknowledged` parsing.
+    #[tokio::test]
+    async fn event_summarize_rejects_malformed_acknowledged() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("summarize".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("acknowledged".to_owned(), json!("maybe"));
+        let result = router.call_tool("event", args).await.expect("call_tool ok");
+        let text = result_to_string(&result);
+        assert!(
+            text.contains("acknowledged") && text.contains("boolean"),
+            "a malformed acknowledged must be rejected before the call: {text}"
+        );
+    }
+
+    /// Inline `comment create` enforces the same ≤25 attachment cap as `attach`
+    /// — 26 inline `target_ids` are rejected before any network round-trip.
+    #[tokio::test]
+    async fn comment_create_rejects_more_than_25_target_ids() {
+        let router = authed_router().await;
+        let ids: Vec<String> = (0..26).map(|i| format!("obj{i}")).collect();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("create".to_owned()));
+        args.insert(
+            "entity_type".to_owned(),
+            Value::String("workspace".to_owned()),
+        );
+        args.insert("entity_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("node_id".to_owned(), Value::String("node1".to_owned()));
+        args.insert("text".to_owned(), Value::String("hi".to_owned()));
+        args.insert("target_ids".to_owned(), Value::String(ids.join(",")));
+        let result = router
+            .call_tool("comment", args)
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&result);
+        assert!(
+            text.contains("at most 25 attachments"),
+            "create with 26 target_ids must be rejected, got: {text}"
         );
     }
 }
