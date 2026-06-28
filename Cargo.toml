@@ -1,6 +1,6 @@
 [package]
 name = "fastio-cli"
-version = "2026.6.16"
+version = "0.2.5"
 edition = "2024"
 description = "Command-line interface for the Fast.io cloud storage platform"
 license = "Apache-2.0"
