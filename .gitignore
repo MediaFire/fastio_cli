@@ -11,6 +11,13 @@
 # OS
 .DS_Store
 Thumbs.db
+# macOS Spotlight indexing marker (load-bearing — ignore, never delete)
+.metadata_never_index
+
+# Tool scratch & caches
+.antigravitycli/
+cache/
+temp/
 
 # Environment
 .env

@@ -20,15 +20,15 @@ Both modes share a common API layer, ensuring zero code duplication.
         v                    v                         v
 +----------------+   +------------------+     +------------------+
 |  cli.rs        |   |  commands/       |     |  mcp/            |
-|  Clap derive   |   |  25 command      |     |  MCP server      |
-|  definitions   |   |  modules         |     |  22 tools        |
+|  Clap derive   |   |  29 command      |     |  MCP server      |
+|  definitions   |   |  modules         |     |  25 tools        |
 +----------------+   +------------------+     +------------------+
                           |         |               |
                     +-----+         +--------+      |
                     v                        v      |
             +-------------+          +------+------+
             |  api/       |          |  output/    |
-            |  16 endpoint|          |  JSON,Table,|
+            |  25 endpoint|          |  JSON,Table,|
             |  modules    |          |  CSV render |
             +-------------+          +-------------+
                     |
@@ -61,19 +61,19 @@ Both modes share a common API layer, ensuring zero code duplication.
 - Tokio async entry point
 - MCP mode detection — routes to MCP server before tracing init (to avoid corrupting stdio)
 - CLI mode: parses args via clap, initializes tracing (stderr), loads config, dispatches to commands
-- Error interception with colored output and suggestions via `CliError::render_stderr()`
+- Error interception with colored output and suggestions via `cli_error_render()`, which renders the anyhow chain through `render_chain_dedup()` (collapsing the `#[from]` forward-to-source duplicate `thiserror` generates for `CliError::Api`) and appends the `CliError`'s own `suggestion()` as a `hint:` line
 
 ### `cli.rs`
 - Defines `Cli` struct with `#[derive(Parser)]`
 - Global flags: `--format`, `--fields`, `--no-color`, `--quiet`, `--verbose`, `--profile`, `--token`, `--api-base`
-- `Commands` enum with 25 top-level subcommands
+- `Commands` enum with 31 top-level subcommands (incl. hidden legacy aliases)
 - Nested subcommand enums for complex groups (org billing, org members, share files, task lists, etc.)
 
 ### `error.rs`
-- `CliError` enum using `thiserror` with variants: `Api`, `Auth`, `Config`, `Io`, `Http`, `Parse`, `RateLimit`
+- `CliError` enum using `thiserror` with variants: `Api`, `Auth`, `Config`, `Io`, `Http`, `Parse`, `RateLimit`, `ArtifactNotReady`, `InvalidHeaderValue` (secret can't form an HTTP header), `MappedApi` (command-layer hint override wrapper), `VersionConflict` (CAS write-back conflict)
 - `ApiError` struct: `code`, `error_code`, `message`, `http_status`
-- `suggestion()` methods providing actionable hints based on error codes and HTTP status
-- `render_stderr()` for colored error display
+- `suggestion()` methods providing actionable hints based on error codes and HTTP status (`ArtifactNotReady` returns the poll-and-retry hint instead of the generic-404 wording)
+- `render_stderr()` for colored error display of a bare `CliError`; the `main.rs` interception now renders through `cli_error_render()` + `render_chain_dedup()` (chain-aware, byte-identical to `render_stderr` for a bare `CliError`)
 
 ### `config.rs`
 - Manages `~/.fastio/config.json`
@@ -91,6 +91,7 @@ Both modes share a common API layer, ensuring zero code duplication.
 - User-Agent: `fastio-cli/<version>`
 - 120-second request timeout (supports event long-polling)
 - `get_token()` accessor for MCP mode token forwarding
+- **Link-password header seam (File Shares).** `get_with_password` / `post_with_password` / `download_file_stream_with_password` attach the link password in the `x-ve-password` header (set sensitive, added to `SECRET_LOG_KEYS` so it is redacted from traces) and route through a **no-redirect** client whenever a password is present — reqwest 0.12 does NOT strip custom headers on a cross-origin 3xx, so a redirect-following client would replay the password to the `Location` target. `post_sensitive_form` is the FORM-FIELD sibling: it protects a sensitive FORM value (the password sent as a `password=…` form field on management create/update), failing closed on any 3xx so the body is never replayed — NOT a header-password path. The preview path (`download_preview_following_redirect`) follows at most ONE redirect MANUALLY, re-issuing the follow GET WITHOUT `Authorization` or `x-ve-password` (the embedded download token authorizes it) and failing closed on a second redirect
 
 ### `auth/`
 
@@ -113,7 +114,9 @@ Both modes share a common API layer, ensuring zero code duplication.
 - Local TCP server on port 19836 for OAuth callback
 - Authorization code + state extraction and CSRF validation
 
-### `api/` — 16 Modules
+### `api/` — 27 Modules
+
+Count convention: **25 endpoint modules** = `src/api/*.rs` excluding `mod.rs` (declarations) and `types.rs` (shared structs; the `—` table row). The table below lists representative modules, not all 25.
 
 Each module contains typed functions mapping to Fast.io REST endpoints:
 
@@ -122,22 +125,26 @@ Each module contains typed functions mapping to Fast.io REST endpoints:
 | `auth.rs` | 21 functions | Login, signup, 2FA, API keys, OAuth sessions, PKCE |
 | `user.rs` | 16 functions | Profile, search, assets, invitations |
 | `org.rs` | 42 functions | CRUD, billing, members, transfer, discovery, assets |
-| `workspace.rs` | 38 functions | CRUD, metadata, notes, quickshares, archiving |
-| `storage.rs` | 23 functions | File/folder CRUD, versions, locks, search |
+| `workspace.rs` | 35 functions | CRUD, metadata, notes, archiving |
+| `storage.rs` | 22 functions | File/folder CRUD, versions, locks, search |
 | `upload.rs` | 17 functions | Sessions, chunks, finalize, web import, limits |
-| `download.rs` | 3 functions | Token-based downloads, ZIP, quickshare |
-| `share.rs` | 17 functions | CRUD, storage, members, password, quickshare |
+| `download.rs` | 2 functions | Token-based downloads, ZIP |
+| `share.rs` | 16 functions | CRUD, storage, members, password |
 | `ai.rs` | 14 functions | Chat CRUD, messages, search, summarize |
 | `comment.rs` | 12 functions | CRUD, reactions, linking |
 | `event.rs` | 5 functions | Search, summarize, details, polling |
 | `member.rs` | 9 functions | Add, remove, transfer, leave, join |
-| `workflow.rs` | 33 functions | Tasks, task lists, worklogs, approvals, todos |
+| `workflow.rs` | 25 functions | Tasks API: task lists, tasks, comments, attachments |
 | `apps.rs` | 4 functions | List, details, launch, tool-apps |
 | `import.rs` | 22 functions | Providers, identities, sources, jobs, writebacks |
 | `locking.rs` | 3 functions | Acquire, status, release |
+| `signing.rs` | 14 functions | E-signature (SignEnvelope) — workspace-only CRUD/lifecycle, document/preview/signed/audit download paths |
+| `fileshare.rs` | 10 functions | File Shares — durable single-file link shares (replacing the retired QuickShare): management create/list/update/delete + grants, password-capable anonymous consumption (details/versions), write-back path builders, websocket-auth token, named-key extractors |
 | `types.rs` | — | Shared response structs |
 
-### `commands/` — 25 Modules
+### `commands/` — 32 Modules
+
+Count convention: **29 command modules** = `src/bin/fastio/commands/*.rs` excluding `mod.rs` (declarations); there is no `types.rs` here. (Note: `secret_output.rs` is a shared HELPER module, not a command group — it is counted here because the convention counts every `*.rs` under `commands/` except `mod.rs`.) The table below lists representative modules, not all 29.
 
 Each module handles one command group, orchestrating API calls and output rendering:
 
@@ -146,8 +153,8 @@ Each module handles one command group, orchestrating API calls and output render
 | `auth.rs` | 21 | Login, 2FA, API keys, OAuth sessions |
 | `user.rs` | 16 | Profile, search, assets, invitations |
 | `org.rs` | 42 | Full org management with nested billing/members/invitations/transfer/assets |
-| `workspace.rs` | 24 | CRUD, metadata, notes, quickshares |
-| `files.rs` | 23 | Storage operations, locking, quickshares |
+| `workspace.rs` | 24 | CRUD, metadata, notes |
+| `files.rs` | 22 | Storage operations, locking |
 | `upload.rs` | 18 | Chunked upload with progress bars, session management |
 | `download.rs` | 3 | Streaming download with progress bars |
 | `share.rs` | 17 | Share management with nested files/members |
@@ -159,12 +166,12 @@ Each module handles one command group, orchestrating API calls and output render
 | `preview.rs` | 3 | Preview URLs and transforms |
 | `asset.rs` | 3 | Asset management |
 | `task.rs` | 16 | Tasks and task lists |
-| `worklog.rs` | 6 | Worklog entries |
-| `approval.rs` | 4 | Approval workflows |
-| `todo.rs` | 7 | Todo items |
 | `apps.rs` | 4 | App integration |
 | `import.rs` | 22 | Cloud import/sync |
 | `lock.rs` | 3 | File locking |
+| `sign.rs` | 10 | E-signature (workspace-only): envelope create/list/get/update/send/void, document download/preview/signed, audit download |
+| `fileshare.rs` | 12 | File Shares: create/list/info/update/delete, grants list/add/remove, download/versions/preview, upload (write-back, CAS), activity, ws-token. `map_fileshare_error` + anonymous-capable consumption client |
+| `secret_output.rs` | — | Shared helper (not a command group): `extract_secret` / `write_secret_file` (0600) / `redact_secret_field` for realtime / ws tokens (used by `workflow` and `fileshare`) |
 | `configure.rs` | 4 | CLI configuration |
 | `mod.rs` | — | Module declarations |
 
@@ -179,7 +186,7 @@ Each module handles one command group, orchestrating API calls and output render
 - Tracing disabled to keep stdout clean for JSON-RPC
 
 #### `tools.rs`
-- 22 action-routed tools with 286 total actions
+- 25 action-routed tools (each multiplexes many actions via its `action` parameter)
 - Each tool has an `action` parameter for routing (mirrors the remote MCP server pattern)
 - All handlers call existing `src/api/` functions — zero duplicated API logic
 - Returns MCP text content blocks with markdown-formatted data,
@@ -301,7 +308,7 @@ The `ApiClient::handle_response()` method:
 
 1. **Direct REST API** — calls `api.fast.io` directly, not through the MCP server, for single-hop latency
 2. **Shared API layer** — both CLI and MCP modes use `src/api/`, ensuring feature parity
-3. **Action-based MCP tools** — mirrors the remote MCP server's consolidated tool pattern (22 tools with action routing vs 286 individual tools)
+3. **Action-based MCP tools** — mirrors the remote MCP server's consolidated tool pattern (25 action-routed tools rather than one tool per individual action)
 4. **Form-encoded POST bodies** — matches the Fast.io API convention (not JSON, unless specifically required)
 5. **Cursor-based pagination** — for storage endpoints; offset-based for other list endpoints
 6. **CSPRNG for PKCE** — `getrandom` crate, not `HashMap::RandomState`

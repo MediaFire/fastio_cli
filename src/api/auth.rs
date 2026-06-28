@@ -34,12 +34,18 @@ pub async fn sign_in(
 /// Create a new user account.
 ///
 /// `POST /user/` with form-encoded body.
+///
+/// When `agent` is `true` the `agent` form field is sent as `"true"`, tagging
+/// the account as an AI-agent account (`account_type` becomes `"agent"`
+/// permanently per `auth.txt`). When `false` the field is omitted (default
+/// non-agent account).
 pub async fn sign_up(
     client: &ApiClient,
     email: &str,
     password: &str,
     first_name: Option<&str>,
     last_name: Option<&str>,
+    agent: bool,
 ) -> Result<SignUpResponse, CliError> {
     let mut form = HashMap::new();
     form.insert("email_address".to_owned(), email.to_owned());
@@ -52,6 +58,9 @@ pub async fn sign_up(
     if let Some(last) = last_name {
         form.insert("last_name".to_owned(), last.to_owned());
     }
+    if agent {
+        form.insert("agent".to_owned(), "true".to_owned());
+    }
 
     client.post_no_auth("/user/", &form).await
 }
@@ -61,6 +70,46 @@ pub async fn sign_up(
 /// `GET /user/auth/check/`
 pub async fn check_token(client: &ApiClient) -> Result<AuthCheckResponse, CliError> {
     client.get("/user/auth/check/").await
+}
+
+/// Sign out — invalidate every revocable JWT issued to the calling user.
+///
+/// `POST /user/auth/sign-out/` (no body).
+///
+/// This is the server-side "logout" for interactive (revocable) browser
+/// sessions; per `auth.txt` it does NOT affect API keys, OAuth/PKCE access
+/// tokens, agent tokens, or non-revocable JWTs. For a strict superset that also
+/// kills account-session tokens, use [`invalidate_all`].
+pub async fn sign_out(client: &ApiClient) -> Result<EmptyResponse, CliError> {
+    client.post_empty("/user/auth/sign-out/").await
+}
+
+/// Invalidate EVERY login session for the calling user ("sign out everywhere").
+///
+/// `POST /user/auth/invalidate-all/` (no body).
+///
+/// A strict superset of [`sign_out`]: per `auth.txt` it bumps both the user's
+/// `session_version` (revocable browser tokens) and `global_session_version`
+/// (all account-session tokens — interactive logins regardless of the revocable
+/// opt-in, Ripley AI-chat tokens, and workflow-agent tokens). It does NOT affect
+/// OAuth/PKCE access tokens or API keys, which have separate revocation paths.
+pub async fn invalidate_all(client: &ApiClient) -> Result<EmptyResponse, CliError> {
+    client.post_empty("/user/auth/invalidate-all/").await
+}
+
+/// Confirm a pending email-address change.
+///
+/// `POST /user/email/change/` with the one-time `token` from the confirmation
+/// link emailed to the new address. The change is requested via
+/// `POST /user/update/` (`email_address` + `current_password`) and only takes
+/// effect once confirmed here (per `auth.txt`).
+pub async fn email_change_confirm(
+    client: &ApiClient,
+    token: &str,
+) -> Result<EmptyResponse, CliError> {
+    let mut form = HashMap::new();
+    form.insert("token".to_owned(), token.to_owned());
+    client.post("/user/email/change/", &form).await
 }
 
 /// Send or confirm email verification.
@@ -201,11 +250,16 @@ pub async fn two_factor_disable(
 /// Create an API key.
 ///
 /// `POST /user/auth/key/`
+///
+/// `expires` is an optional expiration datetime — any `strtotime`-compatible
+/// value, canonical form `Y-m-d H:i:s UTC` (e.g. `2026-12-31 23:59:59 UTC`),
+/// and must be in the future (per `auth.txt`). Omit for a non-expiring key.
 pub async fn api_key_create(
     client: &ApiClient,
     name: Option<&str>,
     scopes: Option<&str>,
     agent_name: Option<&str>,
+    expires: Option<&str>,
 ) -> Result<ApiKeyCreateResponse, CliError> {
     let mut form = HashMap::new();
     if let Some(n) = name {
@@ -216,6 +270,9 @@ pub async fn api_key_create(
     }
     if let Some(a) = agent_name {
         form.insert("agent_name".to_owned(), a.to_owned());
+    }
+    if let Some(e) = expires {
+        form.insert("expires".to_owned(), e.to_owned());
     }
     client.post("/user/auth/key/", &form).await
 }
@@ -246,11 +303,16 @@ pub async fn api_key_get(client: &ApiClient, key_id: &str) -> Result<Value, CliE
 /// Update an API key.
 ///
 /// `POST /user/auth/key/{key_id}/`
+///
+/// `agent_name` and `expires` mirror [`api_key_create`]; an empty string for
+/// `expires` clears an existing expiration (per `auth.txt`).
 pub async fn api_key_update(
     client: &ApiClient,
     key_id: &str,
     name: Option<&str>,
     scopes: Option<&str>,
+    agent_name: Option<&str>,
+    expires: Option<&str>,
 ) -> Result<Value, CliError> {
     let mut form = HashMap::new();
     if let Some(n) = name {
@@ -258,6 +320,12 @@ pub async fn api_key_update(
     }
     if let Some(s) = scopes {
         form.insert("scopes".to_owned(), s.to_owned());
+    }
+    if let Some(a) = agent_name {
+        form.insert("agent_name".to_owned(), a.to_owned());
+    }
+    if let Some(e) = expires {
+        form.insert("expires".to_owned(), e.to_owned());
     }
     let path = format!("/user/auth/key/{}/", urlencoding::encode(key_id));
     client.post(&path, &form).await
@@ -320,6 +388,29 @@ pub async fn oauth_details(client: &ApiClient, session_id: &str) -> Result<Value
     client.get(&path).await
 }
 
+/// Rename an OAuth session's display labels.
+///
+/// `PATCH /oauth/sessions/{session_id}/` with a form-encoded body. Updates the
+/// session's `device_name` (human-readable device label) and/or `agent_name`
+/// (connection/agent label) per `oauth.txt`; an empty string clears a label to
+/// null. At least one of the two should be provided.
+pub async fn oauth_rename(
+    client: &ApiClient,
+    session_id: &str,
+    device_name: Option<&str>,
+    agent_name: Option<&str>,
+) -> Result<Value, CliError> {
+    let mut form = HashMap::new();
+    if let Some(d) = device_name {
+        form.insert("device_name".to_owned(), d.to_owned());
+    }
+    if let Some(a) = agent_name {
+        form.insert("agent_name".to_owned(), a.to_owned());
+    }
+    let path = format!("/oauth/sessions/{}/", urlencoding::encode(session_id));
+    client.patch_form(&path, &form).await
+}
+
 /// Revoke a single OAuth session.
 ///
 /// `DELETE /oauth/sessions/{session_id}/`
@@ -331,8 +422,22 @@ pub async fn oauth_revoke(client: &ApiClient, session_id: &str) -> Result<Value,
 /// Revoke all OAuth sessions.
 ///
 /// `DELETE /oauth/sessions/`
-pub async fn oauth_revoke_all(client: &ApiClient) -> Result<Value, CliError> {
-    client.delete("/oauth/sessions/").await
+///
+/// When `keep_session_id` is `Some`, the documented `exclude_current=true` +
+/// `current_session_id=<id>` query pair is sent so that one session (e.g. the
+/// caller's own) is preserved while all others are revoked (per `oauth.txt`).
+pub async fn oauth_revoke_all(
+    client: &ApiClient,
+    keep_session_id: Option<&str>,
+) -> Result<Value, CliError> {
+    if let Some(session_id) = keep_session_id {
+        let mut params = HashMap::new();
+        params.insert("exclude_current".to_owned(), "true".to_owned());
+        params.insert("current_session_id".to_owned(), session_id.to_owned());
+        client.delete_with_params("/oauth/sessions/", &params).await
+    } else {
+        client.delete("/oauth/sessions/").await
+    }
 }
 
 /// Get the current session info (alias for user details).

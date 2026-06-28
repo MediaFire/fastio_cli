@@ -24,8 +24,10 @@ pub mod json;
 pub mod markdown;
 /// Table output renderer.
 pub mod table;
+/// Terminal markdown renderer for `fastio view`.
+pub mod view;
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 
 use serde_json::Value;
 
@@ -62,6 +64,60 @@ impl std::fmt::Display for OutputFormat {
     }
 }
 
+/// Server-side response-verbosity level, selected by the global `--detail`
+/// flag and threaded into envelope GET requests as `?output=<detail>`.
+///
+/// This is **orthogonal** to [`OutputFormat`]: `--detail` controls how much
+/// data the *server* returns (smaller payloads, fewer tokens), while
+/// `--format` controls how the client *renders* whatever it received. The
+/// tokens map 1:1 onto the documented server `output=` detail levels
+/// (`terse`/`standard`/`full`); `full` is the server default and equivalent
+/// to omitting the parameter.
+///
+/// `#[non_exhaustive]` because the server may add detail levels without an
+/// API-version bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OutputDetail {
+    /// Smallest useful shape: identifiers and navigation fields only.
+    Terse,
+    /// `terse` plus the operational context most list/detail views render.
+    Standard,
+    /// The complete resource shape (server default).
+    Full,
+}
+
+impl OutputDetail {
+    /// The server query token for this detail level.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Terse => "terse",
+            Self::Standard => "standard",
+            Self::Full => "full",
+        }
+    }
+
+    /// Parse a `--detail` flag value, returning `None` for an unrecognized or
+    /// absent token (the caller then injects nothing and the server applies
+    /// its `full` default).
+    #[must_use]
+    pub fn from_flag(s: Option<&str>) -> Option<Self> {
+        match s {
+            Some("terse") => Some(Self::Terse),
+            Some("standard") => Some(Self::Standard),
+            Some("full") => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for OutputDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl OutputFormat {
     /// Parse a format string (from `--format` flag).
     #[must_use]
@@ -93,7 +149,7 @@ impl OutputFormat {
 /// Configuration for output rendering.
 #[derive(Debug, Clone)]
 pub struct OutputConfig {
-    /// The output format to use.
+    /// The output format to use (how the client renders the data).
     pub format: OutputFormat,
     /// Optional field filter (comma-separated field names).
     pub fields: Option<Vec<String>>,
@@ -101,6 +157,9 @@ pub struct OutputConfig {
     pub no_color: bool,
     /// Suppress all output.
     pub quiet: bool,
+    /// Optional server-side verbosity (`--detail`); threaded into envelope
+    /// GETs as `?output=<detail>`. Orthogonal to [`OutputConfig::format`].
+    pub detail: Option<OutputDetail>,
 }
 
 impl OutputConfig {
@@ -112,11 +171,25 @@ impl OutputConfig {
         no_color: bool,
         quiet: bool,
     ) -> Self {
+        Self::from_flags_detail(format, fields, no_color, quiet, None)
+    }
+
+    /// Build an `OutputConfig` from CLI flags, including the `--detail`
+    /// server-verbosity flag.
+    #[must_use]
+    pub fn from_flags_detail(
+        format: Option<&str>,
+        fields: Option<&str>,
+        no_color: bool,
+        quiet: bool,
+        detail: Option<&str>,
+    ) -> Self {
         Self {
             format: OutputFormat::from_str_or_default(format),
             fields: fields.map(|f| f.split(',').map(|s| s.trim().to_owned()).collect()),
             no_color,
             quiet,
+            detail: OutputDetail::from_flag(detail),
         }
     }
 
@@ -127,6 +200,19 @@ impl OutputConfig {
         }
 
         let filtered = format::filter_fields(value, self.fields.as_deref());
+
+        // Unified-search responses carry a top-level `buckets` map. The
+        // default `flatten_response` path returns only the FIRST array it
+        // finds, which would silently drop every bucket but one — so detect
+        // the grouped shape and render each bucket as its own labelled
+        // section. JSON passthrough is unchanged (the bucket structure is
+        // already faithfully serialized).
+        if self.format != OutputFormat::Json
+            && let Value::Object(map) = &filtered
+            && let Some(Value::Object(buckets)) = map.get("buckets")
+        {
+            return render_buckets(buckets, self.format, self.no_color);
+        }
 
         match self.format {
             OutputFormat::Json => json::render(&filtered),
@@ -145,6 +231,362 @@ impl OutputConfig {
             OutputFormat::Markdown => markdown::render(&filtered),
         }
     }
+
+    /// Render a single rich state-snapshot OBJECT faithfully.
+    ///
+    /// The workflow runtime-state snapshot (`fastio workflow state` / `wait`) is
+    /// one object carrying `state`/`workflow`, `progress`, `recent_steps`,
+    /// `credit_budget`, and an `active_steps` array that is empty on a terminal
+    /// workflow. The shared [`flatten_response`] table/CSV heuristic returns the
+    /// FIRST array field — `active_steps` — which renders an EMPTY table on a
+    /// completed workflow and silently drops every other field. This snapshot is
+    /// an object, not a list, so table/CSV here render its top-level fields as
+    /// `field`/`value` rows (nested arrays/objects shown compactly as JSON),
+    /// NOT via the first-array flatten.
+    ///
+    /// JSON and Markdown output are byte-identical to [`Self::render`]; only the
+    /// Table and CSV paths differ, and only for this snapshot shape. The shared
+    /// `flatten_response` heuristic is untouched (other commands depend on it).
+    pub fn render_state_snapshot(&self, value: &Value) -> Result<(), std::io::Error> {
+        if self.quiet {
+            return Ok(());
+        }
+
+        // JSON / Markdown are unchanged — delegate to the standard path so
+        // those byte streams stay identical to every other command.
+        if matches!(self.format, OutputFormat::Json | OutputFormat::Markdown) {
+            return self.render(value);
+        }
+
+        let filtered = format::filter_fields(value, self.fields.as_deref());
+
+        // Peel a `response` wrapper if present (mirrors how the snapshot's
+        // lifecycle state is read elsewhere), then render the object's
+        // top-level fields as `field`/`value` rows. Metadata/envelope keys are
+        // skipped so a stray `result` doesn't masquerade as snapshot data.
+        let snapshot = match &filtered {
+            Value::Object(map) => match map.get("response") {
+                Some(Value::Object(_)) => &filtered["response"],
+                _ => &filtered,
+            },
+            _ => &filtered,
+        };
+
+        let rows = state_snapshot_rows(snapshot);
+        match self.format {
+            OutputFormat::Table => table::render(&rows, self.no_color),
+            OutputFormat::Csv => csv_output::render(&rows),
+            // JSON / Markdown handled above.
+            OutputFormat::Json | OutputFormat::Markdown => self.render(value),
+        }
+    }
+}
+
+/// Build the `[{"field": <name>, "value": <compact>}, …]` row array used by
+/// [`OutputConfig::render_state_snapshot`] for table/CSV.
+///
+/// Each top-level field of the snapshot object becomes one row. Scalars render
+/// as themselves; nested objects and arrays render compactly (their JSON), so
+/// no field is dropped and the table never collapses to an empty
+/// `active_steps`. Envelope/metadata keys ([`METADATA_KEYS`]) are skipped. A
+/// non-object snapshot is wrapped in a single `value` row so the caller always
+/// gets a renderable array.
+fn state_snapshot_rows(snapshot: &Value) -> Value {
+    let Value::Object(map) = snapshot else {
+        return Value::Array(vec![serde_json::json!({"value": compact_value(snapshot)})]);
+    };
+    let rows: Vec<Value> = map
+        .iter()
+        .filter(|(k, _)| !METADATA_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| serde_json::json!({"field": k, "value": compact_value(v)}))
+        .collect();
+    Value::Array(rows)
+}
+
+/// Render a snapshot field value compactly for a `field`/`value` row: scalars
+/// pass through; objects and arrays are compact-serialized to JSON so a nested
+/// `progress` / `credit_budget` / `recent_steps` shows its content on one line
+/// rather than being dropped.
+fn compact_value(value: &Value) -> Value {
+    match value {
+        Value::Object(_) | Value::Array(_) => {
+            Value::String(serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}")))
+        }
+        other => other.clone(),
+    }
+}
+
+/// Render a unified-search `buckets` map (one bucket per result type) as a
+/// sequence of labelled sections, one per bucket, in insertion order.
+///
+/// Each section emits a heading (bucket name + a human-readable pagination
+/// summary), surfaces any `status == "degraded"` and `total_relation == "gte"`
+/// conditions as visible notices, and then renders the bucket's `items` array
+/// in the requested format. Every user-controlled string flows through
+/// [`markdown::sanitize_inline`] so the bucket-aware path carries the same
+/// Trojan-Source / control-character defenses as the main markdown renderer.
+///
+/// **CSV is special-cased:** labelled section headers are plain text and
+/// per-bucket CSV fragments each carry their own header row, so emitting them
+/// back to back yields output no CSV parser can read. For CSV this instead
+/// renders ONE table — every bucket's items flattened into a single array with
+/// a leading `bucket` and `status` column (and a sentinel row per empty/
+/// degraded bucket) — so the whole stream is one valid CSV document. Table and
+/// markdown keep the labelled-section layout.
+///
+/// This deliberately does NOT route through [`flatten_response`], which would
+/// collapse the grouped structure to a single bucket's items.
+fn render_buckets(
+    buckets: &serde_json::Map<String, Value>,
+    format: OutputFormat,
+    no_color: bool,
+) -> Result<(), std::io::Error> {
+    // Headings + notices are written to the in-process buffer; each bucket's
+    // items are then rendered by the existing table/CSV/markdown renderers,
+    // which lock and write stdout themselves. The buffer is flushed before
+    // each delegated render so section ordering stays deterministic.
+    // Markdown is fully buffered (single string covering every bucket) so the
+    // exact byte shape is unit-testable; table/CSV stream because their
+    // renderers own stdout.
+    if format == OutputFormat::Markdown {
+        let mut stdout = std::io::stdout().lock();
+        return stdout.write_all(buckets_to_markdown(buckets).as_bytes());
+    }
+
+    // CSV must be a SINGLE parseable stream — labelled section headers and
+    // per-bucket CSV fragments (the old behavior) produce text interleaved
+    // with multiple independent header rows, which no CSV parser can read. So
+    // flatten every bucket into one array of records carrying a leading
+    // `bucket` (and `status`) column and render it as one table.
+    if format == OutputFormat::Csv {
+        return csv_output::render(&buckets_to_csv_rows(buckets));
+    }
+
+    let mut stdout = std::io::stdout().lock();
+    let mut first = true;
+    for (name, bucket) in buckets {
+        let mut header = String::new();
+        write_bucket_header(&mut header, name, bucket, format, first);
+        first = false;
+        stdout.write_all(header.as_bytes())?;
+        stdout.flush()?;
+
+        let items = bucket.get("items").cloned().unwrap_or(Value::Array(vec![]));
+        if items.as_array().is_some_and(Vec::is_empty) {
+            stdout.write_all(b"(no results)\n")?;
+            continue;
+        }
+        match format {
+            OutputFormat::Table => table::render(&items, no_color)?,
+            // CSV is handled by the single-stream path above; Markdown is
+            // fully buffered above. Both branches are unreachable here, but we
+            // degrade to a table render rather than panic so a future refactor
+            // fails soft (no `unreachable!` in a production path).
+            OutputFormat::Csv | OutputFormat::Markdown | OutputFormat::Json => {
+                table::render(&items, no_color)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The reserved leading/metadata column names a bucket CSV row carries, which
+/// item fields must never shadow. Kept in one place so the shadow guard and the
+/// column writers can't drift apart.
+const BUCKET_CSV_RESERVED_COLUMNS: &[&str] = &[
+    "bucket",
+    "status",
+    "note",
+    "bucket_total",
+    "bucket_total_relation",
+    "bucket_has_more",
+    "bucket_offset",
+    "bucket_limit",
+];
+
+/// Insert the per-bucket pagination/metadata columns into a CSV `row`, in a
+/// fixed order so the single CSV table keeps consistent columns across every
+/// bucket. Emits `bucket_total`, `bucket_total_relation`, `bucket_has_more`,
+/// `bucket_offset`, and `bucket_limit` whenever the bucket carries them. The
+/// `bucket_total_relation` value (`gte` vs `eq`) is the lower-bound signal a CSV
+/// consumer otherwise could not see, since the human-readable `bucket_notices`
+/// path is markdown/table-only.
+fn insert_bucket_metadata_columns(row: &mut serde_json::Map<String, Value>, bucket: &Value) {
+    let Value::Object(map) = bucket else {
+        return;
+    };
+    if let Some(total) = map.get("total").and_then(Value::as_u64) {
+        row.insert("bucket_total".to_owned(), Value::from(total));
+    }
+    if let Some(rel) = map.get("total_relation").and_then(Value::as_str) {
+        row.insert(
+            "bucket_total_relation".to_owned(),
+            Value::String(rel.to_owned()),
+        );
+    }
+    if let Some(has_more) = map.get("has_more").and_then(Value::as_bool) {
+        row.insert("bucket_has_more".to_owned(), Value::Bool(has_more));
+    }
+    if let Some(offset) = map.get("offset").and_then(Value::as_u64) {
+        row.insert("bucket_offset".to_owned(), Value::from(offset));
+    }
+    if let Some(limit) = map.get("limit").and_then(Value::as_u64) {
+        row.insert("bucket_limit".to_owned(), Value::from(limit));
+    }
+}
+
+/// Flatten a unified-search `buckets` map into a single array of CSV records:
+/// one record per item, each prefixed with a `bucket` column (the bucket name),
+/// a `status` column (the bucket's `status`, defaulting to `ok`), and the
+/// per-bucket pagination metadata (`bucket_total`, `bucket_total_relation`,
+/// `bucket_has_more`, `bucket_offset`, `bucket_limit`) so a CSV consumer can
+/// tell a total is approximate (`bucket_total_relation == "gte"`) or that more
+/// results exist (`bucket_has_more == true`) — signals that the non-CSV
+/// `bucket_notices` header path otherwise keeps to itself. Empty or degraded
+/// buckets still contribute a single sentinel row (no `id`/item fields, just the
+/// `bucket`/`status`/metadata columns and a `note`) so the CSV faithfully
+/// reports every bucket — including ones the server returned empty or degraded —
+/// in one coherent table. Insertion order puts `bucket`/`status` first, then the
+/// `bucket_*` metadata columns, then item fields.
+fn buckets_to_csv_rows(buckets: &serde_json::Map<String, Value>) -> Value {
+    let mut rows = Vec::new();
+    for (name, bucket) in buckets {
+        let status = bucket
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("ok")
+            .to_owned();
+        let degraded = status == "degraded";
+        let items = bucket.get("items").and_then(Value::as_array);
+        let non_empty = items.is_some_and(|a| !a.is_empty());
+        if non_empty {
+            for item in items.into_iter().flatten() {
+                let mut row = serde_json::Map::new();
+                row.insert("bucket".to_owned(), Value::String(name.clone()));
+                row.insert("status".to_owned(), Value::String(status.clone()));
+                insert_bucket_metadata_columns(&mut row, bucket);
+                if let Value::Object(obj) = item {
+                    for (k, v) in obj {
+                        // Don't let item fields shadow the leading/metadata cols.
+                        if !BUCKET_CSV_RESERVED_COLUMNS.contains(&k.as_str()) {
+                            row.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                rows.push(Value::Object(row));
+            }
+        } else {
+            // Sentinel row for an empty (or empty-degraded) bucket.
+            let mut row = serde_json::Map::new();
+            row.insert("bucket".to_owned(), Value::String(name.clone()));
+            row.insert("status".to_owned(), Value::String(status.clone()));
+            insert_bucket_metadata_columns(&mut row, bucket);
+            let note = if degraded {
+                "degraded: backend temporarily unavailable; results may be incomplete"
+            } else {
+                "no results"
+            };
+            row.insert("note".to_owned(), Value::String(note.to_owned()));
+            rows.push(Value::Object(row));
+        }
+    }
+    Value::Array(rows)
+}
+
+/// Render every bucket as a single markdown string: an `## <bucket>` heading
+/// (with pagination summary + notices) followed by that bucket's items as a
+/// GFM table (or `_No results._`). This is the buffered, fully-testable path
+/// for [`OutputFormat::Markdown`] and is the regression guard that ALL buckets
+/// are rendered — never just the first (the `flatten_response` bug).
+fn buckets_to_markdown(buckets: &serde_json::Map<String, Value>) -> String {
+    let mut out = String::new();
+    let mut first = true;
+    for (name, bucket) in buckets {
+        write_bucket_header(&mut out, name, bucket, OutputFormat::Markdown, first);
+        first = false;
+        let items = bucket.get("items").cloned().unwrap_or(Value::Array(vec![]));
+        if items.as_array().is_some_and(Vec::is_empty) {
+            out.push_str("_No results._\n");
+        } else {
+            out.push_str(&markdown::to_markdown(&items));
+        }
+    }
+    out
+}
+
+/// Write a single bucket's heading line (plus pagination summary and any
+/// notices) into `out`. Separated from [`render_buckets`] so its formatting is
+/// unit-testable without capturing stdout. `first` controls the blank-line
+/// separator that precedes every bucket except the first.
+fn write_bucket_header(
+    out: &mut String,
+    name: &str,
+    bucket: &Value,
+    format: OutputFormat,
+    first: bool,
+) {
+    use std::fmt::Write as _;
+    if !first {
+        out.push('\n');
+    }
+    let name = markdown::sanitize_inline(name);
+    let summary = bucket_summary(bucket);
+    // Writing into a String via `fmt::Write` is infallible.
+    let _ = match format {
+        OutputFormat::Markdown => write!(out, "## {name}{summary}\n\n"),
+        _ => writeln!(out, "=== {name}{summary} ==="),
+    };
+    for notice in bucket_notices(bucket) {
+        out.push_str(&notice);
+        out.push('\n');
+    }
+}
+
+/// Build the trailing pagination summary appended to a bucket heading, e.g.
+/// ` (total 1, offset 0, limit 10)`. Returns an empty string when no
+/// pagination fields are present.
+fn bucket_summary(bucket: &Value) -> String {
+    let Value::Object(map) = bucket else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    if let Some(t) = map.get("total").and_then(Value::as_u64) {
+        parts.push(format!("total {t}"));
+    }
+    if let Some(o) = map.get("offset").and_then(Value::as_u64) {
+        parts.push(format!("offset {o}"));
+    }
+    if let Some(l) = map.get("limit").and_then(Value::as_u64) {
+        parts.push(format!("limit {l}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+/// Collect the human-readable per-bucket notices (degraded backend,
+/// lower-bound count, more-results-available) to print under a bucket heading.
+fn bucket_notices(bucket: &Value) -> Vec<String> {
+    let Value::Object(map) = bucket else {
+        return Vec::new();
+    };
+    let mut notices = Vec::new();
+    if map.get("status").and_then(Value::as_str) == Some("degraded") {
+        notices.push(
+            "! degraded: this bucket's backend was temporarily unavailable; \
+             results may be incomplete (safe to retry)."
+                .to_owned(),
+        );
+    }
+    if map.get("total_relation").and_then(Value::as_str) == Some("gte") {
+        let total = map.get("total").and_then(Value::as_u64).unwrap_or(0);
+        notices.push(format!(
+            "~ total is a lower bound (≥ {total}); more matches may exist beyond the searched window."
+        ));
+    }
+    notices
 }
 
 /// Flatten an API response envelope for table/CSV/markdown rendering.
@@ -165,7 +607,10 @@ impl OutputConfig {
 ///
 /// Metadata keys (`pagination`, `meta`, `links`) are skipped in both passes.
 /// If the input is already an array or a scalar, it is returned as-is.
-fn flatten_response(value: &Value) -> Value {
+///
+/// `pub(crate)` so search-path tests can assert the end-to-end flatten shape
+/// of a normalized search response; it is otherwise an internal helper.
+pub(crate) fn flatten_response(value: &Value) -> Value {
     let Value::Object(map) = value else {
         return value.clone();
     };
@@ -208,6 +653,72 @@ fn flatten_response(value: &Value) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn state_snapshot_rows_surfaces_terminal_fields_not_empty_active_steps() {
+        // A terminal snapshot: `active_steps` is empty (the field the shared
+        // `flatten_response` would pick and render as an empty table), while the
+        // meaningful fields live elsewhere.
+        let snap = json!({
+            "result": true,
+            "state": "completed",
+            "active_steps": [],
+            "recent_steps": [{"id": "s1", "state": "completed"}],
+            "progress": {"completed_occurrences": 6, "known_total_occurrences": 6},
+            "credit_budget": {"cap": 20000, "spent_so_far": 245},
+        });
+
+        let rows = state_snapshot_rows(&snap);
+        let arr = rows.as_array().expect("rows is an array");
+        // Not empty (the bug rendered an empty table), and `result` (metadata)
+        // is filtered out.
+        assert!(!arr.is_empty(), "snapshot rows must not be empty");
+        assert!(
+            arr.iter().all(|r| r["field"] != "result"),
+            "envelope `result` must be filtered out"
+        );
+
+        // Build a field->value map for assertions.
+        let mut fields = std::collections::HashMap::new();
+        for r in arr {
+            let name = r["field"].as_str().expect("field name").to_owned();
+            fields.insert(name, r["value"].clone());
+        }
+
+        // `state` and `progress` are surfaced (the dropped fields in the bug).
+        assert_eq!(
+            fields.get("state").and_then(Value::as_str),
+            Some("completed")
+        );
+        let progress = fields.get("progress").and_then(Value::as_str).unwrap_or("");
+        assert!(
+            progress.contains("completed_occurrences"),
+            "progress must be surfaced compactly: {progress}"
+        );
+        // `credit_budget` and `recent_steps` are also surfaced.
+        assert!(fields.contains_key("credit_budget"));
+        let recent = fields
+            .get("recent_steps")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(recent.contains("\"state\":\"completed\""), "got: {recent}");
+        // `active_steps` is present (empty array compacted), NOT the whole table.
+        assert_eq!(
+            fields.get("active_steps").and_then(Value::as_str),
+            Some("[]")
+        );
+    }
+
+    #[test]
+    fn state_snapshot_rows_peels_response_wrapper() {
+        // render_state_snapshot peels a `response` wrapper before row-building;
+        // assert the inner-object path is what state_snapshot_rows operates on.
+        let inner = json!({"state": "active", "progress": {"x": 1}});
+        let rows = state_snapshot_rows(&inner);
+        let arr = rows.as_array().expect("array");
+        assert!(arr.iter().any(|r| r["field"] == "state"));
+        assert!(arr.iter().any(|r| r["field"] == "progress"));
+    }
 
     #[test]
     fn flatten_extracts_top_level_array() {
@@ -267,6 +778,180 @@ mod tests {
     }
 
     #[test]
+    fn output_detail_parses_known_tokens() {
+        assert_eq!(
+            OutputDetail::from_flag(Some("terse")),
+            Some(OutputDetail::Terse)
+        );
+        assert_eq!(
+            OutputDetail::from_flag(Some("standard")),
+            Some(OutputDetail::Standard)
+        );
+        assert_eq!(
+            OutputDetail::from_flag(Some("full")),
+            Some(OutputDetail::Full)
+        );
+    }
+
+    #[test]
+    fn output_detail_unknown_or_absent_is_none() {
+        assert_eq!(OutputDetail::from_flag(None), None);
+        assert_eq!(OutputDetail::from_flag(Some("verbose")), None);
+        assert_eq!(OutputDetail::from_flag(Some("")), None);
+    }
+
+    #[test]
+    fn output_detail_round_trips_token() {
+        assert_eq!(OutputDetail::Terse.as_str(), "terse");
+        assert_eq!(OutputDetail::Standard.as_str(), "standard");
+        assert_eq!(OutputDetail::Full.as_str(), "full");
+        assert_eq!(OutputDetail::Standard.to_string(), "standard");
+    }
+
+    // ── Bucket-aware unified-search renderer ────────────────────────────
+
+    /// A representative multi-bucket unified-search response: every applicable
+    /// bucket present, one with `status: degraded`, one with
+    /// `total_relation: gte`.
+    fn multi_bucket_fixture() -> serde_json::Map<String, Value> {
+        let v = json!({
+            "files": {
+                "items": [{"node_id": "f1", "name": "Q4 Report.pdf", "relevance_score": 0.93}],
+                "offset": 0, "limit": 10, "total": 1, "total_relation": "eq",
+                "has_more": false, "status": "ok"
+            },
+            "metadata": {
+                "items": [{"node_id": "m1", "name": "Invoice.pdf", "template_ids": ["t1"]}],
+                "offset": 0, "limit": 25, "total": 50, "total_relation": "gte",
+                "has_more": true, "status": "ok"
+            },
+            "comments": {
+                "items": [{"comment_id": "c1", "snippet": "double-check totals"}],
+                "offset": 0, "limit": 5, "total": 1, "total_relation": "eq",
+                "has_more": false, "status": "ok"
+            },
+            "workflows": {
+                "items": [],
+                "offset": 0, "limit": 25, "total": 0, "total_relation": "eq",
+                "has_more": false, "status": "degraded"
+            }
+        });
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn buckets_markdown_renders_all_buckets_not_just_first() {
+        // Regression guard for the `flatten_response` bug: the lossy flattener
+        // returns only the first array, which would silently drop every
+        // bucket but `files`. The bucket-aware renderer must emit ALL of them.
+        let buckets = multi_bucket_fixture();
+        let md = buckets_to_markdown(&buckets);
+        for name in ["files", "metadata", "comments", "workflows"] {
+            assert!(
+                md.contains(&format!("## {name}")),
+                "missing bucket: {name}\n{md}"
+            );
+        }
+        // Items from each non-empty bucket appear.
+        assert!(md.contains("Q4 Report.pdf"), "{md}");
+        assert!(md.contains("Invoice.pdf"), "{md}");
+        assert!(md.contains("double-check totals"), "{md}");
+    }
+
+    #[test]
+    fn buckets_markdown_surfaces_degraded_and_gte() {
+        let buckets = multi_bucket_fixture();
+        let md = buckets_to_markdown(&buckets);
+        assert!(md.contains("degraded"), "degraded notice missing:\n{md}");
+        assert!(md.contains("lower bound"), "gte notice missing:\n{md}");
+        // The empty degraded bucket still renders its heading + a no-results line.
+        assert!(md.contains("## workflows"), "{md}");
+        assert!(md.contains("_No results._"), "{md}");
+    }
+
+    #[test]
+    fn flatten_response_would_collapse_buckets_documenting_the_bug() {
+        // This is why unified search must NOT route through `flatten_response`:
+        // given the `{result, buckets}` envelope, the flattener returns the
+        // single `buckets` object (pass 2's nested-object fallback) — which a
+        // table/CSV renderer would then treat as ONE row of bucket→object
+        // columns, not four labelled result sections. The bucket-aware path
+        // exists precisely to avoid this. Locked here so a future refactor
+        // can't silently re-route bucket output through the flattener.
+        let buckets = multi_bucket_fixture();
+        let envelope = json!({ "result": true, "buckets": Value::Object(buckets) });
+        let flattened = flatten_response(&envelope);
+        // It collapses to the bucket map as a single object — NOT a sequence
+        // of per-bucket renderable sections.
+        assert!(flattened.is_object(), "got: {flattened}");
+        let obj = flattened.as_object().unwrap();
+        // The four bucket keys survive as object keys, but as a single flat
+        // object the renderer cannot label/paginate them as sections; the
+        // dedicated bucket renderer (asserted above) is required.
+        assert!(obj.contains_key("files") && obj.contains_key("workflows"));
+    }
+
+    #[test]
+    fn bucket_summary_formats_pagination() {
+        let bucket = json!({"total": 50, "offset": 0, "limit": 25});
+        assert_eq!(bucket_summary(&bucket), " (total 50, offset 0, limit 25)");
+        assert_eq!(bucket_summary(&json!({})), "");
+        assert_eq!(bucket_summary(&json!("x")), "");
+    }
+
+    #[test]
+    fn bucket_notices_reports_degraded_and_gte() {
+        let degraded = json!({"status": "degraded"});
+        assert!(
+            bucket_notices(&degraded)
+                .iter()
+                .any(|n| n.contains("degraded"))
+        );
+        let gte = json!({"total_relation": "gte", "total": 99});
+        let notices = bucket_notices(&gte);
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("lower bound") && n.contains("99"))
+        );
+        let ok = json!({"status": "ok", "total_relation": "eq"});
+        assert!(bucket_notices(&ok).is_empty());
+    }
+
+    #[test]
+    fn every_bucket_gets_a_header_even_when_empty() {
+        // The streaming table/CSV path and the buffered markdown path both
+        // iterate EVERY bucket. `write_bucket_header` is the shared, stdout-
+        // free entry point; assert a header is produced for each bucket
+        // (including the empty degraded one) — the regression guard against
+        // dropping all-but-one bucket.
+        let buckets = multi_bucket_fixture();
+        for (name, bucket) in &buckets {
+            let mut header = String::new();
+            write_bucket_header(&mut header, name, bucket, OutputFormat::Csv, false);
+            assert!(
+                header.contains(name),
+                "no header for bucket {name}: {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn bucket_header_sanitizes_hostile_bucket_name() {
+        // A bidi-override / control char in a bucket key must be stripped.
+        let mut out = String::new();
+        write_bucket_header(
+            &mut out,
+            "files\u{202E}\u{0007}",
+            &json!({"total": 1}),
+            OutputFormat::Markdown,
+            true,
+        );
+        assert!(!out.contains('\u{202E}'), "bidi override leaked: {out:?}");
+        assert!(!out.contains('\u{0007}'), "control char leaked: {out:?}");
+    }
+
+    #[test]
     fn flatten_prefers_array_over_sibling_object() {
         // BTreeMap iteration order puts `stats` before `workspaces`
         // alphabetically; pass 1 must skip the sibling object and return
@@ -280,5 +965,150 @@ mod tests {
         assert!(result.is_array(), "got: {result}");
         assert_eq!(result.as_array().unwrap().len(), 2);
         assert_eq!(result[0]["id"], "w1");
+    }
+
+    #[test]
+    fn buckets_csv_is_one_parseable_table_with_bucket_column() {
+        // FIX 2 regression guard: the CSV path must be a SINGLE valid CSV
+        // document — one header row, a leading `bucket` column — not text
+        // headers interleaved with multiple CSV fragments.
+        let buckets = multi_bucket_fixture();
+        let rows = buckets_to_csv_rows(&buckets);
+        let arr = rows.as_array().expect("array of rows");
+
+        // Every bucket is represented: files/metadata/comments have one item
+        // each; the empty degraded `workflows` bucket gets a sentinel row.
+        let bucket_names: Vec<&str> = arr
+            .iter()
+            .filter_map(|r| r.get("bucket").and_then(Value::as_str))
+            .collect();
+        for name in ["files", "metadata", "comments", "workflows"] {
+            assert!(bucket_names.contains(&name), "missing bucket {name}");
+        }
+
+        // Leading columns are present and ordered first on every row.
+        for row in arr {
+            let obj = row.as_object().unwrap();
+            let first_two: Vec<&String> = obj.keys().take(2).collect();
+            assert_eq!(first_two, vec!["bucket", "status"], "row: {row}");
+        }
+
+        // The degraded empty bucket carries a status + note sentinel.
+        let workflows = arr
+            .iter()
+            .find(|r| r.get("bucket").and_then(Value::as_str) == Some("workflows"))
+            .expect("workflows row");
+        assert_eq!(workflows["status"], "degraded");
+        assert!(
+            workflows["note"].as_str().unwrap().contains("degraded"),
+            "{workflows}"
+        );
+
+        // Render through the real CSV writer and re-parse it: exactly ONE
+        // header row, and every data row resolves a `bucket` field.
+        csv_output::render(&rows).expect("csv render");
+        let headers = csv_output::collect_headers(arr);
+        assert_eq!(headers[0], "bucket");
+        assert_eq!(headers[1], "status");
+        // A non-empty bucket's item fields are present as columns.
+        assert!(headers.iter().any(|h| h == "name"), "headers: {headers:?}");
+    }
+
+    #[test]
+    fn buckets_csv_item_fields_do_not_shadow_leading_columns() {
+        // An item that itself carries reserved column keys (`bucket`/`status`
+        // or any `bucket_*` metadata column) must not overwrite the synthesized
+        // leading/metadata columns.
+        let mut buckets = serde_json::Map::new();
+        buckets.insert(
+            "files".to_owned(),
+            json!({
+                "status": "ok",
+                "total": 7, "total_relation": "gte", "has_more": true,
+                "offset": 0, "limit": 10,
+                "items": [{
+                    "bucket": "EVIL", "status": "EVIL",
+                    "bucket_total": 999, "bucket_total_relation": "EVIL",
+                    "bucket_has_more": false, "bucket_offset": 999, "bucket_limit": 999,
+                    "name": "x"
+                }]
+            }),
+        );
+        let rows = buckets_to_csv_rows(&buckets);
+        let row = &rows.as_array().unwrap()[0];
+        assert_eq!(row["bucket"], "files");
+        assert_eq!(row["status"], "ok");
+        // Metadata columns reflect the BUCKET, not the item's spoofed values.
+        assert_eq!(row["bucket_total"], 7);
+        assert_eq!(row["bucket_total_relation"], "gte");
+        assert_eq!(row["bucket_has_more"], true);
+        assert_eq!(row["bucket_offset"], 0);
+        assert_eq!(row["bucket_limit"], 10);
+        assert_eq!(row["name"], "x");
+    }
+
+    #[test]
+    fn buckets_csv_surfaces_gte_and_has_more_metadata() {
+        // FIX 2 regression guard: a `total_relation: "gte"` / `has_more: true`
+        // bucket must surface those lower-bound signals in the CSV, since the
+        // human-readable `bucket_notices` path is markdown/table-only. Assert
+        // via the real CSV writer + header collection so the columns are proven
+        // to land in one parseable table.
+        let buckets = multi_bucket_fixture();
+        let rows = buckets_to_csv_rows(&buckets);
+        let arr = rows.as_array().expect("array of rows");
+
+        // The `metadata` bucket is the gte/has_more one in the fixture.
+        let meta = arr
+            .iter()
+            .find(|r| r.get("bucket").and_then(Value::as_str) == Some("metadata"))
+            .expect("metadata row");
+        assert_eq!(meta["bucket_total"], 50);
+        assert_eq!(meta["bucket_total_relation"], "gte");
+        assert_eq!(meta["bucket_has_more"], true);
+
+        // The `files` bucket is the eq/no-more one.
+        let files = arr
+            .iter()
+            .find(|r| r.get("bucket").and_then(Value::as_str) == Some("files"))
+            .expect("files row");
+        assert_eq!(files["bucket_total_relation"], "eq");
+        assert_eq!(files["bucket_has_more"], false);
+
+        // The metadata columns appear as headers in the single CSV table, and
+        // CSV rendering succeeds (one parseable document).
+        csv_output::render(&rows).expect("csv render");
+        let headers = csv_output::collect_headers(arr);
+        for col in [
+            "bucket_total",
+            "bucket_total_relation",
+            "bucket_has_more",
+            "bucket_offset",
+            "bucket_limit",
+        ] {
+            assert!(
+                headers.iter().any(|h| h == col),
+                "missing metadata column {col}, headers: {headers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flatten_files_object_is_not_specially_converted() {
+        // Regression guard: `flatten_response` is a GENERIC helper used by
+        // every command. The storage-search files-MAP → rows conversion is
+        // handled in the search command path (see `commands::files` /
+        // `commands::ai` `normalize_search_response`), NOT here, so a future
+        // endpoint that legitimately returns a top-level `files` object is not
+        // silently restructured. Pass 2 returns the lone nested object as-is.
+        let input = json!({
+            "files": {
+                "f1": {"name": "File 1", "type": "file"},
+                "f2": {"name": "File 2", "type": "file"}
+            }
+        });
+        let result = flatten_response(&input);
+        assert!(result.is_object(), "expected object, got: {result}");
+        assert!(result.as_object().unwrap().contains_key("f1"));
     }
 }

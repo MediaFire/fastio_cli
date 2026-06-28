@@ -12,14 +12,19 @@ use crate::error::CliError;
 
 /// Acquire an exclusive lock on a file.
 ///
-/// `POST /{context_type}/{context_id}/storage/{node_id}/lock/`
+/// `POST /{context_type}/{context_id}/storage/{node_id}/lock/` — optional
+/// `duration` (60-3600 seconds) sets the lock lifetime and `client_info`
+/// (a JSON object, e.g. `{"device_name":"…","client_version":"…"}`) records
+/// client metadata.
 pub async fn lock_acquire(
     client: &ApiClient,
     context_type: &str,
     context_id: &str,
     node_id: &str,
+    duration: Option<u32>,
+    client_info: Option<&str>,
 ) -> Result<Value, CliError> {
-    let form = HashMap::new();
+    let form = crate::api::storage::lock_acquire_form(duration, client_info);
     let path = format!(
         "/{}/{}/storage/{}/lock/",
         urlencoding::encode(context_type),

@@ -123,8 +123,10 @@ async fn decline(
         entity_type,
         entity_id,
         invitation_id,
-        Some("declined"),
-        None,
+        &api::invitation::UpdateInvitationParams {
+            new_state: Some("declined"),
+            ..Default::default()
+        },
     )
     .await
     .context("failed to decline invitation")?;

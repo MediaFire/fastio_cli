@@ -1,8 +1,8 @@
 #![allow(clippy::missing_errors_doc)]
 
-/// Workflow API endpoints for the Fast.io REST API.
+/// Tasks API endpoints for the Fast.io REST API.
 ///
-/// Covers task lists, tasks, worklogs, approvals, and todos.
+/// Covers task lists, tasks, task comments, and task attachments.
 /// All endpoints use JSON request bodies (not form-encoded).
 use std::collections::HashMap;
 
@@ -134,6 +134,8 @@ pub struct CreateTaskParams<'a> {
     pub priority: Option<u8>,
     /// Assignee profile ID.
     pub assignee_id: Option<&'a str>,
+    /// Primary linked storage node ID (single-node link on the task).
+    pub node_id: Option<&'a str>,
 }
 
 /// Create a task in a task list.
@@ -155,6 +157,9 @@ pub async fn create_task(
     }
     if let Some(a) = params.assignee_id {
         body["assignee_id"] = Value::String(a.to_owned());
+    }
+    if let Some(n) = params.node_id {
+        body["node_id"] = Value::String(n.to_owned());
     }
     let path = format!(
         "/tasks/{}/items/create/",
@@ -191,6 +196,8 @@ pub struct UpdateTaskParams<'a> {
     pub priority: Option<u8>,
     /// New assignee.
     pub assignee_id: Option<&'a str>,
+    /// New primary linked storage node ID (single-node link on the task).
+    pub node_id: Option<&'a str>,
 }
 
 /// Update a task.
@@ -218,6 +225,18 @@ pub async fn update_task(
     }
     if let Some(a) = params.assignee_id {
         body.insert("assignee_id".to_owned(), Value::String(a.to_owned()));
+    }
+    if let Some(n) = params.node_id {
+        // An empty string clears the link (the API accepts `node_id: null`);
+        // a non-empty value sets it.
+        body.insert(
+            "node_id".to_owned(),
+            if n.is_empty() {
+                Value::Null
+            } else {
+                Value::String(n.to_owned())
+            },
+        );
     }
     let path = format!(
         "/tasks/{}/items/{}/update/",
@@ -282,15 +301,17 @@ pub async fn change_task_status(
     client.post_json(&path, &body).await
 }
 
-// ─── Worklogs ───────────────────────────────────────────────────────────────
+// ─── Task Comments ────────────────────────────────────────────────────────────
 
-/// List worklog entries.
+/// List a task's comment thread.
 ///
-/// `GET /worklogs/{entity_type}/{entity_id}/`
-pub async fn list_worklogs(
+/// `GET /tasks/{list_id}/items/{task_id}/comments/`
+/// Task comments are private to the task — they are not returned by the generic
+/// comment-listing endpoints and do not appear in comment search.
+pub async fn list_task_comments(
     client: &ApiClient,
-    entity_type: &str,
-    entity_id: &str,
+    list_id: &str,
+    task_id: &str,
     limit: Option<u32>,
     offset: Option<u32>,
 ) -> Result<Value, CliError> {
@@ -302,9 +323,9 @@ pub async fn list_worklogs(
         params.insert("offset".to_owned(), o.to_string());
     }
     let path = format!(
-        "/worklogs/{}/{}/",
-        urlencoding::encode(entity_type),
-        urlencoding::encode(entity_id),
+        "/tasks/{}/items/{}/comments/",
+        urlencoding::encode(list_id),
+        urlencoding::encode(task_id),
     );
     if params.is_empty() {
         client.get(&path).await
@@ -313,339 +334,107 @@ pub async fn list_worklogs(
     }
 }
 
-/// Append a worklog entry.
+/// Parameters for [`post_task_comment`].
+pub struct PostTaskCommentParams<'a> {
+    /// Task list ID.
+    pub list_id: &'a str,
+    /// Task ID.
+    pub task_id: &'a str,
+    /// Comment body (1–8192 chars; may include `@[user:{id}:{name}]` mentions).
+    pub body: &'a str,
+    /// Parent comment ID for a single-level threaded reply.
+    pub parent_id: Option<&'a str>,
+    /// Optional anchoring reference (JSON object) into a file position.
+    pub reference: Option<&'a Value>,
+    /// Optional arbitrary key-value metadata (JSON object).
+    pub properties: Option<&'a Value>,
+}
+
+/// Post a comment (or threaded reply) on a task.
 ///
-/// `POST /worklogs/{entity_type}/{entity_id}/append/`
-pub async fn append_worklog(
+/// `POST /tasks/{list_id}/items/{task_id}/comments/` (JSON body). This endpoint
+/// never edits — to edit or delete a task comment use the generic comment
+/// endpoints by comment ID (`comment::update_comment` / `comment::delete_comment`).
+pub async fn post_task_comment(
     client: &ApiClient,
-    entity_type: &str,
-    entity_id: &str,
-    content: &str,
+    params: &PostTaskCommentParams<'_>,
 ) -> Result<Value, CliError> {
-    let body = serde_json::json!({ "content": content });
+    let mut body = serde_json::json!({ "body": params.body });
+    if let Some(p) = params.parent_id {
+        body["parent_id"] = Value::String(p.to_owned());
+    }
+    if let Some(r) = params.reference {
+        body["reference"] = r.clone();
+    }
+    if let Some(p) = params.properties {
+        body["properties"] = p.clone();
+    }
     let path = format!(
-        "/worklogs/{}/{}/append/",
-        urlencoding::encode(entity_type),
-        urlencoding::encode(entity_id),
+        "/tasks/{}/items/{}/comments/",
+        urlencoding::encode(params.list_id),
+        urlencoding::encode(params.task_id),
     );
     client.post_json(&path, &body).await
 }
 
-/// Create a worklog interjection.
+// ─── Task Attachments ─────────────────────────────────────────────────────────
+
+/// List a task's attachments (hydrated).
 ///
-/// `POST /worklogs/{entity_type}/{entity_id}/interjection/`
-pub async fn interject_worklog(
+/// `GET /tasks/{list_id}/items/{task_id}/attachments/`
+pub async fn list_task_attachments(
     client: &ApiClient,
-    entity_type: &str,
-    entity_id: &str,
-    content: &str,
+    list_id: &str,
+    task_id: &str,
 ) -> Result<Value, CliError> {
-    let body = serde_json::json!({ "content": content });
     let path = format!(
-        "/worklogs/{}/{}/interjection/",
-        urlencoding::encode(entity_type),
-        urlencoding::encode(entity_id),
+        "/tasks/{}/items/{}/attachments/",
+        urlencoding::encode(list_id),
+        urlencoding::encode(task_id),
     );
-    client.post_json(&path, &body).await
-}
-
-// ─── Approvals ──────────────────────────────────────────────────────────────
-
-/// List approvals in a workspace.
-///
-/// `GET /workspace/{workspace_id}/approvals/`
-pub async fn list_approvals(
-    client: &ApiClient,
-    workspace_id: &str,
-    status: Option<&str>,
-    limit: Option<u32>,
-    offset: Option<u32>,
-) -> Result<Value, CliError> {
-    let mut params = HashMap::new();
-    if let Some(s) = status {
-        params.insert("status".to_owned(), s.to_owned());
-    }
-    if let Some(l) = limit {
-        params.insert("limit".to_owned(), l.to_string());
-    }
-    if let Some(o) = offset {
-        params.insert("offset".to_owned(), o.to_string());
-    }
-    let path = format!(
-        "/workspace/{}/approvals/",
-        urlencoding::encode(workspace_id),
-    );
-    if params.is_empty() {
-        client.get(&path).await
-    } else {
-        client.get_with_params(&path, &params).await
-    }
-}
-
-/// Create an approval request.
-///
-/// `POST /approvals/{entity_type}/{entity_id}/create/`
-pub async fn create_approval(
-    client: &ApiClient,
-    entity_type: &str,
-    entity_id: &str,
-    description: &str,
-    profile_id: &str,
-    approver_id: Option<&str>,
-) -> Result<Value, CliError> {
-    let mut body = serde_json::json!({
-        "description": description,
-        "profile_id": profile_id,
-    });
-    if let Some(a) = approver_id {
-        body["approver_id"] = Value::String(a.to_owned());
-    }
-    let path = format!(
-        "/approvals/{}/{}/create/",
-        urlencoding::encode(entity_type),
-        urlencoding::encode(entity_id),
-    );
-    client.post_json(&path, &body).await
-}
-
-/// Get approval details.
-///
-/// `GET /approvals/{approval_id}/details/`
-#[allow(dead_code)]
-pub async fn get_approval(client: &ApiClient, approval_id: &str) -> Result<Value, CliError> {
-    let path = format!("/approvals/{}/details/", urlencoding::encode(approval_id),);
     client.get(&path).await
 }
 
-/// Resolve (approve or reject) an approval.
+/// Attach one or more objects to a task.
 ///
-/// `POST /approvals/{approval_id}/resolve/`
-pub async fn resolve_approval(
+/// `POST /tasks/{list_id}/items/{task_id}/attachments/` (JSON body). Sends the
+/// `target_ids` array form (1–100 ids), which the server accepts for both a
+/// single and a bulk attach. The operation is atomic (a partial-batch failure
+/// attaches nothing), idempotent (re-attaching is a no-op), and capped at 100
+/// attachments per task. Returns the full updated attachment list.
+pub async fn attach_to_task(
     client: &ApiClient,
-    approval_id: &str,
-    action: &str,
-    comment: Option<&str>,
+    list_id: &str,
+    task_id: &str,
+    target_ids: &[String],
 ) -> Result<Value, CliError> {
-    let mut body = serde_json::json!({ "action": action });
-    if let Some(c) = comment {
-        body["comment"] = Value::String(c.to_owned());
-    }
-    let path = format!("/approvals/{}/resolve/", urlencoding::encode(approval_id),);
-    client.post_json(&path, &body).await
-}
-
-// ─── Todos ──────────────────────────────────────────────────────────────────
-
-/// List todos in a workspace.
-///
-/// `GET /workspace/{workspace_id}/todos/`
-pub async fn list_todos(
-    client: &ApiClient,
-    workspace_id: &str,
-    limit: Option<u32>,
-    offset: Option<u32>,
-) -> Result<Value, CliError> {
-    let mut params = HashMap::new();
-    if let Some(l) = limit {
-        params.insert("limit".to_owned(), l.to_string());
-    }
-    if let Some(o) = offset {
-        params.insert("offset".to_owned(), o.to_string());
-    }
-    let path = format!("/workspace/{}/todos/", urlencoding::encode(workspace_id),);
-    if params.is_empty() {
-        client.get(&path).await
-    } else {
-        client.get_with_params(&path, &params).await
-    }
-}
-
-/// Create a todo.
-///
-/// `POST /workspace/{workspace_id}/todos/create/`
-pub async fn create_todo(
-    client: &ApiClient,
-    workspace_id: &str,
-    title: &str,
-    assignee_id: Option<&str>,
-) -> Result<Value, CliError> {
-    let mut body = serde_json::json!({ "title": title });
-    if let Some(a) = assignee_id {
-        body["assignee_id"] = Value::String(a.to_owned());
-    }
+    let body = serde_json::json!({ "target_ids": target_ids });
     let path = format!(
-        "/workspace/{}/todos/create/",
-        urlencoding::encode(workspace_id),
+        "/tasks/{}/items/{}/attachments/",
+        urlencoding::encode(list_id),
+        urlencoding::encode(task_id),
     );
     client.post_json(&path, &body).await
 }
 
-/// Update a todo.
+/// Detach a single object from a task.
 ///
-/// `POST /todos/{todo_id}/details/update/`
-pub async fn update_todo(
+/// `POST /tasks/{list_id}/items/{task_id}/attachments/detach/` (JSON body).
+/// Detach is single-object only — there is no batch detach; call once per
+/// object. Idempotent: detaching a non-attached object returns `removed: false`.
+pub async fn detach_from_task(
     client: &ApiClient,
-    todo_id: &str,
-    title: Option<&str>,
-    done: Option<bool>,
-    assignee_id: Option<&str>,
+    list_id: &str,
+    task_id: &str,
+    target_id: &str,
 ) -> Result<Value, CliError> {
-    let mut body = serde_json::Map::new();
-    if let Some(t) = title {
-        body.insert("title".to_owned(), Value::String(t.to_owned()));
-    }
-    if let Some(d) = done {
-        body.insert("done".to_owned(), Value::Bool(d));
-    }
-    if let Some(a) = assignee_id {
-        body.insert("assignee_id".to_owned(), Value::String(a.to_owned()));
-    }
-    let path = format!("/todos/{}/details/update/", urlencoding::encode(todo_id));
-    client.post_json(&path, &Value::Object(body)).await
-}
-
-/// Delete a todo (soft delete).
-///
-/// `POST /todos/{todo_id}/details/delete/`
-pub async fn delete_todo(client: &ApiClient, todo_id: &str) -> Result<Value, CliError> {
-    let path = format!("/todos/{}/details/delete/", urlencoding::encode(todo_id));
-    client.post_json(&path, &serde_json::json!({})).await
-}
-
-/// Toggle a todo's completion state.
-///
-/// `POST /todos/{todo_id}/details/toggle/`
-pub async fn toggle_todo(client: &ApiClient, todo_id: &str) -> Result<Value, CliError> {
-    let path = format!("/todos/{}/details/toggle/", urlencoding::encode(todo_id),);
-    client.post_json(&path, &serde_json::json!({})).await
-}
-
-/// Get todo details.
-///
-/// `GET /todos/{todo_id}/details/`
-pub async fn get_todo_details(client: &ApiClient, todo_id: &str) -> Result<Value, CliError> {
-    let path = format!("/todos/{}/details/", urlencoding::encode(todo_id));
-    client.get(&path).await
-}
-
-/// Bulk toggle todos.
-///
-/// `POST /{profile_type}/{profile_id}/todos/bulk-toggle/`
-pub async fn bulk_toggle_todos(
-    client: &ApiClient,
-    profile_type: &str,
-    profile_id: &str,
-    todo_ids: &[String],
-    done: bool,
-) -> Result<Value, CliError> {
-    let body = serde_json::json!({
-        "todo_ids": todo_ids,
-        "done": done,
-    });
+    let body = serde_json::json!({ "target_id": target_id });
     let path = format!(
-        "/{}/{}/todos/bulk-toggle/",
-        urlencoding::encode(profile_type),
-        urlencoding::encode(profile_id),
+        "/tasks/{}/items/{}/attachments/detach/",
+        urlencoding::encode(list_id),
+        urlencoding::encode(task_id),
     );
     client.post_json(&path, &body).await
-}
-
-/// List todos in a context (workspace or share).
-///
-/// `GET /{profile_type}/{profile_id}/todos/`
-pub async fn list_todos_ctx(
-    client: &ApiClient,
-    profile_type: &str,
-    profile_id: &str,
-    limit: Option<u32>,
-    offset: Option<u32>,
-) -> Result<Value, CliError> {
-    let mut params = HashMap::new();
-    if let Some(l) = limit {
-        params.insert("limit".to_owned(), l.to_string());
-    }
-    if let Some(o) = offset {
-        params.insert("offset".to_owned(), o.to_string());
-    }
-    let path = format!(
-        "/{}/{}/todos/",
-        urlencoding::encode(profile_type),
-        urlencoding::encode(profile_id),
-    );
-    if params.is_empty() {
-        client.get(&path).await
-    } else {
-        client.get_with_params(&path, &params).await
-    }
-}
-
-/// Create a todo in a context (workspace or share).
-///
-/// `POST /{profile_type}/{profile_id}/todos/create/`
-pub async fn create_todo_ctx(
-    client: &ApiClient,
-    profile_type: &str,
-    profile_id: &str,
-    title: &str,
-    assignee_id: Option<&str>,
-) -> Result<Value, CliError> {
-    let mut body = serde_json::json!({ "title": title });
-    if let Some(a) = assignee_id {
-        body["assignee_id"] = Value::String(a.to_owned());
-    }
-    let path = format!(
-        "/{}/{}/todos/create/",
-        urlencoding::encode(profile_type),
-        urlencoding::encode(profile_id),
-    );
-    client.post_json(&path, &body).await
-}
-
-// ─── Worklog Extensions ────────────────────────────────────────────────────
-
-/// Get worklog entry details.
-///
-/// `GET /worklogs/{entry_id}/details/`
-pub async fn worklog_details(client: &ApiClient, entry_id: &str) -> Result<Value, CliError> {
-    let path = format!("/worklogs/{}/details/", urlencoding::encode(entry_id));
-    client.get(&path).await
-}
-
-/// Acknowledge a worklog interjection.
-///
-/// `POST /worklogs/{entry_id}/acknowledge/`
-pub async fn acknowledge_worklog(client: &ApiClient, entry_id: &str) -> Result<Value, CliError> {
-    let path = format!("/worklogs/{}/acknowledge/", urlencoding::encode(entry_id));
-    client.post_json(&path, &serde_json::json!({})).await
-}
-
-/// List unacknowledged interjections.
-///
-/// `GET /worklogs/{entity_type}/{entity_id}/interjections/`
-pub async fn unacknowledged_worklogs(
-    client: &ApiClient,
-    entity_type: &str,
-    entity_id: &str,
-    limit: Option<u32>,
-    offset: Option<u32>,
-) -> Result<Value, CliError> {
-    let mut params = HashMap::new();
-    if let Some(l) = limit {
-        params.insert("limit".to_owned(), l.to_string());
-    }
-    if let Some(o) = offset {
-        params.insert("offset".to_owned(), o.to_string());
-    }
-    let path = format!(
-        "/worklogs/{}/{}/interjections/",
-        urlencoding::encode(entity_type),
-        urlencoding::encode(entity_id),
-    );
-    if params.is_empty() {
-        client.get(&path).await
-    } else {
-        client.get_with_params(&path, &params).await
-    }
 }
 
 // ─── Task Extensions ───────────────────────────────────────────────────────
@@ -780,4 +569,160 @@ pub async fn reorder_task_lists(
         urlencoding::encode(profile_id),
     );
     client.post_json(&path, &body).await
+}
+
+// ─── Filtered Lists & Summaries ──────────────────────────────────────────────
+//
+// The Tasks API exposes profile-scoped filtered list endpoints
+// (`/{profile_type}/{profile_id}/{kind}/list/{filter}/`) and count summaries
+// (`/{profile_type}/{profile_id}/{kind}/summary/`). On a workspace these are
+// the personal view (filtered to the current user); on a share they are the
+// group view for owners and a scoped view for guests.
+
+/// Common pagination + filter query parameters for the filtered-list endpoints.
+///
+/// `status` is optional and only honored by the task filters that document it.
+#[derive(Default)]
+pub struct FilterQuery<'a> {
+    /// Max results (server default 50, max 100).
+    pub limit: Option<u32>,
+    /// Number of results to skip.
+    pub offset: Option<u32>,
+    /// Status filter (task status values). Only honored by the task filters
+    /// that document it.
+    pub status: Option<&'a str>,
+}
+
+impl FilterQuery<'_> {
+    /// Build the query-parameter map for this filter.
+    fn to_params(&self) -> HashMap<String, String> {
+        let mut params = HashMap::new();
+        if let Some(l) = self.limit {
+            params.insert("limit".to_owned(), l.to_string());
+        }
+        if let Some(o) = self.offset {
+            params.insert("offset".to_owned(), o.to_string());
+        }
+        if let Some(s) = self.status {
+            params.insert("status".to_owned(), s.to_owned());
+        }
+        params
+    }
+}
+
+/// Issue a GET, omitting the query string entirely when no params are set.
+async fn get_maybe_params(
+    client: &ApiClient,
+    path: &str,
+    params: &HashMap<String, String>,
+) -> Result<Value, CliError> {
+    if params.is_empty() {
+        client.get(path).await
+    } else {
+        client.get_with_params(path, params).await
+    }
+}
+
+/// Build a profile-scoped filtered-list path
+/// (`/{profile_type}/{profile_id}/{kind}/list/{filter}/`).
+fn filtered_list_path(profile_type: &str, profile_id: &str, kind: &str, filter: &str) -> String {
+    format!(
+        "/{}/{}/{kind}/list/{}/",
+        urlencoding::encode(profile_type),
+        urlencoding::encode(profile_id),
+        urlencoding::encode(filter),
+    )
+}
+
+/// Build a profile-scoped summary path (`/{profile_type}/{profile_id}/{kind}/summary/`).
+fn summary_path(profile_type: &str, profile_id: &str, kind: &str) -> String {
+    format!(
+        "/{}/{}/{kind}/summary/",
+        urlencoding::encode(profile_type),
+        urlencoding::encode(profile_id),
+    )
+}
+
+/// Filtered task list for a workspace or share (personal / group view).
+///
+/// `GET /{profile_type}/{profile_id}/tasks/list/{filter}/`
+///
+/// Filters: `assigned`, `created` (both accept an optional `status`), `status`
+/// (requires `status`).
+pub async fn list_tasks_filtered(
+    client: &ApiClient,
+    profile_type: &str,
+    profile_id: &str,
+    filter: &str,
+    query: &FilterQuery<'_>,
+) -> Result<Value, CliError> {
+    let path = filtered_list_path(profile_type, profile_id, "tasks", filter);
+    get_maybe_params(client, &path, &query.to_params()).await
+}
+
+/// Task count summary for a workspace or share.
+///
+/// `GET /{profile_type}/{profile_id}/tasks/summary/`
+pub async fn tasks_summary(
+    client: &ApiClient,
+    profile_type: &str,
+    profile_id: &str,
+) -> Result<Value, CliError> {
+    let path = summary_path(profile_type, profile_id, "tasks");
+    client.get(&path).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FilterQuery, filtered_list_path, summary_path};
+
+    #[test]
+    fn filtered_list_path_builds_task_route() {
+        assert_eq!(
+            filtered_list_path("workspace", "1", "tasks", "assigned"),
+            "/workspace/1/tasks/list/assigned/"
+        );
+        assert_eq!(
+            filtered_list_path("share", "1", "tasks", "status"),
+            "/share/1/tasks/list/status/"
+        );
+    }
+
+    #[test]
+    fn filtered_list_path_url_encodes_segments() {
+        let p = filtered_list_path("workspace", "w s", "tasks", "a/b");
+        assert!(p.contains("w%20s"), "{p}");
+        assert!(p.contains("a%2Fb"), "{p}");
+    }
+
+    #[test]
+    fn summary_path_is_flat() {
+        assert_eq!(
+            summary_path("workspace", "1", "tasks"),
+            "/workspace/1/tasks/summary/"
+        );
+        assert_eq!(
+            summary_path("share", "1", "tasks"),
+            "/share/1/tasks/summary/"
+        );
+    }
+
+    #[test]
+    fn filter_query_builds_only_set_params() {
+        let q = FilterQuery {
+            limit: Some(10),
+            offset: None,
+            status: Some("pending"),
+        };
+        let params = q.to_params();
+        assert_eq!(params.get("limit").map(String::as_str), Some("10"));
+        assert_eq!(params.get("status").map(String::as_str), Some("pending"));
+        assert!(!params.contains_key("offset"));
+    }
+
+    #[test]
+    fn filter_query_empty_is_empty() {
+        let q = FilterQuery::default();
+        assert!(q.to_params().is_empty());
+    }
 }

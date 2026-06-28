@@ -35,12 +35,15 @@ pub async fn execute(
             }
         }
         AuthCommand::Logout => logout(ctx),
+        AuthCommand::Signout => signout(ctx).await,
+        AuthCommand::InvalidateAll => invalidate_all(ctx).await,
         AuthCommand::Status => status(ctx).await,
         AuthCommand::Signup {
             email,
             password,
             first_name,
             last_name,
+            agent,
         } => {
             signup(
                 config,
@@ -49,6 +52,7 @@ pub async fn execute(
                 password,
                 first_name.as_deref(),
                 last_name.as_deref(),
+                *agent,
             )
             .await
         }
@@ -81,8 +85,12 @@ pub enum AuthCommand {
         /// Password for basic auth login.
         password: Option<String>,
     },
-    /// Clear stored credentials.
+    /// Clear stored credentials (local only).
     Logout,
+    /// Server-side sign-out (revoke revocable session tokens) + local clear.
+    Signout,
+    /// Invalidate all sessions everywhere + local clear.
+    InvalidateAll,
     /// Show authentication status.
     Status,
     /// Create a new account.
@@ -95,6 +103,8 @@ pub enum AuthCommand {
         first_name: Option<String>,
         /// Last name.
         last_name: Option<String>,
+        /// Create an AI-agent account.
+        agent: bool,
     },
     /// Send or confirm email verification.
     Verify {
@@ -184,6 +194,10 @@ pub enum ApiKeyCommand {
         name: Option<String>,
         /// Scopes (JSON array string).
         scopes: Option<String>,
+        /// Agent / application name for tracking.
+        agent_name: Option<String>,
+        /// Expiration datetime (strtotime-compatible).
+        expires: Option<String>,
     },
     /// List all API keys.
     List,
@@ -205,6 +219,10 @@ pub enum ApiKeyCommand {
         name: Option<String>,
         /// New scopes.
         scopes: Option<String>,
+        /// New agent / application name.
+        agent_name: Option<String>,
+        /// New expiration datetime (empty string clears).
+        expires: Option<String>,
     },
 }
 
@@ -219,13 +237,25 @@ pub enum OauthCommand {
         /// Session ID.
         session_id: String,
     },
+    /// Rename a session's display labels.
+    Rename {
+        /// Session ID.
+        session_id: String,
+        /// New device name (empty string clears).
+        device_name: Option<String>,
+        /// New agent name (empty string clears).
+        agent_name: Option<String>,
+    },
     /// Revoke a single session.
     Revoke {
         /// Session ID.
         session_id: String,
     },
     /// Revoke all sessions.
-    RevokeAll,
+    RevokeAll {
+        /// Session ID to keep active while revoking all others.
+        exclude_current: Option<String>,
+    },
 }
 
 /// Login via email/password (HTTP Basic Auth).
@@ -395,6 +425,61 @@ fn logout(ctx: &CommandContext<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Sign out server-side (revoke revocable session tokens), then clear local
+/// credentials for the active profile.
+async fn signout(ctx: &CommandContext<'_>) -> Result<()> {
+    let resolved = token::resolve_token(ctx.flag_token, ctx.profile_name, ctx.config_dir)
+        .context("failed to resolve token")?;
+    let t = resolved
+        .ok_or_else(|| anyhow::anyhow!("authentication required. Run: fastio auth login"))?;
+    let client = ApiClient::new(ctx.api_base, Some(t)).context("failed to create API client")?;
+
+    api::auth::sign_out(&client)
+        .await
+        .context("sign-out failed")?;
+
+    // The server token is now invalid; drop the local credentials too.
+    let mut creds_file =
+        CredentialsFile::load(ctx.config_dir).context("failed to load credentials")?;
+    creds_file
+        .remove(ctx.profile_name, ctx.config_dir)
+        .context("failed to clear credentials")?;
+
+    let value = json!({
+        "status": "signed_out",
+        "profile": ctx.profile_name,
+    });
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Invalidate every login session for the user (sign out everywhere), then
+/// clear local credentials for the active profile.
+async fn invalidate_all(ctx: &CommandContext<'_>) -> Result<()> {
+    let resolved = token::resolve_token(ctx.flag_token, ctx.profile_name, ctx.config_dir)
+        .context("failed to resolve token")?;
+    let t = resolved
+        .ok_or_else(|| anyhow::anyhow!("authentication required. Run: fastio auth login"))?;
+    let client = ApiClient::new(ctx.api_base, Some(t)).context("failed to create API client")?;
+
+    api::auth::invalidate_all(&client)
+        .await
+        .context("session invalidation failed")?;
+
+    let mut creds_file =
+        CredentialsFile::load(ctx.config_dir).context("failed to load credentials")?;
+    creds_file
+        .remove(ctx.profile_name, ctx.config_dir)
+        .context("failed to clear credentials")?;
+
+    let value = json!({
+        "status": "all_sessions_invalidated",
+        "profile": ctx.profile_name,
+    });
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
 /// Show authentication status.
 async fn status(ctx: &CommandContext<'_>) -> Result<()> {
     let resolved = token::resolve_token(ctx.flag_token, ctx.profile_name, ctx.config_dir)
@@ -468,10 +553,11 @@ async fn signup(
     password: &str,
     first_name: Option<&str>,
     last_name: Option<&str>,
+    agent: bool,
 ) -> Result<()> {
     let client = ApiClient::new(ctx.api_base, None).context("failed to create API client")?;
 
-    api::auth::sign_up(&client, email, password, first_name, last_name)
+    api::auth::sign_up(&client, email, password, first_name, last_name, agent)
         .await
         .context("signup failed")?;
 
@@ -628,11 +714,21 @@ async fn api_key(cmd: &ApiKeyCommand, ctx: &CommandContext<'_>) -> Result<()> {
     let client = ApiClient::new(ctx.api_base, Some(t)).context("failed to create API client")?;
 
     match cmd {
-        ApiKeyCommand::Create { name, scopes } => {
-            let result =
-                api::auth::api_key_create(&client, name.as_deref(), scopes.as_deref(), None)
-                    .await
-                    .context("API key creation failed")?;
+        ApiKeyCommand::Create {
+            name,
+            scopes,
+            agent_name,
+            expires,
+        } => {
+            let result = api::auth::api_key_create(
+                &client,
+                name.as_deref(),
+                scopes.as_deref(),
+                agent_name.as_deref(),
+                expires.as_deref(),
+            )
+            .await
+            .context("API key creation failed")?;
 
             let value = json!({
                 "status": "created",
@@ -674,14 +770,25 @@ async fn api_key(cmd: &ApiKeyCommand, ctx: &CommandContext<'_>) -> Result<()> {
             key_id,
             name,
             scopes,
+            agent_name,
+            expires,
         } => {
-            if name.is_none() && scopes.is_none() {
-                anyhow::bail!("at least one update field is required (--name, --scopes)");
+            if name.is_none() && scopes.is_none() && agent_name.is_none() && expires.is_none() {
+                anyhow::bail!(
+                    "at least one update field is required \
+                     (--name, --scopes, --agent-name, --expires)"
+                );
             }
-            let result =
-                api::auth::api_key_update(&client, key_id, name.as_deref(), scopes.as_deref())
-                    .await
-                    .context("API key update failed")?;
+            let result = api::auth::api_key_update(
+                &client,
+                key_id,
+                name.as_deref(),
+                scopes.as_deref(),
+                agent_name.as_deref(),
+                expires.as_deref(),
+            )
+            .await
+            .context("API key update failed")?;
             ctx.output.render(&result)?;
         }
     }
@@ -789,6 +896,24 @@ async fn oauth(cmd: &OauthCommand, ctx: &CommandContext<'_>) -> Result<()> {
                 .context("failed to get OAuth session details")?;
             ctx.output.render(&value)?;
         }
+        OauthCommand::Rename {
+            session_id,
+            device_name,
+            agent_name,
+        } => {
+            if device_name.is_none() && agent_name.is_none() {
+                anyhow::bail!("at least one of --device-name or --agent-name is required");
+            }
+            let value = api::auth::oauth_rename(
+                &client,
+                session_id,
+                device_name.as_deref(),
+                agent_name.as_deref(),
+            )
+            .await
+            .context("failed to rename OAuth session")?;
+            ctx.output.render(&value)?;
+        }
         OauthCommand::Revoke { session_id } => {
             api::auth::oauth_revoke(&client, session_id)
                 .await
@@ -799,12 +924,13 @@ async fn oauth(cmd: &OauthCommand, ctx: &CommandContext<'_>) -> Result<()> {
             });
             ctx.output.render(&value)?;
         }
-        OauthCommand::RevokeAll => {
-            api::auth::oauth_revoke_all(&client)
+        OauthCommand::RevokeAll { exclude_current } => {
+            api::auth::oauth_revoke_all(&client, exclude_current.as_deref())
                 .await
                 .context("failed to revoke all OAuth sessions")?;
             let value = json!({
                 "status": "all_revoked",
+                "excluded_session": exclude_current,
             });
             ctx.output.render(&value)?;
         }

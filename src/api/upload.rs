@@ -13,10 +13,56 @@ use bytes::Bytes;
 use colored::Colorize;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::multipart;
+use secrecy::SecretString;
 use serde_json::{Value, json};
 
-use crate::client::ApiClient;
+use crate::client::{ApiClient, build_password_header};
 use crate::error::CliError;
+
+/// Name of the request header carrying a File Share recipient's link password.
+///
+/// Mirrors the constant of the same value in `crate::client`; declared here too
+/// because the raw-reqwest upload paths attach the header at their own
+/// request-builder sites. The header VALUE is built by the single shared
+/// [`crate::client::build_password_header`] seam (sensitive, UTF-8-capable);
+/// only the header NAME is needed here.
+const PASSWORD_HEADER: &str = "x-ve-password";
+
+/// Parse a Fast.io error envelope from a raw write-back / chunk response body
+/// into a [`CliError::Api`], tolerating the platform's shape variations.
+///
+/// The named-key write-back endpoints can return the message under either
+/// `error.text` OR `error.message`, and the code as either a JSON number
+/// (`"code": 400`) OR a string-encoded number (`"code": "400"`). This shared
+/// parser (used by both [`single_shot_fileshare_writeback`] and
+/// [`handle_chunk_response`]) accepts all of those; an unparseable / absent code
+/// falls back to `0` (the HTTP status still drives the suggestion) and an absent
+/// message falls back to `fallback_message`. Mirrors the client-layer
+/// `ApiClient::extract_error` contract for the raw paths that cannot reach it.
+#[must_use]
+fn parse_writeback_error(body: &Value, http_status: u16, fallback_message: &str) -> CliError {
+    let err = body.get("error");
+    let message = err
+        .and_then(|e| e.get("text").or_else(|| e.get("message")))
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_message)
+        .to_owned();
+    let code = err
+        .and_then(|e| e.get("code"))
+        .and_then(|c| {
+            c.as_u64()
+                .or_else(|| c.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0);
+    CliError::Api(crate::error::ApiError {
+        code,
+        error_code: None,
+        message,
+        http_status,
+        details: None,
+    })
+}
 
 /// User-Agent string for upload requests.
 const UPLOAD_USER_AGENT: &str = concat!("fastio-cli/", env!("CARGO_PKG_VERSION"));
@@ -49,7 +95,8 @@ pub const SINGLE_CALL_MAX_SIZE: u64 = 4 * 1024 * 1024;
 pub async fn single_call_upload(
     token: &str,
     api_base: &str,
-    workspace_id: &str,
+    instance_id: &str,
+    profile_type: &str,
     folder_id: &str,
     filename: &str,
     file_data: Vec<u8>,
@@ -72,9 +119,9 @@ pub async fn single_call_upload(
             .text("name", filename.to_owned())
             .text("size", file_size.to_string())
             .text("action", "create")
-            .text("instance_id", workspace_id.to_owned())
+            .text("instance_id", instance_id.to_owned())
             .text("folder_id", folder_id.to_owned())
-            .text("profile_type", "workspace")
+            .text("profile_type", profile_type.to_owned())
             .part("chunk", part);
 
         let send_result = http_client
@@ -161,6 +208,7 @@ pub async fn single_call_upload(
                     error_code: None,
                     message: message.to_owned(),
                     http_status: status.as_u16(),
+                    details: None,
                 }));
             }
             Err(err) => {
@@ -178,19 +226,330 @@ pub async fn single_call_upload(
 /// `POST /upload/`
 pub async fn create_upload_session(
     client: &ApiClient,
-    workspace_id: &str,
+    instance_id: &str,
+    profile_type: &str,
     folder_id: &str,
     filename: &str,
     filesize: u64,
 ) -> Result<Value, CliError> {
+    let form = create_upload_session_form(instance_id, profile_type, folder_id, filename, filesize);
+    client.post("/upload/", &form).await
+}
+
+/// Build the form body for [`create_upload_session`]. `profile_type` is
+/// `workspace` or `share` and `instance_id` is the target workspace/share id.
+fn create_upload_session_form(
+    instance_id: &str,
+    profile_type: &str,
+    folder_id: &str,
+    filename: &str,
+    filesize: u64,
+) -> HashMap<String, String> {
     let mut form = HashMap::new();
     form.insert("name".to_owned(), filename.to_owned());
     form.insert("size".to_owned(), filesize.to_string());
     form.insert("action".to_owned(), "create".to_owned());
-    form.insert("instance_id".to_owned(), workspace_id.to_owned());
+    form.insert("instance_id".to_owned(), instance_id.to_owned());
     form.insert("folder_id".to_owned(), folder_id.to_owned());
-    form.insert("profile_type".to_owned(), "workspace".to_owned());
-    client.post("/upload/", &form).await
+    form.insert("profile_type".to_owned(), profile_type.to_owned());
+    form
+}
+
+// ─── File Share write-back (external edit) ─────────────────────────────────
+//
+// A holder of an `edit` grant replaces a File Share's bound file content by
+// targeting the FILE SHARE id as the update target of a normal upload session
+// (`upload.txt:650-693`). These functions differ from the workspace upload
+// helpers above in three ways: `action=update` (not `create`), `instance_id` is
+// the File Share id (not a workspace id), NO `profile_type`/`folder_id` is sent,
+// and an optional `if_version_id` compare-and-swap precondition is honored
+// (File-Share-only; 400 on any other target). The share's read gate applies to
+// EVERY step, so each helper threads the optional `x-ve-password` header.
+
+/// Build the shared write-back session form fields.
+///
+/// `name` / `size` / `action=update` / `instance_id={fileshare_id}` /
+/// `file_id={bound_node_id}` plus `if_version_id` only when `Some`. Deliberately
+/// emits NEITHER `profile_type` NOR `folder_id` — the write-back contract omits
+/// both (`upload.txt:657-666`). Shared by the session-create and single-shot
+/// paths so the field set cannot drift between them.
+#[must_use]
+fn writeback_form_fields(
+    fileshare_id: &str,
+    bound_node_id: &str,
+    filename: &str,
+    filesize: u64,
+    if_version_id: Option<&str>,
+) -> HashMap<String, String> {
+    let mut form = HashMap::new();
+    form.insert("name".to_owned(), filename.to_owned());
+    form.insert("size".to_owned(), filesize.to_string());
+    form.insert("action".to_owned(), "update".to_owned());
+    form.insert("instance_id".to_owned(), fileshare_id.to_owned());
+    form.insert("file_id".to_owned(), bound_node_id.to_owned());
+    if let Some(version) = if_version_id {
+        form.insert("if_version_id".to_owned(), version.to_owned());
+    }
+    form
+}
+
+/// Create a chunked write-back upload session targeting a File Share's bound
+/// file.
+///
+/// `POST /upload/` (form) with `action=update`, `instance_id={fileshare_id}`,
+/// `file_id={bound_node_id}`, and optional `if_version_id`; NO `profile_type`.
+/// Routed through [`ApiClient::post_with_password`] so the share's read gate
+/// (link password) is satisfied. Do NOT reuse [`create_upload_session`] — it
+/// hardcodes `action=create` / `profile_type=workspace`.
+pub async fn create_fileshare_writeback_session(
+    client: &ApiClient,
+    fileshare_id: &str,
+    bound_node_id: &str,
+    filename: &str,
+    filesize: u64,
+    if_version_id: Option<&str>,
+    password: Option<&SecretString>,
+) -> Result<Value, CliError> {
+    let form = writeback_form_fields(
+        fileshare_id,
+        bound_node_id,
+        filename,
+        filesize,
+        if_version_id,
+    );
+    client.post_with_password("/upload/", &form, password).await
+}
+
+/// Replace a File Share's bound file in a TRUE single-shot multipart request.
+///
+/// `POST /upload/` with the chunk bytes attached to the INITIAL request
+/// alongside the write-back form fields (`action=update`, `instance_id`,
+/// `file_id`, optional `if_version_id`) and the optional `x-ve-password` header.
+/// The session **auto-assembles** when the full chunk rides the initial request
+/// — do NOT call `complete` afterwards (it returns a benign "not in a valid
+/// state" error, `upload.txt:653`). Modeled on [`single_call_upload`]'s
+/// multipart mechanics but with the write-back fields and password support, and
+/// without the create-only `profile_type` / `folder_id`.
+///
+/// Returns the unwrapped response payload (the write-back `session` is at the
+/// top level of the named-key envelope; see
+/// [`crate::api::fileshare::extract_session`]).
+///
+/// **Idempotency / retry policy:** this is a TRUE single-shot upload — the full
+/// file body rides the initial request and the server auto-assembles a new
+/// version from it. The retry policy is therefore even narrower than
+/// [`stream_upload`]: only **429** (the server rejected the request before
+/// touching the body) and a **`is_connect`** failure (the TCP connection itself
+/// could not be established, so no bytes reached the wire) are retried.
+/// **`is_request`, 5xx, and timeouts are NOT retried** — once the whole body is
+/// on the wire the server may have already assembled and written a new version
+/// before returning a 500 (or before the client timed out / the in-flight
+/// `inner.call(req)` errored), so a replay could create a duplicate version or,
+/// with `if_version_id`, turn a silent success into a later CAS conflict. In
+/// reqwest 0.12 a request error wraps `inner.call(req).await`, which can fire
+/// while the body is mid-send — so it is excluded here even though
+/// [`stream_upload`] (where the same hazard exists but the precedent is broader)
+/// still retries it. The re-sendable chunked path
+/// ([`upload_chunk_with_password`]) keeps its broader retry behavior.
+// The write-back contract genuinely needs every field (target ids, filename,
+// bytes, CAS precondition, password).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn single_shot_fileshare_writeback(
+    token: &str,
+    api_base: &str,
+    fileshare_id: &str,
+    bound_node_id: &str,
+    filename: &str,
+    file_data: Vec<u8>,
+    if_version_id: Option<&str>,
+    password: Option<&SecretString>,
+) -> Result<Value, CliError> {
+    let file_size = file_data.len() as u64;
+    let url = format!("{}/upload/", api_base.trim_end_matches('/'));
+
+    // The write-back client is built with `redirect(Policy::none())`
+    // UNCONDITIONALLY: this path is always potentially password-bearing
+    // (`x-ve-password`), and reqwest follows up to 10 redirects by default
+    // WITHOUT stripping custom headers, so a stray 3xx would forward the link
+    // password to the `Location` target. `.build()` surfaces its error rather
+    // than falling back to a redirect-following client (H1/H2).
+    let http_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(CHUNK_UPLOAD_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(CHUNK_CONNECT_TIMEOUT_SECS))
+        .build()
+        .map_err(CliError::Http)?;
+
+    // L1: parse the optional password to a sensitive header value ONCE before
+    // the retry loop (a bad value fails fast, without a panic) — the value is
+    // cheaply cloned per attempt inside the loop. Uses the single shared
+    // `client::build_password_header` seam (F2-9).
+    let password_header = password.map(build_password_header).transpose()?;
+    // L2: the multipart text fields derive from the single `writeback_form_fields`
+    // source of truth so the field set cannot drift from the chunked path; the
+    // file bytes are attached as the `chunk` part on top. `Bytes` clones O(1)
+    // per retry (L7) instead of copying the whole buffer.
+    let writeback_fields = writeback_form_fields(
+        fileshare_id,
+        bound_node_id,
+        filename,
+        file_size,
+        if_version_id,
+    );
+    let file_bytes = Bytes::from(file_data);
+
+    let mut attempt: u32 = 0;
+    let mut backoff = CHUNK_INITIAL_BACKOFF;
+
+    loop {
+        let mut form = multipart::Form::new();
+        for (key, value) in &writeback_fields {
+            form = form.text(key.clone(), value.clone());
+        }
+        let chunk_len = file_bytes.len() as u64;
+        let part = multipart::Part::stream_with_length(file_bytes.clone(), chunk_len)
+            .file_name(filename.to_owned());
+        let form = form.part("chunk", part);
+
+        let mut request = http_client
+            .post(&url)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header(USER_AGENT, UPLOAD_USER_AGENT)
+            .multipart(form);
+        if let Some(value) = &password_header {
+            request = request.header(PASSWORD_HEADER, value.clone());
+        }
+
+        match request.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+
+                // 429 is safe to retry — the server rejected the request before
+                // processing the body, so no version was assembled.
+                if status.as_u16() == 429 && attempt < CHUNK_MAX_RETRIES {
+                    let retry_secs = parse_rate_limit_expiry(&resp);
+                    attempt += 1;
+                    eprintln!(
+                        "{} Write-back rate limited (attempt {}/{CHUNK_MAX_RETRIES}). \
+                         Waiting {retry_secs} seconds.",
+                        "warning:".yellow().bold(),
+                        attempt,
+                    );
+                    tokio::time::sleep(Duration::from_secs(retry_secs)).await;
+                    continue;
+                }
+
+                // Do NOT retry 5xx — this is a single-shot, auto-assembling
+                // write-back: the server may have already created a new version
+                // from the body before returning an error. Replaying could
+                // duplicate the version or convert an `if_version_id` success
+                // into a later CAS conflict (mirrors `stream_upload`).
+
+                // Fail closed on an unexpected redirect: the no-redirect client
+                // did NOT follow it. Chasing it would forward any link password
+                // (when one is present) to the `Location` target, and the client
+                // is built no-redirect UNCONDITIONALLY — so the message must not
+                // claim the upload was password-protected (it may not be). Secret-
+                // and URL-free message (H1).
+                if status.is_redirection() {
+                    return Err(CliError::Parse(format!(
+                        "File Share write-back upload cannot follow redirects \
+                         (HTTP {}); refusing to follow it",
+                        status.as_u16()
+                    )));
+                }
+
+                let body: Value = resp.json().await.map_err(|e| {
+                    CliError::Parse(format!("failed to parse write-back response: {e}"))
+                })?;
+
+                let result_ok = match body.get("result") {
+                    Some(Value::String(s)) => s == "yes",
+                    Some(Value::Bool(b)) => *b,
+                    _ => false,
+                };
+
+                if result_ok {
+                    // L6: this DELIBERATELY preserves the top-level `result` (the
+                    // named-key write-back envelope; `extract_session` reads the
+                    // top-level `session`), unlike `single_call_upload`, which
+                    // unwraps/strips into a `new_file_id` shape. Only server
+                    // bookkeeping (`current_api_version`) is removed.
+                    let payload = if let Some(response_obj) = body.get("response") {
+                        response_obj.clone()
+                    } else {
+                        let mut map = body;
+                        if let Some(obj) = map.as_object_mut() {
+                            obj.remove("current_api_version");
+                        }
+                        map
+                    };
+                    return Ok(payload);
+                }
+
+                return Err(parse_writeback_error(
+                    &body,
+                    status.as_u16(),
+                    "File Share write-back failed",
+                ));
+            }
+            Err(err) => {
+                // Retry ONLY a defensibly-pre-send failure: `is_connect` (the
+                // TCP connection itself failed) occurs before any bytes reach the
+                // wire, so a replay cannot duplicate a version. `is_request` is
+                // DELIBERATELY excluded — in reqwest 0.12 a request error wraps
+                // failures from `inner.call(req).await`, which can fire WHILE the
+                // body is being sent or the response awaited; for a non-idempotent
+                // single-shot write-back that may have already created a version,
+                // replaying on `is_request` risks a duplicate version or, with
+                // `if_version_id`, converting a silent success into a later CAS
+                // conflict. A timeout is likewise excluded — the full body may
+                // have been sent and a new version assembled before the client
+                // timed out. The classifiers OVERLAP in reqwest 0.12 (a timed-out
+                // connect can ALSO report `is_connect`), so the leading
+                // `!is_timeout()` guard keeps a post-send timeout out even on the
+                // narrowed `is_connect()` predicate.
+                let retryable =
+                    writeback_send_error_is_retryable(err.is_timeout(), err.is_connect());
+                if retryable && attempt < CHUNK_MAX_RETRIES {
+                    attempt += 1;
+                    eprintln!(
+                        "{} Write-back connection error (attempt {}/{CHUNK_MAX_RETRIES}): \
+                         {}. Retrying in {} seconds.",
+                        "warning:".yellow().bold(),
+                        attempt,
+                        // URL-scrubbed (F2-10 rationale; the write-back path is
+                        // password-bearing so the URL must never reach the log).
+                        network_error_without_url(&err),
+                        backoff.as_secs(),
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff.saturating_mul(2), CHUNK_MAX_BACKOFF);
+                    continue;
+                }
+                return Err(err.into());
+            }
+        }
+    }
+}
+
+/// Decide whether a SEND error from the single-shot write-back is safe to retry.
+///
+/// Split out from [`single_shot_fileshare_writeback`] so the (security-sensitive)
+/// retry predicate is unit-testable without fabricating a classified
+/// `reqwest::Error` (reqwest exposes no constructor that pins `is_connect` /
+/// `is_request` / `is_timeout`). Takes the relevant classifier flags directly.
+///
+/// Only `is_connect` (the TCP connection itself failed — no bytes on the wire)
+/// is retryable, and only when NOT also a timeout (the reqwest 0.12 classifiers
+/// overlap, so a timed-out connect can report `is_connect` too). `is_request` is
+/// intentionally NOT a parameter: it is never retryable on this non-idempotent
+/// single-shot path, because in reqwest 0.12 a request error wraps
+/// `inner.call(req).await` and can fire mid-send after the server may already
+/// have assembled a new version.
+#[must_use]
+fn writeback_send_error_is_retryable(is_timeout: bool, is_connect: bool) -> bool {
+    !is_timeout && is_connect
 }
 
 /// Upload a single chunk of file data via multipart form.
@@ -257,6 +616,80 @@ pub async fn upload_chunk(
     }
 }
 
+/// Upload a single chunk of a File Share write-back session, threading the
+/// optional `x-ve-password` header.
+///
+/// Identical to [`upload_chunk`] but attaches the optional recipient link
+/// password (the share's read gate applies to every write-back step). Existing
+/// non-write-back chunk uploads stay on [`upload_chunk`] (zero blast radius).
+pub async fn upload_chunk_with_password(
+    token: &str,
+    api_base: &str,
+    upload_id: &str,
+    chunk_number: u32,
+    chunk_data: Vec<u8>,
+    password: Option<&SecretString>,
+) -> Result<Value, CliError> {
+    let chunk_size = chunk_data.len();
+    let url = format!(
+        "{}/upload/{}/chunk/?order={}&size={}",
+        api_base.trim_end_matches('/'),
+        urlencoding::encode(upload_id),
+        chunk_number,
+        chunk_size,
+    );
+
+    // Built with `redirect(Policy::none())` unconditionally — this path is
+    // always potentially password-bearing, and reqwest does not strip
+    // `x-ve-password` across a redirect; a stray 3xx fails closed in
+    // `handle_chunk_response` instead of leaking the password (H1/H2).
+    let http_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(CHUNK_UPLOAD_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(CHUNK_CONNECT_TIMEOUT_SECS))
+        .build()
+        .map_err(CliError::Http)?;
+
+    // L1: parse the optional password ONCE before the retry loop; clone the
+    // sensitive header value per attempt. Uses the single shared
+    // `client::build_password_header` seam (F2-9).
+    let password_header = password.map(build_password_header).transpose()?;
+
+    let mut attempt: u32 = 0;
+    let mut backoff = CHUNK_INITIAL_BACKOFF;
+
+    loop {
+        let part = multipart::Part::bytes(chunk_data.clone()).file_name("chunk.bin");
+        let form = multipart::Form::new().part("chunk", part);
+
+        let mut request = http_client
+            .post(&url)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header(USER_AGENT, UPLOAD_USER_AGENT)
+            .multipart(form);
+        if let Some(value) = &password_header {
+            request = request.header(PASSWORD_HEADER, value.clone());
+        }
+
+        match request.send().await {
+            Ok(resp) => {
+                match handle_chunk_response(resp, chunk_number, &mut attempt, &mut backoff).await {
+                    ChunkResult::Success(body) => return Ok(body),
+                    ChunkResult::Error(err) => return Err(err),
+                    ChunkResult::Retry => {}
+                }
+            }
+            Err(err) => {
+                if should_retry_network_error(&err, chunk_number, &mut attempt, &mut backoff).await
+                {
+                    continue;
+                }
+                return Err(err.into());
+            }
+        }
+    }
+}
+
 /// Result of processing a chunk upload HTTP response.
 enum ChunkResult {
     Success(Value),
@@ -301,6 +734,20 @@ async fn handle_chunk_response(
         return ChunkResult::Retry;
     }
 
+    // Fail closed on an unexpected redirect. The password-bearing chunk client
+    // is built with `redirect(Policy::none())`, so a 3xx surfaces here rather
+    // than being followed (which would forward the link password to the
+    // `Location` target); the non-password chunk path never expects a redirect
+    // on this endpoint either, so failing closed is correct for both. The
+    // message embeds neither the secret nor any URL.
+    if status.is_redirection() {
+        return ChunkResult::Error(CliError::Parse(
+            "the server returned an unexpected redirect during a chunk upload; \
+             refusing to follow it"
+                .to_owned(),
+        ));
+    }
+
     let body: Value = match resp.json().await {
         Ok(b) => b,
         Err(e) => {
@@ -320,23 +767,45 @@ async fn handle_chunk_response(
         return ChunkResult::Success(body);
     }
 
-    let message = body
-        .get("error")
-        .and_then(|e| e.get("text"))
-        .and_then(Value::as_str)
-        .unwrap_or("Chunk upload failed");
-    ChunkResult::Error(CliError::Api(crate::error::ApiError {
-        code: u32::try_from(
-            body.get("error")
-                .and_then(|e| e.get("code"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        )
-        .unwrap_or(0),
-        error_code: None,
-        message: message.to_owned(),
-        http_status: status.as_u16(),
-    }))
+    // M1: shared tolerant parser (text|message, numeric|string-numeric code).
+    ChunkResult::Error(parse_writeback_error(
+        &body,
+        status.as_u16(),
+        "Chunk upload failed",
+    ))
+}
+
+/// Render a [`reqwest::Error`] for a log line WITHOUT the request URL.
+///
+/// F2-10: `reqwest::Error`'s `Display` embeds the request URL, which would echo
+/// credentials if `api_base` ever carried any (e.g. userinfo in the URL).
+/// [`reqwest::Error::without_url`] consumes `self`, so it cannot be called on a
+/// borrowed error; this helper reconstructs an equivalent URL-free message from
+/// the error's `kind` flags plus its underlying source chain (the source carries
+/// the real cause — "connection refused", a timeout, etc. — and never the URL).
+/// Behavior-neutral: it only shapes a warning string.
+fn network_error_without_url(err: &reqwest::Error) -> String {
+    let kind = if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connection failed"
+    } else if err.is_request() {
+        "request error"
+    } else {
+        "network error"
+    };
+    // Walk the source chain for the concrete cause, which does not include the
+    // request URL (only the top-level reqwest Display does).
+    let mut cause: Option<String> = None;
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
+    while let Some(s) = source {
+        cause = Some(s.to_string());
+        source = s.source();
+    }
+    match cause {
+        Some(c) => format!("{kind}: {c}"),
+        None => kind.to_owned(),
+    }
 }
 
 /// Check if a network error should be retried, logging and sleeping if so.
@@ -350,10 +819,13 @@ async fn should_retry_network_error(
     if retryable && *attempt < CHUNK_MAX_RETRIES {
         *attempt += 1;
         eprintln!(
-            "{} Chunk {chunk_number} network error (attempt {}/{CHUNK_MAX_RETRIES}): {err}. \
+            "{} Chunk {chunk_number} network error (attempt {}/{CHUNK_MAX_RETRIES}): {}. \
              Retrying in {} seconds.",
             "warning:".yellow().bold(),
             *attempt,
+            // F2-10: scrub the request URL from the error text (see
+            // `network_error_without_url`). Behavior-neutral (log-string only).
+            network_error_without_url(err),
             backoff.as_secs(),
         );
         tokio::time::sleep(*backoff).await;
@@ -364,17 +836,42 @@ async fn should_retry_network_error(
 }
 
 /// Parse the rate-limit expiry header to estimate seconds until reset.
+///
+/// Reads the modern `x-ve-limit-expires` header first, falling back to the
+/// legacy `X-Rate-Limit-Expiry` for older API deployments. HTTP header lookups
+/// are case-insensitive, so the literal casing does not matter. This mirrors
+/// the centralized parser in `crate::client` (which is private there, so the
+/// modern-with-legacy-fallback logic is duplicated here for the upload retry
+/// paths — single/chunk/stream/batch all route through this one function).
 fn parse_rate_limit_expiry(resp: &reqwest::Response) -> u64 {
-    resp.headers()
-        .get("X-Rate-Limit-Expiry")
+    let raw = rate_limit_expiry_header(resp.headers());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    rate_limit_secs_from_expiry(raw, now)
+}
+
+/// Select the rate-limit expiry header value, preferring the modern
+/// `x-ve-limit-expires` over the legacy `X-Rate-Limit-Expiry`.
+///
+/// Split out so the modern-over-legacy selection is unit-testable without
+/// depending on the system clock (which [`parse_rate_limit_expiry`] reads).
+fn rate_limit_expiry_header(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    headers
+        .get("x-ve-limit-expires")
+        .or_else(|| headers.get("X-Rate-Limit-Expiry"))
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .map_or(60, |expiry_epoch| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            expiry_epoch.saturating_sub(now)
-        })
+}
+
+/// Convert a (possibly missing) rate-limit expiry epoch string into seconds
+/// remaining relative to `now`. Falls back to 60s when absent or unparseable.
+///
+/// Split out from [`parse_rate_limit_expiry`] so the modern-with-legacy
+/// header selection and the epoch arithmetic are unit-testable without a live
+/// [`reqwest::Response`].
+fn rate_limit_secs_from_expiry(raw: Option<&str>, now: u64) -> u64 {
+    raw.and_then(|v| v.parse::<u64>().ok())
+        .map_or(60, |expiry_epoch| expiry_epoch.saturating_sub(now))
 }
 
 /// Trigger file assembly after all chunks are uploaded.
@@ -386,12 +883,43 @@ pub async fn complete_upload(client: &ApiClient, upload_id: &str) -> Result<Valu
     client.post(&path, &form).await
 }
 
+/// Trigger assembly for a File Share write-back session, threading the optional
+/// `x-ve-password` header.
+///
+/// `POST /upload/{upload_id}/complete/`. The share's read gate applies to the
+/// complete step too, so the optional link password is forwarded. Existing
+/// non-write-back callers stay on [`complete_upload`].
+pub async fn complete_upload_with_password(
+    client: &ApiClient,
+    upload_id: &str,
+    password: Option<&SecretString>,
+) -> Result<Value, CliError> {
+    let form = HashMap::new();
+    let path = format!("/upload/{}/complete/", urlencoding::encode(upload_id),);
+    client.post_with_password(&path, &form, password).await
+}
+
 /// Get the current status of an upload session.
 ///
 /// `GET /upload/{upload_id}/details/`
 pub async fn get_upload_status(client: &ApiClient, upload_id: &str) -> Result<Value, CliError> {
     let path = format!("/upload/{}/details/", urlencoding::encode(upload_id),);
     client.get(&path).await
+}
+
+/// Poll a File Share write-back session's status, threading the optional
+/// `x-ve-password` header.
+///
+/// `GET /upload/{upload_id}/details/`. The share's read gate applies to status
+/// polling too, so the optional link password is forwarded. Existing
+/// non-write-back callers stay on [`get_upload_status`].
+pub async fn get_upload_status_with_password(
+    client: &ApiClient,
+    upload_id: &str,
+    password: Option<&SecretString>,
+) -> Result<Value, CliError> {
+    let path = format!("/upload/{}/details/", urlencoding::encode(upload_id),);
+    client.get_with_password(&path, password).await
 }
 
 /// Cancel and delete an upload session.
@@ -469,31 +997,114 @@ pub async fn chunk_delete(
 
 /// List web import jobs.
 ///
-/// `GET /web_upload/list/`
-pub async fn web_list(client: &ApiClient) -> Result<Value, CliError> {
-    client.get("/web_upload/list/").await
+/// `GET /web_upload/` (the root handler serves the list — there is no
+/// `/web_upload/list/` subpath). Optional `limit` / `offset` / `status` are
+/// forwarded as query params.
+pub async fn web_list(
+    client: &ApiClient,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    status: Option<&str>,
+) -> Result<Value, CliError> {
+    let mut params = HashMap::new();
+    if let Some(l) = limit {
+        params.insert("limit".to_owned(), l.to_string());
+    }
+    if let Some(o) = offset {
+        params.insert("offset".to_owned(), o.to_string());
+    }
+    if let Some(s) = status {
+        params.insert("status".to_owned(), s.to_owned());
+    }
+    if params.is_empty() {
+        client.get("/web_upload/").await
+    } else {
+        client.get_with_params("/web_upload/", &params).await
+    }
 }
 
 /// Cancel a web import job.
 ///
-/// `DELETE /web_upload/{upload_id}/`
+/// `DELETE /web_upload/?id=<upload_id>` — the id is a QUERY param on the root
+/// handler (NOT a `/web_upload/{id}/` path segment).
 pub async fn web_cancel(client: &ApiClient, upload_id: &str) -> Result<Value, CliError> {
-    let path = format!("/web_upload/{}/", urlencoding::encode(upload_id));
-    client.delete(&path).await
+    let mut params = HashMap::new();
+    params.insert("id".to_owned(), upload_id.to_owned());
+    client.delete_with_params("/web_upload/", &params).await
 }
 
-/// Get upload limits for the user's plan.
+/// Get upload limits for the user's plan, optionally in a target context.
 ///
-/// `GET /upload/limits/`
-pub async fn upload_limits(client: &ApiClient) -> Result<Value, CliError> {
-    client.get("/upload/limits/").await
+/// `GET /upload/limits/` — the optional query params resolve limits in the
+/// context of a specific operation: `action` (`create` or `update`), `org`
+/// (organization id, used when no `action` is given), `instance_id` (target
+/// workspace or share id; required when `action` is `create` or `update`,
+/// since the handler derives the profile type from it), `folder_id` (target
+/// folder `OpaqueId` or `root`), and `file_id` (required when `action=update`).
+pub async fn upload_limits(
+    client: &ApiClient,
+    action: Option<&str>,
+    org: Option<&str>,
+    instance_id: Option<&str>,
+    folder_id: Option<&str>,
+    file_id: Option<&str>,
+) -> Result<Value, CliError> {
+    let params = upload_limits_query(action, org, instance_id, folder_id, file_id);
+    if params.is_empty() {
+        client.get("/upload/limits/").await
+    } else {
+        client.get_with_params("/upload/limits/", &params).await
+    }
+}
+
+/// Build the optional context query map for [`upload_limits`].
+fn upload_limits_query(
+    action: Option<&str>,
+    org: Option<&str>,
+    instance_id: Option<&str>,
+    folder_id: Option<&str>,
+    file_id: Option<&str>,
+) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    if let Some(v) = action {
+        params.insert("action".to_owned(), v.to_owned());
+    }
+    if let Some(v) = org {
+        params.insert("org".to_owned(), v.to_owned());
+    }
+    if let Some(v) = instance_id {
+        params.insert("instance_id".to_owned(), v.to_owned());
+    }
+    if let Some(v) = folder_id {
+        params.insert("folder_id".to_owned(), v.to_owned());
+    }
+    if let Some(v) = file_id {
+        params.insert("file_id".to_owned(), v.to_owned());
+    }
+    params
+}
+
+/// List the hash algorithms supported by the upload integrity-check flow.
+///
+/// `GET /upload/algos/` — returns `{ "algos": ["md5", "sha1", …] }`.
+pub async fn algos(client: &ApiClient) -> Result<Value, CliError> {
+    client.get("/upload/algos/").await
 }
 
 /// Get restricted file extensions.
 ///
-/// `GET /upload/extensions/`
-pub async fn upload_extensions(client: &ApiClient) -> Result<Value, CliError> {
-    client.get("/upload/extensions/").await
+/// `GET /upload/limits/extensions/` — optional `plan` query selects the plan
+/// whose extension limits to return.
+pub async fn upload_extensions(client: &ApiClient, plan: Option<&str>) -> Result<Value, CliError> {
+    if let Some(p) = plan {
+        let mut params = HashMap::new();
+        params.insert("plan".to_owned(), p.to_owned());
+        client
+            .get_with_params("/upload/limits/extensions/", &params)
+            .await
+    } else {
+        client.get("/upload/limits/extensions/").await
+    }
 }
 
 // ─── Streaming Upload ──────────────────────────────────────────────────────
@@ -510,7 +1121,8 @@ const STREAM_UPLOAD_TIMEOUT_SECS: u64 = 600;
 /// bound on the stream payload; if omitted, the plan's file-size limit applies.
 pub async fn create_stream_session(
     client: &ApiClient,
-    workspace_id: &str,
+    instance_id: &str,
+    profile_type: &str,
     folder_id: &str,
     filename: &str,
     max_size: Option<u64>,
@@ -519,9 +1131,9 @@ pub async fn create_stream_session(
     form.insert("name".to_owned(), filename.to_owned());
     form.insert("stream".to_owned(), "true".to_owned());
     form.insert("action".to_owned(), "create".to_owned());
-    form.insert("instance_id".to_owned(), workspace_id.to_owned());
+    form.insert("instance_id".to_owned(), instance_id.to_owned());
     form.insert("folder_id".to_owned(), folder_id.to_owned());
-    form.insert("profile_type".to_owned(), "workspace".to_owned());
+    form.insert("profile_type".to_owned(), profile_type.to_owned());
     if let Some(max) = max_size {
         form.insert("max_size".to_owned(), max.to_string());
     }
@@ -673,6 +1285,7 @@ async fn handle_stream_response(resp: reqwest::Response, attempt: &mut u32) -> S
         error_code: None,
         message: message.to_owned(),
         http_status: status.as_u16(),
+        details: None,
     }))
 }
 
@@ -987,6 +1600,7 @@ fn parse_batch_response(body: &Value, http_status: u16) -> Result<BatchUploadRes
             error_code: None,
             message: message.to_owned(),
             http_status,
+            details: None,
         }));
     }
 
@@ -1208,6 +1822,49 @@ mod tests {
     }
 
     #[test]
+    fn create_session_form_workspace_profile() {
+        let f = create_upload_session_form("19", "workspace", "root", "a.txt", 1024);
+        assert_eq!(f.get("instance_id").map(String::as_str), Some("19"));
+        assert_eq!(f.get("profile_type").map(String::as_str), Some("workspace"));
+        assert_eq!(f.get("folder_id").map(String::as_str), Some("root"));
+        assert_eq!(f.get("size").map(String::as_str), Some("1024"));
+        assert_eq!(f.get("action").map(String::as_str), Some("create"));
+    }
+
+    #[test]
+    fn create_session_form_share_profile() {
+        // Share-context upload: profile_type=share, instance_id=<share id>.
+        let f = create_upload_session_form("55", "share", "fold1", "b.bin", 42);
+        assert_eq!(f.get("instance_id").map(String::as_str), Some("55"));
+        assert_eq!(f.get("profile_type").map(String::as_str), Some("share"));
+    }
+
+    #[test]
+    fn upload_limits_query_empty_by_default() {
+        assert!(upload_limits_query(None, None, None, None, None).is_empty());
+    }
+
+    #[test]
+    fn upload_limits_query_create_context() {
+        let q = upload_limits_query(Some("create"), None, Some("19"), Some("root"), None);
+        assert_eq!(q.get("action").map(String::as_str), Some("create"));
+        assert_eq!(q.get("instance_id").map(String::as_str), Some("19"));
+        assert_eq!(q.get("folder_id").map(String::as_str), Some("root"));
+        assert!(!q.contains_key("org"));
+        assert!(!q.contains_key("file_id"));
+    }
+
+    #[test]
+    fn upload_limits_query_update_context() {
+        // The update context requires instance_id (profile-type source) plus
+        // file_id; both must be forwarded as query params.
+        let q = upload_limits_query(Some("update"), None, Some("19"), None, Some("file9"));
+        assert_eq!(q.get("action").map(String::as_str), Some("update"));
+        assert_eq!(q.get("instance_id").map(String::as_str), Some("19"));
+        assert_eq!(q.get("file_id").map(String::as_str), Some("file9"));
+    }
+
+    #[test]
     fn manifest_includes_hash_pair_only_when_both_present() {
         let items = vec![
             BatchUploadItem {
@@ -1379,6 +2036,219 @@ mod tests {
         assert!(validate_creator_tag("unicode-☃").is_err());
     }
 
+    /// Build a `HeaderMap` carrying the given headers so the modern-over-legacy
+    /// selection in `rate_limit_expiry_header` can be exercised directly
+    /// (no live `reqwest::Response` needed).
+    fn headers_with(pairs: &[(&str, &str)]) -> reqwest::header::HeaderMap {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let mut map = HeaderMap::new();
+        for (k, v) in pairs {
+            let name = HeaderName::from_bytes(k.as_bytes()).expect("valid header name");
+            let value = HeaderValue::from_str(v).expect("valid header value");
+            map.insert(name, value);
+        }
+        map
+    }
+
+    #[test]
+    fn rate_limit_header_prefers_modern_over_legacy() {
+        // FIX 6: the platform now emits x-ve-limit-expires; it must win over
+        // the legacy X-Rate-Limit-Expiry when both are present.
+        let headers = headers_with(&[
+            ("x-ve-limit-expires", "1000"),
+            ("X-Rate-Limit-Expiry", "2000"),
+        ]);
+        assert_eq!(rate_limit_expiry_header(&headers), Some("1000"));
+    }
+
+    #[test]
+    fn rate_limit_header_reads_modern_when_only_modern_present() {
+        let headers = headers_with(&[("x-ve-limit-expires", "1500")]);
+        assert_eq!(rate_limit_expiry_header(&headers), Some("1500"));
+    }
+
+    #[test]
+    fn rate_limit_header_falls_back_to_legacy() {
+        let headers = headers_with(&[("X-Rate-Limit-Expiry", "2000")]);
+        assert_eq!(rate_limit_expiry_header(&headers), Some("2000"));
+        // No headers at all → None (the parse path then defaults to 60s).
+        let none = headers_with(&[]);
+        assert_eq!(rate_limit_expiry_header(&none), None);
+        assert_eq!(
+            rate_limit_secs_from_expiry(rate_limit_expiry_header(&none), 1000),
+            60
+        );
+    }
+
+    #[test]
+    fn rate_limit_secs_from_expiry_arithmetic() {
+        // Future epoch: returns the difference.
+        assert_eq!(rate_limit_secs_from_expiry(Some("1100"), 1000), 100);
+        // Past epoch: saturates to 0.
+        assert_eq!(rate_limit_secs_from_expiry(Some("900"), 1000), 0);
+        // Missing / unparseable: default 60.
+        assert_eq!(rate_limit_secs_from_expiry(None, 1000), 60);
+        assert_eq!(rate_limit_secs_from_expiry(Some("abc"), 1000), 60);
+    }
+
+    #[test]
+    fn writeback_form_has_update_fields_and_omits_create_fields() {
+        let form = writeback_form_fields("FS1", "node1", "v2.pdf", 1024, None);
+        assert_eq!(form.get("action").map(String::as_str), Some("update"));
+        assert_eq!(form.get("instance_id").map(String::as_str), Some("FS1"));
+        assert_eq!(form.get("file_id").map(String::as_str), Some("node1"));
+        assert_eq!(form.get("name").map(String::as_str), Some("v2.pdf"));
+        assert_eq!(form.get("size").map(String::as_str), Some("1024"));
+        // Write-back must NEVER send the create-only fields.
+        assert!(
+            !form.contains_key("profile_type"),
+            "write-back must not send profile_type"
+        );
+        assert!(
+            !form.contains_key("folder_id"),
+            "write-back must not send folder_id"
+        );
+        // if_version_id is omitted when None.
+        assert!(!form.contains_key("if_version_id"));
+    }
+
+    #[test]
+    fn writeback_form_includes_if_version_id_only_when_some() {
+        let with = writeback_form_fields("FS1", "node1", "v2.pdf", 10, Some("v7"));
+        assert_eq!(with.get("if_version_id").map(String::as_str), Some("v7"));
+        let without = writeback_form_fields("FS1", "node1", "v2.pdf", 10, None);
+        assert!(!without.contains_key("if_version_id"));
+    }
+
+    #[tokio::test]
+    async fn network_error_without_url_omits_the_request_url() {
+        // F3-8(a): the write-back log path is password-bearing, so the rendered
+        // network-error warning must NEVER include the request URL (which could
+        // echo userinfo if `api_base` ever carried any). Drive a REAL connect
+        // failure to a refused port with a recognizable URL marker, then assert
+        // the helper's output omits it (while the raw Display would include it).
+        let marker = "URLMARKER-do-not-leak";
+        let url = format!("http://127.0.0.1:1/{marker}");
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client builds");
+        let err = client
+            .get(&url)
+            .send()
+            .await
+            .expect_err("connect to port 1 must fail");
+
+        let rendered = network_error_without_url(&err);
+        assert!(
+            !rendered.contains(marker),
+            "the URL marker must not appear in the scrubbed warning: {rendered}"
+        );
+        // Sanity: the raw reqwest Display DOES embed the URL (so the helper is
+        // doing real work, not trivially passing because reqwest changed).
+        assert!(
+            err.to_string().contains(marker),
+            "raw reqwest Display is expected to carry the URL (regression guard): {err}"
+        );
+    }
+
+    #[test]
+    fn writeback_send_error_retry_predicate_is_connect_only() {
+        // F3-1: the single-shot write-back is non-idempotent, so the SEND-error
+        // retry predicate must be NARROW. A pure `is_connect` failure (no bytes
+        // on the wire) is the only retryable case, and only when it is NOT also
+        // a timeout.
+        assert!(
+            writeback_send_error_is_retryable(false, true),
+            "a pure connect failure is retryable"
+        );
+        // A timeout-classified connect must NOT retry (overlapping classifiers).
+        assert!(
+            !writeback_send_error_is_retryable(true, true),
+            "a timed-out connect must not retry (body may have been sent)"
+        );
+        // A pure timeout (no connect) must NOT retry.
+        assert!(
+            !writeback_send_error_is_retryable(true, false),
+            "a timeout must not retry"
+        );
+        // Neither flag (e.g. an `is_request`-only error, which is not a parameter
+        // here BECAUSE it is never retryable) must NOT retry.
+        assert!(
+            !writeback_send_error_is_retryable(false, false),
+            "a non-connect, non-timeout send error (e.g. is_request) must not retry"
+        );
+    }
+
+    #[test]
+    fn upload_password_header_accepts_utf8_and_marks_sensitive() {
+        // F2-5/F2-9: the upload paths reuse the single shared
+        // `client::build_password_header` seam, which is built from the
+        // password BYTES so a valid non-ASCII UTF-8 link password (settable via
+        // the management form) is sendable rather than rejected. Round-trips and
+        // is marked sensitive.
+        let pw = SecretString::from("pässwört→".to_owned());
+        let value = build_password_header(&pw).expect("utf-8 password header");
+        assert!(
+            value.is_sensitive(),
+            "the password header value must be marked sensitive"
+        );
+        assert_eq!(value.as_bytes(), "pässwört→".as_bytes());
+    }
+
+    #[test]
+    fn upload_password_header_rejects_control_chars_without_leaking() {
+        // A newline still cannot be a header value — must fail without a panic,
+        // name only the header, and never echo the secret.
+        let bad = SecretString::from("line1\nSECRET-LEAK".to_owned());
+        let err = build_password_header(&bad).expect_err("control char must be rejected");
+        match &err {
+            CliError::InvalidHeaderValue { header } => assert_eq!(*header, PASSWORD_HEADER),
+            other => panic!("expected InvalidHeaderValue, got {other:?}"),
+        }
+        assert!(
+            !err.to_string().contains("SECRET-LEAK"),
+            "the secret must never appear in the error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_writeback_error_accepts_text_message_and_string_codes() {
+        // `text` + numeric code.
+        let a = serde_json::json!({"error": {"code": 1605, "text": "bad node"}});
+        let CliError::Api(err) = parse_writeback_error(&a, 400, "fallback") else {
+            panic!("expected Api error");
+        };
+        assert_eq!(err.code, 1605);
+        assert_eq!(err.message, "bad node");
+        assert_eq!(err.http_status, 400);
+
+        // `message` (not `text`) + string-encoded code.
+        let b = serde_json::json!({"error": {"code": "1700", "message": "tier too low"}});
+        let CliError::Api(err) = parse_writeback_error(&b, 403, "fallback") else {
+            panic!("expected Api error");
+        };
+        assert_eq!(err.code, 1700, "string-encoded code must parse");
+        assert_eq!(err.message, "tier too low");
+
+        // Absent error object → fallback message, code 0, status preserved.
+        let c = serde_json::json!({"result": false});
+        let CliError::Api(err) = parse_writeback_error(&c, 500, "fallback") else {
+            panic!("expected Api error");
+        };
+        assert_eq!(err.code, 0);
+        assert_eq!(err.message, "fallback");
+        assert_eq!(err.http_status, 500);
+
+        // Unparseable string code → 0 (no panic).
+        let d = serde_json::json!({"error": {"code": "nope", "text": "x"}});
+        let CliError::Api(err) = parse_writeback_error(&d, 400, "fallback") else {
+            panic!("expected Api error");
+        };
+        assert_eq!(err.code, 0);
+    }
+
     #[tokio::test]
     async fn upload_batch_rejects_empty_and_oversize_batches() {
         // Empty — reject before touching the network.
@@ -1396,5 +2266,176 @@ mod tests {
             .await
             .expect_err("should reject");
         assert!(matches!(err, CliError::Parse(_)));
+    }
+
+    /// Serve a fixed HTTP/1.1 response (`status_line` + optional `Location`) on
+    /// every accepted connection, COUNTING each request, until the test drops the
+    /// returned handle. Returns the bound `127.0.0.1:<port>` and a shared counter.
+    ///
+    /// Adapts the `client.rs` one-shot loopback pattern (F3-4) but accepts in a
+    /// loop and counts requests so the test can prove the single-shot write-back
+    /// makes EXACTLY ONE request (no replay) on a terminal 5xx / 3xx — if the
+    /// code wrongly retried, the counter would exceed 1.
+    async fn spawn_counting_server(
+        status_line: &'static str,
+        location: Option<&'static str>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_srv = Arc::clone(&count);
+        tokio::spawn(async move {
+            // Accept in a loop so a (buggy) replay attempt would be served and
+            // counted rather than hanging.
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let _ = count_srv.fetch_add(1, Ordering::SeqCst);
+                // Drain the FULL request before responding. A single `read`
+                // leaves the multipart/form body undrained; under parallel test
+                // load the client's still-in-flight write then races our close
+                // and gets a TCP RST, so `resp.json()` fails with
+                // `CliError::Parse` instead of the asserted error. We read in a
+                // loop until the header terminator (`\r\n\r\n`) is seen, parse the
+                // declared `Content-Length`, then keep reading until that many
+                // body bytes are consumed (or the peer closes / read returns 0).
+                let mut req_buf: Vec<u8> = Vec::with_capacity(4096);
+                let mut chunk = [0u8; 4096];
+                let mut header_end: Option<usize> = None;
+                let mut content_length: Option<usize> = None;
+                loop {
+                    // Once headers are fully parsed, stop as soon as the declared
+                    // body has been drained (Content-Length: 0 → done immediately).
+                    if let (Some(he), Some(cl)) = (header_end, content_length)
+                        && req_buf.len() >= he + cl
+                    {
+                        break;
+                    }
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break, // peer closed or read error → stop draining
+                        Ok(n) => {
+                            req_buf.extend_from_slice(&chunk[..n]);
+                            if header_end.is_none()
+                                && let Some(pos) = req_buf.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                let he = pos + 4;
+                                header_end = Some(he);
+                                // Case-insensitively parse `Content-Length`.
+                                let headers =
+                                    String::from_utf8_lossy(&req_buf[..he]).to_ascii_lowercase();
+                                content_length = headers
+                                    .lines()
+                                    .find_map(|line| {
+                                        line.strip_prefix("content-length:")
+                                            .map(str::trim)
+                                            .and_then(|v| v.parse::<usize>().ok())
+                                    })
+                                    .or(Some(0));
+                            }
+                        }
+                    }
+                }
+                let body = br#"{"result":false,"error":{"code":500,"text":"boom"}}"#;
+                let header = match location {
+                    Some(loc) => format!(
+                        "HTTP/1.1 {status_line}\r\nLocation: {loc}\r\n\
+                         Content-Length: 0\r\nConnection: close\r\n\r\n",
+                    ),
+                    None => format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    ),
+                };
+                let _ = sock.write_all(header.as_bytes()).await;
+                if location.is_none() {
+                    let _ = sock.write_all(body).await;
+                }
+                let _ = sock.flush().await;
+            }
+        });
+        (addr, count)
+    }
+
+    #[tokio::test]
+    async fn single_shot_writeback_does_not_retry_5xx_terminal_after_one_request() {
+        use std::sync::atomic::Ordering;
+        // F3-4: a 500 on the single-shot, auto-assembling write-back must be
+        // TERMINAL — surfaced as CliError::Api after EXACTLY ONE request. The
+        // server may already have written a new version, so a replay is unsafe;
+        // the request counter proves no replay happened.
+        let (addr, count) = spawn_counting_server("500 Internal Server Error", None).await;
+
+        let err = single_shot_fileshare_writeback(
+            "tok",
+            &format!("http://{addr}"),
+            "FS1",
+            "node1",
+            "v2.bin",
+            b"hello".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a 5xx must surface as a terminal error");
+
+        match err {
+            CliError::Api(api) => assert_eq!(api.http_status, 500),
+            other => panic!("expected terminal CliError::Api, got {other:?}"),
+        }
+        // The critical safety property: the body was sent ONCE — no replay.
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "single-shot write-back must NOT retry a 5xx (the server may have \
+             already assembled a new version)"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_shot_writeback_fails_closed_on_redirect_without_following() {
+        use std::sync::atomic::Ordering;
+        // F3-4 (also H1): the no-redirect client must FAIL CLOSED on a 3xx —
+        // never chase the Location (which would forward the link password) and
+        // never replay. One request, then a clear non-following error.
+        let (addr, count) = spawn_counting_server(
+            "307 Temporary Redirect",
+            Some("http://example.invalid/leak"),
+        )
+        .await;
+
+        let err = single_shot_fileshare_writeback(
+            "tok",
+            &format!("http://{addr}"),
+            "FS1",
+            "node1",
+            "v2.bin",
+            b"hello".to_vec(),
+            None,
+            Some(&SecretString::from("pw".to_owned())),
+        )
+        .await
+        .expect_err("a 3xx must fail closed, not be followed");
+
+        // Fail-closed redirect surfaces as a Parse error (not an Api error), and
+        // its message names neither the secret nor a URL.
+        match &err {
+            CliError::Parse(msg) => {
+                assert!(
+                    !msg.contains("pw") && !msg.contains("example.invalid"),
+                    "redirect error must not leak the password or the Location URL: {msg}"
+                );
+            }
+            other => panic!("expected a fail-closed Parse error, got {other:?}"),
+        }
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "a redirect must be served exactly once and not chased/replayed"
+        );
     }
 }

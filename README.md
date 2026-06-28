@@ -172,7 +172,7 @@ Pipelines that need machine-parseable output can opt back in with
 | Group | Description |
 |-------|-------------|
 | `org` | Org CRUD, billing, members, transfer tokens, discovery, assets |
-| `workspace` | Workspace CRUD, metadata templates, notes, quickshares |
+| `workspace` | Workspace CRUD, metadata templates, notes |
 | `member` | Workspace/share member management |
 | `invitation` | Accept, decline, delete invitations |
 
@@ -182,14 +182,15 @@ Pipelines that need machine-parseable output can opt back in with
 |-------|-------------|
 | `files` | List, create folders, move, copy, rename, delete, trash, versions, search, lock |
 | `upload` | File upload (chunked with progress), text upload, URL import, session management |
-| `download` | File download (streaming with progress), folder ZIP, batch, quickshare |
+| `download` | File download (streaming with progress), folder ZIP, batch |
 | `lock` | Acquire, check, release file locks |
 
 ### Shares & Collaboration
 
 | Group | Description |
 |-------|-------------|
-| `share` | Share CRUD, files, members, quickshares, password auth |
+| `share` | Share CRUD, files, members, password auth |
+| `fileshare` | File Shares — durable single-file link shares (replaces the retired QuickShare): create/list/info/update/delete, grants, download/versions/preview, upload write-back, activity, ws-token |
 | `comment` | Comments, replies, reactions, linking |
 | `event` | Activity events, search, polling |
 | `preview` | File preview URLs and transforms |
@@ -200,10 +201,7 @@ Pipelines that need machine-parseable output can opt back in with
 | Group | Description |
 |-------|-------------|
 | `ai` | Chat, search, history, message management, summarize |
-| `task` | Tasks, task lists, assignment, status changes |
-| `worklog` | Worklog entries, interjections, acknowledgments |
-| `approval` | Request, approve, reject approvals |
-| `todo` | Todo items with toggle, bulk operations |
+| `task` | Tasks API: task lists, tasks, assignment, status changes, comments, attachments |
 
 ### Platform
 
@@ -246,6 +244,12 @@ Filter which tools are available:
 ```bash
 fastio mcp --tools auth,org,workspace,files,upload,download
 ```
+
+Authentication and backend follow the standard CLI rules: the server honors the
+global `--api-base`, `--token`, and `--profile` flags (and the `FASTIO_TOKEN` /
+`FASTIO_API_KEY` env vars), so you can point it at a non-default backend or
+profile — e.g. `fastio --profile staging mcp` or
+`fastio --api-base https://api.example/current mcp`.
 
 ## Shell Completions
 

@@ -19,6 +19,11 @@ pub enum LockCommand {
         context_id: String,
         /// File node ID.
         node_id: String,
+        /// Lock duration in seconds (60-3600).
+        duration: Option<u32>,
+        /// Client metadata as a JSON object (e.g.
+        /// `{"device_name":"…","client_version":"…"}`).
+        client_info: Option<String>,
     },
     /// Check lock status for a file.
     Status {
@@ -61,10 +66,19 @@ pub async fn execute(command: &LockCommand, ctx: &CommandContext<'_>) -> Result<
             context_type,
             context_id,
             node_id,
+            duration,
+            client_info,
         } => {
-            let v = api::locking::lock_acquire(&client, context_type, context_id, node_id)
-                .await
-                .context("failed to acquire lock")?;
+            let v = api::locking::lock_acquire(
+                &client,
+                context_type,
+                context_id,
+                node_id,
+                *duration,
+                client_info.as_deref(),
+            )
+            .await
+            .context("failed to acquire lock")?;
             ctx.output.render(&v)?;
         }
         LockCommand::Status {

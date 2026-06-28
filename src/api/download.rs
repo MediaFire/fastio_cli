@@ -101,6 +101,7 @@ where
             error_code: None,
             message: format!("Download failed with HTTP {status}: {body}"),
             http_status: status,
+            details: None,
         }));
     }
 
@@ -145,32 +146,29 @@ pub fn extract_download_token(response: &Value) -> Option<String> {
 
 /// Request a download token for a file in a workspace or share context.
 ///
-/// `GET /{context_type}/{context_id}/storage/{node_id}/requestread/`
+/// `GET /{context_type}/{context_id}/storage/{node_id}/requestread/` — the
+/// `requestread` endpoint takes no query parameters; the version selector (if
+/// any) is applied on the `/read/` URL built by [`build_download_url_ctx`].
 pub async fn get_download_url_ctx(
     client: &ApiClient,
     context_type: &str,
     context_id: &str,
     node_id: &str,
-    version_id: Option<&str>,
 ) -> Result<Value, CliError> {
-    let mut params = std::collections::HashMap::new();
-    if let Some(v) = version_id {
-        params.insert("version_id".to_owned(), v.to_owned());
-    }
     let path = format!(
         "/{}/{}/storage/{}/requestread/",
         urlencoding::encode(context_type),
         urlencoding::encode(context_id),
         urlencoding::encode(node_id),
     );
-    if params.is_empty() {
-        client.get(&path).await
-    } else {
-        client.get_with_params(&path, &params).await
-    }
+    client.get(&path).await
 }
 
 /// Build a context-aware download URL from a download token.
+///
+/// When `version_id` is supplied it is appended as a `version_id` query
+/// parameter on the `/read/` URL to download that specific version (the
+/// `read` handler reads `token` and `version_id` independently).
 #[must_use]
 pub fn build_download_url_ctx(
     api_base: &str,
@@ -178,15 +176,21 @@ pub fn build_download_url_ctx(
     context_id: &str,
     node_id: &str,
     download_token: &str,
+    version_id: Option<&str>,
 ) -> String {
-    format!(
+    let mut url = format!(
         "{}/{}/{}/storage/{}/read/?token={}",
         api_base.trim_end_matches('/'),
         urlencoding::encode(context_type),
         urlencoding::encode(context_id),
         urlencoding::encode(node_id),
         urlencoding::encode(download_token),
-    )
+    );
+    if let Some(v) = version_id {
+        url.push_str("&version_id=");
+        url.push_str(&urlencoding::encode(v));
+    }
+    url
 }
 
 /// Get a context-aware ZIP download URL.
@@ -204,20 +208,6 @@ pub fn get_zip_url_ctx(
         urlencoding::encode(context_id),
         urlencoding::encode(folder_id),
     )
-}
-
-/// Get quickshare details (no auth required).
-///
-/// `GET /quickshare/{quickshare_id}/details/`
-pub async fn quickshare_details(
-    client: &ApiClient,
-    quickshare_id: &str,
-) -> Result<Value, CliError> {
-    let path = format!(
-        "/quickshare/{}/details/",
-        urlencoding::encode(quickshare_id)
-    );
-    client.get(&path).await
 }
 
 /// Extract filename from node details response.
@@ -249,5 +239,68 @@ pub fn sanitize_filename(name: &str) -> String {
         "download".to_owned()
     } else {
         trimmed.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_download_url_ctx, sanitize_filename};
+
+    #[test]
+    fn ctx_url_workspace_no_version() {
+        // No version → plain token URL, no version_id query param.
+        let url = build_download_url_ctx(
+            "https://api.fast.io/current",
+            "workspace",
+            "19",
+            "node1",
+            "tok",
+            None,
+        );
+        assert_eq!(
+            url,
+            "https://api.fast.io/current/workspace/19/storage/node1/read/?token=tok"
+        );
+        assert!(!url.contains("version_id"));
+    }
+
+    #[test]
+    fn ctx_url_share_with_version() {
+        // Share context + a specific version → version_id is appended as a
+        // query param on the /read/ URL (NOT on requestread).
+        let url = build_download_url_ctx(
+            "https://api.fast.io/current",
+            "share",
+            "55",
+            "node1",
+            "tok",
+            Some("v9bcd"),
+        );
+        assert_eq!(
+            url,
+            "https://api.fast.io/current/share/55/storage/node1/read/?token=tok&version_id=v9bcd"
+        );
+    }
+
+    #[test]
+    fn ctx_url_trims_trailing_base_slash() {
+        let url = build_download_url_ctx(
+            "https://api.fast.io/current/",
+            "workspace",
+            "19",
+            "n",
+            "t",
+            None,
+        );
+        assert!(url.starts_with("https://api.fast.io/current/workspace/19/"));
+    }
+
+    #[test]
+    fn sanitize_filename_strips_traversal() {
+        // Directory components are stripped (basename only), so a traversal
+        // path collapses to its final segment.
+        assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename("/a/b/c.txt"), "c.txt");
+        assert_eq!(sanitize_filename("..."), "download");
     }
 }

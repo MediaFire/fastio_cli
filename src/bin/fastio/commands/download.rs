@@ -20,17 +20,23 @@ use fastio_cli::output::OutputConfig;
 pub enum DownloadCommand {
     /// Download a single file.
     File {
-        /// Workspace ID.
-        workspace: String,
+        /// Workspace ID (omit when downloading via a share).
+        workspace: Option<String>,
+        /// Share ID to download through (alternative to workspace).
+        share: Option<String>,
         /// Node ID of the file to download.
         node_id: String,
         /// Output file path (auto-determined if omitted).
         output_path: Option<String>,
+        /// Specific version `OpaqueId` to download (latest if omitted).
+        version: Option<String>,
     },
     /// Download a folder as a ZIP archive.
     Folder {
-        /// Workspace ID.
-        workspace: String,
+        /// Workspace ID (omit when downloading via a share).
+        workspace: Option<String>,
+        /// Share ID to download through (alternative to workspace).
+        share: Option<String>,
         /// Node ID of the folder to download.
         node_id: String,
         /// Output file path (auto-determined if omitted).
@@ -47,19 +53,65 @@ pub enum DownloadCommand {
     },
 }
 
+/// Resolve the storage context (`type`, `id`) from a workspace/share
+/// selector. Exactly one must be supplied.
+fn resolve_dl_ctx<'a>(
+    workspace: Option<&'a str>,
+    share: Option<&'a str>,
+) -> Result<(&'static str, &'a str)> {
+    match (workspace, share) {
+        (Some(w), None) => {
+            anyhow::ensure!(!w.trim().is_empty(), "workspace ID must not be empty");
+            Ok(("workspace", w))
+        }
+        (None, Some(s)) => {
+            anyhow::ensure!(!s.trim().is_empty(), "share ID must not be empty");
+            Ok(("share", s))
+        }
+        (Some(_), Some(_)) => anyhow::bail!("provide either --workspace or --share, not both"),
+        (None, None) => anyhow::bail!("provide --workspace or --share"),
+    }
+}
+
 /// Execute a download subcommand.
 pub async fn execute(command: &DownloadCommand, ctx: &CommandContext<'_>) -> Result<()> {
     match command {
         DownloadCommand::File {
             workspace,
+            share,
             node_id,
             output_path,
-        } => download_file(ctx, workspace, node_id, output_path.as_deref()).await,
+            version,
+        } => {
+            let (context_type, context_id) =
+                resolve_dl_ctx(workspace.as_deref(), share.as_deref())?;
+            download_file(
+                ctx,
+                context_type,
+                context_id,
+                node_id,
+                output_path.as_deref(),
+                version.as_deref(),
+            )
+            .await
+        }
         DownloadCommand::Folder {
             workspace,
+            share,
             node_id,
             output_path,
-        } => download_folder(ctx, workspace, node_id, output_path.as_deref()).await,
+        } => {
+            let (context_type, context_id) =
+                resolve_dl_ctx(workspace.as_deref(), share.as_deref())?;
+            download_folder(
+                ctx,
+                context_type,
+                context_id,
+                node_id,
+                output_path.as_deref(),
+            )
+            .await
+        }
         DownloadCommand::Batch {
             workspace,
             node_ids,
@@ -135,9 +187,14 @@ fn create_progress_bar(total: Option<u64>, output: &OutputConfig) -> ProgressBar
 }
 
 /// Determine output filename from node details or use a default.
+///
+/// Node details are only fetched in a `workspace` context (the only one with
+/// a details builder); in a `share` context the default `{node_id}{ext}` name
+/// is used unless the caller passes an explicit output path.
 async fn determine_output_path(
     client: &ApiClient,
-    workspace: &str,
+    context_type: &str,
+    context_id: &str,
     node_id: &str,
     user_path: Option<&str>,
     default_ext: &str,
@@ -146,10 +203,14 @@ async fn determine_output_path(
         return Ok(PathBuf::from(p));
     }
 
-    // Get file details to determine name
-    let details = api::download::get_node_details_for_download(client, workspace, node_id)
-        .await
-        .ok();
+    // Get file details to determine name (workspace context only).
+    let details = if context_type == "workspace" {
+        api::download::get_node_details_for_download(client, context_id, node_id)
+            .await
+            .ok()
+    } else {
+        None
+    };
 
     let filename = details
         .as_ref()
@@ -162,34 +223,40 @@ async fn determine_output_path(
 /// Download a single file.
 async fn download_file(
     ctx: &CommandContext<'_>,
-    workspace: &str,
+    context_type: &str,
+    context_id: &str,
     node_id: &str,
     user_output: Option<&str>,
+    version: Option<&str>,
 ) -> Result<()> {
-    anyhow::ensure!(
-        !workspace.trim().is_empty(),
-        "workspace ID must not be empty"
-    );
     anyhow::ensure!(!node_id.trim().is_empty(), "node ID must not be empty");
     let client = ctx.build_client()?;
 
     // Determine output path
-    let output_path = determine_output_path(&client, workspace, node_id, user_output, "").await?;
+    let output_path =
+        determine_output_path(&client, context_type, context_id, node_id, user_output, "").await?;
 
     if !ctx.output.quiet {
         eprintln!("Downloading to: {}", output_path.display());
     }
 
     // Get download token
-    let token_resp = api::download::get_download_url(&client, workspace, node_id)
-        .await
-        .context("failed to get download URL")?;
+    let token_resp =
+        api::download::get_download_url_ctx(&client, context_type, context_id, node_id)
+            .await
+            .context("failed to get download URL")?;
 
     let download_token = api::download::extract_download_token(&token_resp)
         .ok_or_else(|| anyhow::anyhow!("server returned empty download token"))?;
 
-    let download_url =
-        api::download::build_download_url(ctx.api_base, workspace, node_id, &download_token);
+    let download_url = api::download::build_download_url_ctx(
+        ctx.api_base,
+        context_type,
+        context_id,
+        node_id,
+        &download_token,
+        version,
+    );
 
     // Stream download with progress
     let pb = create_progress_bar(None, ctx.output);
@@ -224,28 +291,32 @@ async fn download_file(
 /// Download a folder as a ZIP archive.
 async fn download_folder(
     ctx: &CommandContext<'_>,
-    workspace: &str,
+    context_type: &str,
+    context_id: &str,
     node_id: &str,
     user_output: Option<&str>,
 ) -> Result<()> {
-    anyhow::ensure!(
-        !workspace.trim().is_empty(),
-        "workspace ID must not be empty"
-    );
     anyhow::ensure!(!node_id.trim().is_empty(), "node ID must not be empty");
     let token_str = resolve_auth(ctx.profile_name, ctx.flag_token, ctx.config_dir)?;
     let client = ApiClient::new(ctx.api_base, Some(token_str.clone()))
         .context("failed to create API client")?;
 
     // Determine output path
-    let output_path =
-        determine_output_path(&client, workspace, node_id, user_output, ".zip").await?;
+    let output_path = determine_output_path(
+        &client,
+        context_type,
+        context_id,
+        node_id,
+        user_output,
+        ".zip",
+    )
+    .await?;
 
     if !ctx.output.quiet {
         eprintln!("Downloading folder as ZIP to: {}", output_path.display());
     }
 
-    let zip_url = api::download::get_zip_url(ctx.api_base, workspace, node_id);
+    let zip_url = api::download::get_zip_url_ctx(ctx.api_base, context_type, context_id, node_id);
 
     // Stream download with progress (ZIP requires auth header)
     let pb = create_progress_bar(None, ctx.output);

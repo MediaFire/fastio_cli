@@ -672,6 +672,24 @@ fn push_sanitized_inline(out: &mut String, s: &str) {
     }
 }
 
+/// Sanitize an arbitrary user-controlled string for safe **inline** display
+/// (single-line contexts: bucket table cells, labels), returning a new
+/// `String`.
+///
+/// This is the public, allocation-returning counterpart to the streaming
+/// [`push_sanitized_inline`] helper, exposed so other renderers (e.g. the
+/// bucket-aware unified-search path in [`super`]) can reuse the exact same
+/// Trojan-Source / control-character stripping rather than re-implementing
+/// it. Newlines and carriage returns collapse to a single space; C0/C1
+/// controls and Unicode bidi / zero-width / BOM code points are removed. The
+/// output is capped at [`MAX_OUTPUT_BYTES`].
+#[must_use]
+pub fn sanitize_inline(s: &str) -> String {
+    let mut out = String::new();
+    push_sanitized_inline(&mut out, s);
+    out
+}
+
 fn is_stripped_char(ch: char) -> bool {
     let code = ch as u32;
     if code < 0x20 && ch != '\n' && ch != '\t' {
@@ -1165,7 +1183,7 @@ fast.io
     #[test]
     fn byte_regression_ping_success() {
         // Pinned against a live response from
-        // http://data1.dev1.iah1.veng.tech/api/v1.0/ping/?output=markdown
+        // https://api.fast.io/current/ping/?output=markdown
         // at 2026-04-15. Key shape: bool result, three scalar top-level
         // keys in insertion order.
         let v = json!({
@@ -1184,7 +1202,7 @@ fast.io
     #[test]
     fn byte_regression_orgs_list_auth_error() {
         // Pinned against a live error response from
-        // http://data1.dev1.iah1.veng.tech/api/v1.0/orgs/list/?output=markdown
+        // https://api.fast.io/current/orgs/list/?output=markdown
         // at 2026-04-15. Key shape: result=false, object-valued error.
         let v = json!({
             "result": false,

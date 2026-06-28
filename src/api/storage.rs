@@ -302,15 +302,28 @@ pub async fn create_folder(
     workspace_id: &str,
     parent_id: &str,
     name: &str,
+    force: bool,
 ) -> Result<Value, CliError> {
-    let mut form = HashMap::new();
-    form.insert("name".to_owned(), name.to_owned());
+    let form = create_folder_form(name, force);
     let path = format!(
         "/workspace/{}/storage/{}/createfolder/",
         urlencoding::encode(workspace_id),
         urlencoding::encode(parent_id),
     );
     client.post(&path, &form).await
+}
+
+/// Build the form body for [`create_folder`].
+///
+/// `force=true` always creates a new folder (auto-renamed on a name
+/// collision); the default is idempotent (returns the existing folder).
+fn create_folder_form(name: &str, force: bool) -> HashMap<String, String> {
+    let mut form = HashMap::new();
+    form.insert("name".to_owned(), name.to_owned());
+    if force {
+        form.insert("force".to_owned(), "true".to_owned());
+    }
+    form
 }
 
 /// Move a storage node to a different parent folder.
@@ -351,7 +364,63 @@ pub async fn copy_node(
     client.post(&path, &form).await
 }
 
-/// Rename (update) a storage node.
+/// Update a storage node's name, content source, or metadata overrides.
+///
+/// `POST /{context_type}/{context_id}/storage/{node_id}/update/` (the
+/// `workspace` and `share` twins share one wire contract). All fields are
+/// optional, but the server requires at least one — callers should enforce
+/// that before invoking. `from` is a JSON-encoded source object (same shape
+/// as `addfile`: `{"type":"upload","upload":{"id":"…"}}` or
+/// `{"type":"hash","hash":{"hash":"…","hash_type":"sha256"}}`); supplying it
+/// replaces the file content and creates a new version. `metadata_title`
+/// (max 50) and `metadata_short` (max 2048) override the node's title and
+/// short description. Pass the literal string `"null"` (or `""`) in a field
+/// to clear it, per the server contract.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_node(
+    client: &ApiClient,
+    context_type: &str,
+    context_id: &str,
+    node_id: &str,
+    name: Option<&str>,
+    from: Option<&str>,
+    metadata_title: Option<&str>,
+    metadata_short: Option<&str>,
+) -> Result<Value, CliError> {
+    let form = update_node_form(name, from, metadata_title, metadata_short);
+    let path = format!(
+        "/{}/{}/storage/{}/update/",
+        urlencoding::encode(context_type),
+        urlencoding::encode(context_id),
+        urlencoding::encode(node_id),
+    );
+    client.post(&path, &form).await
+}
+
+/// Build the form body for [`update_node`] from the supplied `Some` fields.
+fn update_node_form(
+    name: Option<&str>,
+    from: Option<&str>,
+    metadata_title: Option<&str>,
+    metadata_short: Option<&str>,
+) -> HashMap<String, String> {
+    let mut form = HashMap::new();
+    if let Some(v) = name {
+        form.insert("name".to_owned(), v.to_owned());
+    }
+    if let Some(v) = from {
+        form.insert("from".to_owned(), v.to_owned());
+    }
+    if let Some(v) = metadata_title {
+        form.insert("metadata_title".to_owned(), v.to_owned());
+    }
+    if let Some(v) = metadata_short {
+        form.insert("metadata_short".to_owned(), v.to_owned());
+    }
+    form
+}
+
+/// Rename a storage node in a workspace (thin wrapper over [`update_node`]).
 ///
 /// `POST /workspace/{workspace_id}/storage/{node_id}/update/`
 pub async fn rename_node(
@@ -360,14 +429,17 @@ pub async fn rename_node(
     node_id: &str,
     new_name: &str,
 ) -> Result<Value, CliError> {
-    let mut form = HashMap::new();
-    form.insert("name".to_owned(), new_name.to_owned());
-    let path = format!(
-        "/workspace/{}/storage/{}/update/",
-        urlencoding::encode(workspace_id),
-        urlencoding::encode(node_id),
-    );
-    client.post(&path, &form).await
+    update_node(
+        client,
+        "workspace",
+        workspace_id,
+        node_id,
+        Some(new_name),
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Move a storage node to trash (soft delete).
@@ -459,29 +531,212 @@ pub async fn list_versions(
     client.get(&path).await
 }
 
-/// Search for files in a workspace.
+/// Parameters for the keyword/semantic file-search endpoint
+/// (`GET .../storage/search/`).
+///
+/// This is the **single** builder shared by `files search`, the deprecated
+/// `ripley search` forwarder, the MCP `files`/`workspace` search actions, and
+/// the re-pointed MCP `handle_ai_search`. No second search builder exists
+/// (the former `api::ai::search` and `api::workspace::search_workspace` both
+/// forward here).
+///
+/// Pagination uses `limit`/`offset` — **not** `page_size`/`cursor` (the
+/// search endpoint does not document keyset pagination, unlike the storage
+/// LIST endpoint). `files_scope`/`folders_scope` narrow the indexed set;
+/// `details=true` enriches each hit with the full node resource (the server
+/// then caps the default `limit` to 10); `output` selects the verbosity of
+/// the `content_snippet` field (`terse`/`standard`/`full`).
+///
+/// Sources: `storage.txt:1574-1677` (canonical `search` + `output`, `files`
+/// MAP response) and `ai.txt:1654-1703` / `agents.md:772-855` (the same
+/// endpoint accepting `limit`, `offset`, `files_scope`, `folders_scope`, and
+/// `details`, with a `results[]` response). Both response shapes are handled
+/// defensively by the renderer.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct SearchFilesParams<'a> {
+    /// Comma-separated `nodeId:versionId` pairs (max 100) narrowing the
+    /// searched files.
+    pub files_scope: Option<&'a str>,
+    /// Comma-separated `nodeId:depth` pairs (max 100) narrowing the searched
+    /// folders.
+    pub folders_scope: Option<&'a str>,
+    /// Maximum number of results (1-500; server caps to 10 when `details`).
+    pub limit: Option<u32>,
+    /// Result offset for pagination.
+    pub offset: Option<u32>,
+    /// When `true`, each hit is enriched with the full node resource.
+    pub details: Option<bool>,
+    /// `content_snippet` verbosity: `terse`, `standard`, or `full`.
+    pub output: Option<&'a str>,
+}
+
+impl<'a> SearchFilesParams<'a> {
+    /// An empty parameter set (all fields unset). Equivalent to
+    /// [`Default::default`]; provided so callers in other crates can build the
+    /// `#[non_exhaustive]` struct without struct-literal syntax.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set `files_scope` (comma-separated `nodeId:versionId` pairs).
+    #[must_use]
+    pub fn files_scope(mut self, v: Option<&'a str>) -> Self {
+        self.files_scope = v;
+        self
+    }
+
+    /// Set `folders_scope` (comma-separated `nodeId:depth` pairs).
+    #[must_use]
+    pub fn folders_scope(mut self, v: Option<&'a str>) -> Self {
+        self.folders_scope = v;
+        self
+    }
+
+    /// Set the result `limit`.
+    #[must_use]
+    pub fn limit(mut self, v: Option<u32>) -> Self {
+        self.limit = v;
+        self
+    }
+
+    /// Set the result `offset`.
+    #[must_use]
+    pub fn offset(mut self, v: Option<u32>) -> Self {
+        self.offset = v;
+        self
+    }
+
+    /// Set `details` (full-node enrichment).
+    #[must_use]
+    pub fn details(mut self, v: bool) -> Self {
+        self.details = v.then_some(true);
+        self
+    }
+
+    /// Set the `content_snippet` verbosity (`output`).
+    #[must_use]
+    pub fn output(mut self, v: Option<&'a str>) -> Self {
+        self.output = v;
+        self
+    }
+
+    /// Build the query-parameter map (excluding `search`, added by the caller).
+    fn into_query(self, query: &str) -> HashMap<String, String> {
+        let mut params = HashMap::new();
+        params.insert("search".to_owned(), query.to_owned());
+        if let Some(v) = self.files_scope {
+            params.insert("files_scope".to_owned(), v.to_owned());
+        }
+        if let Some(v) = self.folders_scope {
+            params.insert("folders_scope".to_owned(), v.to_owned());
+        }
+        if let Some(v) = self.limit {
+            params.insert("limit".to_owned(), v.to_string());
+        }
+        if let Some(v) = self.offset {
+            params.insert("offset".to_owned(), v.to_string());
+        }
+        if let Some(true) = self.details {
+            params.insert("details".to_owned(), "true".to_owned());
+        }
+        if let Some(v) = self.output {
+            params.insert("output".to_owned(), v.to_owned());
+        }
+        params
+    }
+}
+
+/// Search for files in a workspace (keyword + semantic).
 ///
 /// `GET /workspace/{workspace_id}/storage/search/?search=<query>`
+///
+/// THE single file-search builder (see [`SearchFilesParams`]). The response is
+/// either a `files` MAP keyed by node id (keyword-only / canonical
+/// storage.txt shape) or a `results[]` array with `pagination` (the
+/// `details`/ai.txt shape); both are rendered defensively downstream.
 pub async fn search_files(
     client: &ApiClient,
     workspace_id: &str,
     query: &str,
-    page_size: Option<u32>,
-    cursor: Option<&str>,
+    params: SearchFilesParams<'_>,
 ) -> Result<Value, CliError> {
-    let mut params = HashMap::new();
-    params.insert("search".to_owned(), query.to_owned());
-    if let Some(v) = page_size {
-        params.insert("page_size".to_owned(), v.to_string());
-    }
-    if let Some(v) = cursor {
-        params.insert("cursor".to_owned(), v.to_owned());
-    }
+    let query_params = params.into_query(query);
     let path = format!(
         "/workspace/{}/storage/search/",
         urlencoding::encode(workspace_id),
     );
-    client.get_with_params(&path, &params).await
+    client.get_with_params(&path, &query_params).await
+}
+
+/// Search for files in a share (keyword + semantic).
+///
+/// `GET /share/{share_id}/storage/search/?search=<query>`
+///
+/// Same contract as [`search_files`] but share-scoped. Returns `404` (error
+/// `1609`) for workspace-backed (folder) shares, where search is unavailable.
+pub async fn search_files_share(
+    client: &ApiClient,
+    share_id: &str,
+    query: &str,
+    params: SearchFilesParams<'_>,
+) -> Result<Value, CliError> {
+    let query_params = params.into_query(query);
+    let path = format!("/share/{}/storage/search/", urlencoding::encode(share_id),);
+    client.get_with_params(&path, &query_params).await
+}
+
+/// Normalize a `/storage/search/` response so every output format renders one
+/// ROW PER FILE.
+///
+/// The keyword-only / intelligence-disabled search response (the canonical
+/// `storage.txt` shape) returns a top-level `files` value that is a **MAP
+/// keyed by node `OpaqueId`** — e.g. `{"files": {"f3jm5-…": {"name": …}}}`.
+/// Rendered as-is, table/CSV would collapse it to a single row whose columns
+/// are node ids, and markdown would emit a nested bullet list — neither of
+/// which is one-row-per-file. This rewrites that map IN PLACE into an ARRAY of
+/// records, hoisting each node id into both an `id` and a `node_id` field
+/// (the id only ever lives in the map key, never inside the value), and
+/// preserving insertion order so renderers produce a stable table.
+///
+/// The `details`/`ai.txt` shape (a `results[]` array with `pagination`) and
+/// any already-array `files` value are left untouched, as is any non-object
+/// envelope. This is the SCOPED counterpart to the generic
+/// [`crate::output::flatten_response`]: the files-map → rows transform lives
+/// on the search path only, so a future endpoint that legitimately returns a
+/// top-level `files` object is never silently restructured.
+///
+/// Both [`search_files`] callers (`fastio files search`, the deprecated
+/// `fastio ripley search`) run their response through this before rendering.
+#[must_use]
+pub fn normalize_search_response(mut value: Value) -> Value {
+    let Some(map) = value.as_object_mut() else {
+        return value;
+    };
+    // Only the MAP-shaped `files` value is rewritten; an array (or absent
+    // key) is left as the server sent it.
+    let Some(Value::Object(files_map)) = map.get("files") else {
+        return value;
+    };
+    let mut rows = Vec::with_capacity(files_map.len());
+    for (node_id, node_val) in files_map {
+        let mut row = match node_val {
+            Value::Object(obj) => obj.clone(),
+            // Defensive: a non-object value still surfaces as a row carrying
+            // just its id and the raw value, rather than being dropped.
+            other => {
+                let mut m = serde_json::Map::new();
+                m.insert("value".to_owned(), other.clone());
+                m
+            }
+        };
+        row.insert("node_id".to_owned(), Value::String(node_id.clone()));
+        row.insert("id".to_owned(), Value::String(node_id.clone()));
+        rows.push(Value::Object(row));
+    }
+    map.insert("files".to_owned(), Value::Array(rows));
+    value
 }
 
 /// List recently accessed files.
@@ -492,14 +747,9 @@ pub async fn list_recent(
     workspace_id: &str,
     page_size: Option<u32>,
     cursor: Option<&str>,
+    node_type: Option<&str>,
 ) -> Result<Value, CliError> {
-    let mut params = HashMap::new();
-    if let Some(v) = page_size {
-        params.insert("page_size".to_owned(), v.to_string());
-    }
-    if let Some(v) = cursor {
-        params.insert("cursor".to_owned(), v.to_owned());
-    }
+    let params = recent_query(page_size, cursor, node_type);
     let path = format!(
         "/workspace/{}/storage/recent/",
         urlencoding::encode(workspace_id),
@@ -511,9 +761,33 @@ pub async fn list_recent(
     }
 }
 
+/// Build the query map for [`list_recent`]. `node_type` filters by node type
+/// (`file`, `folder`, `link`, `note`).
+fn recent_query(
+    page_size: Option<u32>,
+    cursor: Option<&str>,
+    node_type: Option<&str>,
+) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    if let Some(v) = page_size {
+        params.insert("page_size".to_owned(), v.to_string());
+    }
+    if let Some(v) = cursor {
+        params.insert("cursor".to_owned(), v.to_owned());
+    }
+    if let Some(v) = node_type {
+        params.insert("type".to_owned(), v.to_owned());
+    }
+    params
+}
+
 /// Add a share link to a folder.
 ///
-/// `POST /workspace/{workspace_id}/storage/{parent_id}/addlink/`
+/// `POST /workspace/{workspace_id}/storage/{parent_id}/addlink/` — the node id
+/// is the URL path part; the body carries `type=share` (the only accepted
+/// link-target type) and `share=<share_id>`. The server reads the link-target
+/// type under the wire key `type` (NOT `link_target_type`) and the target id
+/// under `share`.
 pub async fn add_link(
     client: &ApiClient,
     workspace_id: &str,
@@ -521,13 +795,49 @@ pub async fn add_link(
     share_id: &str,
 ) -> Result<Value, CliError> {
     let mut form = HashMap::new();
-    form.insert("share_id".to_owned(), share_id.to_owned());
+    form.insert("type".to_owned(), "share".to_owned());
+    form.insert("share".to_owned(), share_id.to_owned());
     let path = format!(
         "/workspace/{}/storage/{}/addlink/",
         urlencoding::encode(workspace_id),
         urlencoding::encode(parent_id),
     );
     client.post(&path, &form).await
+}
+
+/// Add a file to a folder from a completed upload or by content-hash dedup.
+///
+/// `POST /{context_type}/{context_id}/storage/{parent_id}/addfile/` (the
+/// `workspace` and `share` twins share one wire contract). `from` is a
+/// JSON-encoded source object: either
+/// `{"type":"upload","upload":{"id":"<upload_id>"}}` to attach a completed
+/// upload session, or `{"type":"hash","hash":{"hash":"<hash>","hash_type":"sha256"}}`
+/// to deduplicate against an existing object by content hash (instant add when
+/// the content already exists server-side).
+pub async fn add_file(
+    client: &ApiClient,
+    context_type: &str,
+    context_id: &str,
+    parent_id: &str,
+    name: &str,
+    from: &str,
+) -> Result<Value, CliError> {
+    let form = add_file_form(name, from);
+    let path = format!(
+        "/{}/{}/storage/{}/addfile/",
+        urlencoding::encode(context_type),
+        urlencoding::encode(context_id),
+        urlencoding::encode(parent_id),
+    );
+    client.post(&path, &form).await
+}
+
+/// Build the form body for [`add_file`] (`name` + the JSON-encoded `from`).
+fn add_file_form(name: &str, from: &str) -> HashMap<String, String> {
+    let mut form = HashMap::new();
+    form.insert("name".to_owned(), name.to_owned());
+    form.insert("from".to_owned(), from.to_owned());
+    form
 }
 
 /// Transfer a node to another workspace.
@@ -554,38 +864,61 @@ pub async fn transfer_node(
 
 /// Restore a specific version of a file.
 ///
-/// `POST /workspace/{workspace_id}/storage/{node_id}/versions/{version_id}/restore/`
+/// `POST /workspace/{workspace_id}/storage/{node_id}/restore-version/` — the
+/// node id is the URL path part and `version_id` is a POST **body** field (NOT
+/// a `/versions/{id}/restore/` path segment).
 pub async fn version_restore(
     client: &ApiClient,
     workspace_id: &str,
     node_id: &str,
     version_id: &str,
 ) -> Result<Value, CliError> {
-    let form = HashMap::new();
+    let mut form = HashMap::new();
+    form.insert("version_id".to_owned(), version_id.to_owned());
     let path = format!(
-        "/workspace/{}/storage/{}/versions/{}/restore/",
+        "/workspace/{}/storage/{}/restore-version/",
         urlencoding::encode(workspace_id),
         urlencoding::encode(node_id),
-        urlencoding::encode(version_id),
     );
     client.post(&path, &form).await
 }
 
 /// Acquire a file lock.
 ///
-/// `POST /workspace/{workspace_id}/storage/{node_id}/lock/`
+/// `POST /workspace/{workspace_id}/storage/{node_id}/lock/` — optional
+/// `duration` (60-3600 seconds) sets the lock lifetime and `client_info`
+/// (a JSON object, e.g. `{"device_name":"…","client_version":"…"}`) records
+/// client metadata.
 pub async fn lock_acquire(
     client: &ApiClient,
     workspace_id: &str,
     node_id: &str,
+    duration: Option<u32>,
+    client_info: Option<&str>,
 ) -> Result<Value, CliError> {
-    let form = HashMap::new();
+    let form = lock_acquire_form(duration, client_info);
     let path = format!(
         "/workspace/{}/storage/{}/lock/",
         urlencoding::encode(workspace_id),
         urlencoding::encode(node_id),
     );
     client.post(&path, &form).await
+}
+
+/// Build the form body for an acquire-lock request. `duration` (60-3600 s)
+/// sets the lock lifetime; `client_info` is a JSON object of client metadata.
+pub(crate) fn lock_acquire_form(
+    duration: Option<u32>,
+    client_info: Option<&str>,
+) -> HashMap<String, String> {
+    let mut form = HashMap::new();
+    if let Some(d) = duration {
+        form.insert("duration".to_owned(), d.to_string());
+    }
+    if let Some(ci) = client_info {
+        form.insert("client_info".to_owned(), ci.to_owned());
+    }
+    form
 }
 
 /// Check lock status.
@@ -642,30 +975,225 @@ pub async fn read_content(
     client.get(&path).await
 }
 
-/// Get or create a quickshare link.
+/// Read raw file bytes as text.
 ///
-/// `GET /workspace/{workspace_id}/storage/{node_id}/quickshare/`
-pub async fn quickshare_get(
+/// `GET /workspace/{workspace_id}/storage/{node_id}/read/`
+///
+/// Returns the node's raw content as a UTF-8 string (for a `.md` file, the
+/// markdown source). Unlike [`read_content`] (which returns the `/content/`
+/// JSON envelope) this is the binary `/read/` endpoint surfaced as text, used
+/// by `fastio view` as the fallback for raw `.md` files that are not Note
+/// nodes. An optional `version_id` reads a specific version.
+pub async fn read_raw(
     client: &ApiClient,
     workspace_id: &str,
     node_id: &str,
-) -> Result<Value, CliError> {
+    version_id: Option<&str>,
+) -> Result<String, CliError> {
     let path = format!(
-        "/workspace/{}/storage/{}/quickshare/",
+        "/workspace/{}/storage/{}/read/",
         urlencoding::encode(workspace_id),
         urlencoding::encode(node_id),
     );
-    client.get(&path).await
+    let params = version_id.map(|v| {
+        let mut p = HashMap::new();
+        p.insert("version_id".to_owned(), v.to_owned());
+        p
+    });
+    client.get_raw_text(&path, params.as_ref()).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BULK_DETAILS_MAX_IDS, BulkDetailsResponse, parse_bulk_details_response,
-        sanitize_terminal_string,
+        BULK_DETAILS_MAX_IDS, BulkDetailsResponse, SearchFilesParams, add_file_form,
+        create_folder_form, lock_acquire_form, normalize_search_response,
+        parse_bulk_details_response, recent_query, sanitize_terminal_string, update_node_form,
     };
     use crate::error::CliError;
-    use serde_json::json;
+    use crate::output::flatten_response;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn create_folder_form_omits_force_by_default() {
+        let f = create_folder_form("docs", false);
+        assert_eq!(f.get("name").map(String::as_str), Some("docs"));
+        assert!(!f.contains_key("force"), "force omitted unless requested");
+    }
+
+    #[test]
+    fn create_folder_form_sets_force() {
+        let f = create_folder_form("docs", true);
+        assert_eq!(f.get("force").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn recent_query_filters_by_type() {
+        let q = recent_query(Some(250), Some("cur"), Some("file"));
+        assert_eq!(q.get("page_size").map(String::as_str), Some("250"));
+        assert_eq!(q.get("cursor").map(String::as_str), Some("cur"));
+        assert_eq!(q.get("type").map(String::as_str), Some("file"));
+    }
+
+    #[test]
+    fn recent_query_empty_when_no_args() {
+        assert!(recent_query(None, None, None).is_empty());
+    }
+
+    #[test]
+    fn update_node_form_sends_only_present_fields() {
+        let f = update_node_form(None, None, Some("My Title"), Some("Short desc"));
+        assert_eq!(
+            f.get("metadata_title").map(String::as_str),
+            Some("My Title")
+        );
+        assert_eq!(
+            f.get("metadata_short").map(String::as_str),
+            Some("Short desc")
+        );
+        assert!(!f.contains_key("name"));
+        assert!(!f.contains_key("from"));
+        assert_eq!(f.len(), 2);
+    }
+
+    #[test]
+    fn update_node_form_carries_content_source() {
+        let from = r#"{"type":"upload","upload":{"id":"u1"}}"#;
+        let f = update_node_form(Some("new.txt"), Some(from), None, None);
+        assert_eq!(f.get("name").map(String::as_str), Some("new.txt"));
+        assert_eq!(f.get("from").map(String::as_str), Some(from));
+    }
+
+    #[test]
+    fn add_file_form_carries_name_and_from() {
+        let from = r#"{"type":"hash","hash":{"hash":"abc","hash_type":"sha256"}}"#;
+        let f = add_file_form("photo.jpg", from);
+        assert_eq!(f.get("name").map(String::as_str), Some("photo.jpg"));
+        assert_eq!(f.get("from").map(String::as_str), Some(from));
+    }
+
+    #[test]
+    fn lock_acquire_form_emits_duration_and_client_info() {
+        let f = lock_acquire_form(Some(300), Some(r#"{"device_name":"Laptop"}"#));
+        assert_eq!(f.get("duration").map(String::as_str), Some("300"));
+        assert_eq!(
+            f.get("client_info").map(String::as_str),
+            Some(r#"{"device_name":"Laptop"}"#)
+        );
+    }
+
+    #[test]
+    fn lock_acquire_form_empty_by_default() {
+        assert!(lock_acquire_form(None, None).is_empty());
+    }
+
+    #[test]
+    fn normalize_search_files_map_to_rows() {
+        // Keyword-only / intelligence-disabled shape: `files` is a MAP keyed by
+        // node id. After normalization it must be an ARRAY with one record per
+        // file, each carrying `id` and `node_id`.
+        let resp = json!({
+            "result": true,
+            "files": {
+                "f1": {"name": "File 1", "type": "file"},
+                "f2": {"name": "File 2", "type": "file", "relevance_score": 0.5}
+            }
+        });
+        let out = normalize_search_response(resp);
+        let files = out.get("files").and_then(Value::as_array).expect("array");
+        assert_eq!(files.len(), 2);
+        // Order preserved (preserve_order feature).
+        assert_eq!(files[0]["id"], "f1");
+        assert_eq!(files[0]["node_id"], "f1");
+        assert_eq!(files[0]["name"], "File 1");
+        assert_eq!(files[1]["id"], "f2");
+        // The envelope `result` field survives for the markdown preamble.
+        assert_eq!(out["result"], json!(true));
+    }
+
+    #[test]
+    fn normalize_search_files_map_flattens_to_one_row_per_file() {
+        // End-to-end: the normalized envelope must flatten (table/CSV path) to
+        // the `files` ARRAY — one row per file — not a single object row.
+        let resp = json!({
+            "result": true,
+            "files": {
+                "f1": {"name": "File 1"},
+                "f2": {"name": "File 2"}
+            }
+        });
+        let flattened = flatten_response(&normalize_search_response(resp));
+        let arr = flattened.as_array().expect("flattened to array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["node_id"], "f1");
+    }
+
+    #[test]
+    fn normalize_search_results_array_untouched() {
+        // The `details`/ai.txt shape (`results[]` + pagination) has no `files`
+        // map and must pass through unchanged.
+        let resp = json!({
+            "result": true,
+            "results": [{"node_id": "f1", "score": 0.9}],
+            "pagination": {"total": 1, "has_more": false}
+        });
+        let out = normalize_search_response(resp.clone());
+        assert_eq!(out, resp);
+    }
+
+    #[test]
+    fn normalize_search_files_array_untouched() {
+        // An already-array `files` value (or any non-map) is left as-is.
+        let resp = json!({"files": [{"id": "f1"}]});
+        let out = normalize_search_response(resp.clone());
+        assert_eq!(out, resp);
+    }
+
+    #[test]
+    fn normalize_search_non_object_envelope_untouched() {
+        let resp = json!(["a", "b"]);
+        assert_eq!(normalize_search_response(resp.clone()), resp);
+    }
+
+    #[test]
+    fn search_files_params_emit_documented_keys_only() {
+        // Per storage.txt/ai.txt the SEARCH endpoint takes search/limit/offset/
+        // files_scope/folders_scope/details/output — and NEVER page_size/cursor.
+        let params = SearchFilesParams::new()
+            .files_scope(Some("f1:v1"))
+            .folders_scope(Some("d1:3"))
+            .limit(Some(10))
+            .offset(Some(5))
+            .details(true)
+            .output(Some("terse"));
+        let q = params.into_query("quarterly report");
+        assert_eq!(
+            q.get("search").map(String::as_str),
+            Some("quarterly report")
+        );
+        assert_eq!(q.get("files_scope").map(String::as_str), Some("f1:v1"));
+        assert_eq!(q.get("folders_scope").map(String::as_str), Some("d1:3"));
+        assert_eq!(q.get("limit").map(String::as_str), Some("10"));
+        assert_eq!(q.get("offset").map(String::as_str), Some("5"));
+        assert_eq!(q.get("details").map(String::as_str), Some("true"));
+        assert_eq!(q.get("output").map(String::as_str), Some("terse"));
+        // The retired keyset params must never appear.
+        assert!(!q.contains_key("page_size"), "page_size must not be sent");
+        assert!(!q.contains_key("cursor"), "cursor must not be sent");
+    }
+
+    #[test]
+    fn search_files_params_default_sends_only_search() {
+        let q = SearchFilesParams::new().into_query("hello");
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.get("search").map(String::as_str), Some("hello"));
+    }
+
+    #[test]
+    fn search_files_params_details_false_omits_key() {
+        let q = SearchFilesParams::new().details(false).into_query("x");
+        assert!(!q.contains_key("details"));
+    }
 
     fn parsed(body: &serde_json::Value) -> BulkDetailsResponse {
         parse_bulk_details_response(body).expect("test body should parse")

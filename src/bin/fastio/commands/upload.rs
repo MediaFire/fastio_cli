@@ -45,8 +45,10 @@ pub enum UploadCommand {
     },
     /// Upload text content as a file.
     Text {
-        /// Workspace ID.
-        workspace: String,
+        /// Workspace ID (omit when targeting a share).
+        workspace: Option<String>,
+        /// Share ID (alternative upload target to `--workspace`).
+        share: Option<String>,
         /// Filename for the uploaded file.
         name: String,
         /// Text content to upload.
@@ -67,8 +69,10 @@ pub enum UploadCommand {
     },
     /// Create an upload session manually.
     CreateSession {
-        /// Workspace ID.
-        workspace: String,
+        /// Workspace ID (omit when targeting a share).
+        workspace: Option<String>,
+        /// Share ID (alternative upload target to `--workspace`).
+        share: Option<String>,
         /// Filename.
         filename: String,
         /// File size in bytes.
@@ -117,7 +121,14 @@ pub enum UploadCommand {
         chunk_num: u32,
     },
     /// List web imports.
-    WebList,
+    WebList {
+        /// Maximum number of jobs to return.
+        limit: Option<u32>,
+        /// Offset for pagination.
+        offset: Option<u32>,
+        /// Filter by job status.
+        status: Option<String>,
+    },
     /// Cancel a web import.
     WebCancel {
         /// Upload ID.
@@ -128,14 +139,32 @@ pub enum UploadCommand {
         /// Upload ID.
         upload_id: String,
     },
-    /// Get upload limits.
-    Limits,
+    /// Get upload limits (optionally in a target context).
+    Limits {
+        /// Limit-resolution action context: `create` or `update`.
+        action: Option<String>,
+        /// Organization ID for limit resolution (used when no action).
+        org: Option<String>,
+        /// Target workspace or share ID (required when action=create).
+        instance_id: Option<String>,
+        /// Target folder `OpaqueId` or `root`.
+        folder_id: Option<String>,
+        /// File ID for update context (required when action=update).
+        file_id: Option<String>,
+    },
+    /// List supported upload hash algorithms.
+    Algos,
     /// Get restricted extensions.
-    Extensions,
+    Extensions {
+        /// Plan whose extension limits to return.
+        plan: Option<String>,
+    },
     /// Upload a local file via streaming (no exact size required upfront).
     Stream {
-        /// Workspace ID.
-        workspace: String,
+        /// Workspace ID (omit when targeting a share).
+        workspace: Option<String>,
+        /// Share ID (alternative upload target to `--workspace`).
+        share: Option<String>,
         /// Path to the local file (use `-` for stdin).
         file_path: String,
         /// Destination folder node ID (defaults to root).
@@ -151,8 +180,10 @@ pub enum UploadCommand {
     },
     /// Create a streaming upload session manually.
     CreateStreamSession {
-        /// Workspace ID.
-        workspace: String,
+        /// Workspace ID (omit when targeting a share).
+        workspace: Option<String>,
+        /// Share ID (alternative upload target to `--workspace`).
+        share: Option<String>,
         /// Filename.
         filename: String,
         /// Destination folder node ID (defaults to root).
@@ -200,13 +231,17 @@ pub async fn execute(command: &UploadCommand, ctx: &CommandContext<'_>) -> Resul
         }
         UploadCommand::Text {
             workspace,
+            share,
             name,
             content,
             folder,
         } => {
+            let (instance_id, profile_type) =
+                resolve_upload_target(workspace.as_deref(), share.as_deref())?;
             upload_text(
                 ctx,
-                workspace,
+                instance_id,
+                profile_type,
                 name,
                 content,
                 folder.as_deref().unwrap_or("root"),
@@ -230,10 +265,23 @@ pub async fn execute(command: &UploadCommand, ctx: &CommandContext<'_>) -> Resul
         }
         UploadCommand::CreateSession {
             workspace,
+            share,
             filename,
             filesize,
             folder,
-        } => create_session(ctx, workspace, filename, *filesize, folder.as_deref()).await,
+        } => {
+            let (instance_id, profile_type) =
+                resolve_upload_target(workspace.as_deref(), share.as_deref())?;
+            create_session(
+                ctx,
+                instance_id,
+                profile_type,
+                filename,
+                *filesize,
+                folder.as_deref(),
+            )
+            .await
+        }
         UploadCommand::Chunk {
             upload_key,
             chunk_num,
@@ -249,13 +297,35 @@ pub async fn execute(command: &UploadCommand, ctx: &CommandContext<'_>) -> Resul
             upload_key,
             chunk_num,
         } => chunk_delete(ctx, upload_key, *chunk_num).await,
-        UploadCommand::WebList => web_list(ctx).await,
+        UploadCommand::WebList {
+            limit,
+            offset,
+            status,
+        } => web_list(ctx, *limit, *offset, status.as_deref()).await,
         UploadCommand::WebCancel { upload_id } => web_cancel(ctx, upload_id).await,
         UploadCommand::WebStatus { upload_id } => web_status(ctx, upload_id).await,
-        UploadCommand::Limits => upload_limits(ctx).await,
-        UploadCommand::Extensions => upload_extensions(ctx).await,
+        UploadCommand::Limits {
+            action,
+            org,
+            instance_id,
+            folder_id,
+            file_id,
+        } => {
+            upload_limits(
+                ctx,
+                action.as_deref(),
+                org.as_deref(),
+                instance_id.as_deref(),
+                folder_id.as_deref(),
+                file_id.as_deref(),
+            )
+            .await
+        }
+        UploadCommand::Algos => upload_algos(ctx).await,
+        UploadCommand::Extensions { plan } => upload_extensions(ctx, plan.as_deref()).await,
         UploadCommand::Stream {
             workspace,
+            share,
             file_path,
             folder,
             max_size,
@@ -263,9 +333,12 @@ pub async fn execute(command: &UploadCommand, ctx: &CommandContext<'_>) -> Resul
             hash,
             hash_algo,
         } => {
+            let (instance_id, profile_type) =
+                resolve_upload_target(workspace.as_deref(), share.as_deref())?;
             stream_file(
                 ctx,
-                workspace,
+                instance_id,
+                profile_type,
                 file_path,
                 folder.as_deref().unwrap_or("root"),
                 *max_size,
@@ -277,10 +350,23 @@ pub async fn execute(command: &UploadCommand, ctx: &CommandContext<'_>) -> Resul
         }
         UploadCommand::CreateStreamSession {
             workspace,
+            share,
             filename,
             folder,
             max_size,
-        } => create_stream_session(ctx, workspace, filename, folder.as_deref(), *max_size).await,
+        } => {
+            let (instance_id, profile_type) =
+                resolve_upload_target(workspace.as_deref(), share.as_deref())?;
+            create_stream_session(
+                ctx,
+                instance_id,
+                profile_type,
+                filename,
+                folder.as_deref(),
+                *max_size,
+            )
+            .await
+        }
         UploadCommand::StreamSend {
             upload_key,
             file,
@@ -301,22 +387,40 @@ pub async fn execute(command: &UploadCommand, ctx: &CommandContext<'_>) -> Resul
     }
 }
 
+/// Resolve the upload target `(instance_id, profile_type)` from a
+/// `--workspace` / `--share` selector. Exactly one must be supplied.
+fn resolve_upload_target<'a>(
+    workspace: Option<&'a str>,
+    share: Option<&'a str>,
+) -> Result<(&'a str, &'static str)> {
+    match (workspace, share) {
+        (Some(w), None) => {
+            anyhow::ensure!(!w.trim().is_empty(), "workspace ID must not be empty");
+            Ok((w, "workspace"))
+        }
+        (None, Some(s)) => {
+            anyhow::ensure!(!s.trim().is_empty(), "share ID must not be empty");
+            Ok((s, "share"))
+        }
+        (Some(_), Some(_)) => anyhow::bail!("provide either --workspace or --share, not both"),
+        (None, None) => anyhow::bail!("provide --workspace or --share"),
+    }
+}
+
 /// Create an upload session.
 async fn create_session(
     ctx: &CommandContext<'_>,
-    workspace: &str,
+    instance_id: &str,
+    profile_type: &str,
     filename: &str,
     filesize: u64,
     folder: Option<&str>,
 ) -> Result<()> {
-    anyhow::ensure!(
-        !workspace.trim().is_empty(),
-        "workspace ID must not be empty"
-    );
     let client = ctx.build_client()?;
     let value = api::upload::create_upload_session(
         &client,
-        workspace,
+        instance_id,
+        profile_type,
         folder.unwrap_or("root"),
         filename,
         filesize,
@@ -416,9 +520,14 @@ async fn chunk_delete(ctx: &CommandContext<'_>, upload_key: &str, chunk_num: u32
 }
 
 /// List web imports.
-async fn web_list(ctx: &CommandContext<'_>) -> Result<()> {
+async fn web_list(
+    ctx: &CommandContext<'_>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    status: Option<&str>,
+) -> Result<()> {
     let client = ctx.build_client()?;
-    let value = api::upload::web_list(&client)
+    let value = api::upload::web_list(&client, limit, offset, status)
         .await
         .context("failed to list web imports")?;
     ctx.output.render(&value)?;
@@ -446,20 +555,72 @@ async fn web_status(ctx: &CommandContext<'_>, upload_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Get upload limits.
-async fn upload_limits(ctx: &CommandContext<'_>) -> Result<()> {
+/// Validate the per-action required arguments for `upload limits`.
+///
+/// The `/upload/limits/` handler derives the profile type from `instance_id`
+/// for both the `create` and `update` contexts, so `instance_id` is required
+/// whenever an `--action` is given; `update` additionally requires `file_id`.
+/// (`handleOnUpdate` marks `instance_id` `Optional` in its input spec but then
+/// rejects a missing/invalid one when resolving the profile type.) Without an
+/// `--action`, limits resolve from the caller's plan (optionally scoped by
+/// `--org`) and neither field is required.
+pub(crate) fn validate_limits_action_context(
+    action: Option<&str>,
+    instance_id: Option<&str>,
+    file_id: Option<&str>,
+) -> Result<()> {
+    match action {
+        Some("create") => anyhow::ensure!(
+            instance_id.is_some(),
+            "--instance-id is required when --action create (target workspace or share ID)"
+        ),
+        Some("update") => {
+            anyhow::ensure!(
+                instance_id.is_some(),
+                "--instance-id is required when --action update (target workspace or share ID)"
+            );
+            anyhow::ensure!(
+                file_id.is_some(),
+                "--file-id is required when --action update"
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Get upload limits, optionally resolved in a target context.
+async fn upload_limits(
+    ctx: &CommandContext<'_>,
+    action: Option<&str>,
+    org: Option<&str>,
+    instance_id: Option<&str>,
+    folder_id: Option<&str>,
+    file_id: Option<&str>,
+) -> Result<()> {
+    validate_limits_action_context(action, instance_id, file_id)?;
     let client = ctx.build_client()?;
-    let value = api::upload::upload_limits(&client)
+    let value = api::upload::upload_limits(&client, action, org, instance_id, folder_id, file_id)
         .await
         .context("failed to get upload limits")?;
     ctx.output.render(&value)?;
     Ok(())
 }
 
-/// Get restricted extensions.
-async fn upload_extensions(ctx: &CommandContext<'_>) -> Result<()> {
+/// List supported upload hash algorithms.
+async fn upload_algos(ctx: &CommandContext<'_>) -> Result<()> {
     let client = ctx.build_client()?;
-    let value = api::upload::upload_extensions(&client)
+    let value = api::upload::algos(&client)
+        .await
+        .context("failed to get upload algorithms")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Get restricted extensions.
+async fn upload_extensions(ctx: &CommandContext<'_>, plan: Option<&str>) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::upload::upload_extensions(&client, plan)
         .await
         .context("failed to get upload extensions")?;
     ctx.output.render(&value)?;
@@ -1181,6 +1342,7 @@ async fn upload_large_via_chunked(
     let session = fastio_cli::api::upload::create_upload_session(
         client,
         workspace,
+        "workspace",
         folder,
         &inp.filename,
         inp.size,
@@ -1265,6 +1427,7 @@ async fn upload_file(
             &token_str,
             ctx.api_base,
             workspace,
+            "workspace",
             folder,
             filename,
             file_data,
@@ -1317,10 +1480,16 @@ async fn upload_file(
     let client = ApiClient::new(ctx.api_base, Some(token_str.clone()))
         .context("failed to create API client")?;
 
-    let session =
-        api::upload::create_upload_session(&client, workspace, folder, filename, file_size)
-            .await
-            .context("failed to create upload session")?;
+    let session = api::upload::create_upload_session(
+        &client,
+        workspace,
+        "workspace",
+        folder,
+        filename,
+        file_size,
+    )
+    .await
+    .context("failed to create upload session")?;
 
     let upload_id = session
         .get("id")
@@ -1379,15 +1548,12 @@ async fn upload_file(
 /// to the multi-step chunked flow.
 async fn upload_text(
     ctx: &CommandContext<'_>,
-    workspace: &str,
+    instance_id: &str,
+    profile_type: &str,
     name: &str,
     content: &str,
     folder: &str,
 ) -> Result<()> {
-    anyhow::ensure!(
-        !workspace.trim().is_empty(),
-        "workspace ID must not be empty"
-    );
     let token_str = resolve_auth(ctx.profile_name, ctx.flag_token, ctx.config_dir)?;
 
     let content_bytes = content.as_bytes();
@@ -1405,7 +1571,8 @@ async fn upload_text(
         let resp = api::upload::single_call_upload(
             &token_str,
             ctx.api_base,
-            workspace,
+            instance_id,
+            profile_type,
             folder,
             name,
             content_bytes.to_vec(),
@@ -1454,9 +1621,16 @@ async fn upload_text(
     let client = ApiClient::new(ctx.api_base, Some(token_str.clone()))
         .context("failed to create API client")?;
 
-    let session = api::upload::create_upload_session(&client, workspace, folder, name, file_size)
-        .await
-        .context("failed to create upload session")?;
+    let session = api::upload::create_upload_session(
+        &client,
+        instance_id,
+        profile_type,
+        folder,
+        name,
+        file_size,
+    )
+    .await
+    .context("failed to create upload session")?;
 
     let upload_id = session
         .get("id")
@@ -1503,7 +1677,8 @@ async fn upload_text(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn stream_file(
     ctx: &CommandContext<'_>,
-    workspace: &str,
+    instance_id: &str,
+    profile_type: &str,
     file_path: &str,
     folder: &str,
     max_size: Option<u64>,
@@ -1511,11 +1686,6 @@ async fn stream_file(
     hash: Option<&str>,
     hash_algo: Option<&str>,
 ) -> Result<()> {
-    anyhow::ensure!(
-        !workspace.trim().is_empty(),
-        "workspace ID must not be empty"
-    );
-
     let (data, filename) = if file_path == "-" {
         use std::io::Read;
         let name = name_override
@@ -1586,10 +1756,16 @@ async fn stream_file(
         eprintln!("Streaming upload {} ({})", filename, format_bytes(data_len));
     }
 
-    let session =
-        api::upload::create_stream_session(&client, workspace, folder, &filename, max_size)
-            .await
-            .context("failed to create stream session")?;
+    let session = api::upload::create_stream_session(
+        &client,
+        instance_id,
+        profile_type,
+        folder,
+        &filename,
+        max_size,
+    )
+    .await
+    .context("failed to create stream session")?;
 
     let upload_id = session
         .get("id")
@@ -1676,19 +1852,17 @@ async fn stream_file(
 /// Create a streaming upload session manually.
 async fn create_stream_session(
     ctx: &CommandContext<'_>,
-    workspace: &str,
+    instance_id: &str,
+    profile_type: &str,
     filename: &str,
     folder: Option<&str>,
     max_size: Option<u64>,
 ) -> Result<()> {
-    anyhow::ensure!(
-        !workspace.trim().is_empty(),
-        "workspace ID must not be empty"
-    );
     let client = ctx.build_client()?;
     let value = api::upload::create_stream_session(
         &client,
-        workspace,
+        instance_id,
+        profile_type,
         folder.unwrap_or("root"),
         filename,
         max_size,
@@ -1791,7 +1965,28 @@ async fn upload_url(
 
 #[cfg(test)]
 mod tests {
-    use super::pack_batches;
+    use super::{pack_batches, validate_limits_action_context};
+
+    #[test]
+    fn limits_create_requires_instance_id() {
+        assert!(validate_limits_action_context(Some("create"), None, None).is_err());
+        assert!(validate_limits_action_context(Some("create"), Some("19"), None).is_ok());
+    }
+
+    #[test]
+    fn limits_update_requires_instance_id_and_file_id() {
+        // Missing both, missing instance_id, and missing file_id all fail.
+        assert!(validate_limits_action_context(Some("update"), None, None).is_err());
+        assert!(validate_limits_action_context(Some("update"), None, Some("f1")).is_err());
+        assert!(validate_limits_action_context(Some("update"), Some("19"), None).is_err());
+        // Both present succeeds.
+        assert!(validate_limits_action_context(Some("update"), Some("19"), Some("f1")).is_ok());
+    }
+
+    #[test]
+    fn limits_no_action_requires_nothing() {
+        assert!(validate_limits_action_context(None, None, None).is_ok());
+    }
 
     #[test]
     fn pack_batches_count_boundary() {

@@ -16,10 +16,30 @@ pub enum EventCommand {
         workspace: Option<String>,
         /// Filter by share ID.
         share: Option<String>,
+        /// Filter by acting user profile ID.
+        user_id: Option<String>,
+        /// Filter by organization ID.
+        org_id: Option<String>,
         /// Filter by event name.
         event: Option<String>,
         /// Filter by category.
         category: Option<String>,
+        /// Filter by subcategory.
+        subcategory: Option<String>,
+        /// Drill into a serial/batch parent event's children.
+        parent_event_id: Option<String>,
+        /// Filter by the user who triggered the event.
+        calling_user_id: Option<String>,
+        /// Filter by related object ID.
+        object_id: Option<String>,
+        /// Audit-log read filter: `external_audit_log` or `external`.
+        visibility: Option<String>,
+        /// Filter by acknowledgment status.
+        acknowledged: Option<bool>,
+        /// Lower bound for event creation time.
+        created_min: Option<String>,
+        /// Upper bound for event creation time.
+        created_max: Option<String>,
         /// Max results.
         limit: Option<u32>,
         /// Offset for pagination.
@@ -50,12 +70,30 @@ pub enum EventCommand {
         workspace: Option<String>,
         /// Filter by share ID.
         share: Option<String>,
+        /// Filter by acting user profile ID.
+        user_id: Option<String>,
+        /// Filter by organization ID.
+        org_id: Option<String>,
         /// Filter by event name.
         event: Option<String>,
         /// Filter by category.
         category: Option<String>,
         /// Filter by subcategory.
         subcategory: Option<String>,
+        /// Drill into a serial/batch parent event's children.
+        parent_event_id: Option<String>,
+        /// Filter by the user who triggered the event.
+        calling_user_id: Option<String>,
+        /// Filter by related object ID.
+        object_id: Option<String>,
+        /// Audit-log read filter: `external_audit_log` or `external`.
+        visibility: Option<String>,
+        /// Filter by acknowledgment status.
+        acknowledged: Option<bool>,
+        /// Lower bound for event creation time.
+        created_min: Option<String>,
+        /// Upper bound for event creation time.
+        created_max: Option<String>,
         /// Free-text context for the AI summarizer.
         user_context: Option<String>,
         /// Max events to include.
@@ -71,21 +109,40 @@ pub async fn execute(command: &EventCommand, ctx: &CommandContext<'_>) -> Result
         EventCommand::List {
             workspace,
             share,
+            user_id,
+            org_id,
             event,
             category,
+            subcategory,
+            parent_event_id,
+            calling_user_id,
+            object_id,
+            visibility,
+            acknowledged,
+            created_min,
+            created_max,
             limit,
             offset,
         } => {
-            list(
-                ctx,
-                workspace.as_deref(),
-                share.as_deref(),
-                event.as_deref(),
-                category.as_deref(),
-                *limit,
-                *offset,
-            )
-            .await
+            let params = api::event::SearchEventsParams {
+                workspace_id: workspace.as_deref(),
+                share_id: share.as_deref(),
+                user_id: user_id.as_deref(),
+                org_id: org_id.as_deref(),
+                event: event.as_deref(),
+                category: category.as_deref(),
+                subcategory: subcategory.as_deref(),
+                parent_event_id: parent_event_id.as_deref(),
+                calling_user_id: calling_user_id.as_deref(),
+                object_id: object_id.as_deref(),
+                visibility: visibility.as_deref(),
+                acknowledged: *acknowledged,
+                created_min: created_min.as_deref(),
+                created_max: created_max.as_deref(),
+                limit: *limit,
+                offset: *offset,
+            };
+            list(ctx, &params).await
         }
         EventCommand::Info { event_id } => info(ctx, event_id).await,
         EventCommand::Poll {
@@ -97,54 +154,52 @@ pub async fn execute(command: &EventCommand, ctx: &CommandContext<'_>) -> Result
         EventCommand::Summarize {
             workspace,
             share,
+            user_id,
+            org_id,
             event,
             category,
             subcategory,
+            parent_event_id,
+            calling_user_id,
+            object_id,
+            visibility,
+            acknowledged,
+            created_min,
+            created_max,
             user_context,
             limit,
             offset,
         } => {
-            summarize(
-                ctx,
-                workspace.as_deref(),
-                share.as_deref(),
-                event.as_deref(),
-                category.as_deref(),
-                subcategory.as_deref(),
-                user_context.as_deref(),
-                *limit,
-                *offset,
-            )
-            .await
+            let params = api::event::SummarizeEventsParams {
+                workspace_id: workspace.as_deref(),
+                share_id: share.as_deref(),
+                user_id: user_id.as_deref(),
+                org_id: org_id.as_deref(),
+                event: event.as_deref(),
+                category: category.as_deref(),
+                subcategory: subcategory.as_deref(),
+                parent_event_id: parent_event_id.as_deref(),
+                calling_user_id: calling_user_id.as_deref(),
+                object_id: object_id.as_deref(),
+                visibility: visibility.as_deref(),
+                acknowledged: *acknowledged,
+                created_min: created_min.as_deref(),
+                created_max: created_max.as_deref(),
+                user_context: user_context.as_deref(),
+                limit: *limit,
+                offset: *offset,
+            };
+            summarize(ctx, &params).await
         }
     }
 }
 
 /// List/search events.
-async fn list(
-    ctx: &CommandContext<'_>,
-    workspace: Option<&str>,
-    share: Option<&str>,
-    event: Option<&str>,
-    category: Option<&str>,
-    limit: Option<u32>,
-    offset: Option<u32>,
-) -> Result<()> {
+async fn list(ctx: &CommandContext<'_>, params: &api::event::SearchEventsParams<'_>) -> Result<()> {
     let client = ctx.build_client()?;
-    let value = api::event::search_events(
-        &client,
-        &api::event::SearchEventsParams {
-            workspace_id: workspace,
-            share_id: share,
-            event,
-            category,
-            limit,
-            offset,
-            ..Default::default()
-        },
-    )
-    .await
-    .context("failed to search events")?;
+    let value = api::event::search_events(&client, params)
+        .await
+        .context("failed to search events")?;
     ctx.output.render(&value)?;
     Ok(())
 }
@@ -185,35 +240,14 @@ async fn ack(ctx: &CommandContext<'_>, event_id: &str) -> Result<()> {
 }
 
 /// Get an AI-powered summary of events.
-#[allow(clippy::too_many_arguments)]
 async fn summarize(
     ctx: &CommandContext<'_>,
-    workspace: Option<&str>,
-    share: Option<&str>,
-    event: Option<&str>,
-    category: Option<&str>,
-    subcategory: Option<&str>,
-    user_context: Option<&str>,
-    limit: Option<u32>,
-    offset: Option<u32>,
+    params: &api::event::SummarizeEventsParams<'_>,
 ) -> Result<()> {
     let client = ctx.build_client()?;
-    let value = api::event::summarize_events(
-        &client,
-        &api::event::SummarizeEventsParams {
-            workspace_id: workspace,
-            share_id: share,
-            event,
-            category,
-            subcategory,
-            user_context,
-            limit,
-            offset,
-            ..Default::default()
-        },
-    )
-    .await
-    .context("failed to summarize events")?;
+    let value = api::event::summarize_events(&client, params)
+        .await
+        .context("failed to summarize events")?;
     ctx.output.render(&value)?;
     Ok(())
 }

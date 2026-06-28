@@ -51,6 +51,8 @@ pub enum TaskCommand {
         priority: Option<u8>,
         /// Assignee profile ID.
         assignee_id: Option<String>,
+        /// Primary linked storage node ID.
+        node_id: Option<String>,
     },
     /// Get task details.
     Info {
@@ -75,6 +77,8 @@ pub enum TaskCommand {
         priority: Option<u8>,
         /// New assignee.
         assignee_id: Option<String>,
+        /// New primary linked storage node ID.
+        node_id: Option<String>,
     },
     /// Delete a task.
     Delete {
@@ -135,8 +139,113 @@ pub enum TaskCommand {
         /// Comma-separated list IDs in desired order.
         list_ids: String,
     },
+    /// Filtered task list (personal/group view).
+    Filter {
+        /// Profile type: workspace or share.
+        profile_type: String,
+        /// Workspace or share ID.
+        profile_id: String,
+        /// Filter: assigned, created, status.
+        filter: String,
+        /// Status filter.
+        status: Option<String>,
+        /// Max results.
+        limit: Option<u32>,
+        /// Offset for pagination.
+        offset: Option<u32>,
+    },
+    /// Task count summary for a workspace or share.
+    Summary {
+        /// Profile type: workspace or share.
+        profile_type: String,
+        /// Workspace or share ID.
+        profile_id: String,
+    },
+    /// List a task's attachments.
+    Attachments {
+        /// Task list ID.
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+    },
+    /// Attach one or more objects to a task.
+    Attach {
+        /// Task list ID.
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+        /// Object IDs to attach.
+        target_ids: Vec<String>,
+    },
+    /// Detach a single object from a task.
+    Detach {
+        /// Task list ID.
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+        /// Object ID to detach.
+        target_id: String,
+    },
+    /// Manage a task's comment thread.
+    Comment(TaskCommentCommand),
     /// Manage task lists.
     Lists(TaskListCommand),
+}
+
+/// Task comment subcommand variants.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum TaskCommentCommand {
+    /// List a task's comment thread.
+    List {
+        /// Task list ID.
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+        /// Max results.
+        limit: Option<u32>,
+        /// Offset for pagination.
+        offset: Option<u32>,
+    },
+    /// Post a comment (or threaded reply) on a task.
+    Post {
+        /// Task list ID.
+        list_id: String,
+        /// Task ID.
+        task_id: String,
+        /// Comment text.
+        text: String,
+        /// Parent comment ID for a threaded reply.
+        parent_id: Option<String>,
+        /// Anchoring reference as a JSON object string.
+        reference: Option<String>,
+        /// Arbitrary metadata as a JSON object string.
+        properties: Option<String>,
+    },
+    /// Edit a task comment's text (by comment ID).
+    Edit {
+        /// Comment ID.
+        comment_id: String,
+        /// New comment text.
+        text: String,
+    },
+    /// Delete a task comment (by comment ID).
+    Delete {
+        /// Comment ID.
+        comment_id: String,
+    },
+    /// Add an emoji reaction to a task comment (by comment ID).
+    React {
+        /// Comment ID.
+        comment_id: String,
+        /// Emoji to react with.
+        emoji: String,
+    },
+    /// Remove your emoji reaction from a task comment (by comment ID).
+    Unreact {
+        /// Comment ID.
+        comment_id: String,
+    },
 }
 
 /// Task list subcommand variants.
@@ -182,6 +291,7 @@ pub enum TaskListCommand {
 }
 
 /// Execute a task subcommand.
+#[allow(clippy::too_many_lines)]
 pub async fn execute(command: &TaskCommand, ctx: &CommandContext<'_>) -> Result<()> {
     match command {
         TaskCommand::List {
@@ -198,6 +308,7 @@ pub async fn execute(command: &TaskCommand, ctx: &CommandContext<'_>) -> Result<
             status,
             priority,
             assignee_id,
+            node_id,
         } => {
             create(
                 ctx,
@@ -208,6 +319,7 @@ pub async fn execute(command: &TaskCommand, ctx: &CommandContext<'_>) -> Result<
                 status.as_deref(),
                 *priority,
                 assignee_id.as_deref(),
+                node_id.as_deref(),
             )
             .await
         }
@@ -220,6 +332,7 @@ pub async fn execute(command: &TaskCommand, ctx: &CommandContext<'_>) -> Result<
             status,
             priority,
             assignee_id,
+            node_id,
         } => {
             update(
                 ctx,
@@ -230,6 +343,7 @@ pub async fn execute(command: &TaskCommand, ctx: &CommandContext<'_>) -> Result<
                 status.as_deref(),
                 *priority,
                 assignee_id.as_deref(),
+                node_id.as_deref(),
             )
             .await
         }
@@ -257,8 +371,84 @@ pub async fn execute(command: &TaskCommand, ctx: &CommandContext<'_>) -> Result<
             profile_id,
             list_ids,
         } => reorder_lists(ctx, profile_type, profile_id, list_ids).await,
+        TaskCommand::Filter {
+            profile_type,
+            profile_id,
+            filter,
+            status,
+            limit,
+            offset,
+        } => {
+            filter_tasks(
+                ctx,
+                profile_type,
+                profile_id,
+                filter,
+                status.as_deref(),
+                *limit,
+                *offset,
+            )
+            .await
+        }
+        TaskCommand::Summary {
+            profile_type,
+            profile_id,
+        } => tasks_summary(ctx, profile_type, profile_id).await,
+        TaskCommand::Attachments { list_id, task_id } => attachments(ctx, list_id, task_id).await,
+        TaskCommand::Attach {
+            list_id,
+            task_id,
+            target_ids,
+        } => attach(ctx, list_id, task_id, target_ids).await,
+        TaskCommand::Detach {
+            list_id,
+            task_id,
+            target_id,
+        } => detach(ctx, list_id, task_id, target_id).await,
+        TaskCommand::Comment(cmd) => comment(cmd, ctx).await,
         TaskCommand::Lists(cmd) => lists(cmd, ctx).await,
     }
+}
+
+/// Filtered task list.
+async fn filter_tasks(
+    ctx: &CommandContext<'_>,
+    profile_type: &str,
+    profile_id: &str,
+    filter: &str,
+    status: Option<&str>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<()> {
+    if filter == "status" && status.is_none() {
+        anyhow::bail!("the `status` filter requires --status");
+    }
+    let client = ctx.build_client()?;
+    let query = api::workflow::FilterQuery {
+        limit,
+        offset,
+        status,
+    };
+    let value =
+        api::workflow::list_tasks_filtered(&client, profile_type, profile_id, filter, &query)
+            .await
+            .context("failed to list filtered tasks")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Task count summary.
+async fn tasks_summary(
+    ctx: &CommandContext<'_>,
+    profile_type: &str,
+    profile_id: &str,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::workflow::tasks_summary(&client, profile_type, profile_id)
+        .await
+        .context("failed to get task summary")?;
+    ctx.output.render(&value)?;
+    Ok(())
 }
 
 /// List tasks.
@@ -297,6 +487,7 @@ async fn create(
     status: Option<&str>,
     priority: Option<u8>,
     assignee_id: Option<&str>,
+    node_id: Option<&str>,
 ) -> Result<()> {
     validate_priority(priority)?;
 
@@ -310,6 +501,7 @@ async fn create(
             status,
             priority,
             assignee_id,
+            node_id,
         },
     )
     .await
@@ -339,15 +531,17 @@ async fn update(
     status: Option<&str>,
     priority: Option<u8>,
     assignee_id: Option<&str>,
+    node_id: Option<&str>,
 ) -> Result<()> {
     if title.is_none()
         && description.is_none()
         && status.is_none()
         && priority.is_none()
         && assignee_id.is_none()
+        && node_id.is_none()
     {
         anyhow::bail!(
-            "at least one update field is required (--title, --description, --status, --priority, --assignee-id)"
+            "at least one update field is required (--title, --description, --status, --priority, --assignee-id, --node-id)"
         );
     }
 
@@ -364,6 +558,7 @@ async fn update(
             status,
             priority,
             assignee_id,
+            node_id,
         },
     )
     .await
@@ -482,6 +677,127 @@ async fn reorder_lists(
         .await
         .context("failed to reorder task lists")?;
     ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// List a task's attachments.
+async fn attachments(ctx: &CommandContext<'_>, list_id: &str, task_id: &str) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::workflow::list_task_attachments(&client, list_id, task_id)
+        .await
+        .context("failed to list task attachments")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Attach one or more objects to a task.
+async fn attach(
+    ctx: &CommandContext<'_>,
+    list_id: &str,
+    task_id: &str,
+    target_ids: &[String],
+) -> Result<()> {
+    let ids: Vec<String> = target_ids
+        .iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    anyhow::ensure!(!ids.is_empty(), "at least one --target-id is required");
+    anyhow::ensure!(
+        ids.len() <= 100,
+        "a single attach call accepts at most 100 target ids (got {})",
+        ids.len()
+    );
+    let client = ctx.build_client()?;
+    let value = api::workflow::attach_to_task(&client, list_id, task_id, &ids)
+        .await
+        .context("failed to attach to task")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Detach a single object from a task.
+async fn detach(
+    ctx: &CommandContext<'_>,
+    list_id: &str,
+    task_id: &str,
+    target_id: &str,
+) -> Result<()> {
+    let client = ctx.build_client()?;
+    let value = api::workflow::detach_from_task(&client, list_id, task_id, target_id)
+        .await
+        .context("failed to detach from task")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Handle task comment subcommands.
+async fn comment(cmd: &TaskCommentCommand, ctx: &CommandContext<'_>) -> Result<()> {
+    let client = ctx.build_client()?;
+    match cmd {
+        TaskCommentCommand::List {
+            list_id,
+            task_id,
+            limit,
+            offset,
+        } => {
+            let value =
+                api::workflow::list_task_comments(&client, list_id, task_id, *limit, *offset)
+                    .await
+                    .context("failed to list task comments")?;
+            ctx.output.render(&value)?;
+        }
+        TaskCommentCommand::Post {
+            list_id,
+            task_id,
+            text,
+            parent_id,
+            reference,
+            properties,
+        } => {
+            let reference = super::parse_json_object_arg(reference.as_deref(), "reference")?;
+            let properties = super::parse_json_object_arg(properties.as_deref(), "properties")?;
+            let value = api::workflow::post_task_comment(
+                &client,
+                &api::workflow::PostTaskCommentParams {
+                    list_id,
+                    task_id,
+                    body: text,
+                    parent_id: parent_id.as_deref(),
+                    reference: reference.as_ref(),
+                    properties: properties.as_ref(),
+                },
+            )
+            .await
+            .context("failed to post task comment")?;
+            ctx.output.render(&value)?;
+        }
+        TaskCommentCommand::Edit { comment_id, text } => {
+            let value = api::comment::update_comment(&client, comment_id, text)
+                .await
+                .context("failed to edit task comment")?;
+            ctx.output.render(&value)?;
+        }
+        TaskCommentCommand::Delete { comment_id } => {
+            api::comment::delete_comment(&client, comment_id)
+                .await
+                .context("failed to delete task comment")?;
+            let value = json!({ "status": "deleted", "comment_id": comment_id });
+            ctx.output.render(&value)?;
+        }
+        TaskCommentCommand::React { comment_id, emoji } => {
+            let value = api::comment::add_reaction(&client, comment_id, emoji)
+                .await
+                .context("failed to add reaction")?;
+            ctx.output.render(&value)?;
+        }
+        TaskCommentCommand::Unreact { comment_id } => {
+            let value = api::comment::remove_reaction(&client, comment_id)
+                .await
+                .context("failed to remove reaction")?;
+            ctx.output.render(&value)?;
+        }
+    }
     Ok(())
 }
 
