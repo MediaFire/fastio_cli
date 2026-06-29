@@ -629,8 +629,8 @@ mod tests {
             plan_metadata_request("POST", true, true, false),
             MetadataRequestKind::PostForm
         );
-        // No form supplied → JSON fallback (template-select sends no body;
-        // any genuinely-JSON POST endpoint keeps JSON).
+        // No form supplied → JSON fallback (a no-body / genuinely-JSON POST
+        // endpoint keeps JSON).
         assert_eq!(
             plan_metadata_request("POST", false, true, false),
             MetadataRequestKind::PostJson
