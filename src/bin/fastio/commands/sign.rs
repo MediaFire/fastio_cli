@@ -36,7 +36,10 @@ use fastio_cli::api::signing::{
 };
 use fastio_cli::error::CliError;
 
-use crate::cli::{SignAuditCommands, SignCommands, SignDocumentCommands, SignEnvelopeCommands};
+use crate::cli::{
+    SignAuditCommands, SignCommands, SignDocumentCommands, SignEnvelopeCommands,
+    SignTemplateCommands,
+};
 
 use super::CommandContext;
 
@@ -471,6 +474,7 @@ fn map_signing_error(err: CliError, ctx: &'static str, op: SignOp) -> anyhow::Er
 pub async fn execute(command: SignCommands, ctx: &CommandContext<'_>) -> Result<()> {
     match command {
         SignCommands::Envelope(c) => execute_envelope(c, ctx).await,
+        SignCommands::Template(c) => execute_template(c, ctx).await,
         SignCommands::Document(c) => execute_document(c, ctx).await,
         SignCommands::Audit(c) => execute_audit(c, ctx).await,
     }
@@ -871,6 +875,162 @@ fn build_update_params(
         .documents(documents)
         .recipients(recipients)
         .fields(fields))
+}
+
+// ─── Signing templates ─────────────────────────────────────────────────────────
+
+/// Execute a `fastio sign template` command (reusable envelope blueprints).
+///
+/// Mirrors [`execute_envelope`]: JSON args are resolved with the same `@file`
+/// helpers ([`resolve_json_value`] / [`resolve_opt_json_object`] /
+/// [`resolve_opt_json_array`]), the [`signing`] template builders are called,
+/// every error flows through [`map_signing_error`] (the signing-specific
+/// framing), and the destructive `delete` is gated behind
+/// [`confirm_destructive`]. `--snapshot` / `--recipient-bindings` are objects;
+/// `--documents` is an array.
+#[allow(clippy::too_many_lines)] // a flat dispatch over the template CRUD surface
+async fn execute_template(command: SignTemplateCommands, ctx: &CommandContext<'_>) -> Result<()> {
+    match command {
+        SignTemplateCommands::Create {
+            workspace,
+            name,
+            description,
+            snapshot,
+        } => {
+            // The snapshot is a JSON OBJECT blueprint, passed through verbatim
+            // (the server validates its internals, like policy_json on envelopes).
+            let snapshot = resolve_json_value(&snapshot, "snapshot JSON")?;
+            anyhow::ensure!(snapshot.is_object(), "snapshot JSON must be a JSON object");
+            let client = ctx.build_client()?;
+            let v = signing::create_sign_template(
+                &client,
+                &workspace,
+                &name,
+                description.as_deref(),
+                &snapshot,
+            )
+            .await
+            .map_err(|e| map_signing_error(e, "failed to create sign template", SignOp::General))?;
+            ctx.output.render(&v)?;
+            Ok(())
+        }
+        SignTemplateCommands::List {
+            workspace,
+            offset,
+            limit,
+        } => {
+            let client = ctx.build_client()?;
+            let v = signing::list_sign_templates(&client, &workspace, offset, limit)
+                .await
+                .map_err(|e| {
+                    map_signing_error(e, "failed to list sign templates", SignOp::General)
+                })?;
+            ctx.output.render(&v)?;
+            Ok(())
+        }
+        SignTemplateCommands::Get {
+            workspace,
+            template_id,
+        } => {
+            let client = ctx.build_client()?;
+            let v = signing::get_sign_template(&client, &workspace, &template_id)
+                .await
+                .map_err(|e| {
+                    map_signing_error(e, "failed to get sign template", SignOp::General)
+                })?;
+            ctx.output.render(&v)?;
+            Ok(())
+        }
+        SignTemplateCommands::Update {
+            workspace,
+            template_id,
+            expected_version,
+            name,
+            description,
+            snapshot,
+        } => {
+            // `--snapshot`, when present, is a full blueprint replacement (a JSON
+            // object); omit it to leave the snapshot unchanged.
+            let snapshot = resolve_opt_json_object(snapshot.as_deref(), "snapshot JSON")?;
+            // `--expected-version` alone changes nothing — require a mutable field
+            // so an empty (no-op) update is not sent.
+            anyhow::ensure!(
+                name.is_some() || description.is_some() || snapshot.is_some(),
+                "no fields to update were supplied: pass at least one of --name / --description / \
+                 --snapshot (--expected-version is the optimistic-CAS guard, not a change)"
+            );
+            let client = ctx.build_client()?;
+            let v = signing::update_sign_template(
+                &client,
+                &workspace,
+                &template_id,
+                expected_version,
+                name.as_deref(),
+                description.as_deref(),
+                snapshot.as_ref(),
+            )
+            .await
+            .map_err(|e| map_signing_error(e, "failed to update sign template", SignOp::General))?;
+            ctx.output.render(&v)?;
+            Ok(())
+        }
+        SignTemplateCommands::Delete {
+            workspace,
+            template_id,
+            yes,
+        } => {
+            confirm_destructive(
+                "sign template delete",
+                "soft-deletes the template — it disappears from the workspace (existing envelopes \
+                 keep their own captured copy); a PERM_ADMIN action that is never blocked by \
+                 referrers",
+                yes,
+            )?;
+            let client = ctx.build_client()?;
+            let v = signing::delete_sign_template(&client, &workspace, &template_id)
+                .await
+                .map_err(|e| {
+                    map_signing_error(e, "failed to delete sign template", SignOp::General)
+                })?;
+            ctx.output.render(&v)?;
+            Ok(())
+        }
+        SignTemplateCommands::Instantiate {
+            workspace,
+            template_id,
+            recipient_bindings,
+            documents,
+            envelope_name,
+        } => {
+            // `recipient_bindings` is REQUIRED and MUST be a JSON object/map keyed
+            // by slot_key (an array is rejected) — mirror the policy_json object
+            // guard so a mistyped array fails client-side before the network.
+            let bindings = resolve_json_value(&recipient_bindings, "recipient bindings JSON")?;
+            anyhow::ensure!(
+                bindings.is_object(),
+                "recipient bindings JSON must be a JSON object/map keyed by slot_key \
+                 (an array is rejected)"
+            );
+            // `--documents` is an optional JSON array of slot bindings.
+            let documents =
+                resolve_opt_json_array(documents.as_deref(), "documents JSON")?.map(Value::Array);
+            let client = ctx.build_client()?;
+            let v = signing::instantiate_sign_template(
+                &client,
+                &workspace,
+                &template_id,
+                &bindings,
+                documents.as_ref(),
+                envelope_name.as_deref(),
+            )
+            .await
+            .map_err(|e| {
+                map_signing_error(e, "failed to instantiate sign template", SignOp::General)
+            })?;
+            ctx.output.render(&v)?;
+            Ok(())
+        }
+    }
 }
 
 // ─── Document downloads ───────────────────────────────────────────────────────

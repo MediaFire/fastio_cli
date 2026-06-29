@@ -2170,7 +2170,21 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             ("limit", "Pagination limit (integer)", false),
             ("offset", "Pagination offset (integer)", false),
-            ("cursor", "Cursor for grant-list pagination", false),
+            (
+                "cursor",
+                "Opaque keyset cursor: pass back the prior response's pagination.next_cursor verbatim (list keyset pagination; also grant-list pagination)",
+                false,
+            ),
+            (
+                "page_size",
+                "Opt-in keyset page size 1-100, server default 50 (list). Setting page_size / cursor / bucket switches the response to the keyset shape (pagination + counts).",
+                false,
+            ),
+            (
+                "bucket",
+                "Execution-status bucket filter (list): one of in_flight, completed, paused, failed",
+                false,
+            ),
             (
                 "modification_id",
                 "Mid-run modification proposal OpaqueId (modification-get / -apply / -cancel)",
@@ -2247,7 +2261,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "sign",
-        description: "E-signature (SignEnvelope): draft and drive electronic-signature envelopes (PDFs sent to recipients). Every envelope is parented to a workspace (workspace_id; the former org surface was removed). This tool exposes READ, reversible-DRAFT-drive, and idempotent-RECOVERY actions: envelope-create (creates a DRAFT — reversible), envelope-update (draft-only; recipients are a full replacement; expires_at/policy_json are DECLARATIVE — omitting them CLEARS those fields, re-send to retain), envelope-list (filter via envelope_status / created_after / created_before), envelope-get, envelope-retry (re-drives a STUCK envelope through self-healing recovery — admin; idempotent + no-op-success; notifies no one; a permanent failure cascades to Failed), envelope-my-sign-link (mints YOUR OWN signing link for an envelope — the dashboard signature-card primary action; reversible/idempotent and notifies no one; requires a WRITE-scope token, so a read-only token is rejected with 10754; the structured result tells you the state — sign_url non-null = sign now, is_terminal = completed/void/declined, reauth_required = re-authenticate first, else you are blocked by routing order per blocked_signers), document-download (covers preview needs — the download bytes ARE the source/preview PDF, so there is no separate MCP preview action), signed-download, audit-download, describe. The OUTWARD-FACING / TERMINAL actions — send (EMAILS REAL RECIPIENTS) and void (terminal) — are intentionally CLI-binary-only (`fastio sign envelope send|void …`) and are NOT routable over MCP (mirrors how the workflow tool keeps cancel CLI-only). Envelopes are voided, not deleted — there is no delete action. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Signing is a paid-plan feature (a non-entitled org returns 1670; access also requires workspace membership). Call action='describe' for the authoritative per-action reference.",
+        description: "E-signature (SignEnvelope): draft and drive electronic-signature envelopes (PDFs sent to recipients). Every envelope is parented to a workspace (workspace_id; the former org surface was removed). This tool exposes READ, reversible-DRAFT-drive, and idempotent-RECOVERY actions: envelope-create (creates a DRAFT — reversible), envelope-update (draft-only; recipients are a full replacement; expires_at/policy_json are DECLARATIVE — omitting them CLEARS those fields, re-send to retain), envelope-list (filter via envelope_status / created_after / created_before), envelope-get, envelope-retry (re-drives a STUCK envelope through self-healing recovery — admin; idempotent + no-op-success; notifies no one; a permanent failure cascades to Failed), envelope-my-sign-link (mints YOUR OWN signing link for an envelope — the dashboard signature-card primary action; reversible/idempotent and notifies no one; requires a WRITE-scope token, so a read-only token is rejected with 10754; the structured result tells you the state — sign_url non-null = sign now, is_terminal = completed/void/declined, reauth_required = re-authenticate first, else you are blocked by routing order per blocked_signers), document-download (covers preview needs — the download bytes ARE the source/preview PDF, so there is no separate MCP preview action), signed-download, audit-download, describe. SIGN TEMPLATES (reusable envelope blueprints, template id sa…): template-list, template-details, and template-instantiate (resolves recipient_bindings/documents against the blueprint and creates a reversible DRAFT envelope) are exposed over MCP (reads + reversible draft creation); template-create, template-update, and template-delete are intentionally CLI-binary-only (`fastio sign template create|update|delete …`) and are NOT routable over MCP (mirrors the send/void boundary). The OUTWARD-FACING / TERMINAL actions — send (EMAILS REAL RECIPIENTS) and void (terminal) — are intentionally CLI-binary-only (`fastio sign envelope send|void …`) and are NOT routable over MCP (mirrors how the workflow tool keeps cancel CLI-only). Envelopes are voided, not deleted — there is no delete action. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Signing is a paid-plan feature (a non-entitled org returns 1670; access also requires workspace membership). Call action='describe' for the authoritative per-action reference.",
         actions: &[
             "describe",
             "envelope-create",
@@ -2256,6 +2270,9 @@ const TOOL_DEFS: &[ToolDef] = &[
             "envelope-get",
             "envelope-retry",
             "envelope-my-sign-link",
+            "template-list",
+            "template-details",
+            "template-instantiate",
             "document-download",
             "signed-download",
             "audit-download",
@@ -2356,8 +2373,36 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "envelope-list filter: only envelopes created before this time (Y-m-d H:i:s UTC)",
                 false,
             ),
-            ("limit", "Pagination limit (envelope-list)", false),
-            ("offset", "Pagination offset (envelope-list)", false),
+            (
+                "limit",
+                "Pagination limit (envelope-list / template-list)",
+                false,
+            ),
+            (
+                "offset",
+                "Pagination offset (envelope-list / template-list)",
+                false,
+            ),
+            (
+                "template_id",
+                "Sign-template OpaqueId (sa…) — template-details / template-instantiate",
+                false,
+            ),
+            (
+                "recipient_bindings",
+                "template-instantiate: REQUIRED JSON OBJECT/map STRING keyed by slot_key → {email, display_name?, auth_method?}. An array is rejected.",
+                false,
+            ),
+            (
+                "documents",
+                "template-instantiate: optional JSON ARRAY STRING of {document_slot_index, source_node_id, source_version_id?}",
+                false,
+            ),
+            (
+                "envelope_name",
+                "template-instantiate: optional name override for the created DRAFT envelope",
+                false,
+            ),
         ],
     },
     ToolDef {
@@ -10821,9 +10866,16 @@ fn workflow_describe() -> CallToolResult {
                 "created_by_me",
                 "participant_me",
                 "include",
+                "page_size",
+                "cursor",
+                "bucket",
             ],
             "filters narrow BEFORE pagination and compose (AND). created_by_me → created_by=me; \
-             participant_me → participant=me. include is a CSV of run_summary / run_meta.",
+             participant_me → participant=me. include is a CSV of run_summary / run_meta. \
+             OPT-IN keyset pagination: page_size (1-100) + cursor (the prior response's \
+             pagination.next_cursor) and the execution-status bucket (in_flight / completed / \
+             paused / failed) switch the response to the keyset shape (pagination + counts); \
+             limit / offset are the legacy offset path.",
         ),
         ("state", &["workflow_id"], &[], ""),
         (
@@ -11242,7 +11294,12 @@ async fn handle_workflow(
                 .archived(archived)
                 .created_by_me(created_by_me)
                 .participant_me(participant_me)
-                .include(optional_str(args, "include").map(str::to_owned));
+                .include(optional_str(args, "include").map(str::to_owned))
+                // Opt-in keyset pagination + execution-status bucket, passed
+                // through verbatim (the server validates the bucket value).
+                .page_size(optional_u32(args, "page_size"))
+                .cursor(optional_str(args, "cursor").map(str::to_owned))
+                .bucket(optional_str(args, "bucket").map(str::to_owned));
             wf_render(wf::list_workflows(&client, ws, &params).await)
         }
         "state" => {
@@ -12587,6 +12644,31 @@ fn sign_describe() -> CallToolResult {
              you are blocked by routing order (see blocked_signers).",
         ),
         (
+            "template-list",
+            &["workspace_id"],
+            &["offset", "limit"],
+            "offset-paginated (offset default 0; limit default 50, max 200). Lists reusable \
+             signing-template blueprints (template id sa…).",
+        ),
+        (
+            "template-details",
+            &["workspace_id", "template_id"],
+            &[],
+            "the full template blueprint (snapshot: recipient_slots / document_slots / fields / \
+             policy).",
+        ),
+        (
+            "template-instantiate",
+            &["workspace_id", "template_id", "recipient_bindings"],
+            &["documents", "envelope_name"],
+            "creates a reversible DRAFT envelope from the template. recipient_bindings is REQUIRED \
+             and MUST be a JSON OBJECT/map keyed by slot_key → {email, display_name?, auth_method?} \
+             (an array is rejected). documents is an optional JSON array of {document_slot_index, \
+             source_node_id, source_version_id?}; envelope_name overrides the created envelope's \
+             name. The result is the new sign_envelope plus geometry_mismatch / geometry_details. \
+             template-create / -update / -delete are CLI-binary-only.",
+        ),
+        (
             "document-download",
             &["workspace_id", "envelope_id", "document_id"],
             &["output_path"],
@@ -12637,6 +12719,9 @@ fn sign_describe() -> CallToolResult {
     let cli_only: Vec<Value> = [
         "envelope send (EMAILS REAL RECIPIENTS)",
         "envelope void (terminal; credits not refunded)",
+        "template create (`fastio sign template create …`)",
+        "template update (optimistic-CAS; `fastio sign template update …`)",
+        "template delete (soft-delete; `fastio sign template delete …`)",
     ]
     .iter()
     .map(|s| Value::String((*s).to_owned()))
@@ -12664,6 +12749,11 @@ fn sign_describe() -> CallToolResult {
             "send_void": "To send (emails real recipients) or void an envelope, run the CLI: \
                           `fastio sign envelope send|void …`. These are NOT available over MCP by \
                           design. Envelopes are voided, not deleted — there is no delete action.",
+            "templates": "Reusable signing-template blueprints (template id sa…): template-list, \
+                          template-details, and template-instantiate (creates a reversible DRAFT \
+                          envelope) are exposed over MCP. template-create / template-update \
+                          (optimistic-CAS) / template-delete (soft-delete) are CLI-binary-only — \
+                          run `fastio sign template create|update|delete …`.",
             "cli_only_actions": cli_only,
         },
         "actions": Value::Object(action_map),
@@ -12706,6 +12796,22 @@ async fn handle_sign(
             "send and void are CLI-binary-only for the sign tool: send EMAILS REAL RECIPIENTS and \
              void is terminal. Run them via the CLI — `fastio sign envelope send|void …`. Call \
              action='describe' for the MCP action list.",
+        ));
+    }
+    // The signing-template SETTERS (create / update / delete) are CLI-binary-only
+    // — mirroring the send/void boundary. Route them to guidance FIRST (before
+    // auth/workspace extraction) so the message is "this is CLI-only" rather than
+    // "Missing required parameter". Only template-list / -details / -instantiate
+    // (reads + reversible draft creation) are exposed over MCP.
+    if matches!(
+        action,
+        "template-create" | "template-update" | "template-delete"
+    ) {
+        return Ok(error_text(
+            "sign-template create / update / delete are CLI-binary-only: run them via the CLI — \
+             `fastio sign template create|update|delete …`. Over MCP only template-list, \
+             template-details, and template-instantiate (reads + reversible DRAFT creation) are \
+             exposed. Call action='describe' for the MCP action list.",
         ));
     }
     if let Err(e) = require_auth(state).await {
@@ -12838,6 +12944,81 @@ async fn handle_sign(
                 Err(e) => Ok(sign_err_to_result(
                     &e,
                     "failed to mint sign link",
+                    SignOp::General,
+                )),
+            }
+        }
+        "template-list" => {
+            match signing::list_sign_templates(
+                &client,
+                workspace_id,
+                optional_u32(args, "offset"),
+                optional_u32(args, "limit"),
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(sign_err_to_result(
+                    &e,
+                    "failed to list sign templates",
+                    SignOp::General,
+                )),
+            }
+        }
+        "template-details" => {
+            let template_id = match required_str(args, "template_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            match signing::get_sign_template(&client, workspace_id, template_id).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(sign_err_to_result(
+                    &e,
+                    "failed to get sign template",
+                    SignOp::General,
+                )),
+            }
+        }
+        "template-instantiate" => {
+            // Creates a reversible DRAFT envelope from the template. Its safety
+            // profile matches the read/draft surface (like envelope-create), so it
+            // IS exposed over MCP; the template SETTERS (create/update/delete) are
+            // CLI-only and handled earlier.
+            let template_id = match required_str(args, "template_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            // recipient_bindings is REQUIRED and MUST be a JSON object/map keyed
+            // by slot_key (an array is rejected by `sign_json_object`).
+            let bindings = match sign_json_object(args, "recipient_bindings") {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    return Ok(error_text(
+                        "template-instantiate requires recipient_bindings: a JSON object/map keyed \
+                         by slot_key → {email, display_name?, auth_method?} (an array is rejected)",
+                    ));
+                }
+                Err(e) => return Ok(e),
+            };
+            // documents is an optional JSON array of slot bindings.
+            let documents = match sign_json_array(args, "documents") {
+                Ok(opt) => opt.map(Value::Array),
+                Err(e) => return Ok(e),
+            };
+            match signing::instantiate_sign_template(
+                &client,
+                workspace_id,
+                template_id,
+                &bindings,
+                documents.as_ref(),
+                optional_str(args, "envelope_name"),
+            )
+            .await
+            {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(sign_err_to_result(
+                    &e,
+                    "failed to instantiate sign template",
                     SignOp::General,
                 )),
             }
@@ -15846,18 +16027,26 @@ mod ripley_tool_tests {
             "void",
             "envelope-delete",
             "delete",
+            // The sign-template SETTERS are CLI-binary-only — never advertised.
+            "template-create",
+            "template-update",
+            "template-delete",
         ] {
             assert!(
                 !actions.contains(&forbidden),
                 "sign MCP tool must NOT advertise outward/destructive action '{forbidden}'"
             );
         }
-        // The reversible read + draft-drive actions MUST be present.
+        // The reversible read + draft-drive actions MUST be present — including
+        // the sign-template reads + reversible draft creation.
         for present in [
             "envelope-create",
             "envelope-update",
             "envelope-list",
             "envelope-get",
+            "template-list",
+            "template-details",
+            "template-instantiate",
             "document-download",
             "signed-download",
             "audit-download",

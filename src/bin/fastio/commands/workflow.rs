@@ -637,6 +637,9 @@ pub async fn execute(command: WorkflowCommands, ctx: &CommandContext<'_>) -> Res
             created_by_me,
             participant_me,
             include,
+            page_size,
+            cursor,
+            bucket,
         } => {
             let client = ctx.build_client()?;
             let params = orchestration::ListWorkflowsParams::new()
@@ -647,7 +650,10 @@ pub async fn execute(command: WorkflowCommands, ctx: &CommandContext<'_>) -> Res
                 .archived(archived)
                 .created_by_me(created_by_me)
                 .participant_me(participant_me)
-                .include(include);
+                .include(include)
+                .page_size(page_size)
+                .cursor(cursor)
+                .bucket(bucket);
             let v = orchestration::list_workflows(&client, &workspace_id, &params)
                 .await
                 .context("failed to list workflows")?;

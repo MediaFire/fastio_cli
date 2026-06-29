@@ -1175,6 +1175,236 @@ pub fn audit_download_path(workspace_id: &str, envelope_id: &str) -> Result<Stri
     envelope_action_path(workspace_id, envelope_id, "audit/download")
 }
 
+// ─── Sign Templates (reusable envelope blueprints) ──────────────────────────────
+//
+// A SignTemplate is a workspace-parented, reusable blueprint (recipient slots /
+// document slots / fields / policy captured as a `snapshot`) that an
+// `instantiate` call turns into a fresh DRAFT envelope. Template ids are `sa…`
+// `OpaqueId` strings. The routes mirror the envelope surface — action-suffixed
+// under `/workspace/{id}/sign_templates/` with **JSON** bodies (NOT form
+// encoding):
+//
+// | Op | Method + path | Response key |
+// |---|---|---|
+// | Create | `POST .../create/` (JSON) | `sign_template` |
+// | List | `GET .../list/` (offset/limit) | `sign_templates` |
+// | Details | `GET .../{tpl}/details/` | `sign_template` |
+// | Update | `POST .../{tpl}/update/` (JSON; optimistic CAS) | `sign_template` |
+// | Delete | `POST .../{tpl}/delete/` (bodyless; soft-delete) | (deletion summary) |
+// | Instantiate | `POST .../{tpl}/instantiate/` (JSON) | `sign_envelope` |
+//
+// `update` is optimistic-CAS (`expected_version` REQUIRED; a `409`/`147321` is a
+// version conflict). `delete` is a PERM_ADMIN soft-delete that is never blocked
+// by referrers. `instantiate` creates a reversible DRAFT envelope and REQUIRES
+// `recipient_bindings` to be a JSON object/map (an array is rejected).
+
+/// Build the `/workspace/{id}/sign_templates/` base path for a template
+/// collection.
+///
+/// Every template is workspace-parented (mirrors [`workspace_path`]).
+/// `workspace_id` is URL-encoded. The `Result` return type rejects an empty
+/// workspace id with a clear [`CliError::Config`] before any network call rather
+/// than building a malformed `/workspace//sign_templates/` path.
+///
+/// # Errors
+///
+/// Returns [`CliError::Config`] when `workspace_id` is empty.
+pub fn sign_templates_path(workspace_id: &str) -> Result<String, CliError> {
+    if workspace_id.is_empty() {
+        return Err(CliError::Config(
+            "a workspace id is required for sign-template operations".to_owned(),
+        ));
+    }
+    Ok(format!(
+        "/workspace/{}/sign_templates/",
+        urlencoding::encode(workspace_id)
+    ))
+}
+
+/// Build the path to a single template's action endpoint:
+/// `/workspace/{id}/sign_templates/{template_id}/{action}/`.
+///
+/// All single-template routes are action-suffixed (`details` / `update` /
+/// `delete` / `instantiate`); mirrors [`envelope_action_path`]. Both ids are
+/// URL-encoded.
+fn template_action_path(
+    workspace_id: &str,
+    template_id: &str,
+    action: &str,
+) -> Result<String, CliError> {
+    let base = sign_templates_path(workspace_id)?;
+    Ok(format!(
+        "{base}{}/{action}/",
+        urlencoding::encode(template_id)
+    ))
+}
+
+/// Pull the bare `sign_template` object out of a signing-template response
+/// envelope.
+///
+/// Tolerates the named-key shape `{"result": true, "sign_template": {…}}`
+/// (create / details / update) AND the standard
+/// `{"response": {"sign_template": {…}}}` wrapper, returning `None` when neither
+/// is present. Mirrors [`extract_sign_envelope`].
+#[must_use]
+pub fn extract_sign_template(value: &Value) -> Option<&Value> {
+    let payload = value.get("response").unwrap_or(value);
+    payload.get("sign_template")
+}
+
+/// Pull the bare list of templates out of a template-list response.
+///
+/// Keys the array on `sign_templates`, also tolerating the standard
+/// `{"response": {…}}` wrapper. Mirrors [`extract_sign_envelopes`]. Returns
+/// `None` when the key is absent.
+#[must_use]
+pub fn extract_sign_templates(value: &Value) -> Option<&Value> {
+    let payload = value.get("response").unwrap_or(value);
+    payload.get("sign_templates")
+}
+
+/// Create a sign template.
+///
+/// `POST /workspace/{id}/sign_templates/create/` (JSON body
+/// `{name, description?, snapshot}`). `name` is required (≤255); `description`
+/// is optional (≤1024, nullable) and omitted when `None`; `snapshot` is the
+/// caller-supplied JSON blueprint object (`recipient_slots` / `document_slots`
+/// / `fields` / `policy`) passed through verbatim — this module does not
+/// validate its internal shape (like `policy_json` on envelopes). The server
+/// validates the caps and snapshot structure.
+pub async fn create_sign_template(
+    client: &ApiClient,
+    workspace_id: &str,
+    name: &str,
+    description: Option<&str>,
+    snapshot: &Value,
+) -> Result<Value, CliError> {
+    let mut obj = serde_json::Map::new();
+    obj.insert("name".to_owned(), Value::String(name.to_owned()));
+    if let Some(desc) = description {
+        obj.insert("description".to_owned(), Value::String(desc.to_owned()));
+    }
+    obj.insert("snapshot".to_owned(), snapshot.clone());
+    let path = format!("{}create/", sign_templates_path(workspace_id)?);
+    client.post_json(&path, &Value::Object(obj)).await
+}
+
+/// List sign templates for the workspace (offset-paginated).
+///
+/// `GET /workspace/{id}/sign_templates/list/` with `offset` (default 0) and
+/// `limit` (default 50, max 200) query parameters; each is emitted only when
+/// supplied (the server applies its defaults otherwise).
+pub async fn list_sign_templates(
+    client: &ApiClient,
+    workspace_id: &str,
+    offset: Option<u32>,
+    limit: Option<u32>,
+) -> Result<Value, CliError> {
+    let base = sign_templates_path(workspace_id)?;
+    let path = format!("{base}list/");
+    let mut query = std::collections::HashMap::new();
+    if let Some(o) = offset {
+        query.insert("offset".to_owned(), o.to_string());
+    }
+    if let Some(l) = limit {
+        query.insert("limit".to_owned(), l.to_string());
+    }
+    client.get_with_params(&path, &query).await
+}
+
+/// Get a single sign template.
+///
+/// `GET /workspace/{id}/sign_templates/{template_id}/details/`.
+pub async fn get_sign_template(
+    client: &ApiClient,
+    workspace_id: &str,
+    template_id: &str,
+) -> Result<Value, CliError> {
+    let path = template_action_path(workspace_id, template_id, "details")?;
+    client.get(&path).await
+}
+
+/// Update a sign template (optimistic-CAS).
+///
+/// `POST /workspace/{id}/sign_templates/{template_id}/update/` (JSON body).
+/// `expected_version` (≥1) is REQUIRED — a stale value is rejected server-side
+/// with a `409`/`147321` version conflict. `name` / `description` are updated
+/// only when supplied; `snapshot`, when present, is a FULL replacement of the
+/// blueprint (passed through verbatim, like `policy_json` on envelopes) — omit
+/// it to leave the snapshot unchanged.
+pub async fn update_sign_template(
+    client: &ApiClient,
+    workspace_id: &str,
+    template_id: &str,
+    expected_version: u64,
+    name: Option<&str>,
+    description: Option<&str>,
+    snapshot: Option<&Value>,
+) -> Result<Value, CliError> {
+    let mut obj = serde_json::Map::new();
+    obj.insert("expected_version".to_owned(), Value::from(expected_version));
+    if let Some(n) = name {
+        obj.insert("name".to_owned(), Value::String(n.to_owned()));
+    }
+    if let Some(d) = description {
+        obj.insert("description".to_owned(), Value::String(d.to_owned()));
+    }
+    if let Some(s) = snapshot {
+        obj.insert("snapshot".to_owned(), s.clone());
+    }
+    let path = template_action_path(workspace_id, template_id, "update")?;
+    client.post_json(&path, &Value::Object(obj)).await
+}
+
+/// Soft-delete a sign template (`PERM_ADMIN`; never blocked by referrers).
+///
+/// `POST /workspace/{id}/sign_templates/{template_id}/delete/` (no body). Like
+/// the envelope `/send/` route, this is a **bodyless** POST routed through
+/// [`ApiClient::post_empty`] (no JSON body, no `Content-Type`). The response is
+/// a deletion summary (`{sign_template_id, deleted, referrer_count, referrers}`)
+/// preserved verbatim. The delete is reversible at the data layer (soft) and
+/// proceeds even when other resources still reference the template.
+pub async fn delete_sign_template(
+    client: &ApiClient,
+    workspace_id: &str,
+    template_id: &str,
+) -> Result<Value, CliError> {
+    let path = template_action_path(workspace_id, template_id, "delete")?;
+    client.post_empty(&path).await
+}
+
+/// Instantiate a sign template into a fresh DRAFT envelope (reversible).
+///
+/// `POST /workspace/{id}/sign_templates/{template_id}/instantiate/` (JSON body).
+/// `recipient_bindings` is REQUIRED and MUST be a JSON object/map keyed by
+/// `slot_key` → `{email, display_name?, auth_method?}` (an array is rejected —
+/// the caller is responsible for the object-shape check before calling, like
+/// the command layer does for `policy_json`). `documents` (optional) is an array
+/// of `{document_slot_index, source_node_id, source_version_id?}`; `envelope_name`
+/// (optional) overrides the created envelope's name. The blueprint values are
+/// passed through verbatim; the server resolves slots and creates a DRAFT
+/// envelope (returned under `sign_envelope`, alongside `geometry_mismatch` /
+/// `geometry_details`).
+pub async fn instantiate_sign_template(
+    client: &ApiClient,
+    workspace_id: &str,
+    template_id: &str,
+    recipient_bindings: &Value,
+    documents: Option<&Value>,
+    envelope_name: Option<&str>,
+) -> Result<Value, CliError> {
+    let mut obj = serde_json::Map::new();
+    obj.insert("recipient_bindings".to_owned(), recipient_bindings.clone());
+    if let Some(docs) = documents {
+        obj.insert("documents".to_owned(), docs.clone());
+    }
+    if let Some(n) = envelope_name {
+        obj.insert("envelope_name".to_owned(), Value::String(n.to_owned()));
+    }
+    let path = template_action_path(workspace_id, template_id, "instantiate")?;
+    client.post_json(&path, &Value::Object(obj)).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1312,6 +1542,95 @@ mod tests {
         assert!(document_download_path("", "env1", "doc1").is_err());
         assert!(document_preview_path("", "env1", "doc1").is_err());
         assert!(audit_download_path("", "env1").is_err());
+    }
+
+    // ─── sign-template path builders (mirror the envelope path tests) ─────────
+
+    #[test]
+    fn sign_templates_path_builds_base() {
+        assert_eq!(
+            sign_templates_path("4011234567890123456").unwrap(),
+            "/workspace/4011234567890123456/sign_templates/"
+        );
+    }
+
+    #[test]
+    fn sign_templates_path_rejects_empty_id() {
+        let err = sign_templates_path("").unwrap_err();
+        assert!(
+            matches!(err, CliError::Config(_)),
+            "expected Config error for an empty workspace id, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn sign_templates_path_urlencodes_and_suffixes() {
+        // The workspace id is URL-encoded into the base.
+        assert_eq!(
+            sign_templates_path("a/b c").unwrap(),
+            "/workspace/a%2Fb%20c/sign_templates/"
+        );
+        // The collection routes (create / list) hang off the base.
+        let base = sign_templates_path("4011234567890123456").unwrap();
+        assert_eq!(
+            format!("{base}create/"),
+            "/workspace/4011234567890123456/sign_templates/create/"
+        );
+        assert_eq!(
+            format!("{base}list/"),
+            "/workspace/4011234567890123456/sign_templates/list/"
+        );
+    }
+
+    #[test]
+    fn template_action_paths_build_and_encode() {
+        assert_eq!(
+            template_action_path("ws1", "sa-abc", "details").unwrap(),
+            "/workspace/ws1/sign_templates/sa-abc/details/"
+        );
+        assert_eq!(
+            template_action_path("ws1", "sa-abc", "update").unwrap(),
+            "/workspace/ws1/sign_templates/sa-abc/update/"
+        );
+        assert_eq!(
+            template_action_path("ws1", "sa-abc", "delete").unwrap(),
+            "/workspace/ws1/sign_templates/sa-abc/delete/"
+        );
+        assert_eq!(
+            template_action_path("ws1", "sa-abc", "instantiate").unwrap(),
+            "/workspace/ws1/sign_templates/sa-abc/instantiate/"
+        );
+        // Both the template id and the workspace id are URL-encoded.
+        assert_eq!(
+            template_action_path("a/b", "sa/1", "details").unwrap(),
+            "/workspace/a%2Fb/sign_templates/sa%2F1/details/"
+        );
+    }
+
+    #[test]
+    fn template_action_path_rejects_empty_workspace() {
+        assert!(template_action_path("", "sa-1", "details").is_err());
+    }
+
+    #[test]
+    fn extract_sign_template_handles_named_and_wrapped() {
+        let named = json!({"result": true, "sign_template": {"id": "sa-1"}});
+        assert_eq!(extract_sign_template(&named).unwrap()["id"], json!("sa-1"));
+        let wrapped = json!({"response": {"sign_template": {"id": "sa-2"}}});
+        assert_eq!(
+            extract_sign_template(&wrapped).unwrap()["id"],
+            json!("sa-2")
+        );
+        assert!(extract_sign_template(&json!({"other": 1})).is_none());
+    }
+
+    #[test]
+    fn extract_sign_templates_handles_named_and_wrapped() {
+        let named = json!({"result": true, "sign_templates": [{"id": "sa-1"}]});
+        assert!(extract_sign_templates(&named).unwrap().is_array());
+        let wrapped = json!({"response": {"sign_templates": []}});
+        assert!(extract_sign_templates(&wrapped).unwrap().is_array());
+        assert!(extract_sign_templates(&json!({"other": 1})).is_none());
     }
 
     // ─── list-filter query assembly (order-independent) ──────────────────────
