@@ -412,14 +412,15 @@ pub enum WorkflowCommands {
         #[arg(long)]
         visibility: Option<String>,
     },
-    /// List workflow profiles in a workspace (offset-paginated, filterable).
+    /// List workflow profiles in a workspace (keyset- or offset-paginated,
+    /// filterable).
     List {
         /// Workspace ID.
         workspace_id: String,
-        /// Pagination limit.
+        /// Pagination limit (LEGACY — prefer `--page-size` keyset pagination).
         #[arg(long)]
         limit: Option<u32>,
-        /// Pagination offset.
+        /// Pagination offset (LEGACY — prefer `--page-size`/`--cursor`).
         #[arg(long)]
         offset: Option<u32>,
         /// Narrow to a single template's runs (exact `template_id` match).
@@ -441,6 +442,18 @@ pub enum WorkflowCommands {
         /// Per-item enrichment, a CSV of `run_summary` / `run_meta`.
         #[arg(long)]
         include: Option<String>,
+        /// Opt-in keyset page size (1-100; server default 50). The
+        /// cursor-pagination opt-in — `--limit`/`--offset` are legacy.
+        #[arg(long)]
+        page_size: Option<u32>,
+        /// Opaque keyset cursor: pass back the prior response's
+        /// `pagination.next_cursor` verbatim. The cursor-pagination opt-in —
+        /// `--limit`/`--offset` are legacy.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Execution-status bucket filter (one of the closed set).
+        #[arg(long, value_parser = ["in_flight", "completed", "paused", "failed"])]
+        bucket: Option<String>,
     },
     /// Get a single workflow profile.
     Get {
@@ -1775,6 +1788,10 @@ pub enum SignCommands {
     /// Envelope lifecycle (create / list / get / update / send / void).
     #[command(subcommand)]
     Envelope(SignEnvelopeCommands),
+    /// Reusable signing-template blueprints (create / list / get / update /
+    /// delete / instantiate).
+    #[command(subcommand)]
+    Template(SignTemplateCommands),
     /// Document byte downloads (source PDF, preview, signed PDF).
     #[command(subcommand)]
     Document(SignDocumentCommands),
@@ -2027,6 +2044,109 @@ pub enum SignAuditCommands {
         /// Output file path.
         #[arg(long, short)]
         output: String,
+    },
+}
+
+/// Signing-template (`fastio sign template`) subcommands.
+///
+/// A `SignTemplate` is a workspace-parented, reusable envelope blueprint (template
+/// id `sa…`). Bodies are JSON; the `--snapshot` / `--recipient-bindings` /
+/// `--documents` arguments accept inline JSON or an `@file.json` path. `update`
+/// is optimistic-CAS (`--expected-version` is required); `delete` is a reversible
+/// soft-delete; `instantiate` creates a DRAFT envelope.
+#[derive(Subcommand, Debug)]
+#[non_exhaustive]
+pub enum SignTemplateCommands {
+    /// Create a signing template from a snapshot blueprint.
+    Create {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Display name (required, max 255 chars).
+        #[arg(long)]
+        name: String,
+        /// Optional description (max 1024 chars).
+        #[arg(long)]
+        description: Option<String>,
+        /// Snapshot blueprint as a JSON OBJECT (or `@file.json`) — the
+        /// `recipient_slots` / `document_slots` / `fields` / `policy` bag.
+        /// Passed through verbatim; the server validates its internal shape.
+        #[arg(long)]
+        snapshot: String,
+    },
+    /// List signing templates for the workspace (offset-paginated).
+    List {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Pagination offset (default 0).
+        #[arg(long)]
+        offset: Option<u32>,
+        /// Pagination limit (default 50, max 200).
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Get a single signing template.
+    Get {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Template ID (`sa…` `OpaqueId`).
+        template_id: String,
+    },
+    /// Update a signing template (optimistic-CAS via `--expected-version`).
+    Update {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Template ID (`sa…` `OpaqueId`).
+        template_id: String,
+        /// REQUIRED expected current version (≥1). A stale value is rejected
+        /// server-side as a version conflict (409 / 147321).
+        #[arg(long)]
+        expected_version: u64,
+        /// New display name (max 255 chars). Omit to leave unchanged.
+        #[arg(long)]
+        name: Option<String>,
+        /// New description (max 1024 chars). Omit to leave unchanged.
+        #[arg(long)]
+        description: Option<String>,
+        /// New snapshot blueprint as a JSON OBJECT (or `@file.json`). When
+        /// present this is a FULL replacement of the blueprint; omit to leave
+        /// the snapshot unchanged.
+        #[arg(long)]
+        snapshot: Option<String>,
+    },
+    /// Soft-delete a signing template (reversible; never blocked by referrers).
+    Delete {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Template ID (`sa…` `OpaqueId`).
+        template_id: String,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Instantiate a template into a fresh DRAFT envelope (reversible).
+    Instantiate {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Template ID (`sa…` `OpaqueId`).
+        template_id: String,
+        /// REQUIRED recipient bindings as a JSON OBJECT/map (or `@file.json`)
+        /// keyed by `slot_key` → `{email, display_name?, auth_method?}`. An
+        /// array is rejected.
+        #[arg(long)]
+        recipient_bindings: String,
+        /// Optional document bindings as a JSON ARRAY (or `@file.json`) of
+        /// `{document_slot_index, source_node_id, source_version_id?}`.
+        #[arg(long)]
+        documents: Option<String>,
+        /// Optional name override for the created envelope.
+        #[arg(long)]
+        envelope_name: Option<String>,
     },
 }
 

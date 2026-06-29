@@ -213,6 +213,15 @@ pub async fn create_workflow(
 /// pagination (so `pagination.total` reflects the filtered count) and compose
 /// (multiple filters AND together). `#[non_exhaustive]` because the list surface
 /// keeps gaining filters.
+///
+/// The endpoint also supports OPT-IN keyset pagination: `?page_size=` (1–100,
+/// server default 50) + `?cursor=` (the prior response's
+/// `pagination.next_cursor`, passed back verbatim) and the execution-status
+/// `?bucket=` filter (`in_flight` / `completed` / `paused` / `failed`). Setting
+/// any of `page_size` / `cursor` / `bucket` switches the response from the
+/// legacy `{total,limit,offset,has_more}` shape to the keyset shape
+/// (`pagination.{has_more,next_cursor,page_size}` + `counts`). `limit` / `offset`
+/// / `state` remain accepted (deprecated) — this surface is purely additive.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ListWorkflowsParams {
@@ -233,6 +242,16 @@ pub struct ListWorkflowsParams {
     pub participant_me: bool,
     /// Per-item enrichment selector — a CSV of `run_summary` / `run_meta`.
     pub include: Option<String>,
+    /// Opt-in keyset page size (1–100; server default 50). Setting any of
+    /// `page_size` / `cursor` / `bucket` switches the response to the keyset
+    /// shape (`pagination.{has_more,next_cursor,page_size}` + `counts`).
+    pub page_size: Option<u32>,
+    /// Opaque keyset cursor — pass back the prior response's
+    /// `pagination.next_cursor` verbatim (the client query layer URL-encodes it).
+    pub cursor: Option<String>,
+    /// Execution-status bucket filter: exactly one of `in_flight` / `completed`
+    /// / `paused` / `failed`.
+    pub bucket: Option<String>,
 }
 
 impl ListWorkflowsParams {
@@ -300,6 +319,28 @@ impl ListWorkflowsParams {
         self.include = include;
         self
     }
+
+    /// Set the opt-in keyset page size (1–100; server default 50).
+    #[must_use]
+    pub fn page_size(mut self, page_size: Option<u32>) -> Self {
+        self.page_size = page_size;
+        self
+    }
+
+    /// Set the opaque keyset cursor (the prior response's `next_cursor`).
+    #[must_use]
+    pub fn cursor(mut self, cursor: Option<String>) -> Self {
+        self.cursor = cursor;
+        self
+    }
+
+    /// Set the execution-status bucket filter (`in_flight` / `completed` /
+    /// `paused` / `failed`).
+    #[must_use]
+    pub fn bucket(mut self, bucket: Option<String>) -> Self {
+        self.bucket = bucket;
+        self
+    }
 }
 
 /// Build the query map for [`list_workflows`] from a [`ListWorkflowsParams`].
@@ -324,6 +365,13 @@ fn build_list_workflows_query(params: &ListWorkflowsParams) -> HashMap<String, S
         query.insert("participant".to_owned(), "me".to_owned());
     }
     put_opt(&mut query, "include", params.include.as_deref());
+    // Opt-in keyset pagination + execution-status bucket (purely additive; the
+    // server switches to the keyset response shape when any is present).
+    if let Some(ps) = params.page_size {
+        query.insert("page_size".to_owned(), ps.to_string());
+    }
+    put_opt(&mut query, "cursor", params.cursor.as_deref());
+    put_opt(&mut query, "bucket", params.bucket.as_deref());
     query
 }
 
@@ -3287,7 +3335,10 @@ mod tests {
             .archived(Some("all".to_owned()))
             .created_by_me(true)
             .participant_me(true)
-            .include(Some("run_summary,run_meta".to_owned()));
+            .include(Some("run_summary,run_meta".to_owned()))
+            .page_size(Some(50))
+            .cursor(Some("opaque-cursor-xyz".to_owned()))
+            .bucket(Some("in_flight".to_owned()));
         let q = build_list_workflows_query(&params);
         assert_eq!(q.get("limit").map(String::as_str), Some("25"));
         assert_eq!(q.get("template_id").map(String::as_str), Some("wtpl-1"));
@@ -3300,15 +3351,26 @@ mod tests {
             q.get("include").map(String::as_str),
             Some("run_summary,run_meta")
         );
+        // Opt-in keyset pagination + bucket are emitted verbatim when set.
+        assert_eq!(q.get("page_size").map(String::as_str), Some("50"));
+        assert_eq!(
+            q.get("cursor").map(String::as_str),
+            Some("opaque-cursor-xyz")
+        );
+        assert_eq!(q.get("bucket").map(String::as_str), Some("in_flight"));
         // offset was never set → absent.
         assert!(!q.contains_key("offset"));
     }
 
     #[test]
     fn list_workflows_query_omits_unset_filters() {
-        // A default params set forwards no filter keys at all.
+        // A default params set forwards no filter keys at all — including the
+        // opt-in keyset pagination + bucket keys.
         let q = build_list_workflows_query(&ListWorkflowsParams::new());
         assert!(q.is_empty());
+        assert!(!q.contains_key("page_size"));
+        assert!(!q.contains_key("cursor"));
+        assert!(!q.contains_key("bucket"));
     }
 
     #[test]
