@@ -959,20 +959,21 @@ pub async fn lock_release(
     client.delete_with_form(&path, &form).await
 }
 
-/// Read file content (text).
+/// Read a file's content as UTF-8 text.
 ///
-/// `GET /workspace/{workspace_id}/storage/{node_id}/content/`
+/// `GET /workspace/{workspace_id}/storage/{node_id}/read/`
+///
+/// Returns `{ "node_id": <id>, "content": <text> }`. There is no `/content/`
+/// storage route: file bytes come from `/read/` (this fn / [`read_raw`]) and a
+/// note's markdown from `/readnote/` ([`crate::api::workspace::read_note`], used
+/// by `fastio view`).
 pub async fn read_content(
     client: &ApiClient,
     workspace_id: &str,
     node_id: &str,
 ) -> Result<Value, CliError> {
-    let path = format!(
-        "/workspace/{}/storage/{}/content/",
-        urlencoding::encode(workspace_id),
-        urlencoding::encode(node_id),
-    );
-    client.get(&path).await
+    let content = read_raw(client, workspace_id, node_id, None).await?;
+    Ok(serde_json::json!({ "node_id": node_id, "content": content }))
 }
 
 /// Read raw file bytes as text.
@@ -980,10 +981,10 @@ pub async fn read_content(
 /// `GET /workspace/{workspace_id}/storage/{node_id}/read/`
 ///
 /// Returns the node's raw content as a UTF-8 string (for a `.md` file, the
-/// markdown source). Unlike [`read_content`] (which returns the `/content/`
-/// JSON envelope) this is the binary `/read/` endpoint surfaced as text, used
-/// by `fastio view` as the fallback for raw `.md` files that are not Note
-/// nodes. An optional `version_id` reads a specific version.
+/// markdown source). This is the binary `/read/` endpoint surfaced as text,
+/// used by `fastio view` as the fallback for raw `.md` files that are not Note
+/// nodes, and by [`read_content`] (which wraps it as JSON). An optional
+/// `version_id` reads a specific version.
 pub async fn read_raw(
     client: &ApiClient,
     workspace_id: &str,
