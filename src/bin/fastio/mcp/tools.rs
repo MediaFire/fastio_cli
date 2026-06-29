@@ -735,7 +735,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             "read-note",
             "enable-import",
             "disable-import",
-            "metadata-template-categories",
             "metadata-template-create",
             "metadata-template-preview-match",
             "metadata-template-suggest-fields",
@@ -879,7 +878,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("order_desc", "Descending order (true/false)", false),
             (
                 "config",
-                "JSON-encoded saved-view config string: {version:1, columns:[{field,visible?,width?}], sort:{field,dir}, filters:[{field,operator,value_type,value}]} (metadata-view-save)",
+                "JSON-encoded saved-view config string: {version:1, columns:[{field,visible?,width?}], sort:{field,dir}, filters:[{field,operator,value_type,value}]} (metadata-view-save; optional `name` max 30 sets the view label)",
                 false,
             ),
             (
@@ -4794,22 +4793,6 @@ async fn handle_workspace(
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
         }
-        "metadata-template-categories" => {
-            match api::workspace::metadata_api(
-                &client,
-                "",
-                "metadata/templates/categories/",
-                "GET",
-                None,
-                None,
-                None,
-            )
-            .await
-            {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
         "metadata-template-create" => {
             let ws_id = match required_str(args, "workspace_id") {
                 Ok(v) => v,
@@ -4990,6 +4973,12 @@ async fn handle_workspace(
                 form.insert("name".to_owned(), v.to_owned());
             }
             if let Some(v) = optional_str(args, "description") {
+                if v.chars().count() > api::metadata::TEMPLATE_DESCRIPTION_MAX_CHARS {
+                    return Ok(error_text(&format!(
+                        "description must be at most {} chars",
+                        api::metadata::TEMPLATE_DESCRIPTION_MAX_CHARS
+                    )));
+                }
                 form.insert("description".to_owned(), v.to_owned());
             }
             if let Some(v) = optional_str(args, "category") {
@@ -5321,6 +5310,17 @@ async fn handle_workspace(
                 std::collections::HashMap::new();
             form.insert("template_id".to_owned(), tid.to_owned());
             form.insert("config".to_owned(), config.to_owned());
+            // Optional human label for the view (max 30 chars); the server
+            // preserves it on upsert when omitted, so only send when non-empty.
+            if let Some(name) = optional_str(args, "name") {
+                let name = name.trim();
+                if !name.is_empty() {
+                    if name.chars().count() > 30 {
+                        return Ok(error_text("name must be at most 30 characters"));
+                    }
+                    form.insert("name".to_owned(), name.to_owned());
+                }
+            }
             match api::workspace::metadata_api(
                 &client,
                 ws_id,
