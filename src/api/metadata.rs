@@ -244,39 +244,18 @@ pub fn parse_bulk_metadata_details_response(
         });
     }
 
-    // Single-format: legacy single-id endpoint shape, where the
-    // payload itself is the metadata object. Hoist its `template`
-    // (if any) into a `templates` map keyed by `template_id` so
-    // downstream code can render single and multi responses with
-    // the same logic.
-    let mut object = payload.clone();
-    let mut templates: serde_json::Map<String, Value> = serde_json::Map::new();
-    if let Value::Object(obj) = &mut object {
-        // The single-id legacy shape carried the template definition
-        // inline as a `template` field. Move it out into the
-        // hoisted map and replace it with a reference (just the id)
-        // so the multi-format invariant — `objects[*]` carries the
-        // template *id*, `templates[id]` carries the *definition* —
-        // holds for both shapes.
-        let template_id = obj
-            .get("template_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if let Some(tpl) = obj.remove("template")
-            && let Some(tid) = template_id
-            && !tpl.is_null()
-        {
-            templates.insert(tid, tpl);
-        }
-    }
-    let objects = if object.is_null() {
+    // Non-multi fallback: the payload itself IS the single per-node metadata
+    // object (the `details` shape — `template_metadata[]` + `custom_metadata[]`).
+    // Return it verbatim as the sole object; the current API carries no
+    // top-level `template` definition to hoist.
+    let objects = if payload.is_null() {
         Vec::new()
     } else {
-        vec![object]
+        vec![payload.clone()]
     };
     Ok(BulkMetadataDetailsResponse {
         objects,
-        templates,
+        templates: serde_json::Map::new(),
         errors: Vec::new(),
     })
 }
@@ -744,7 +723,7 @@ pub async fn create_template(
 ) -> Result<Value, CliError> {
     validate_name(name)?;
     validate_category(category)?;
-    validate_description(description)?;
+    validate_template_description(description)?;
     validate_fields(fields)?;
     let path = format!(
         "/workspace/{}/metadata/templates/",
@@ -758,8 +737,12 @@ pub async fn create_template(
     client.post(&path, &form).await
 }
 
-/// Maximum character count for a template description.
+/// Maximum character count for a template description on preview-match /
+/// suggest-fields.
 const DESCRIPTION_MAX_CHARS: usize = 2000;
+/// Server-enforced cap on a template `description` at create/update — tighter
+/// than [`DESCRIPTION_MAX_CHARS`] (which applies to preview-match/suggest-fields).
+pub const TEMPLATE_DESCRIPTION_MAX_CHARS: usize = 1000;
 /// Maximum character count for the optional `user_context` hint.
 const USER_CONTEXT_MAX_CHARS: usize = 64;
 /// Maximum number of node IDs accepted by `suggest-fields`.
@@ -854,7 +837,7 @@ pub async fn search_metadata(
 /// [`EXPORT_VIEW_PARENT_NODE_ID_MAX_CHARS`] characters; this client
 /// rejects oversize values up front. The caller must already have a
 /// saved view for `(workspace, user, template)`; the server returns
-/// 404 otherwise.
+/// `1609` (not found) otherwise.
 pub async fn export_view(
     client: &ApiClient,
     workspace_id: &str,
@@ -911,6 +894,21 @@ fn validate_description(description: &str) -> Result<(), CliError> {
     if len > DESCRIPTION_MAX_CHARS {
         return Err(CliError::Parse(format!(
             "description must be at most {DESCRIPTION_MAX_CHARS} chars (got {len})",
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a template `description` for create/update — required and at most
+/// [`TEMPLATE_DESCRIPTION_MAX_CHARS`] characters (tighter than preview/suggest).
+fn validate_template_description(description: &str) -> Result<(), CliError> {
+    if description.trim().is_empty() {
+        return Err(CliError::Parse("description must not be empty".to_owned()));
+    }
+    let len = description.chars().count();
+    if len > TEMPLATE_DESCRIPTION_MAX_CHARS {
+        return Err(CliError::Parse(format!(
+            "description must be at most {TEMPLATE_DESCRIPTION_MAX_CHARS} chars (got {len})",
         )));
     }
     Ok(())
@@ -1139,12 +1137,13 @@ mod tests {
         BULK_METADATA_DETAILS_MAX_IDS, BulkMetadataDetailsResponse, CATEGORY_MAX_CHARS,
         DESCRIPTION_MAX_CHARS, EXPORT_VIEW_PARENT_NODE_ID_MAX_CHARS, ExtractJobState,
         METADATA_SEARCH_DEEP_PAGE_MAX, METADATA_SEARCH_LIMIT_MAX, METADATA_SEARCH_QUERY_MAX_CHARS,
-        NAME_MAX_CHARS, SUGGEST_NODE_IDS_MAX, USER_CONTEXT_MAX_CHARS,
-        build_bulk_metadata_details_path, classify_single_extract_job,
+        NAME_MAX_CHARS, SUGGEST_NODE_IDS_MAX, TEMPLATE_DESCRIPTION_MAX_CHARS,
+        USER_CONTEXT_MAX_CHARS, build_bulk_metadata_details_path, classify_single_extract_job,
         parse_bulk_metadata_details_response, sanitize_terminal_string, validate_category,
         validate_description, validate_extract_fields, validate_fields, validate_name,
         validate_node_ids, validate_parent_node_id, validate_search_limit, validate_search_query,
-        validate_search_window, validate_sort_dir, validate_sort_params, validate_user_context,
+        validate_search_window, validate_sort_dir, validate_sort_params,
+        validate_template_description, validate_user_context,
     };
     use crate::error::CliError;
     use serde_json::json;
@@ -1201,22 +1200,24 @@ mod tests {
     }
 
     #[test]
-    fn metadata_parse_single_format_lifts_object_and_hoists_template() {
+    fn metadata_parse_single_format_returns_object_without_hoist() {
+        // Current per-node details shape: split template_metadata/custom_metadata,
+        // no top-level `template`. The non-multi fallback returns it verbatim as
+        // objects[0] with an empty templates map (nothing to hoist).
         let body = json!({
             "result": "yes",
             "response": {
-                "node_id": "abc",
+                "object_id": "abc",
                 "template_id": "tpl1",
-                "template": {"name": "Photos", "fields": []},
-                "custom_metadata": {"k": "v"}
+                "template_metadata": [{"key": "k", "value": "v"}],
+                "custom_metadata": []
             }
         });
         let r = parsed_metadata(&body);
         assert_eq!(r.objects.len(), 1);
-        assert!(r.templates.contains_key("tpl1"));
-        // Object retains template_id but template definition is hoisted out.
+        assert!(r.templates.is_empty());
         assert_eq!(r.objects[0]["template_id"], "tpl1");
-        assert!(r.objects[0].get("template").is_none());
+        assert_eq!(r.objects[0]["template_metadata"][0]["key"], "k");
     }
 
     #[test]
@@ -1231,6 +1232,16 @@ mod tests {
         let r = parsed_metadata(&body);
         assert!(r.objects.is_empty());
         assert_eq!(r.errors.len(), 1);
+    }
+
+    #[test]
+    fn validate_template_description_enforces_1000() {
+        assert!(validate_template_description("").is_err());
+        assert!(validate_template_description("   ").is_err());
+        let ok: String = "x".repeat(TEMPLATE_DESCRIPTION_MAX_CHARS);
+        assert!(validate_template_description(&ok).is_ok());
+        let too_long: String = "x".repeat(TEMPLATE_DESCRIPTION_MAX_CHARS + 1);
+        assert!(validate_template_description(&too_long).is_err());
     }
 
     #[test]
