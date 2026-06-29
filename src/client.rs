@@ -65,8 +65,7 @@ const POOL_MAX_IDLE_PER_HOST: usize = 10;
 /// Responses" for storage search and metadata), so the generic `--detail`
 /// passthrough is correct for them and they are injectable. The binary
 /// variants of asset/preview endpoints are already covered by the `/read/`
-/// and `/content/` families below; their JSON-list envelope siblings are
-/// injectable.
+/// family below; their JSON-list envelope siblings are injectable.
 ///
 /// Matched as a case-insensitive substring of the request path. The
 /// pre-existing-`output=` guard in [`Self::output_injectable`] is a separate
@@ -74,7 +73,6 @@ const POOL_MAX_IDLE_PER_HOST: usize = 10;
 const OUTPUT_INJECT_DENY_SUBSTRINGS: &[&str] = &[
     // Non-envelope / binary / raw / auth paths only.
     "/read/",
-    "/content/",
     "/download/",
     "/oauth/",
 ];
@@ -689,7 +687,7 @@ impl ApiClient {
     /// [`OutputDetail`] is configured on the client and `path` is injectable,
     /// it appends `?output=<detail>` (see [`Self::build_get`] /
     /// [`Self::output_injectable`]); only genuine non-envelope binary/raw/oauth
-    /// paths (read/content/download/oauth) are excluded.
+    /// paths (read/download/oauth) are excluded.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, CliError> {
         tracing::trace!(method = "GET", path = %redact_path_for_log(path), "api request");
         self.send_with_retry(|| self.build_get(path)).await
@@ -2945,7 +2943,6 @@ mod tests {
         assert!(!ApiClient::output_injectable("/storage/abc/download/"));
         assert!(!ApiClient::output_injectable("/oauth/token/"));
         assert!(!ApiClient::output_injectable("/user/u/assets/a/read/"));
-        assert!(!ApiClient::output_injectable("/storage/n/content/"));
         // Signing audit/source/signed binary streams go through /download/.
         assert!(!ApiClient::output_injectable(
             "/workspace/1/sign_envelopes/e/audit/download/"
