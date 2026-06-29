@@ -673,7 +673,7 @@ pub async fn preview_match(
     client.post(&path, &form).await
 }
 
-/// Ask the server to suggest 1-5 custom columns for a proposed template.
+/// Ask the server to suggest 1-10 custom columns for a proposed template.
 ///
 /// Returns a `suggested_fields` array directly compatible with the `fields`
 /// parameter of [`create_template`]. Each suggested field may also carry

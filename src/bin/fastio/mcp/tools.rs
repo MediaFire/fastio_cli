@@ -749,7 +749,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             "metadata-extract",
             "metadata-extract-and-wait",
             "metadata-list",
-            "metadata-template-select",
             "metadata-templates-in-use",
             "metadata-update",
             "metadata-view-save",
@@ -5224,25 +5223,6 @@ async fn handle_workspace(
                 Some(&params)
             };
             match api::workspace::metadata_api(&client, ws_id, &sub, "GET", None, None, p).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "metadata-template-select" => {
-            let ws_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let nid = match required_str(args, "node_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let sub = format!(
-                "storage/{}/metadata/template_select/",
-                urlencoding::encode(nid)
-            );
-            match api::workspace::metadata_api(&client, ws_id, &sub, "POST", None, None, None).await
-            {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
