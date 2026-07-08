@@ -1360,7 +1360,8 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             (
                 "type",
-                "Chat type: chat or chat_with_files (chat-create)",
+                "[deprecated/ignored] Chat type — dead on the migrated /ai/agent/ \
+                 endpoint; accepted but not sent",
                 false,
             ),
             ("chat_id", "Chat ID", false),
@@ -1384,17 +1385,23 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             (
                 "files_scope",
-                "Comma-separated nodeId:versionId file scope pairs (chat-create, message-send)",
+                "Comma-separated file nodeId[:versionId] pairs (chat-create, message-send, ask). \
+                 Version is optional (auto-resolved). Becomes file items in the `references` array; \
+                 may be combined with folders_scope/files_attach.",
                 false,
             ),
             (
                 "folders_scope",
-                "Comma-separated nodeId:depth folder scope pairs (chat-create, message-send)",
+                "Comma-separated folder nodeId pairs (chat-create, message-send, ask). Any \
+                 :depth suffix is ignored. Becomes folder items in the `references` array; \
+                 may be combined with files_scope/files_attach.",
                 false,
             ),
             (
                 "files_attach",
-                "Comma-separated file nodeId:versionId attachment pairs (chat-create, message-send)",
+                "Comma-separated file nodeId[:versionId] pairs (chat-create, message-send, ask). \
+                 Collapses to the same file items in the `references` array as files_scope; \
+                 may be combined with files_scope/folders_scope.",
                 false,
             ),
             (
@@ -1407,7 +1414,12 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "Comma-separated file IDs (share-generate; converted to a JSON `files` array)",
                 false,
             ),
-            ("personality", "Response style: concise or detailed", false),
+            (
+                "personality",
+                "[deprecated/ignored] Response style — dead on the migrated /ai/agent/ \
+                 endpoint; accepted but not sent",
+                false,
+            ),
             (
                 "include_deleted",
                 "List deleted chats instead (chat-list)",
@@ -6963,22 +6975,23 @@ async fn handle_ai(
     }
 }
 
-/// Guard the `/ai/agent/` mutual-exclusion rule: `files_attach` cannot be
-/// combined with `files_scope`/`folders_scope` in the same request — the
-/// server rejects both with `1605` (ai.txt:115,311,609). Returns an error
-/// `CallToolResult` to surface to the agent if the combination is present.
-fn check_files_attach_exclusion(args: &Map<String, Value>) -> Option<CallToolResult> {
-    let has_attach = optional_str(args, "files_attach").is_some();
-    let has_scope = optional_str(args, "files_scope").is_some()
-        || optional_str(args, "folders_scope").is_some();
-    if has_attach && has_scope {
-        Some(error_text(
-            "files_attach cannot be combined with files_scope/folders_scope — \
-             use one or the other",
-        ))
-    } else {
-        None
-    }
+/// Build the `/ai/agent/` `references` form value from the MCP `files_scope` /
+/// `folders_scope` / `files_attach` args.
+///
+/// On the migrated agent endpoint these three inputs collapse into a single
+/// structured `references` JSON array (files from `files_scope` + `files_attach`,
+/// folders from `folders_scope`, depth dropped). This constructs a
+/// [`api::ai::ChatScope`] from the args and delegates to the shared
+/// [`api::ai::build_references`] so the CLI and MCP paths emit byte-identical
+/// bodies. Returns `None` when no references result (the caller then omits the
+/// field). The three inputs may be freely combined — there is no
+/// mutual-exclusion check.
+fn build_references_from_args(args: &Map<String, Value>) -> Option<String> {
+    let mut scope = api::ai::ChatScope::default();
+    scope.files_scope = optional_str(args, "files_scope").map(str::to_owned);
+    scope.folders_scope = optional_str(args, "folders_scope").map(str::to_owned);
+    scope.files_attach = optional_str(args, "files_attach").map(str::to_owned);
+    api::ai::build_references(&scope)
 }
 
 /// Build the prominent note attached to a `needs_input` MCP `ask` result.
@@ -7049,17 +7062,12 @@ async fn handle_ai_chat_create(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let chat_type = optional_str(args, "type").unwrap_or("chat");
-    // The `/ai/agent/` create endpoint is form-encoded; emit only the
-    // documented field set (no retired `nodes`/`folder_id`/`intelligence`).
+    // The `/ai/agent/` create endpoint is form-encoded. `type`/`personality`
+    // are dead on the migrated agent endpoint, and file/folder context is the
+    // single structured `references` field (built from `files_scope` /
+    // `folders_scope` / `files_attach` via the shared `build_references`) — the
+    // retired `nodes`/`folder_id`/`intelligence` and flat scope fields are gone.
     let mut form = std::collections::HashMap::new();
-    form.insert("type".to_owned(), chat_type.to_owned());
-    form.insert(
-        "personality".to_owned(),
-        optional_str(args, "personality")
-            .unwrap_or("detailed")
-            .to_owned(),
-    );
     // `question` is REQUIRED for chat create (ai.txt:265). Reject a create
     // that omits it rather than silently sending a question-less body.
     let question = match required_str(args, "query_text") {
@@ -7090,17 +7098,8 @@ async fn handle_ai_chat_create(
             warnings.push(PRIVACY_SHARE_WARNING);
         }
     }
-    if let Some(err) = check_files_attach_exclusion(args) {
-        return Ok(err);
-    }
-    if let Some(v) = optional_str(args, "files_scope") {
-        form.insert("files_scope".to_owned(), v.to_owned());
-    }
-    if let Some(v) = optional_str(args, "folders_scope") {
-        form.insert("folders_scope".to_owned(), v.to_owned());
-    }
-    if let Some(v) = optional_str(args, "files_attach") {
-        form.insert("files_attach".to_owned(), v.to_owned());
+    if let Some(references) = build_references_from_args(args) {
+        form.insert("references".to_owned(), references);
     }
     match api::ai::ai_api_form(&client, ctx_type, ctx_id, "agent/", &form).await {
         Ok(mut v) => {
@@ -7279,23 +7278,14 @@ async fn handle_ai_message_send(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    // Follow-up messages are form-encoded; `type` is inherited from the chat.
+    // Follow-up messages are form-encoded; `type` is inherited from the chat and
+    // `personality` is dead on the migrated agent endpoint. File/folder context
+    // is the single structured `references` field (built from `files_scope` /
+    // `folders_scope` / `files_attach` via the shared `build_references`).
     let mut form = std::collections::HashMap::new();
     form.insert("question".to_owned(), query.to_owned());
-    if let Some(v) = optional_str(args, "personality") {
-        form.insert("personality".to_owned(), v.to_owned());
-    }
-    if let Some(err) = check_files_attach_exclusion(args) {
-        return Ok(err);
-    }
-    if let Some(v) = optional_str(args, "files_scope") {
-        form.insert("files_scope".to_owned(), v.to_owned());
-    }
-    if let Some(v) = optional_str(args, "folders_scope") {
-        form.insert("folders_scope".to_owned(), v.to_owned());
-    }
-    if let Some(v) = optional_str(args, "files_attach") {
-        form.insert("files_attach".to_owned(), v.to_owned());
+    if let Some(references) = build_references_from_args(args) {
+        form.insert("references".to_owned(), references);
     }
     let sub = format!("agent/{}/message/", urlencoding::encode(chat_id));
     match api::ai::ai_api_form(&client, ctx_type, ctx_id, &sub, &form).await {
@@ -7542,18 +7532,12 @@ async fn handle_ai_ask(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    if let Some(err) = check_files_attach_exclusion(args) {
-        return Ok(err);
-    }
+    // `type`/`personality` are dead on the migrated agent endpoint. File/folder
+    // context is the single structured `references` field (built from
+    // `files_scope` / `folders_scope` / `files_attach` via the shared
+    // `build_references`), so those inputs may be freely combined.
     let mut form = std::collections::HashMap::new();
-    form.insert("type".to_owned(), "chat_with_files".to_owned());
     form.insert("question".to_owned(), question.to_owned());
-    form.insert(
-        "personality".to_owned(),
-        optional_str(args, "personality")
-            .unwrap_or("detailed")
-            .to_owned(),
-    );
     // `kind` is workspace-only — share chats reject it, so forward it only in a
     // workspace context and, for a share, surface a one-line note (rather than
     // silently dropping it). Keep the call lenient — no hard error.
@@ -7565,14 +7549,8 @@ async fn handle_ai_ask(
             kind_warning = Some(KIND_SHARE_WARNING.to_owned());
         }
     }
-    if let Some(v) = optional_str(args, "files_scope") {
-        form.insert("files_scope".to_owned(), v.to_owned());
-    }
-    if let Some(v) = optional_str(args, "folders_scope") {
-        form.insert("folders_scope".to_owned(), v.to_owned());
-    }
-    if let Some(v) = optional_str(args, "files_attach") {
-        form.insert("files_attach".to_owned(), v.to_owned());
+    if let Some(references) = build_references_from_args(args) {
+        form.insert("references".to_owned(), references);
     }
 
     let resp = match api::ai::ai_api_form(&client, ctx_type, ctx_id, "agent/", &form).await {
@@ -7580,13 +7558,19 @@ async fn handle_ai_ask(
         Err(e) => return Ok(ai_send_err_to_result(&e)),
     };
 
+    // The migrated create response is {result, thread: {thread_id}, turn:
+    // {turn_id}} (ai.txt:334-335); probe those FIRST, then legacy fallbacks.
     let chat_id = resp
-        .get("chat_id")
+        .get("thread")
+        .and_then(|t| t.get("thread_id"))
+        .or_else(|| resp.get("chat_id"))
         .or_else(|| resp.get("chat").and_then(|c| c.get("id")))
         .or_else(|| resp.get("id"))
         .and_then(json_value_id_to_string);
     let message_id = resp
-        .get("message_id")
+        .get("turn")
+        .and_then(|t| t.get("turn_id"))
+        .or_else(|| resp.get("message_id"))
         .or_else(|| {
             resp.get("chat")
                 .and_then(|c| c.get("message"))
