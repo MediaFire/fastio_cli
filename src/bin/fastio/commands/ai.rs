@@ -435,14 +435,15 @@ struct ChatFlags<'a> {
 
 /// Build a `files_scope` value from legacy `--node-ids` entries.
 ///
-/// The API requires every `files_scope` pair to be `nodeId:versionId` with
-/// BOTH parts non-empty (ai.txt:125-127). Therefore:
-/// - entries already in `nodeId:versionId` form pass through (after trim);
-/// - whitespace-only / empty entries are dropped;
-/// - a BARE node id (no `:versionId`, or one with an empty version half) is
-///   an error — we refuse to fabricate an invalid `nodeId:` pair.
+/// On the migrated `/ai/agent/` contract a file reference's version is
+/// optional — an empty version auto-resolves to the current version
+/// server-side (`build_references` emits `"version_id": ""`). Therefore:
+/// - a fully-qualified `nodeId:versionId` entry passes through as-is (trimmed);
+/// - a BARE node id (no version, or a trailing-colon empty version) is kept as
+///   the bare `nodeId` — it is NO LONGER an error;
+/// - whitespace-only / empty entries are dropped.
 ///
-/// Errors if a bare id is present, or if nothing valid remains.
+/// Errors only if nothing valid remains after filtering.
 fn files_scope_from_legacy_node_ids(node_ids: &[String]) -> Result<String> {
     let mut pairs: Vec<String> = Vec::new();
     for raw in node_ids {
@@ -454,49 +455,43 @@ fn files_scope_from_legacy_node_ids(node_ids: &[String]) -> Result<String> {
             Some((node, version)) if !node.trim().is_empty() && !version.trim().is_empty() => {
                 pairs.push(format!("{}:{}", node.trim(), version.trim()));
             }
-            _ => {
-                anyhow::bail!(
-                    "`--node-ids` entry `{n}` is missing a version; the API requires \
-                     `nodeId:versionId` pairs. Supply versions via \
-                     `--files-scope nodeId:versionId` (or `--files-attach`)."
-                );
+            // Bare id, or trailing-colon empty version → keep the node id alone;
+            // `build_references` resolves the empty version server-side.
+            Some((node, _)) if !node.trim().is_empty() => {
+                pairs.push(node.trim().to_owned());
             }
+            None => {
+                pairs.push(n.to_owned());
+            }
+            // An empty node half (e.g. `:v1`) is unusable — drop it.
+            Some(_) => {}
         }
     }
     anyhow::ensure!(
         !pairs.is_empty(),
-        "`--node-ids` contained no valid `nodeId:versionId` entries; \
-         use `--files-scope nodeId:versionId` instead"
+        "`--node-ids` contained no valid node ids; \
+         use `--files-scope nodeId[:versionId]` instead"
     );
     Ok(pairs.join(","))
 }
 
 /// Normalise a legacy `--folder-id` value into a `folders_scope` entry.
 ///
-/// Trims and rejects an empty value. An already-`nodeId:depth`-qualified
-/// value is accepted as-is after validating the depth is 1..=10; an
-/// unqualified id gets `:10` appended (full depth).
+/// The migrated `/ai/agent/` contract has no folder-depth field, so any
+/// `:depth` suffix is dropped. Accepts `nodeId` or `nodeId:depth`; trims,
+/// rejects an empty node id, and returns just the node id.
 fn folders_scope_from_legacy_folder_id(folder_id: &str) -> Result<String> {
     let fid = folder_id.trim();
     anyhow::ensure!(!fid.is_empty(), "`--folder-id` must not be empty");
-    if let Some((node, depth)) = fid.split_once(':') {
-        let node = node.trim();
-        let depth = depth.trim();
-        anyhow::ensure!(
-            !node.is_empty(),
-            "`--folder-id` entry `{fid}` has an empty node id"
-        );
-        let parsed: u32 = depth.parse().map_err(|_| {
-            anyhow::anyhow!("`--folder-id` depth `{depth}` is not a valid integer (expected 1-10)")
-        })?;
-        anyhow::ensure!(
-            (1..=10).contains(&parsed),
-            "`--folder-id` depth must be 1-10, got {parsed}"
-        );
-        Ok(format!("{node}:{parsed}"))
-    } else {
-        Ok(format!("{fid}:10"))
-    }
+    let node = match fid.split_once(':') {
+        Some((node, _depth)) => node.trim(),
+        None => fid,
+    };
+    anyhow::ensure!(
+        !node.is_empty(),
+        "`--folder-id` entry `{fid}` has an empty node id"
+    );
+    Ok(node.to_owned())
 }
 
 /// Resolve the effective [`ChatScope`] from the visible and legacy flags.
@@ -506,11 +501,17 @@ fn folders_scope_from_legacy_folder_id(folder_id: &str) -> Result<String> {
 /// are BOTH supplied, that is a hard error (the user should pick one). When
 /// only a legacy flag is given, it is translated (with a one-time stderr
 /// deprecation note) into the corresponding scope field:
-/// - `--node-ids` -> `files_scope` (requires `nodeId:versionId` entries; bare
-///   ids are rejected — see [`files_scope_from_legacy_node_ids`]).
-/// - `--folder-id` -> `folders_scope` (see [`folders_scope_from_legacy_folder_id`]).
+/// - `--node-ids` -> `files_scope` (bare ids are accepted; the version
+///   auto-resolves — see [`files_scope_from_legacy_node_ids`]).
+/// - `--folder-id` -> `folders_scope` (depth is dropped — see
+///   [`folders_scope_from_legacy_folder_id`]).
 /// - `--intelligence` -> no longer maps to a chat parameter; ignored with a
 ///   deprecation warning.
+///
+/// On the migrated `/ai/agent/` contract `files_scope`/`folders_scope` and
+/// `files_attach` all collapse into the single `references` array
+/// ([`fastio_cli::api::ai::build_references`]), so they may now be combined —
+/// there is NO mutual-exclusion check.
 fn resolve_chat_scope(quiet: bool, flags: &ChatFlags<'_>) -> Result<ChatScope> {
     let mut scope = ChatScope::default();
 
@@ -551,31 +552,22 @@ fn resolve_chat_scope(quiet: bool, flags: &ChatFlags<'_>) -> Result<ChatScope> {
     } else if let Some(fid) = flags.folder_id {
         if !quiet {
             eprintln!(
-                "[deprecated] `--folder-id` is translated to `folders_scope` (full depth). \
-                 Prefer `--folders-scope nodeId:depth`."
+                "[deprecated] `--folder-id` is translated to `folders_scope`. \
+                 Prefer `--folders-scope nodeId`."
             );
         }
         scope.folders_scope = Some(folders_scope_from_legacy_folder_id(fid)?);
     }
 
     // files_attach: no legacy counterpart; just forward (trim, reject empty).
+    // On the migrated /ai/agent/ contract files_attach may be freely combined
+    // with files_scope/folders_scope — all collapse into the single
+    // `references` array — so there is no mutual-exclusion check here.
     if let Some(fa) = flags.files_attach {
         let fa = fa.trim();
         anyhow::ensure!(!fa.is_empty(), "`--files-attach` must not be empty");
         scope.files_attach = Some(fa.to_owned());
     }
-
-    // Mutual exclusion: `files_attach` and `files_scope`/`folders_scope` cannot
-    // be combined in the same request — the server rejects both with `1605`
-    // (ai.txt:115,311,609). Enforce on the RESOLVED scope so the legacy
-    // `--node-ids` -> files_scope and `--folder-id` -> folders_scope
-    // translations are caught too, not just the literal `--files-scope` flag.
-    anyhow::ensure!(
-        !(scope.files_attach.is_some()
-            && (scope.files_scope.is_some() || scope.folders_scope.is_some())),
-        "files_attach cannot be combined with files_scope/folders_scope — \
-         use one or the other"
-    );
 
     if flags.intelligence.is_some() && !quiet {
         eprintln!(
@@ -623,35 +615,14 @@ async fn chat(
                 Ok(v) => v,
                 Err(e) => return Err(map_ai_send_error(e, "failed to create AI chat")),
             };
-        let cid = resp
-            .get("chat_id")
-            .or_else(|| resp.get("chat").and_then(|c| c.get("id")))
-            .or_else(|| resp.get("id"));
-        let cid = cid
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                Value::Number(n) => Some(n.to_string()),
-                _ => None,
-            })
-            .ok_or_else(|| anyhow::anyhow!("no chat_id in response"))?;
+        let cid =
+            extract_chat_id(&resp).ok_or_else(|| anyhow::anyhow!("no chat_id in response"))?;
         (cid, resp)
     };
 
-    // Step 2: Extract message_id from response (handle both string and numeric IDs)
-    let message_id_value = initial_response
-        .get("message_id")
-        .or_else(|| initial_response.get("message").and_then(|m| m.get("id")))
-        .or_else(|| {
-            initial_response
-                .get("message")
-                .and_then(|m| m.get("message_id"))
-        });
-    let message_id = message_id_value
-        .and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        })
+    // Step 2: Extract message_id from the response (probes `turn.turn_id` first,
+    // then the legacy fallbacks — handles both string and numeric IDs).
+    let message_id = extract_message_id(&initial_response)
         .ok_or_else(|| anyhow::anyhow!("no message_id in response"))?;
 
     // Step 3: Wait for the AI response using the SAME bounded activity-poll
@@ -846,13 +817,9 @@ async fn ask(
         "{profile_type} ID must not be empty"
     );
     anyhow::ensure!(!question.trim().is_empty(), "question must not be empty");
-    // Mutual exclusion: files_attach cannot combine with files_scope/folders_scope
-    // (ai.txt:115,311,609). Enforce client-side before the round-trip.
-    anyhow::ensure!(
-        !(scope.files_attach.is_some()
-            && (scope.files_scope.is_some() || scope.folders_scope.is_some())),
-        "files_attach cannot be combined with files_scope/folders_scope — use one or the other"
-    );
+    // `personality` is dead on /ai/agent; kept in the signature for compat but
+    // never sent.
+    let _ = personality;
     // `kind` is workspace-only; a share rejects it, so it's silently dropped for
     // a share context. Note the drop on stderr (gated on quiet, like the
     // deprecation notices) rather than hard-erroring — keep the call lenient.
@@ -862,28 +829,25 @@ async fn ask(
 
     let client = ctx.build_client()?;
 
-    // Build the create form (always form-encoded; documented field set only).
+    // Build the create form (always form-encoded). `type`/`personality` are dead
+    // on the migrated agent endpoint; file/folder context is the single
+    // structured `references` field. files_scope + files_attach collapse into
+    // file references, folders_scope into folder references — see
+    // `build_references` — so they may be freely combined (no exclusion).
     let mut form = std::collections::HashMap::new();
-    form.insert("type".to_owned(), "chat_with_files".to_owned());
     form.insert("question".to_owned(), question.to_owned());
-    form.insert(
-        "personality".to_owned(),
-        personality.unwrap_or("detailed").to_owned(),
-    );
     // `kind` is workspace-only — share chats reject it.
     if profile_type == "workspace"
         && let Some(k) = kind
     {
         form.insert("kind".to_owned(), k.to_owned());
     }
-    if let Some(v) = &scope.files_scope {
-        form.insert("files_scope".to_owned(), v.clone());
-    }
-    if let Some(v) = &scope.folders_scope {
-        form.insert("folders_scope".to_owned(), v.clone());
-    }
-    if let Some(v) = &scope.files_attach {
-        form.insert("files_attach".to_owned(), v.clone());
+    let mut chat_scope = ChatScope::default();
+    chat_scope.files_scope = scope.files_scope.clone();
+    chat_scope.folders_scope = scope.folders_scope.clone();
+    chat_scope.files_attach = scope.files_attach.clone();
+    if let Some(references) = api::ai::build_references(&chat_scope) {
+        form.insert("references".to_owned(), references);
     }
 
     let resp = match api::ai::ai_api_form(&client, profile_type, profile_id, "agent/", &form).await
@@ -1109,21 +1073,32 @@ async fn wait_for_answer(
     }
 }
 
-/// Extract the chat id from a create-chat response, handling the documented
-/// `chat.id` shape plus the legacy `chat_id`/`id` fallbacks.
+/// Extract the chat id from a create-chat/message response.
+///
+/// The migrated `/ai/agent/` response shape is `{thread: {thread_id}, ...}`
+/// (`~/vividengine/llms/ai.txt:334`), so `thread.thread_id` is probed FIRST;
+/// the older `chat_id` / `chat.id` / `id` shapes remain as trailing fallbacks.
 fn extract_chat_id(resp: &Value) -> Option<String> {
     let v = resp
-        .get("chat_id")
+        .get("thread")
+        .and_then(|t| t.get("thread_id"))
+        .or_else(|| resp.get("chat_id"))
         .or_else(|| resp.get("chat").and_then(|c| c.get("id")))
         .or_else(|| resp.get("id"))?;
     json_id_to_string(v)
 }
 
-/// Extract the initial message id from a create-chat response, handling the
-/// documented `chat.message.id` shape plus the legacy fallbacks.
+/// Extract the initial message id from a create-chat/message response.
+///
+/// The migrated `/ai/agent/` response shape is `{turn: {turn_id}, ...}`
+/// (`~/vividengine/llms/ai.txt:335`), so `turn.turn_id` is probed FIRST; the
+/// older `message_id` / `chat.message.id` / `message.id` / `message.message_id`
+/// shapes remain as trailing fallbacks.
 fn extract_message_id(resp: &Value) -> Option<String> {
     let v = resp
-        .get("message_id")
+        .get("turn")
+        .and_then(|t| t.get("turn_id"))
+        .or_else(|| resp.get("message_id"))
         .or_else(|| {
             resp.get("chat")
                 .and_then(|c| c.get("message"))
@@ -1470,12 +1445,39 @@ mod phase2_tests {
     }
 
     #[test]
+    fn extract_ids_handle_migrated_thread_turn_shape() {
+        // The migrated /ai/agent/ create response is
+        // {result, thread: {thread_id}, turn: {turn_id}} (ai.txt:306-335).
+        // chat_id comes from thread.thread_id, message_id from turn.turn_id.
+        let resp = json!({
+            "result": "yes",
+            "thread": {"thread_id": "T1"},
+            "turn": {"turn_id": "U1"},
+        });
+        assert_eq!(extract_chat_id(&resp).as_deref(), Some("T1"));
+        assert_eq!(extract_message_id(&resp).as_deref(), Some("U1"));
+    }
+
+    #[test]
     fn extract_ids_handle_documented_chat_message_shape() {
-        // ai.txt:288-303 — the documented create response is
-        // {"chat": {"id": ..., "message": {"id": ...}}}.
+        // Legacy fallback: the older create response
+        // {"chat": {"id": ..., "message": {"id": ...}}} is still accepted.
         let resp = json!({"chat": {"id": "C1", "message": {"id": "M1"}}});
         assert_eq!(extract_chat_id(&resp).as_deref(), Some("C1"));
         assert_eq!(extract_message_id(&resp).as_deref(), Some("M1"));
+    }
+
+    #[test]
+    fn extract_ids_thread_turn_wins_over_legacy_fallbacks() {
+        // If both the migrated and legacy shapes are present, thread/turn win.
+        let resp = json!({
+            "thread": {"thread_id": "T9"},
+            "turn": {"turn_id": "U9"},
+            "chat_id": "OLD_C",
+            "message_id": "OLD_M",
+        });
+        assert_eq!(extract_chat_id(&resp).as_deref(), Some("T9"));
+        assert_eq!(extract_message_id(&resp).as_deref(), Some("U9"));
     }
 
     #[test]
@@ -1800,33 +1802,35 @@ mod legacy_flag_tests {
     }
 
     #[test]
-    fn bare_node_id_is_rejected() {
-        // A bare node id (no version) is invalid per ai.txt:125-127.
+    fn bare_node_id_is_now_accepted() {
+        // On the migrated /ai/agent/ contract the version is optional (it
+        // auto-resolves), so a bare node id is kept as-is (no more error).
         let nodes = vec!["abc".to_owned()];
-        let err = resolve_chat_scope(
+        let scope = resolve_chat_scope(
             true,
             &ChatFlags {
                 node_ids: Some(&nodes),
                 ..flags()
             },
         )
-        .expect_err("bare node id must be rejected");
-        assert!(err.to_string().contains("missing a version"));
+        .expect("bare node id is now accepted");
+        assert_eq!(scope.files_scope.as_deref(), Some("abc"));
     }
 
     #[test]
-    fn node_id_with_empty_version_half_is_rejected() {
-        // `abc:` (trailing colon, empty version) must also be rejected.
+    fn node_id_with_empty_version_half_is_kept_as_bare_id() {
+        // `abc:` (trailing colon, empty version) → kept as the bare node id
+        // `abc`; build_references emits `"version_id": ""` downstream.
         let nodes = vec!["abc:".to_owned()];
-        let err = resolve_chat_scope(
+        let scope = resolve_chat_scope(
             true,
             &ChatFlags {
                 node_ids: Some(&nodes),
                 ..flags()
             },
         )
-        .expect_err("empty version half must be rejected");
-        assert!(err.to_string().contains("missing a version"));
+        .expect("empty version half is now accepted as a bare node id");
+        assert_eq!(scope.files_scope.as_deref(), Some("abc"));
     }
 
     #[test]
@@ -1846,7 +1850,9 @@ mod legacy_flag_tests {
     }
 
     #[test]
-    fn folder_id_maps_to_folders_scope_depth_10() {
+    fn folder_id_maps_to_folders_scope_bare_node() {
+        // The migrated contract has no folder-depth field — a bare folder id
+        // maps to just the node id (no `:10` appended).
         let scope = resolve_chat_scope(
             true,
             &ChatFlags {
@@ -1854,13 +1860,14 @@ mod legacy_flag_tests {
                 ..flags()
             },
         )
-        .expect("bare folder id gets :10 appended");
-        assert_eq!(scope.folders_scope.as_deref(), Some("F123:10"));
+        .expect("bare folder id maps to the node id");
+        assert_eq!(scope.folders_scope.as_deref(), Some("F123"));
         assert!(scope.files_scope.is_none());
     }
 
     #[test]
-    fn folder_id_already_qualified_is_validated_and_kept() {
+    fn folder_id_qualified_depth_is_dropped() {
+        // A `nodeId:depth` folder id keeps only the node — depth is dropped.
         let scope = resolve_chat_scope(
             true,
             &ChatFlags {
@@ -1868,21 +1875,23 @@ mod legacy_flag_tests {
                 ..flags()
             },
         )
-        .expect("valid nodeId:depth folder id is kept as-is");
-        assert_eq!(scope.folders_scope.as_deref(), Some("F123:3"));
+        .expect("nodeId:depth folder id keeps only the node");
+        assert_eq!(scope.folders_scope.as_deref(), Some("F123"));
     }
 
     #[test]
-    fn folder_id_with_out_of_range_depth_is_rejected() {
-        let err = resolve_chat_scope(
+    fn folder_id_out_of_range_depth_is_dropped_not_rejected() {
+        // Depth is no longer validated (it's dropped), so an out-of-range
+        // depth is no longer an error — the node survives.
+        let scope = resolve_chat_scope(
             true,
             &ChatFlags {
                 folder_id: Some("F123:99"),
                 ..flags()
             },
         )
-        .expect_err("depth outside 1-10 must be rejected");
-        assert!(err.to_string().contains("depth must be 1-10"));
+        .expect("depth is dropped, so 99 is no longer an error");
+        assert_eq!(scope.folders_scope.as_deref(), Some("F123"));
     }
 
     #[test]
@@ -1915,9 +1924,9 @@ mod legacy_flag_tests {
 
     #[test]
     fn new_flags_reach_the_scope() {
-        // `files_scope` + `folders_scope` reach the scope verbatim. (They
-        // cannot be combined with `files_attach` — that mutual exclusion is
-        // covered by `files_attach_with_files_scope_errors` below.)
+        // `files_scope` + `folders_scope` reach the scope verbatim. (On the
+        // migrated contract they may also be combined with `files_attach` —
+        // covered by `files_attach_merges_with_files_scope` below.)
         let scope = resolve_chat_scope(
             true,
             &ChatFlags {
@@ -1933,10 +1942,12 @@ mod legacy_flag_tests {
     }
 
     #[test]
-    fn files_attach_with_files_scope_errors() {
-        // ai.txt:115,311,609 — `files_attach` and `files_scope` are mutually
-        // exclusive; sending both makes the server reject with `1605`.
-        let err = resolve_chat_scope(
+    fn files_attach_merges_with_files_scope() {
+        // On the migrated /ai/agent/ contract files_attach and
+        // files_scope/folders_scope both collapse into `references`, so they may
+        // be combined — no longer a client-side error. The resolved scope keeps
+        // both fields populated verbatim (build_references does the merge).
+        let scope = resolve_chat_scope(
             true,
             &ChatFlags {
                 files_scope: Some("n1:v1"),
@@ -1944,19 +1955,17 @@ mod legacy_flag_tests {
                 ..flags()
             },
         )
-        .expect_err("files_attach + files_scope must be rejected client-side");
-        assert!(
-            err.to_string()
-                .contains("files_attach cannot be combined with files_scope/folders_scope")
-        );
+        .expect("files_attach + files_scope are now allowed (they merge)");
+        assert_eq!(scope.files_scope.as_deref(), Some("n1:v1"));
+        assert_eq!(scope.files_attach.as_deref(), Some("a1:v1"));
     }
 
     #[test]
-    fn files_attach_with_legacy_node_ids_errors() {
-        // The guard runs on the RESOLVED scope, so the legacy
-        // `--node-ids` -> files_scope translation is caught too.
+    fn files_attach_merges_with_legacy_node_ids() {
+        // The legacy `--node-ids` -> files_scope translation combined with
+        // `--files-attach` is also allowed now (they merge into references).
         let nodes = vec!["abc:v1".to_owned()];
-        let err = resolve_chat_scope(
+        let scope = resolve_chat_scope(
             true,
             &ChatFlags {
                 node_ids: Some(&nodes),
@@ -1964,11 +1973,9 @@ mod legacy_flag_tests {
                 ..flags()
             },
         )
-        .expect_err("files_attach + legacy --node-ids must be rejected client-side");
-        assert!(
-            err.to_string()
-                .contains("files_attach cannot be combined with files_scope/folders_scope")
-        );
+        .expect("files_attach + legacy --node-ids are now allowed (they merge)");
+        assert_eq!(scope.files_scope.as_deref(), Some("abc:v1"));
+        assert_eq!(scope.files_attach.as_deref(), Some("a1:v1"));
     }
 
     #[test]

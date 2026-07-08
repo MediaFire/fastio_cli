@@ -14,22 +14,35 @@ use crate::error::{ApiError, CliError};
 /// Optional scope/attachment parameters shared by chat create and follow-up
 /// message sends.
 ///
-/// All fields are pre-formatted strings matching the `/ai/agent/` form
-/// contract (see `~/vividengine/llms/ai.txt:271-273,579-581`):
-/// - `files_scope` / `folders_scope` — comma-separated `nodeId:versionId`
-///   (files) or `nodeId:depth` (folders) pairs.
-/// - `files_attach` — comma-separated file `nodeId:versionId` pairs.
+/// These fields carry the caller-facing CSV inputs (still populated from the
+/// `--files-scope` / `--folders-scope` / `--files-attach` flags and the MCP
+/// args of the same names):
+/// - `files_scope` / `files_attach` — comma-separated file `nodeId:versionId`
+///   pairs. On the migrated `/ai/agent/` contract these two collapse to the
+///   SAME thing — a file reference item — so both feed FILE items into the
+///   single `references` array.
+/// - `folders_scope` — comma-separated `nodeId:depth` folder pairs. The depth
+///   half is **dropped** (the migrated contract has no folder-depth field); only
+///   the node id survives, as a FOLDER reference item.
 ///
-/// The shared builder forwards whatever is set verbatim; per-context
-/// validation (e.g. share chats rejecting `privacy`) lives at the caller.
+/// The wire contract is NOT these three fields. [`build_references`] converts
+/// the populated CSVs into ONE JSON-encoded `references` array of reference
+/// items and [`apply_scope`] inserts it under the single form field
+/// `references` (the legacy `files_scope`/`folders_scope`/`files_attach` form
+/// fields are dead on `/ai/agent/` — the backend silently drops unknown keys).
+/// See [`build_references`] for the exact item shapes; an empty/absent version
+/// resolves to `"version_id": ""`, which the backend auto-resolves to the
+/// current version.
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
 pub struct ChatScope {
-    /// Comma-separated `nodeId:versionId` file scope pairs (max 100).
+    /// Comma-separated file `nodeId:versionId` scope pairs → FILE references.
     pub files_scope: Option<String>,
-    /// Comma-separated `nodeId:depth` folder scope pairs (max 100).
+    /// Comma-separated `nodeId:depth` folder pairs → FOLDER references (depth
+    /// is dropped).
     pub folders_scope: Option<String>,
-    /// Comma-separated file `nodeId:versionId` attachment pairs (max 20).
+    /// Comma-separated file `nodeId:versionId` attachment pairs → FILE
+    /// references (collapse to the same item shape as `files_scope`).
     pub files_attach: Option<String>,
 }
 
@@ -46,7 +59,8 @@ pub struct ChatCreateOptions {
     pub privacy: Option<String>,
     /// Chat display name (auto-generated from the question if omitted).
     pub name: Option<String>,
-    /// `concise` or `detailed` (defaults to `detailed` server-side).
+    /// `concise` or `detailed`. **Dead on `/ai/agent/`** — retained for
+    /// signature/back-compat but no longer sent (see [`create_chat`]).
     pub personality: Option<String>,
     /// `user` or `agent` (workspace-only; immutable after creation).
     pub kind: Option<String>,
@@ -58,9 +72,12 @@ pub struct ChatCreateOptions {
 ///
 /// `POST /workspace/{workspace_id}/ai/agent/` (or the share variant via the
 /// `ai_api*` path builders). The body is **form-encoded** per the
-/// `/ai/agent/` contract (`~/vividengine/llms/ai.txt:251-283`); the legacy
-/// JSON `nodes`/`folder_id`/`intelligence` fields are gone — use
-/// `files_scope`/`folders_scope`/`files_attach` instead.
+/// `/ai/agent/` contract (`~/vividengine/llms/ai.txt:251-284`). File/folder
+/// context is carried by the single structured `references` form field (see
+/// [`ChatScope`] / [`build_references`]); the legacy JSON
+/// `nodes`/`folder_id`/`intelligence` fields AND the flat
+/// `files_scope`/`folders_scope`/`files_attach`/`type`/`personality` form
+/// fields are dead on the migrated agent endpoint.
 pub async fn create_chat(
     client: &ApiClient,
     workspace_id: &str,
@@ -68,8 +85,9 @@ pub async fn create_chat(
     chat_type: &str,
     options: &ChatCreateOptions,
 ) -> Result<Value, CliError> {
+    // `chat_type` is dead on /ai/agent; kept for signature compat.
+    let _ = chat_type;
     let mut form = HashMap::new();
-    form.insert("type".to_owned(), chat_type.to_owned());
     form.insert("question".to_owned(), question.to_owned());
     if let Some(p) = &options.privacy {
         form.insert("privacy".to_owned(), p.clone());
@@ -77,9 +95,9 @@ pub async fn create_chat(
     if let Some(n) = &options.name {
         form.insert("name".to_owned(), n.clone());
     }
-    if let Some(p) = &options.personality {
-        form.insert("personality".to_owned(), p.clone());
-    }
+    // `personality` is dead on /ai/agent; the field is kept on
+    // `ChatCreateOptions` for signature compat but no longer sent.
+    let _ = &options.personality;
     if let Some(k) = &options.kind {
         form.insert("kind".to_owned(), k.clone());
     }
@@ -88,25 +106,118 @@ pub async fn create_chat(
     client.post(&path, &form).await
 }
 
-/// Insert any populated scope/attach fields into a form body.
+/// Insert the migrated `references` field into a form body when the scope
+/// resolves to at least one reference item.
+///
+/// The legacy `files_scope`/`folders_scope`/`files_attach` form fields are dead
+/// on `/ai/agent/` (the backend silently drops unknown keys), so this inserts a
+/// SINGLE `references` field carrying [`build_references`]'s JSON array. When
+/// there are no references, the field is omitted entirely.
 fn apply_scope(form: &mut HashMap<String, String>, scope: &ChatScope) {
-    if let Some(v) = &scope.files_scope {
-        form.insert("files_scope".to_owned(), v.clone());
+    if let Some(references) = build_references(scope) {
+        form.insert("references".to_owned(), references);
     }
-    if let Some(v) = &scope.folders_scope {
-        form.insert("folders_scope".to_owned(), v.clone());
+}
+
+/// Convert a [`ChatScope`]'s CSV inputs into the `/ai/agent/` `references` form
+/// value: a JSON-encoded array of reference items.
+///
+/// The migrated `/ai/agent/` contract (`~/vividengine/llms/ai.txt:120-146`)
+/// replaces the three legacy `files_scope`/`folders_scope`/`files_attach` form
+/// fields with a single structured `references` array. Item shapes:
+/// - FILE (from `files_scope` AND `files_attach` — they collapse to the same
+///   thing now):
+///   `{"type":"file","id":"<nodeId>","file_details":{"node_id":"<nodeId>","version_id":"<versionId or empty string>"}}`
+/// - FOLDER (from `folders_scope`, depth dropped):
+///   `{"type":"folder","id":"<nodeId>","folder_details":{"node_id":"<nodeId>"}}`
+///
+/// Parsing rules: each CSV is split on `,`; entries are trimmed; empty entries
+/// are skipped. A file entry is `nodeId:versionId` — an empty/absent version
+/// (e.g. `abc` or `abc:`) yields `"version_id": ""`, which the backend
+/// auto-resolves to the current version. A folder entry may be `nodeId` or
+/// `nodeId:depth`; the depth is dropped and only the node id is kept. Items are
+/// DEDUPED by `(type, id)` with the first occurrence winning, so a node named in
+/// both `files_scope` and `files_attach` (or twice in one CSV) emits once.
+///
+/// Returns `None` when no reference items result (so the caller omits the
+/// `references` field entirely); otherwise the `serde_json` array string.
+/// `serde_json::to_string` of a `Vec<Value>` never fails, so the fallback arm
+/// exists only to satisfy the type.
+#[must_use]
+pub fn build_references(scope: &ChatScope) -> Option<String> {
+    let mut items: Vec<Value> = Vec::new();
+    let mut seen: Vec<(&'static str, String)> = Vec::new();
+
+    // Files from BOTH files_scope and files_attach collapse to file items.
+    for csv in [scope.files_scope.as_deref(), scope.files_attach.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        for entry in csv.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            // `nodeId` or `nodeId:versionId` — empty/absent version → "".
+            let (node, version) = match entry.split_once(':') {
+                Some((n, v)) => (n.trim(), v.trim()),
+                None => (entry, ""),
+            };
+            if node.is_empty() {
+                continue;
+            }
+            if seen.iter().any(|(t, id)| *t == "file" && id == node) {
+                continue;
+            }
+            seen.push(("file", node.to_owned()));
+            items.push(serde_json::json!({
+                "type": "file",
+                "id": node,
+                "file_details": { "node_id": node, "version_id": version },
+            }));
+        }
     }
-    if let Some(v) = &scope.files_attach {
-        form.insert("files_attach".to_owned(), v.clone());
+
+    // Folders from folders_scope; the `:depth` half (if any) is dropped.
+    if let Some(csv) = scope.folders_scope.as_deref() {
+        for entry in csv.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let node = match entry.split_once(':') {
+                Some((n, _depth)) => n.trim(),
+                None => entry,
+            };
+            if node.is_empty() {
+                continue;
+            }
+            if seen.iter().any(|(t, id)| *t == "folder" && id == node) {
+                continue;
+            }
+            seen.push(("folder", node.to_owned()));
+            items.push(serde_json::json!({
+                "type": "folder",
+                "id": node,
+                "folder_details": { "node_id": node },
+            }));
+        }
     }
+
+    if items.is_empty() {
+        return None;
+    }
+    Some(serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_owned()))
 }
 
 /// Send a message to an existing AI chat.
 ///
 /// `POST /workspace/{workspace_id}/ai/agent/{chat_id}/message/`. The body is
 /// **form-encoded** per the `/ai/agent/` contract
-/// (`~/vividengine/llms/ai.txt:563-591`). The chat type is inherited from
-/// the chat, so `type` is not resent.
+/// (`~/vividengine/llms/ai.txt:563-601`). The chat type is inherited from
+/// the chat, so `type` is not resent; `personality` is dead on the migrated
+/// endpoint and also not sent. File/folder context uses the single structured
+/// `references` field (see [`ChatScope`] / [`build_references`]).
 pub async fn send_message(
     client: &ApiClient,
     workspace_id: &str,
@@ -115,11 +226,11 @@ pub async fn send_message(
     personality: Option<&str>,
     scope: &ChatScope,
 ) -> Result<Value, CliError> {
+    // `personality` is dead on /ai/agent; the param is kept for signature
+    // compat (callers still pass it) but no longer inserted into the form.
+    let _ = personality;
     let mut form = HashMap::new();
     form.insert("question".to_owned(), question.to_owned());
-    if let Some(p) = personality {
-        form.insert("personality".to_owned(), p.to_owned());
-    }
     apply_scope(&mut form, scope);
     let path = format!(
         "/workspace/{}/ai/agent/{}/message/",
@@ -711,11 +822,11 @@ pub fn extract_clarification_question(msg_data: &Value) -> Option<String> {
 mod tests {
     use super::{
         CONVERSATION_TOO_LARGE_CODES, ChatCreateOptions, ChatScope, agent_chat_path,
-        build_cancel_path, build_share_form, extract_clarification_question, is_terminal_state,
-        message_detail, parse_cancel_response,
+        build_cancel_path, build_references, build_share_form, extract_clarification_question,
+        is_terminal_state, message_detail, parse_cancel_response,
     };
     use crate::error::CliError;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn is_terminal_state_includes_needs_input() {
@@ -955,11 +1066,13 @@ mod tests {
     }
 
     #[test]
-    fn create_chat_form_carries_only_documented_fields() {
-        // The form body must NOT emit the retired `nodes`/`folder_id`/
-        // `intelligence` fields — those are the cause of the live outage.
+    fn create_chat_form_carries_references_not_legacy_scope_or_type() {
+        // On the migrated /ai/agent/ contract the form carries thread-level
+        // fields (`question`/`privacy`/`name`/`kind`) plus the SINGLE structured
+        // `references` field — NOT the retired `type`/`personality` or the flat
+        // `files_scope`/`folders_scope`/`files_attach` form fields, and not the
+        // older `nodes`/`folder_id`/`intelligence` fields.
         let mut form = std::collections::HashMap::new();
-        form.insert("type".to_owned(), "chat_with_files".to_owned());
         form.insert("question".to_owned(), "hi".to_owned());
         let opts = ChatCreateOptions {
             privacy: Some("private".to_owned()),
@@ -979,29 +1092,145 @@ mod tests {
         if let Some(n) = &opts.name {
             form.insert("name".to_owned(), n.clone());
         }
-        if let Some(p) = &opts.personality {
-            form.insert("personality".to_owned(), p.clone());
-        }
         if let Some(k) = &opts.kind {
             form.insert("kind".to_owned(), k.clone());
         }
-        // Documented field set present.
-        for key in [
-            "type",
-            "question",
-            "privacy",
-            "name",
-            "personality",
-            "kind",
-            "files_scope",
-            "folders_scope",
-        ] {
+        // Thread-level + references fields present.
+        for key in ["question", "privacy", "name", "kind", "references"] {
             assert!(form.contains_key(key), "missing {key}");
         }
-        // Retired fields absent.
-        for key in ["nodes", "folder_id", "intelligence"] {
+        // Retired thread fields AND the flat scope fields must be absent.
+        for key in [
+            "type",
+            "personality",
+            "files_scope",
+            "folders_scope",
+            "files_attach",
+            "nodes",
+            "folder_id",
+            "intelligence",
+        ] {
             assert!(!form.contains_key(key), "should not emit {key}");
         }
+        // The references array collapses `n1:` (empty version → "") into a file
+        // item and `f1:10` (depth dropped) into a folder item.
+        let refs: Value = serde_json::from_str(form.get("references").expect("references present"))
+            .expect("json");
+        assert_eq!(
+            refs,
+            json!([
+                {"type": "file", "id": "n1", "file_details": {"node_id": "n1", "version_id": ""}},
+                {"type": "folder", "id": "f1", "folder_details": {"node_id": "f1"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn build_references_file_with_version() {
+        let scope = ChatScope {
+            files_scope: Some("n1:v9".to_owned()),
+            ..ChatScope::default()
+        };
+        let refs: Value =
+            serde_json::from_str(&build_references(&scope).expect("some")).expect("json");
+        assert_eq!(
+            refs,
+            json!([
+                {"type": "file", "id": "n1", "file_details": {"node_id": "n1", "version_id": "v9"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn build_references_file_empty_version_becomes_empty_string() {
+        // Both a trailing-colon (`abc:`) and a bare id (`abc`) yield `""`, which
+        // the backend auto-resolves to the current version.
+        for input in ["abc:", "abc"] {
+            let scope = ChatScope {
+                files_scope: Some(input.to_owned()),
+                ..ChatScope::default()
+            };
+            let refs: Value =
+                serde_json::from_str(&build_references(&scope).expect("some")).expect("json");
+            assert_eq!(
+                refs,
+                json!([
+                    {"type": "file", "id": "abc", "file_details": {"node_id": "abc", "version_id": ""}},
+                ]),
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_references_folder_drops_depth() {
+        let scope = ChatScope {
+            folders_scope: Some("f1:7".to_owned()),
+            ..ChatScope::default()
+        };
+        let refs: Value =
+            serde_json::from_str(&build_references(&scope).expect("some")).expect("json");
+        // No depth field on the folder item.
+        assert_eq!(
+            refs,
+            json!([{"type": "folder", "id": "f1", "folder_details": {"node_id": "f1"}}])
+        );
+    }
+
+    #[test]
+    fn build_references_scope_and_attach_merge_and_dedupe() {
+        // files_scope + files_attach collapse to file items; a node named in
+        // both is deduped (first occurrence — from files_scope — wins).
+        let scope = ChatScope {
+            files_scope: Some("n1:v1, n2:v2".to_owned()),
+            files_attach: Some("n1:vX, n3".to_owned()),
+            ..ChatScope::default()
+        };
+        let refs: Value =
+            serde_json::from_str(&build_references(&scope).expect("some")).expect("json");
+        assert_eq!(
+            refs,
+            json!([
+                {"type": "file", "id": "n1", "file_details": {"node_id": "n1", "version_id": "v1"}},
+                {"type": "file", "id": "n2", "file_details": {"node_id": "n2", "version_id": "v2"}},
+                {"type": "file", "id": "n3", "file_details": {"node_id": "n3", "version_id": ""}},
+            ]),
+            "n1 dedupes to its first (files_scope) occurrence; n3 keeps empty version"
+        );
+    }
+
+    #[test]
+    fn build_references_empty_is_none() {
+        // No scope at all, and all-whitespace/empty entries, both yield None so
+        // the caller omits the `references` field entirely.
+        assert!(build_references(&ChatScope::default()).is_none());
+        let scope = ChatScope {
+            files_scope: Some("  , ,".to_owned()),
+            folders_scope: Some(String::new()),
+            files_attach: Some("   ".to_owned()),
+        };
+        assert!(build_references(&scope).is_none());
+    }
+
+    #[test]
+    fn build_references_multiple_mixed_items() {
+        // A mix of files (scope + attach) and folders, all present in one array.
+        let scope = ChatScope {
+            files_scope: Some("f1:v1".to_owned()),
+            folders_scope: Some("d1:3,d2".to_owned()),
+            files_attach: Some("f2".to_owned()),
+        };
+        let refs: Value =
+            serde_json::from_str(&build_references(&scope).expect("some")).expect("json");
+        assert_eq!(
+            refs,
+            json!([
+                {"type": "file", "id": "f1", "file_details": {"node_id": "f1", "version_id": "v1"}},
+                {"type": "file", "id": "f2", "file_details": {"node_id": "f2", "version_id": ""}},
+                {"type": "folder", "id": "d1", "folder_details": {"node_id": "d1"}},
+                {"type": "folder", "id": "d2", "folder_details": {"node_id": "d2"}},
+            ])
+        );
     }
 
     #[test]
