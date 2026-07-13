@@ -849,6 +849,9 @@ async fn ask(
     if let Some(references) = api::ai::build_references(&chat_scope) {
         form.insert("references".to_owned(), references);
     }
+    if let Some(subjects) = api::ai::build_subjects(&chat_scope) {
+        form.insert("subjects".to_owned(), subjects);
+    }
 
     let resp = match api::ai::ai_api_form(&client, profile_type, profile_id, "agent/", &form).await
     {
