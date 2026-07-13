@@ -1075,13 +1075,17 @@ async fn wait_for_answer(
 
 /// Extract the chat id from a create-chat/message response.
 ///
-/// The migrated `/ai/agent/` response shape is `{thread: {thread_id}, ...}`
-/// (`~/vividengine/llms/ai.txt:334`), so `thread.thread_id` is probed FIRST;
-/// the older `chat_id` / `chat.id` / `id` shapes remain as trailing fallbacks.
+/// CREATE (`POST …/ai/agent/`) returns `{thread: {thread_id}, ...}` (NESTED),
+/// while follow-up MESSAGE-SEND (`POST …/ai/agent/{chat}/message/`) returns a
+/// FLAT top-level `{turn_id, thread_id, seq, status, ...}`
+/// (`~/vividengine/llms/ai.txt:334,614-634`). So `thread.thread_id` is probed
+/// FIRST, then the flat top-level `thread_id`; the older `chat_id` / `chat.id`
+/// / `id` shapes remain as trailing fallbacks.
 fn extract_chat_id(resp: &Value) -> Option<String> {
     let v = resp
         .get("thread")
         .and_then(|t| t.get("thread_id"))
+        .or_else(|| resp.get("thread_id"))
         .or_else(|| resp.get("chat_id"))
         .or_else(|| resp.get("chat").and_then(|c| c.get("id")))
         .or_else(|| resp.get("id"))?;
@@ -1090,14 +1094,20 @@ fn extract_chat_id(resp: &Value) -> Option<String> {
 
 /// Extract the initial message id from a create-chat/message response.
 ///
-/// The migrated `/ai/agent/` response shape is `{turn: {turn_id}, ...}`
-/// (`~/vividengine/llms/ai.txt:335`), so `turn.turn_id` is probed FIRST; the
-/// older `message_id` / `chat.message.id` / `message.id` / `message.message_id`
-/// shapes remain as trailing fallbacks.
+/// CREATE (`POST …/ai/agent/`) returns `{turn: {turn_id}, ...}` (NESTED), while
+/// follow-up MESSAGE-SEND (`POST …/ai/agent/{chat}/message/`) returns a FLAT
+/// top-level `{turn_id, thread_id, seq, status, ...}` — the created turn's
+/// fields are at the top level, NOT under a `turn`/`message` object
+/// (`~/vividengine/llms/ai.txt:335,614-634`). So `turn.turn_id` is probed
+/// FIRST, then the flat top-level `turn_id`; the older `message_id` /
+/// `chat.message.id` / `message.id` / `message.message_id` shapes remain as
+/// trailing fallbacks. Without the flat probe, a follow-up
+/// `ripley chat --chat-id …` aborts with "no `message_id` in response".
 fn extract_message_id(resp: &Value) -> Option<String> {
     let v = resp
         .get("turn")
         .and_then(|t| t.get("turn_id"))
+        .or_else(|| resp.get("turn_id"))
         .or_else(|| resp.get("message_id"))
         .or_else(|| {
             resp.get("chat")
@@ -1456,6 +1466,27 @@ mod phase2_tests {
         });
         assert_eq!(extract_chat_id(&resp).as_deref(), Some("T1"));
         assert_eq!(extract_message_id(&resp).as_deref(), Some("U1"));
+    }
+
+    #[test]
+    fn extract_ids_handle_flat_message_send_shape() {
+        // The follow-up message-send response is FLAT — the created turn's
+        // fields are at the TOP LEVEL, not nested under `turn`/`message`
+        // (ai.txt:614-634): message_id = top-level `turn_id`, chat_id =
+        // top-level `thread_id`. Without the flat probe a `ripley chat`
+        // follow-up aborts with "no message_id in response".
+        let resp = json!({
+            "result": true,
+            "turn_id": "9azfj-flat-turn",
+            "thread_id": "9iacg-flat-thread",
+            "seq": 2,
+            "status": "pending",
+        });
+        assert_eq!(
+            extract_message_id(&resp).as_deref(),
+            Some("9azfj-flat-turn")
+        );
+        assert_eq!(extract_chat_id(&resp).as_deref(), Some("9iacg-flat-thread"));
     }
 
     #[test]
