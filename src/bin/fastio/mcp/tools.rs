@@ -6975,23 +6975,29 @@ async fn handle_ai(
     }
 }
 
-/// Build the `/ai/agent/` `references` form value from the MCP `files_scope` /
-/// `folders_scope` / `files_attach` args.
+/// Emit the `/ai/agent/` `references` (SCOPE) and `subjects` (ATTACH) form
+/// fields from the MCP `files_scope` / `folders_scope` / `files_attach` args.
 ///
-/// On the migrated agent endpoint these three inputs collapse into a single
-/// structured `references` JSON array (files from `files_scope` + `files_attach`,
-/// folders from `folders_scope`, depth dropped). This constructs a
-/// [`api::ai::ChatScope`] from the args and delegates to the shared
-/// [`api::ai::build_references`] so the CLI and MCP paths emit byte-identical
-/// bodies. Returns `None` when no references result (the caller then omits the
-/// field). The three inputs may be freely combined — there is no
-/// mutual-exclusion check.
-fn build_references_from_args(args: &Map<String, Value>) -> Option<String> {
+/// `files_scope` + `folders_scope` → `references`; `files_attach` → the SEPARATE
+/// `subjects` array (the platform routes ATTACHED files there — the focus
+/// surface — while `references` becomes inline content). Delegates to the shared
+/// [`api::ai::build_references`] / [`api::ai::build_subjects`] so the CLI and MCP
+/// paths emit byte-identical bodies. Each field is omitted when it has no items;
+/// the inputs may be freely combined (no mutual-exclusion check).
+fn apply_ai_scope_from_args(
+    form: &mut std::collections::HashMap<String, String>,
+    args: &Map<String, Value>,
+) {
     let mut scope = api::ai::ChatScope::default();
     scope.files_scope = optional_str(args, "files_scope").map(str::to_owned);
     scope.folders_scope = optional_str(args, "folders_scope").map(str::to_owned);
     scope.files_attach = optional_str(args, "files_attach").map(str::to_owned);
-    api::ai::build_references(&scope)
+    if let Some(references) = api::ai::build_references(&scope) {
+        form.insert("references".to_owned(), references);
+    }
+    if let Some(subjects) = api::ai::build_subjects(&scope) {
+        form.insert("subjects".to_owned(), subjects);
+    }
 }
 
 /// Build the prominent note attached to a `needs_input` MCP `ask` result.
@@ -7098,9 +7104,7 @@ async fn handle_ai_chat_create(
             warnings.push(PRIVACY_SHARE_WARNING);
         }
     }
-    if let Some(references) = build_references_from_args(args) {
-        form.insert("references".to_owned(), references);
-    }
+    apply_ai_scope_from_args(&mut form, args);
     match api::ai::ai_api_form(&client, ctx_type, ctx_id, "agent/", &form).await {
         Ok(mut v) => {
             for w in &warnings {
@@ -7284,9 +7288,7 @@ async fn handle_ai_message_send(
     // `folders_scope` / `files_attach` via the shared `build_references`).
     let mut form = std::collections::HashMap::new();
     form.insert("question".to_owned(), query.to_owned());
-    if let Some(references) = build_references_from_args(args) {
-        form.insert("references".to_owned(), references);
-    }
+    apply_ai_scope_from_args(&mut form, args);
     let sub = format!("agent/{}/message/", urlencoding::encode(chat_id));
     match api::ai::ai_api_form(&client, ctx_type, ctx_id, &sub, &form).await {
         Ok(v) => Ok(success_json(&v)),
@@ -7549,9 +7551,7 @@ async fn handle_ai_ask(
             kind_warning = Some(KIND_SHARE_WARNING.to_owned());
         }
     }
-    if let Some(references) = build_references_from_args(args) {
-        form.insert("references".to_owned(), references);
-    }
+    apply_ai_scope_from_args(&mut form, args);
 
     let resp = match api::ai::ai_api_form(&client, ctx_type, ctx_id, "agent/", &form).await {
         Ok(v) => v,
