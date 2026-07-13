@@ -17,20 +17,22 @@ use crate::error::{ApiError, CliError};
 /// These fields carry the caller-facing CSV inputs (still populated from the
 /// `--files-scope` / `--folders-scope` / `--files-attach` flags and the MCP
 /// args of the same names):
-/// - `files_scope` / `files_attach` — comma-separated file `nodeId:versionId`
-///   pairs. On the migrated `/ai/agent/` contract these two collapse to the
-///   SAME thing — a file reference item — so both feed FILE items into the
-///   single `references` array.
+/// - `files_scope` — comma-separated file `nodeId:versionId` pairs → SCOPE file
+///   items in the `references` array (context the message text discusses).
+/// - `files_attach` — comma-separated file `nodeId:versionId` pairs → ATTACHED
+///   file items in the SEPARATE `subjects` array (the platform's focus surface
+///   for attachments); same item shape as a reference.
 /// - `folders_scope` — comma-separated `nodeId:depth` folder pairs. The depth
 ///   half is **dropped** (the migrated contract has no folder-depth field); only
 ///   the node id survives, as a FOLDER reference item.
 ///
-/// The wire contract is NOT these three fields. [`build_references`] converts
-/// the populated CSVs into ONE JSON-encoded `references` array of reference
-/// items and [`apply_scope`] inserts it under the single form field
-/// `references` (the legacy `files_scope`/`folders_scope`/`files_attach` form
-/// fields are dead on `/ai/agent/` — the backend silently drops unknown keys).
-/// See [`build_references`] for the exact item shapes; an empty/absent version
+/// The wire contract is NOT these three fields. [`apply_scope`] emits two
+/// structured JSON arrays: [`build_references`] converts `files_scope` +
+/// `folders_scope` into the `references` field, and [`build_subjects`] converts
+/// `files_attach` into the SEPARATE `subjects` field (the legacy
+/// `files_scope`/`folders_scope`/`files_attach` form fields are dead on
+/// `/ai/agent/` — the backend silently drops unknown keys). See
+/// [`build_ref_array`] for the exact item shapes; an empty/absent version
 /// resolves to `"version_id": ""`, which the backend auto-resolves to the
 /// current version.
 #[derive(Debug, Default, Clone)]
@@ -41,8 +43,8 @@ pub struct ChatScope {
     /// Comma-separated `nodeId:depth` folder pairs → FOLDER references (depth
     /// is dropped).
     pub folders_scope: Option<String>,
-    /// Comma-separated file `nodeId:versionId` attachment pairs → FILE
-    /// references (collapse to the same item shape as `files_scope`).
+    /// Comma-separated file `nodeId:versionId` attachment pairs → FILE items in
+    /// the SEPARATE `subjects` array (same item shape as a reference).
     pub files_attach: Option<String>,
 }
 
@@ -106,53 +108,47 @@ pub async fn create_chat(
     client.post(&path, &form).await
 }
 
-/// Insert the migrated `references` field into a form body when the scope
-/// resolves to at least one reference item.
+/// Insert the structured `references` and `subjects` fields into a form body.
 ///
-/// The legacy `files_scope`/`folders_scope`/`files_attach` form fields are dead
-/// on `/ai/agent/` (the backend silently drops unknown keys), so this inserts a
-/// SINGLE `references` field carrying [`build_references`]'s JSON array. When
-/// there are no references, the field is omitted entirely.
+/// On the migrated `/ai/agent/` endpoint file context is carried by TWO distinct
+/// structured arrays (the legacy `files_scope`/`folders_scope`/`files_attach`
+/// form fields are dead — the backend drops unknown keys):
+/// - `references` (SCOPE) — from `files_scope` + `folders_scope`. The platform
+///   routes it to the gRPC `ChatQuery.content[]` (inline "pill at end of the
+///   message").
+/// - `subjects` (ATTACH) — from `files_attach`. The platform routes it to the
+///   gRPC `ChatQuery.focus.subjects[]`, the intended surface for ATTACHED files.
+///
+/// Each field is omitted when it resolves to no items.
 fn apply_scope(form: &mut HashMap<String, String>, scope: &ChatScope) {
     if let Some(references) = build_references(scope) {
         form.insert("references".to_owned(), references);
     }
+    if let Some(subjects) = build_subjects(scope) {
+        form.insert("subjects".to_owned(), subjects);
+    }
 }
 
-/// Convert a [`ChatScope`]'s CSV inputs into the `/ai/agent/` `references` form
-/// value: a JSON-encoded array of reference items.
+/// Build a `/ai/agent/` structured reference array — the shared JSON shape used
+/// by BOTH the `references` and `subjects` form fields — from CSV inputs.
 ///
-/// The migrated `/ai/agent/` contract (`~/vividengine/llms/ai.txt:120-146`)
-/// replaces the three legacy `files_scope`/`folders_scope`/`files_attach` form
-/// fields with a single structured `references` array. Item shapes:
-/// - FILE (from `files_scope` AND `files_attach` — they collapse to the same
-///   thing now):
-///   `{"type":"file","id":"<nodeId>","file_details":{"node_id":"<nodeId>","version_id":"<versionId or empty string>"}}`
-/// - FOLDER (from `folders_scope`, depth dropped):
-///   `{"type":"folder","id":"<nodeId>","folder_details":{"node_id":"<nodeId>"}}`
+/// Each `file_csvs` entry is a comma-separated list of file `nodeId` /
+/// `nodeId:versionId` → FILE items
+/// `{"type":"file","id":<node>,"file_details":{"node_id":<node>,"version_id":<ver or "">}}`
+/// (empty/absent version → `""`, which the backend auto-resolves to the current
+/// version). `folder_csv` is a comma-separated list of folder `nodeId` /
+/// `nodeId:depth` (depth dropped) → FOLDER items
+/// `{"type":"folder","id":<node>,"folder_details":{"node_id":<node>}}`.
 ///
-/// Parsing rules: each CSV is split on `,`; entries are trimmed; empty entries
-/// are skipped. A file entry is `nodeId:versionId` — an empty/absent version
-/// (e.g. `abc` or `abc:`) yields `"version_id": ""`, which the backend
-/// auto-resolves to the current version. A folder entry may be `nodeId` or
-/// `nodeId:depth`; the depth is dropped and only the node id is kept. Items are
-/// DEDUPED by `(type, id)` with the first occurrence winning, so a node named in
-/// both `files_scope` and `files_attach` (or twice in one CSV) emits once.
-///
-/// Returns `None` when no reference items result (so the caller omits the
-/// `references` field entirely); otherwise the `serde_json` array string.
-/// `serde_json::to_string` of a `Vec<Value>` never fails, so the fallback arm
-/// exists only to satisfy the type.
-#[must_use]
-pub fn build_references(scope: &ChatScope) -> Option<String> {
+/// Entries are trimmed; empty entries skipped; items DEDUPED by `(type, id)`
+/// (first occurrence wins). Returns `None` when no items result (so the caller
+/// omits the field). `serde_json::to_string` of a `Vec<Value>` never fails, so
+/// the fallback arm only satisfies the type.
+fn build_ref_array(file_csvs: &[Option<&str>], folder_csv: Option<&str>) -> Option<String> {
     let mut items: Vec<Value> = Vec::new();
     let mut seen: Vec<(&'static str, String)> = Vec::new();
 
-    // Files from BOTH files_scope and files_attach collapse to file items.
-    for csv in [scope.files_scope.as_deref(), scope.files_attach.as_deref()]
-        .into_iter()
-        .flatten()
-    {
+    for csv in file_csvs.iter().copied().flatten() {
         for entry in csv.split(',') {
             let entry = entry.trim();
             if entry.is_empty() {
@@ -178,8 +174,8 @@ pub fn build_references(scope: &ChatScope) -> Option<String> {
         }
     }
 
-    // Folders from folders_scope; the `:depth` half (if any) is dropped.
-    if let Some(csv) = scope.folders_scope.as_deref() {
+    // Folders from `folder_csv`; the `:depth` half (if any) is dropped.
+    if let Some(csv) = folder_csv {
         for entry in csv.split(',') {
             let entry = entry.trim();
             if entry.is_empty() {
@@ -208,6 +204,28 @@ pub fn build_references(scope: &ChatScope) -> Option<String> {
         return None;
     }
     Some(serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_owned()))
+}
+
+/// Build the `/ai/agent/` **`references`** field (SCOPE — context the message
+/// text discusses) from a [`ChatScope`]: `files_scope` (files) + `folders_scope`
+/// (folders). ATTACHED files go to `subjects` instead (see [`build_subjects`]).
+/// The platform routes `references` to the gRPC `ChatQuery.content[]`.
+#[must_use]
+pub fn build_references(scope: &ChatScope) -> Option<String> {
+    build_ref_array(
+        &[scope.files_scope.as_deref()],
+        scope.folders_scope.as_deref(),
+    )
+}
+
+/// Build the `/ai/agent/` **`subjects`** field (ATTACHED subject files) from a
+/// [`ChatScope`]'s `files_attach`. The platform routes `subjects` to the gRPC
+/// `ChatQuery.focus.subjects[]` — the intended surface for attachments — whereas
+/// `references` becomes inline `content[]`. Same item shape as a reference
+/// (see [`build_ref_array`]); folders are not attachable, so files only.
+#[must_use]
+pub fn build_subjects(scope: &ChatScope) -> Option<String> {
+    build_ref_array(&[scope.files_attach.as_deref()], None)
 }
 
 /// Send a message to an existing AI chat.
@@ -822,8 +840,8 @@ pub fn extract_clarification_question(msg_data: &Value) -> Option<String> {
 mod tests {
     use super::{
         CONVERSATION_TOO_LARGE_CODES, ChatCreateOptions, ChatScope, agent_chat_path,
-        build_cancel_path, build_references, build_share_form, extract_clarification_question,
-        is_terminal_state, message_detail, parse_cancel_response,
+        build_cancel_path, build_references, build_share_form, build_subjects,
+        extract_clarification_question, is_terminal_state, message_detail, parse_cancel_response,
     };
     use crate::error::CliError;
     use serde_json::{Value, json};
@@ -1178,9 +1196,10 @@ mod tests {
     }
 
     #[test]
-    fn build_references_scope_and_attach_merge_and_dedupe() {
-        // files_scope + files_attach collapse to file items; a node named in
-        // both is deduped (first occurrence — from files_scope — wins).
+    fn build_references_and_subjects_are_separate_arrays() {
+        // files_scope → references; files_attach → subjects. They are DISTINCT
+        // arrays (no cross-merge/dedup), so a node named in both appears in each
+        // with its own version.
         let scope = ChatScope {
             files_scope: Some("n1:v1, n2:v2".to_owned()),
             files_attach: Some("n1:vX, n3".to_owned()),
@@ -1193,9 +1212,18 @@ mod tests {
             json!([
                 {"type": "file", "id": "n1", "file_details": {"node_id": "n1", "version_id": "v1"}},
                 {"type": "file", "id": "n2", "file_details": {"node_id": "n2", "version_id": "v2"}},
+            ]),
+            "references carries files_scope only"
+        );
+        let subs: Value =
+            serde_json::from_str(&build_subjects(&scope).expect("some")).expect("json");
+        assert_eq!(
+            subs,
+            json!([
+                {"type": "file", "id": "n1", "file_details": {"node_id": "n1", "version_id": "vX"}},
                 {"type": "file", "id": "n3", "file_details": {"node_id": "n3", "version_id": ""}},
             ]),
-            "n1 dedupes to its first (files_scope) occurrence; n3 keeps empty version"
+            "subjects carries files_attach only (n1 keeps its own vX — no cross-dedup)"
         );
     }
 
@@ -1213,8 +1241,8 @@ mod tests {
     }
 
     #[test]
-    fn build_references_multiple_mixed_items() {
-        // A mix of files (scope + attach) and folders, all present in one array.
+    fn build_references_files_and_folders_subjects_separate() {
+        // files_scope + folders_scope → references; files_attach → subjects.
         let scope = ChatScope {
             files_scope: Some("f1:v1".to_owned()),
             folders_scope: Some("d1:3,d2".to_owned()),
@@ -1226,10 +1254,38 @@ mod tests {
             refs,
             json!([
                 {"type": "file", "id": "f1", "file_details": {"node_id": "f1", "version_id": "v1"}},
-                {"type": "file", "id": "f2", "file_details": {"node_id": "f2", "version_id": ""}},
                 {"type": "folder", "id": "d1", "folder_details": {"node_id": "d1"}},
                 {"type": "folder", "id": "d2", "folder_details": {"node_id": "d2"}},
             ])
+        );
+        let subs: Value =
+            serde_json::from_str(&build_subjects(&scope).expect("some")).expect("json");
+        assert_eq!(
+            subs,
+            json!([{"type": "file", "id": "f2", "file_details": {"node_id": "f2", "version_id": ""}}])
+        );
+    }
+
+    #[test]
+    fn build_subjects_only_from_files_attach() {
+        // subjects come ONLY from files_attach; files_scope/folders_scope do not
+        // feed subjects, and no files_attach → None.
+        assert!(build_subjects(&ChatScope::default()).is_none());
+        let scope_only_scope = ChatScope {
+            files_scope: Some("n1:v1".to_owned()),
+            folders_scope: Some("d1".to_owned()),
+            files_attach: None,
+        };
+        assert!(build_subjects(&scope_only_scope).is_none());
+        let scope_attach = ChatScope {
+            files_attach: Some("a1:v1".to_owned()),
+            ..ChatScope::default()
+        };
+        let subs: Value =
+            serde_json::from_str(&build_subjects(&scope_attach).expect("some")).expect("json");
+        assert_eq!(
+            subs,
+            json!([{"type": "file", "id": "a1", "file_details": {"node_id": "a1", "version_id": "v1"}}])
         );
     }
 
