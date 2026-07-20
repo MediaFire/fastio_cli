@@ -241,16 +241,12 @@ pub mod share;
 pub mod sign;
 /// System health and status commands.
 pub mod system;
-/// Task management commands.
-pub mod task;
 /// File upload commands.
 pub mod upload;
 /// User profile commands.
 pub mod user;
 /// Terminal markdown viewer command (`fastio view`).
 pub mod view;
-/// Workflow Orchestration (v3.2) commands.
-pub mod workflow;
 /// Workspace management commands.
 pub mod workspace;
 

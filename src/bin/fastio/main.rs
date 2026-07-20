@@ -35,7 +35,6 @@ use commands::share::{
     ShareUpdateArgs,
 };
 use commands::system::SystemCommand;
-use commands::task::{TaskCommand, TaskCommentCommand, TaskListCommand};
 use commands::upload::UploadCommand;
 use commands::user::{
     AvatarCommand, SettingsCommand, UserAssetCommand, UserCommand, UserEmailChangeCommand,
@@ -248,7 +247,6 @@ async fn dispatch(
         Commands::Preview(c) => commands::preview::execute(&map_preview_command(c), ctx).await,
         Commands::Asset(c) => commands::asset::execute(&map_asset_command(c), ctx).await,
         Commands::Ripley(c) => commands::ai::execute(&map_ripley_command(c), ctx).await,
-        Commands::Task(c) => commands::task::execute(&map_task_command(c), ctx).await,
         Commands::Apps(c) => commands::apps::execute(&map_apps_command(&c), ctx).await,
         Commands::Import(c) => commands::import::execute(&map_import_command(&c), ctx).await,
         Commands::Lock(c) => commands::lock::execute(&map_lock_command(&c), ctx).await,
@@ -278,7 +276,6 @@ async fn dispatch(
             context,
         } => commands::howto::execute(ctx, &question, surface.as_deref(), context.as_deref()).await,
         Commands::Metadata(c) => commands::metadata::execute(&map_metadata_command(c), ctx).await,
-        Commands::Workflow(c) => commands::workflow::execute(c, ctx).await,
         Commands::Sign(c) => commands::sign::execute(c, ctx).await,
         Commands::Fileshare(c) => commands::fileshare::execute(c, ctx).await,
         Commands::System(c) => commands::system::execute(&map_system_command(&c), ctx).await,
@@ -2137,240 +2134,6 @@ fn map_ripley_command(cmd: cli::RipleyCommands) -> AiCommand {
                 chat_id,
             }
         }
-    }
-}
-
-/// Convert clap-parsed task commands to the internal enum.
-#[allow(clippy::too_many_lines)]
-fn map_task_command(cmd: cli::TaskCommands) -> TaskCommand {
-    match cmd {
-        cli::TaskCommands::List {
-            workspace,
-            list_id,
-            limit,
-            offset,
-        } => TaskCommand::List {
-            workspace,
-            list_id,
-            limit,
-            offset,
-        },
-        cli::TaskCommands::Create {
-            workspace,
-            list_id,
-            title,
-            description,
-            status,
-            priority,
-            assignee_id,
-            node_id,
-        } => TaskCommand::Create {
-            workspace,
-            list_id,
-            title,
-            description,
-            status,
-            priority,
-            assignee_id,
-            node_id,
-        },
-        cli::TaskCommands::Info { list_id, task_id } => TaskCommand::Info { list_id, task_id },
-        cli::TaskCommands::Update {
-            list_id,
-            task_id,
-            title,
-            description,
-            status,
-            priority,
-            assignee_id,
-            node_id,
-        } => TaskCommand::Update {
-            list_id,
-            task_id,
-            title,
-            description,
-            status,
-            priority,
-            assignee_id,
-            node_id,
-        },
-        cli::TaskCommands::Delete { list_id, task_id } => TaskCommand::Delete { list_id, task_id },
-        cli::TaskCommands::Assign {
-            list_id,
-            task_id,
-            assignee_id,
-        } => TaskCommand::Assign {
-            list_id,
-            task_id,
-            assignee_id,
-        },
-        cli::TaskCommands::Complete { list_id, task_id } => {
-            TaskCommand::Complete { list_id, task_id }
-        }
-        cli::TaskCommands::Move {
-            list_id,
-            task_id,
-            target_list_id,
-            sort_order,
-        } => TaskCommand::Move {
-            list_id,
-            task_id,
-            target_list_id,
-            sort_order,
-        },
-        cli::TaskCommands::BulkStatus {
-            list_id,
-            task_ids,
-            status,
-        } => TaskCommand::BulkStatus {
-            list_id,
-            task_ids,
-            status,
-        },
-        cli::TaskCommands::Reorder { list_id, task_ids } => {
-            TaskCommand::Reorder { list_id, task_ids }
-        }
-        cli::TaskCommands::ReorderLists {
-            profile_type,
-            profile_id,
-            list_ids,
-        } => TaskCommand::ReorderLists {
-            profile_type,
-            profile_id,
-            list_ids,
-        },
-        cli::TaskCommands::Filter {
-            profile_type,
-            profile_id,
-            filter,
-            status,
-            limit,
-            offset,
-        } => TaskCommand::Filter {
-            profile_type,
-            profile_id,
-            filter,
-            status,
-            limit,
-            offset,
-        },
-        cli::TaskCommands::Summary {
-            profile_type,
-            profile_id,
-        } => TaskCommand::Summary {
-            profile_type,
-            profile_id,
-        },
-        cli::TaskCommands::Attachments { list_id, task_id } => {
-            TaskCommand::Attachments { list_id, task_id }
-        }
-        cli::TaskCommands::Attach {
-            list_id,
-            task_id,
-            target_ids,
-        } => TaskCommand::Attach {
-            list_id,
-            task_id,
-            target_ids,
-        },
-        cli::TaskCommands::Detach {
-            list_id,
-            task_id,
-            target_id,
-        } => TaskCommand::Detach {
-            list_id,
-            task_id,
-            target_id,
-        },
-        cli::TaskCommands::Comment(comment_cmd) => {
-            TaskCommand::Comment(map_task_comment_command(comment_cmd))
-        }
-        cli::TaskCommands::Lists(lists_cmd) => TaskCommand::Lists(map_task_list_command(lists_cmd)),
-    }
-}
-
-/// Convert clap-parsed task comment commands to the internal enum.
-fn map_task_comment_command(cmd: cli::TaskCommentCommands) -> TaskCommentCommand {
-    match cmd {
-        cli::TaskCommentCommands::List {
-            list_id,
-            task_id,
-            limit,
-            offset,
-        } => TaskCommentCommand::List {
-            list_id,
-            task_id,
-            limit,
-            offset,
-        },
-        cli::TaskCommentCommands::Post {
-            list_id,
-            task_id,
-            text,
-            parent_id,
-            reference,
-            properties,
-        } => TaskCommentCommand::Post {
-            list_id,
-            task_id,
-            text,
-            parent_id,
-            reference,
-            properties,
-        },
-        cli::TaskCommentCommands::Edit { comment_id, text } => {
-            TaskCommentCommand::Edit { comment_id, text }
-        }
-        cli::TaskCommentCommands::Delete { comment_id } => {
-            TaskCommentCommand::Delete { comment_id }
-        }
-        cli::TaskCommentCommands::React { comment_id, emoji } => {
-            TaskCommentCommand::React { comment_id, emoji }
-        }
-        cli::TaskCommentCommands::Unreact { comment_id } => {
-            TaskCommentCommand::Unreact { comment_id }
-        }
-    }
-}
-
-/// Convert clap-parsed task list commands to the internal enum.
-fn map_task_list_command(cmd: cli::TaskListCommands) -> TaskListCommand {
-    match cmd {
-        cli::TaskListCommands::List {
-            workspace,
-            share,
-            limit,
-            offset,
-        } => {
-            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
-            TaskListCommand::List {
-                profile_type,
-                profile_id,
-                limit,
-                offset,
-            }
-        }
-        cli::TaskListCommands::Create {
-            profile_type,
-            profile_id,
-            name,
-            description,
-        } => TaskListCommand::Create {
-            profile_type,
-            profile_id,
-            name,
-            description,
-        },
-        cli::TaskListCommands::Update {
-            list_id,
-            name,
-            description,
-        } => TaskListCommand::Update {
-            list_id,
-            name,
-            description,
-        },
-        cli::TaskListCommands::Delete { list_id } => TaskListCommand::Delete { list_id },
     }
 }
 
