@@ -1169,6 +1169,9 @@ mod tests {
         assert!(!esign_enabled_from(Some("true")));
         assert!(!esign_enabled_from(Some("0")));
         assert!(!esign_enabled_from(Some("")));
+        assert!(!esign_enabled_from(Some("1 ")));
+        assert!(!esign_enabled_from(Some(" 1")));
+        assert!(!esign_enabled_from(Some("01")));
         assert!(!esign_enabled_from(None));
     }
 

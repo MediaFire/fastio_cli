@@ -1559,7 +1559,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             (
                 "card_key",
-                "Card key from the feed (dismiss / undismiss), e.g. obligation:123…",
+                "Card key from the feed (dismiss / undismiss), e.g. mention:123…",
                 false,
             ),
             (

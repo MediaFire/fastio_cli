@@ -70,8 +70,8 @@ pub async fn get_dashboard(
 
 /// Build the `/cards/{card_key}/dismiss/` action path for a dashboard card.
 ///
-/// The `card_key` contains a `:` separator (e.g. `obligation:123…`) and MUST be
-/// URL-encoded (`obligation%3A123…`) per dashboard.txt:192. Both ids are
+/// The `card_key` contains a `:` separator (e.g. `mention:123…`) and MUST be
+/// URL-encoded (`mention%3A123…`) per dashboard.txt:192. Both ids are
 /// URL-encoded.
 fn card_dismiss_path(workspace_id: &str, card_key: &str) -> String {
     format!(
@@ -135,10 +135,10 @@ mod tests {
 
     #[test]
     fn dismiss_path_urlencodes_card_key_colon() {
-        let path = card_dismiss_path("1234567890123456789", "obligation:9876543210987654321");
+        let path = card_dismiss_path("1234567890123456789", "mention:9876543210987654321");
         assert_eq!(
             path,
-            "/workspace/1234567890123456789/dashboard/cards/obligation%3A9876543210987654321/dismiss/"
+            "/workspace/1234567890123456789/dashboard/cards/mention%3A9876543210987654321/dismiss/"
         );
     }
 
@@ -154,7 +154,7 @@ mod tests {
     fn validate_card_key_rejects_blank() {
         assert!(validate_card_key("").is_err());
         assert!(validate_card_key("   ").is_err());
-        assert!(validate_card_key("obligation:1").is_ok());
+        assert!(validate_card_key("mention:1").is_ok());
     }
 
     #[test]

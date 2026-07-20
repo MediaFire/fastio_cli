@@ -4096,7 +4096,7 @@ pub enum DashboardCommands {
     /// — it never advances, resolves, or changes the underlying card subject.
     /// Pass `--snooze-until` to snooze instead of permanently dismissing.
     Dismiss {
-        /// Card key from the feed (e.g. `obligation:123…`). URL-encoding is
+        /// Card key from the feed (e.g. `mention:123…`). URL-encoding is
         /// handled for you.
         card_key: String,
         /// Workspace ID (19-digit).
