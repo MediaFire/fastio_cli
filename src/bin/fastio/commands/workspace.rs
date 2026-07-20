@@ -1,7 +1,7 @@
 /// Workspace command implementations for `fastio workspace *`.
 ///
 /// Handles workspace listing, creation, details, update, deletion,
-/// workflow management, search, and limits.
+/// search, and limits.
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
@@ -61,8 +61,6 @@ pub enum WorkspaceCommand {
         nl_summaries_enabled: Option<bool>,
         /// AI enrichment daily cap (0-100000).
         nl_summaries_daily_cap: Option<u32>,
-        /// Native workflow-review rollout tier (disabled, mvs, extended).
-        workflow_approval_native_enabled: Option<String>,
         /// Brand accent color (JSON-encoded string).
         accent_color: Option<String>,
         /// Primary background color (JSON-encoded string).
@@ -78,16 +76,6 @@ pub enum WorkspaceCommand {
         workspace_id: String,
         /// Confirmation string.
         confirm: String,
-    },
-    /// Enable workflow features.
-    EnableWorkflow {
-        /// Workspace ID.
-        workspace_id: String,
-    },
-    /// Disable workflow features.
-    DisableWorkflow {
-        /// Workspace ID.
-        workspace_id: String,
     },
     /// List active background jobs (poll after async metadata extract).
     JobsStatus {
@@ -148,7 +136,6 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
             perm_member_manage,
             nl_summaries_enabled,
             nl_summaries_daily_cap,
-            workflow_approval_native_enabled,
             accent_color,
             background_color1,
             background_color2,
@@ -166,7 +153,6 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
                     perm_member_manage: perm_member_manage.as_deref(),
                     nl_summaries_enabled: *nl_summaries_enabled,
                     nl_summaries_daily_cap: *nl_summaries_daily_cap,
-                    workflow_approval_native_enabled: workflow_approval_native_enabled.as_deref(),
                     accent_color: accent_color.as_deref(),
                     background_color1: background_color1.as_deref(),
                     background_color2: background_color2.as_deref(),
@@ -179,12 +165,6 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
             workspace_id,
             confirm,
         } => delete(ctx, workspace_id, confirm).await,
-        WorkspaceCommand::EnableWorkflow { workspace_id } => {
-            enable_workflow(ctx, workspace_id).await
-        }
-        WorkspaceCommand::DisableWorkflow { workspace_id } => {
-            disable_workflow(ctx, workspace_id).await
-        }
         WorkspaceCommand::JobsStatus { workspace_id } => jobs_status(ctx, workspace_id).await,
         WorkspaceCommand::Search {
             workspace_id,
@@ -270,8 +250,6 @@ struct WorkspaceUpdate<'a> {
     nl_summaries_enabled: Option<bool>,
     /// AI enrichment daily cap (0-100000).
     nl_summaries_daily_cap: Option<u32>,
-    /// Native workflow-review rollout tier (disabled, mvs, extended).
-    workflow_approval_native_enabled: Option<&'a str>,
     /// Brand accent color (JSON-encoded string).
     accent_color: Option<&'a str>,
     /// Primary background color (JSON-encoded string).
@@ -293,7 +271,6 @@ impl WorkspaceUpdate<'_> {
             && self.perm_member_manage.is_none()
             && self.nl_summaries_enabled.is_none()
             && self.nl_summaries_daily_cap.is_none()
-            && self.workflow_approval_native_enabled.is_none()
             && self.accent_color.is_none()
             && self.background_color1.is_none()
             && self.background_color2.is_none()
@@ -332,9 +309,6 @@ fn build_workspace_update_fields(u: &WorkspaceUpdate<'_>) -> HashMap<String, Str
     }
     if let Some(v) = u.nl_summaries_daily_cap {
         fields.insert("nl_summaries_daily_cap".to_owned(), v.to_string());
-    }
-    if let Some(v) = u.workflow_approval_native_enabled {
-        fields.insert("workflow_approval_native_enabled".to_owned(), v.to_owned());
     }
     if let Some(v) = u.accent_color {
         fields.insert("accent_color".to_owned(), v.to_owned());
@@ -383,26 +357,6 @@ async fn delete(ctx: &CommandContext<'_>, workspace_id: &str, confirm: &str) -> 
         "status": "deleted",
         "workspace_id": workspace_id,
     });
-    ctx.output.render(&value)?;
-    Ok(())
-}
-
-/// Enable workflow features.
-async fn enable_workflow(ctx: &CommandContext<'_>, workspace_id: &str) -> Result<()> {
-    let client = ctx.build_client()?;
-    let value = api::workspace::enable_workflow(&client, workspace_id)
-        .await
-        .context("failed to enable workflow features")?;
-    ctx.output.render(&value)?;
-    Ok(())
-}
-
-/// Disable workflow features.
-async fn disable_workflow(ctx: &CommandContext<'_>, workspace_id: &str) -> Result<()> {
-    let client = ctx.build_client()?;
-    let value = api::workspace::disable_workflow(&client, workspace_id)
-        .await
-        .context("failed to disable workflow features")?;
     ctx.output.render(&value)?;
     Ok(())
 }
@@ -497,7 +451,6 @@ mod tests {
             perm_member_manage: Some("Admin or above"),
             nl_summaries_enabled: Some(false),
             nl_summaries_daily_cap: Some(250),
-            workflow_approval_native_enabled: Some("mvs"),
             accent_color: Some(r#"{"r":1}"#),
             background_color1: Some(r#"{"g":2}"#),
             background_color2: Some(r#"{"b":3}"#),
@@ -521,12 +474,6 @@ mod tests {
         assert_eq!(
             fields.get("nl_summaries_daily_cap").map(String::as_str),
             Some("250")
-        );
-        assert_eq!(
-            fields
-                .get("workflow_approval_native_enabled")
-                .map(String::as_str),
-            Some("mvs")
         );
         assert_eq!(
             fields.get("accent_color").map(String::as_str),

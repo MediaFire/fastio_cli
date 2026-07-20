@@ -509,22 +509,6 @@ pub async fn check_share_name(client: &ApiClient, name: &str) -> Result<Value, C
     client.get(&path).await
 }
 
-/// Enable workflow on a share.
-///
-/// `POST /share/{share_id}/workflow/enable/`
-pub async fn enable_share_workflow(client: &ApiClient, share_id: &str) -> Result<Value, CliError> {
-    let path = format!("/share/{}/workflow/enable/", urlencoding::encode(share_id));
-    client.post_json(&path, &serde_json::json!({})).await
-}
-
-/// Disable workflow on a share.
-///
-/// `POST /share/{share_id}/workflow/disable/`
-pub async fn disable_share_workflow(client: &ApiClient, share_id: &str) -> Result<Value, CliError> {
-    let path = format!("/share/{}/workflow/disable/", urlencoding::encode(share_id));
-    client.post_json(&path, &serde_json::json!({})).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::{

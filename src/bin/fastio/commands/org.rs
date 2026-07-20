@@ -152,8 +152,6 @@ pub enum OrgCommand {
         perm_member_manage: String,
         /// Enable AI intelligence (indexing).
         intelligence: bool,
-        /// Enable workflow features.
-        workflow: bool,
     },
 }
 
@@ -548,7 +546,6 @@ pub async fn execute(command: &OrgCommand, ctx: &CommandContext<'_>) -> Result<(
             perm_join,
             perm_member_manage,
             intelligence,
-            workflow,
         } => {
             create_workspace(
                 ctx,
@@ -559,7 +556,6 @@ pub async fn execute(command: &OrgCommand, ctx: &CommandContext<'_>) -> Result<(
                 perm_join,
                 perm_member_manage,
                 *intelligence,
-                *workflow,
             )
             .await
         }
@@ -1477,7 +1473,6 @@ async fn create_workspace(
     perm_join: &str,
     perm_member_manage: &str,
     intelligence: bool,
-    workflow: bool,
 ) -> Result<()> {
     validate_org_id(org_id)?;
     let client = ctx.build_client()?;
@@ -1489,7 +1484,6 @@ async fn create_workspace(
         perm_member_manage,
         intelligence,
         description,
-        workflow: workflow.then_some(true),
         accent_color: None,
         background_color1: None,
         background_color2: None,

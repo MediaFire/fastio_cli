@@ -625,7 +625,6 @@ fn map_org_command(cmd: cli::OrgCommands) -> OrgCommand {
             perm_join,
             perm_member_manage,
             intelligence,
-            workflow,
         } => OrgCommand::CreateWorkspace {
             org_id,
             name,
@@ -634,7 +633,6 @@ fn map_org_command(cmd: cli::OrgCommands) -> OrgCommand {
             perm_join,
             perm_member_manage,
             intelligence,
-            workflow,
         },
     }
 }
@@ -820,7 +818,6 @@ fn map_workspace_command(cmd: cli::WorkspaceCommands) -> WorkspaceCommand {
             perm_member_manage,
             nl_summaries_enabled,
             nl_summaries_daily_cap,
-            workflow_approval_native_enabled,
             accent_color,
             background_color1,
             background_color2,
@@ -835,7 +832,6 @@ fn map_workspace_command(cmd: cli::WorkspaceCommands) -> WorkspaceCommand {
             perm_member_manage,
             nl_summaries_enabled,
             nl_summaries_daily_cap,
-            workflow_approval_native_enabled,
             accent_color,
             background_color1,
             background_color2,
@@ -848,12 +844,6 @@ fn map_workspace_command(cmd: cli::WorkspaceCommands) -> WorkspaceCommand {
             workspace_id,
             confirm,
         },
-        cli::WorkspaceCommands::EnableWorkflow { workspace_id } => {
-            WorkspaceCommand::EnableWorkflow { workspace_id }
-        }
-        cli::WorkspaceCommands::DisableWorkflow { workspace_id } => {
-            WorkspaceCommand::DisableWorkflow { workspace_id }
-        }
         cli::WorkspaceCommands::JobsStatus { workspace_id } => {
             WorkspaceCommand::JobsStatus { workspace_id }
         }
@@ -1498,12 +1488,6 @@ fn map_share_command(cmd: cli::ShareCommands) -> ShareCommand {
         cli::ShareCommands::PublicInfo { share_id } => ShareCommand::PublicInfo { share_id },
         cli::ShareCommands::Available => ShareCommand::Available,
         cli::ShareCommands::CheckName { name } => ShareCommand::CheckName { name },
-        cli::ShareCommands::WorkflowEnable { share_id } => {
-            ShareCommand::WorkflowEnable { share_id }
-        }
-        cli::ShareCommands::WorkflowDisable { share_id } => {
-            ShareCommand::WorkflowDisable { share_id }
-        }
         cli::ShareCommands::Files(f) => ShareCommand::Files(map_share_files_command(f)),
         cli::ShareCommands::Members(m) => ShareCommand::Members(map_share_members_command(m)),
         cli::ShareCommands::Invitation(i) => {
@@ -1710,27 +1694,6 @@ fn map_comment_command(cmd: cli::CommentCommands) -> CommentCommand {
         cli::CommentCommands::BulkDelete { comment_ids } => {
             CommentCommand::BulkDelete { comment_ids }
         }
-        cli::CommentCommands::Link {
-            comment_id,
-            entity_type,
-            entity_id,
-        } => CommentCommand::Link {
-            comment_id,
-            entity_type,
-            entity_id,
-        },
-        cli::CommentCommands::Unlink { comment_id } => CommentCommand::Unlink { comment_id },
-        cli::CommentCommands::Linked {
-            entity_type,
-            entity_id,
-            limit,
-            offset,
-        } => CommentCommand::Linked {
-            entity_type,
-            entity_id,
-            limit,
-            offset,
-        },
         cli::CommentCommands::Attachments { comment_id } => {
             CommentCommand::Attachments { comment_id }
         }
@@ -2402,8 +2365,6 @@ fn map_search_command(cmd: cli::SearchCommands) -> SearchCommand {
             metadata_offset,
             comments_limit,
             comments_offset,
-            workflows_limit,
-            workflows_offset,
             only,
         } => SearchCommand::Workspace {
             workspace_id,
@@ -2411,8 +2372,7 @@ fn map_search_command(cmd: cli::SearchCommands) -> SearchCommand {
             params: UnifiedSearchParams::new()
                 .files(files_offset, files_limit)
                 .metadata(metadata_offset, metadata_limit)
-                .comments(comments_offset, comments_limit)
-                .workflows(workflows_offset, workflows_limit),
+                .comments(comments_offset, comments_limit),
             only,
         },
         cli::SearchCommands::Share {

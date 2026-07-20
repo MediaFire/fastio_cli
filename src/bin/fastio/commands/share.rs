@@ -196,16 +196,6 @@ pub enum ShareCommand {
         /// Share name to check.
         name: String,
     },
-    /// Enable workflow on a share.
-    WorkflowEnable {
-        /// Share ID.
-        share_id: String,
-    },
-    /// Disable workflow on a share.
-    WorkflowDisable {
-        /// Share ID.
-        share_id: String,
-    },
     /// Share file operations.
     Files(ShareFilesCommand),
     /// Share member operations.
@@ -442,14 +432,6 @@ pub async fn execute(command: &ShareCommand, ctx: &CommandContext<'_>) -> Result
         }
         ShareCommand::Available => available(ctx).await,
         ShareCommand::CheckName { name } => check_name(ctx, name).await,
-        ShareCommand::WorkflowEnable { share_id } => {
-            validate_share_id(share_id)?;
-            workflow_enable(ctx, share_id).await
-        }
-        ShareCommand::WorkflowDisable { share_id } => {
-            validate_share_id(share_id)?;
-            workflow_disable(ctx, share_id).await
-        }
         ShareCommand::Files(cmd) => files(cmd, ctx).await,
         ShareCommand::Members(cmd) => members(cmd, ctx).await,
         ShareCommand::Invitation(cmd) => invitations(cmd, ctx).await,
@@ -908,26 +890,6 @@ async fn check_name(ctx: &CommandContext<'_>, name: &str) -> Result<()> {
     let value = api::share::check_share_name(&client, name)
         .await
         .context("failed to check share name")?;
-    ctx.output.render(&value)?;
-    Ok(())
-}
-
-/// Enable workflow on a share.
-async fn workflow_enable(ctx: &CommandContext<'_>, share_id: &str) -> Result<()> {
-    let client = ctx.build_client()?;
-    let value = api::share::enable_share_workflow(&client, share_id)
-        .await
-        .context("failed to enable share workflow")?;
-    ctx.output.render(&value)?;
-    Ok(())
-}
-
-/// Disable workflow on a share.
-async fn workflow_disable(ctx: &CommandContext<'_>, share_id: &str) -> Result<()> {
-    let client = ctx.build_client()?;
-    let value = api::share::disable_share_workflow(&client, share_id)
-        .await
-        .context("failed to disable share workflow")?;
     ctx.output.render(&value)?;
     Ok(())
 }

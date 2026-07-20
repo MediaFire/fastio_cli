@@ -134,10 +134,9 @@ pub async fn add_comment(
 /// Edit an existing comment by ID.
 ///
 /// `POST /comments/{comment_id}/update/`
-/// Author-only. Works for every comment surface — workspace, share, node,
-/// File Share, and task comments (the entity-scoped create/update route cannot
-/// address a task comment). The edit cannot move the comment; entity, scope,
-/// threading, and any workflow link are immutable.
+/// Author-only. Works for every comment surface — workspace, share, node, and
+/// File Share. The edit cannot move the comment; entity, scope, and threading
+/// are immutable.
 pub async fn update_comment(
     client: &ApiClient,
     comment_id: &str,
@@ -229,66 +228,6 @@ pub async fn bulk_delete_comments(
     client.post_json("/comments/bulk/delete/", &body).await
 }
 
-/// Link a comment to a workflow entity.
-///
-/// `POST /comments/{comment_id}/link/`. The CLI offers the linked entity types
-/// `task` and `workflow_review` (the legacy `approval` type is deprecated and no
-/// longer offered by the CLI, though the server still accepts it for
-/// back-compat); `entity_type` is forwarded verbatim.
-pub async fn link_comment(
-    client: &ApiClient,
-    comment_id: &str,
-    entity_type: &str,
-    entity_id: &str,
-) -> Result<Value, CliError> {
-    let body = serde_json::json!({
-        "entity_type": entity_type,
-        "entity_id": entity_id,
-    });
-    let path = format!("/comments/{}/link/", urlencoding::encode(comment_id));
-    client.post_json(&path, &body).await
-}
-
-/// Unlink a comment from its workflow entity.
-///
-/// `POST /comments/{comment_id}/unlink/`
-pub async fn unlink_comment(client: &ApiClient, comment_id: &str) -> Result<Value, CliError> {
-    let path = format!("/comments/{}/unlink/", urlencoding::encode(comment_id));
-    client.post_json(&path, &serde_json::json!({})).await
-}
-
-/// Find comments linked to a workflow entity.
-///
-/// `GET /comments/linked/{entity_type}/{entity_id}/` (optional `limit`/`offset`).
-/// The CLI offers the linked entity types `task` and `workflow_review` (the
-/// legacy `approval` type is deprecated and no longer offered by the CLI, though
-/// the server still accepts it for back-compat).
-pub async fn linked_comments(
-    client: &ApiClient,
-    entity_type: &str,
-    entity_id: &str,
-    limit: Option<u32>,
-    offset: Option<u32>,
-) -> Result<Value, CliError> {
-    let mut params = HashMap::new();
-    if let Some(l) = limit {
-        params.insert("limit".to_owned(), l.to_string());
-    }
-    if let Some(o) = offset {
-        params.insert("offset".to_owned(), o.to_string());
-    }
-    let path = format!(
-        "/comments/linked/{}/{}/",
-        urlencoding::encode(entity_type),
-        urlencoding::encode(entity_id),
-    );
-    if params.is_empty() {
-        client.get(&path).await
-    } else {
-        client.get_with_params(&path, &params).await
-    }
-}
-
 // ─── Comment Attachments ──────────────────────────────────────────────────────
 
 /// Selector for which object(s) to attach to a comment.
@@ -329,8 +268,8 @@ pub async fn list_comment_attachments(
 ///
 /// `POST /comments/{comment_id}/attachments/`. Idempotent (already-attached
 /// objects are skipped) and atomic (a partial-batch failure attaches nothing);
-/// author-only and rejected on workflow-review comments — the server enforces
-/// both. Returns the full updated hydrated attachment list.
+/// author-only — the server enforces it. Returns the full updated hydrated
+/// attachment list.
 pub async fn attach_comment(
     client: &ApiClient,
     comment_id: &str,

@@ -194,11 +194,6 @@ const PREVIEW_TYPES: &[&str] = &[
     "mp4",
 ];
 
-/// Valid `linked_entity_type` values for `comment` link/linked actions. The
-/// CLI restricts this via a clap `value_parser`; MCP enforces the same set so
-/// the old, now-invalid `approval` value never reaches the server.
-const LINKED_ENTITY_TYPES: &[&str] = &["task", "workflow_review"];
-
 /// Valid `sort` values for the `comment` list / list-all actions. The CLI
 /// restricts this via a clap `value_parser = ["asc", "desc"]`; MCP enforces the
 /// same set so a bad sort gets a clear error instead of reaching the server.
@@ -678,11 +673,6 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "Enable AI intelligence on the new workspace (create-workspace; default false) — boolean (true/false)",
                 false,
             ),
-            (
-                "workflow",
-                "Enable workflow features on the new workspace (create-workspace) — boolean (true/false)",
-                false,
-            ),
             ("accent_color", "Accent color (create-workspace)", false),
             (
                 "background_color1",
@@ -699,15 +689,13 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "workspace",
-        description: "Workspaces: list, create, view, update, delete, archive/unarchive, members, shares, notes, metadata, import/export, workflow. SIDE EFFECTS — these metadata actions SPEND AI CREDITS: 'metadata-template-preview-match', 'metadata-template-suggest-fields', 'metadata-extract', 'metadata-extract-and-wait'. 'metadata-extract-and-wait' enqueues a single-file extraction and polls workspace jobs-status to a terminal state before returning.",
+        description: "Workspaces: list, create, view, update, delete, archive/unarchive, members, shares, notes, metadata, import/export. SIDE EFFECTS — these metadata actions SPEND AI CREDITS: 'metadata-template-preview-match', 'metadata-template-suggest-fields', 'metadata-extract', 'metadata-extract-and-wait'. 'metadata-extract-and-wait' enqueues a single-file extraction and polls workspace jobs-status to a terminal state before returning.",
         actions: &[
             "list",
             "create",
             "info",
             "update",
             "delete",
-            "enable-workflow",
-            "disable-workflow",
             "jobs-status",
             "search",
             "limits",
@@ -768,11 +756,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             (
                 "nl_summaries_daily_cap",
                 "AI enrichment daily cap, 0-100000 (update)",
-                false,
-            ),
-            (
-                "workflow_approval_native_enabled",
-                "Native workflow-review tier: disabled/mvs/extended (update)",
                 false,
             ),
             (
@@ -1127,7 +1110,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "share",
-        description: "Shares (data rooms): list, create, view, update, delete, archive/unarchive, password-auth, guest-auth, workflow, discovery.",
+        description: "Shares (data rooms): list, create, view, update, delete, archive/unarchive, password-auth, guest-auth, discovery.",
         actions: &[
             "list",
             "create",
@@ -1144,8 +1127,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             "guest-auth",
             "available",
             "check-name",
-            "enable-workflow",
-            "disable-workflow",
         ],
         params: &[
             ("share_id", "Share ID", false),
@@ -1450,7 +1431,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "comment",
-        description: "Comments: list, list-all, create, reply, update, delete, bulk-delete, details, reaction-add, reaction-remove, link, unlink, linked, list-attachments, attach, detach. create accepts an optional anchoring reference + properties metadata and inline attachment(s) (target_id / target_ids, ≤25). attach/detach/list-attachments are author-only and rejected on workflow-review comments (the server enforces). This generic tool also edits/deletes/reacts to TASK comments by comment_id (use the `task` tool to post/list them).",
+        description: "Comments: list, list-all, create, reply, update, delete, bulk-delete, details, reaction-add, reaction-remove, list-attachments, attach, detach. create accepts an optional anchoring reference + properties metadata and inline attachment(s) (target_id / target_ids, ≤25). attach/detach/list-attachments are author-only (the server enforces).",
         actions: &[
             "list",
             "list-all",
@@ -1462,9 +1443,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             "details",
             "reaction-add",
             "reaction-remove",
-            "link",
-            "unlink",
-            "linked",
             "list-attachments",
             "attach",
             "detach",
@@ -1481,12 +1459,6 @@ const TOOL_DEFS: &[ToolDef] = &[
                 false,
             ),
             ("emoji", "Emoji character (reaction-add)", false),
-            (
-                "linked_entity_type",
-                "Linked entity type: task or workflow_review",
-                false,
-            ),
-            ("linked_entity_id", "Linked entity ID", false),
             (
                 "reference",
                 "Anchoring reference as a JSON object (create)",
@@ -4048,10 +4020,6 @@ async fn handle_org_create_workspace(
         Ok(v) => v.unwrap_or(false),
         Err(e) => return Ok(e),
     };
-    let workflow = match optional_bool_strict(args, "workflow") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
     let params = api::org::CreateWorkspaceParams {
         folder_name,
         name,
@@ -4059,7 +4027,6 @@ async fn handle_org_create_workspace(
         perm_member_manage,
         intelligence,
         description: optional_str(args, "description"),
-        workflow,
         accent_color: optional_str(args, "accent_color"),
         background_color1: optional_str(args, "background_color1"),
         background_color2: optional_str(args, "background_color2"),
@@ -4111,9 +4078,7 @@ fn build_workspace_update_fields(
     if let Some(v) = optional_u32(args, "nl_summaries_daily_cap") {
         fields.insert("nl_summaries_daily_cap".to_owned(), v.to_string());
     }
-    if let Some(v) = optional_str(args, "workflow_approval_native_enabled") {
-        fields.insert("workflow_approval_native_enabled".to_owned(), v.to_owned());
-    }
+
     if let Some(v) = optional_str(args, "accent_color") {
         fields.insert("accent_color".to_owned(), v.to_owned());
     }
@@ -4209,16 +4174,6 @@ async fn handle_workspace(
                 Err(e) => return Ok(e),
             };
             match api::workspace::delete_workspace(&client, ws_id, confirm).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "enable-workflow" => {
-            let ws_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workspace::enable_workflow(&client, ws_id).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -4398,16 +4353,6 @@ async fn handle_workspace(
             )
             .await
             {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "disable-workflow" => {
-            let ws_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workspace::disable_workflow(&client, ws_id).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -6187,8 +6132,6 @@ async fn handle_share(
         "guest-auth" => handle_share_guest_auth(state, args).await,
         "available" => handle_share_available(state, args).await,
         "check-name" => handle_share_check_name(state, args).await,
-        "enable-workflow" => handle_share_enable_workflow(state, args).await,
-        "disable-workflow" => handle_share_disable_workflow(state, args).await,
         _ => Ok(error_text(&format!("Unknown share action: {action}"))),
     }
 }
@@ -6548,36 +6491,6 @@ async fn handle_share_check_name(
         Err(e) => return Ok(e),
     };
     match api::share::check_share_name(&client, name).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_share_enable_workflow(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let share_id = match required_str(args, "share_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::share::enable_share_workflow(&client, share_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_share_disable_workflow(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let share_id = match required_str(args, "share_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::share::disable_share_workflow(&client, share_id).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -7682,9 +7595,6 @@ async fn handle_comment(
         "bulk-delete" => handle_comment_bulk_delete(state, args).await,
         "reaction-add" => handle_comment_reaction_add(state, args).await,
         "reaction-remove" => handle_comment_reaction_remove(state, args).await,
-        "link" => handle_comment_link(state, args).await,
-        "unlink" => handle_comment_unlink(state, args).await,
-        "linked" => handle_comment_linked(state, args).await,
         "list-attachments" => handle_comment_list_attachments(state, args).await,
         "attach" => handle_comment_attach(state, args).await,
         "detach" => handle_comment_detach(state, args).await,
@@ -7991,81 +7901,6 @@ async fn handle_comment_reaction_remove(
     }
 }
 
-async fn handle_comment_link(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let comment_id = match required_str(args, "comment_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let etype = match required_str(args, "linked_entity_type") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    if !LINKED_ENTITY_TYPES.contains(&etype) {
-        return Ok(error_text(&format!(
-            "Invalid linked_entity_type '{etype}' (one of: task, workflow_review)"
-        )));
-    }
-    let eid = match required_str(args, "linked_entity_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::comment::link_comment(&client, comment_id, etype, eid).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_comment_unlink(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let comment_id = match required_str(args, "comment_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::comment::unlink_comment(&client, comment_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_comment_linked(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let etype = match required_str(args, "linked_entity_type") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    if !LINKED_ENTITY_TYPES.contains(&etype) {
-        return Ok(error_text(&format!(
-            "Invalid linked_entity_type '{etype}' (one of: task, workflow_review)"
-        )));
-    }
-    let eid = match required_str(args, "linked_entity_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::comment::linked_comments(
-        &client,
-        etype,
-        eid,
-        optional_u32(args, "limit"),
-        optional_u32(args, "offset"),
-    )
-    .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
 /// `comment` list-attachments action: list a comment's attachments (hydrated,
 /// access-gated).
 async fn handle_comment_list_attachments(
@@ -8085,8 +7920,7 @@ async fn handle_comment_list_attachments(
 
 /// `comment` attach action: attach one object (`target_id`) or many
 /// (`target_ids`, ≤25) to a comment. The two are mutually exclusive; exactly one
-/// must be supplied. Author-only and rejected on workflow-review comments — the
-/// server enforces both.
+/// must be supplied. Author-only — the server enforces it.
 async fn handle_comment_attach(
     state: &McpState,
     args: &Map<String, Value>,
@@ -8777,8 +8611,7 @@ fn json_object_arg(args: &Map<String, Value>, key: &str) -> Result<Option<Value>
 }
 
 /// Shared poll-tick error classification for the KEPT MCP wait loops
-/// (Ripley `ask` polling and metadata `extract` polling); also used by the
-/// workflow wait/export loops.
+/// (Ripley `ask` polling and metadata `extract` polling).
 ///
 /// How an MCP poll loop should react to an error from one poll tick.
 ///
@@ -8822,7 +8655,7 @@ fn classify_wf_poll_error(err: &fastio_cli::error::CliError) -> WfPollAction {
 }
 
 /// Read an optional JSON-array argument for a REST field the API expects as a
-/// JSON-array STRING (e.g. workflow `ops`, `apply_change_ids`). MCP clients
+/// JSON-array STRING (e.g. comment `target_ids`, `comment_ids`). MCP clients
 /// commonly pass these as a native JSON array; accept that OR a serialized
 /// JSON-array string and return the serialized form. A missing/null key is
 /// `None`; anything that is not (or does not parse to) a **non-empty** JSON array

@@ -299,7 +299,7 @@ pub enum Commands {
 /// Unified-search subcommands.
 ///
 /// One query, results **grouped by type** into buckets (files, metadata,
-/// comments, workflows for a workspace; files + comments for a share). Each
+/// comments for a workspace; files + comments for a share). Each
 /// bucket paginates independently via its own `--<bucket>-limit/offset`.
 /// `--only` filters which buckets are *displayed* client-side — the server
 /// always searches every applicable bucket (there is no server `only`
@@ -307,7 +307,7 @@ pub enum Commands {
 #[derive(Subcommand, Debug)]
 #[non_exhaustive]
 pub enum SearchCommands {
-    /// Search everything in a workspace (files + metadata + comments + workflows).
+    /// Search everything in a workspace (files + metadata + comments).
     Workspace {
         /// Workspace ID.
         workspace_id: String,
@@ -331,12 +331,6 @@ pub enum SearchCommands {
         /// Offset for the comments bucket.
         #[arg(long)]
         comments_offset: Option<u32>,
-        /// Page size for the workflows bucket.
-        #[arg(long)]
-        workflows_limit: Option<u32>,
-        /// Offset for the workflows bucket.
-        #[arg(long)]
-        workflows_offset: Option<u32>,
         /// Comma-separated buckets to DISPLAY (e.g. `files,comments`).
         /// Client-side filter only; the server still searches every bucket.
         #[arg(long)]
@@ -1858,9 +1852,6 @@ pub enum OrgCommands {
         /// Enable AI intelligence (indexing) on the new workspace.
         #[arg(long)]
         intelligence: bool,
-        /// Enable workflow features on the new workspace.
-        #[arg(long)]
-        workflow: bool,
     },
 }
 
@@ -2008,7 +1999,6 @@ impl fmt::Debug for OrgCommands {
                 perm_join,
                 perm_member_manage,
                 intelligence,
-                workflow,
             } => f
                 .debug_struct("CreateWorkspace")
                 .field("org_id", org_id)
@@ -2018,7 +2008,6 @@ impl fmt::Debug for OrgCommands {
                 .field("perm_join", perm_join)
                 .field("perm_member_manage", perm_member_manage)
                 .field("intelligence", intelligence)
-                .field("workflow", workflow)
                 .finish(),
         }
     }
@@ -2350,9 +2339,6 @@ pub enum WorkspaceCommands {
         /// AI enrichment daily cap (0-100000).
         #[arg(long, value_parser = clap::value_parser!(u32).range(0..=100_000))]
         nl_summaries_daily_cap: Option<u32>,
-        /// Native workflow-review rollout tier (`null`/empty clears to disabled).
-        #[arg(long, value_parser = ["disabled", "mvs", "extended"])]
-        workflow_approval_native_enabled: Option<String>,
         /// Brand accent color as a JSON string (pass `null` to clear).
         #[arg(long)]
         accent_color: Option<String>,
@@ -2373,20 +2359,6 @@ pub enum WorkspaceCommands {
         /// Confirmation string (must match workspace folder name or ID).
         #[arg(long)]
         confirm: String,
-    },
-    /// Enable the Tasks API on a workspace. Does not affect AI indexing — use
-    /// `workspace update --intelligence` for that.
-    #[command(name = "enable-workflow")]
-    EnableWorkflow {
-        /// Workspace ID.
-        workspace_id: String,
-    },
-    /// Disable the Tasks API on a workspace. Existing task lists and tasks are
-    /// preserved but inaccessible until re-enabled.
-    #[command(name = "disable-workflow")]
-    DisableWorkflow {
-        /// Workspace ID.
-        workspace_id: String,
     },
     /// List active background jobs (poll after async metadata extract).
     #[command(name = "jobs-status")]
@@ -3447,16 +3419,6 @@ pub enum ShareCommands {
         /// Share name to check.
         name: String,
     },
-    /// Enable workflow on a share.
-    WorkflowEnable {
-        /// Share ID.
-        share_id: String,
-    },
-    /// Disable workflow on a share.
-    WorkflowDisable {
-        /// Share ID.
-        share_id: String,
-    },
     /// Share file operations.
     #[command(subcommand)]
     Files(ShareFilesCommands),
@@ -3645,14 +3607,6 @@ impl fmt::Debug for ShareCommands {
                 .finish(),
             Self::Available => write!(f, "Available"),
             Self::CheckName { name } => f.debug_struct("CheckName").field("name", name).finish(),
-            Self::WorkflowEnable { share_id } => f
-                .debug_struct("WorkflowEnable")
-                .field("share_id", share_id)
-                .finish(),
-            Self::WorkflowDisable { share_id } => f
-                .debug_struct("WorkflowDisable")
-                .field("share_id", share_id)
-                .finish(),
             Self::Files(c) => f.debug_tuple("Files").field(c).finish(),
             Self::Members(c) => f.debug_tuple("Members").field(c).finish(),
             Self::Invitation(c) => f.debug_tuple("Invitation").field(c).finish(),
@@ -3940,44 +3894,13 @@ pub enum CommentCommands {
         #[arg(long, value_delimiter = ',', required = true)]
         comment_ids: Vec<String>,
     },
-    /// Link a comment to a workflow entity (task or `workflow_review`).
-    Link {
-        /// Comment ID.
-        comment_id: String,
-        /// Workflow entity type to link to.
-        #[arg(long, value_parser = ["task", "workflow_review"])]
-        entity_type: String,
-        /// Workflow entity ID (task or `workflow_review` ID).
-        #[arg(long)]
-        entity_id: String,
-    },
-    /// Remove a comment's link to its workflow entity.
-    Unlink {
-        /// Comment ID.
-        comment_id: String,
-    },
-    /// List comments linked to a workflow entity (task or `workflow_review`).
-    Linked {
-        /// Workflow entity type.
-        #[arg(long, value_parser = ["task", "workflow_review"])]
-        entity_type: String,
-        /// Workflow entity ID (task or `workflow_review` ID).
-        #[arg(long)]
-        entity_id: String,
-        /// Maximum number of results (1–200).
-        #[arg(long)]
-        limit: Option<u32>,
-        /// Offset for pagination.
-        #[arg(long)]
-        offset: Option<u32>,
-    },
     /// List the objects attached to a comment (hydrated, access-gated).
     Attachments {
         /// Comment ID.
         comment_id: String,
     },
     /// Attach one or more objects to a comment (atomic; idempotent; ≤25 total;
-    /// author-only; rejected on workflow-review comments).
+    /// author-only).
     Attach {
         /// Comment ID.
         comment_id: String,

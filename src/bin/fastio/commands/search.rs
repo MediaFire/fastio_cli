@@ -123,14 +123,14 @@ mod tests {
             "buckets": {
                 "files": {"items": [], "status": "ok"},
                 "comments": {"items": [], "status": "ok"},
-                "workflows": {"items": [], "status": "ok"}
+                "metadata": {"items": [], "status": "ok"}
             }
         });
         apply_only_filter(&mut value, Some("files, comments"));
         let buckets = value["buckets"].as_object().unwrap();
         assert!(buckets.contains_key("files"));
         assert!(buckets.contains_key("comments"));
-        assert!(!buckets.contains_key("workflows"));
+        assert!(!buckets.contains_key("metadata"));
     }
 
     #[test]

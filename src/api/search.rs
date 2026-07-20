@@ -4,10 +4,10 @@
 //!
 //! Maps to the `GET /workspace/{id}/search/` and `GET /share/{id}/search/`
 //! endpoints documented at `~/vividengine/llms/storage.txt:1774-1985`. Unlike
-//! the per-type endpoints (`storage/search`, `metadata/search`, comments,
-//! workflow), this composes a single query into a set of independently
+//! the per-type endpoints (`storage/search`, `metadata/search`, comments),
+//! this composes a single query into a set of independently
 //! paginated, independently health-reported **buckets** (`files`, `metadata`,
-//! `comments`, `workflows` — the share endpoint omits `metadata`).
+//! `comments` — the share endpoint omits `metadata`).
 //!
 //! Pagination is **per bucket** via the documented `<bucket>_offset` /
 //! `<bucket>_limit` pairs — there is no global `limit`/`offset`, and there is
@@ -49,10 +49,6 @@ pub struct UnifiedSearchParams {
     pub comments_offset: Option<u32>,
     /// Page size for the `comments` bucket.
     pub comments_limit: Option<u32>,
-    /// Offset for the `workflows` bucket.
-    pub workflows_offset: Option<u32>,
-    /// Page size for the `workflows` bucket.
-    pub workflows_limit: Option<u32>,
 }
 
 impl UnifiedSearchParams {
@@ -88,14 +84,6 @@ impl UnifiedSearchParams {
         self
     }
 
-    /// Set the `workflows` bucket pagination.
-    #[must_use]
-    pub fn workflows(mut self, offset: Option<u32>, limit: Option<u32>) -> Self {
-        self.workflows_offset = offset;
-        self.workflows_limit = limit;
-        self
-    }
-
     /// Build the query-parameter map, inserting `search` plus any supplied
     /// per-bucket offsets/limits. `include_metadata` is `false` for share
     /// searches so the workspace-only `metadata_*` params are never sent.
@@ -115,8 +103,6 @@ impl UnifiedSearchParams {
         }
         put("comments_offset", self.comments_offset);
         put("comments_limit", self.comments_limit);
-        put("workflows_offset", self.workflows_offset);
-        put("workflows_limit", self.workflows_limit);
         params
     }
 }
@@ -141,7 +127,7 @@ fn validate_query(query: &str) -> Result<(), CliError> {
 ///
 /// `GET /workspace/{workspace_id}/search/`
 ///
-/// Returns up to four buckets — `files`, `metadata`, `comments`, `workflows`
+/// Returns up to three buckets — `files`, `metadata`, `comments`
 /// — each with its own `items`, pagination, `total`/`total_relation`,
 /// `has_more`, and `status` (`ok` / `degraded`). See module docs.
 pub async fn unified_search_workspace(
@@ -194,7 +180,6 @@ mod tests {
         assert_eq!(q.get("comments_offset").map(String::as_str), Some("5"));
         // Unset params are absent (server applies defaults).
         assert!(!q.contains_key("files_offset"));
-        assert!(!q.contains_key("workflows_limit"));
     }
 
     #[test]
