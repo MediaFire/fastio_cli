@@ -9749,6 +9749,51 @@ fn json_object_arg(args: &Map<String, Value>, key: &str) -> Result<Option<Value>
     }
 }
 
+/// Shared poll-tick error classification for the KEPT MCP wait loops
+/// (Ripley `ask` polling and metadata `extract` polling); also used by the
+/// workflow wait/export loops.
+///
+/// How an MCP poll loop should react to an error from one poll tick.
+///
+/// Replaces the old `Err(_) => {}` (which silently looped to timeout on a
+/// 404/403/500). The 401 re-auth short-circuit is handled by the caller before
+/// this is reached.
+enum WfPollAction {
+    /// Server asked us to wait this many seconds (0 = no explicit interval).
+    RateLimited { retry_after_secs: u64 },
+    /// A transient failure worth another poll on the regular cadence.
+    RetryTransient,
+    /// A persistent error rendered for return (loop must stop and surface it).
+    Fatal(CallToolResult),
+}
+
+/// Classify a poll-tick [`CliError`] for an MCP wait/export loop.
+///
+/// Mirrors the CLI `classify_poll_error`: rate limits sleep their advertised
+/// interval; all 5xx (`500..=599`) / 408 / transport / I/O are transient; other
+/// 4xx, parse, and config are fatal and surfaced via [`cli_err_to_result`].
+fn classify_wf_poll_error(err: &fastio_cli::error::CliError) -> WfPollAction {
+    use fastio_cli::error::CliError;
+    match err {
+        CliError::RateLimit { retry_after_secs } => WfPollAction::RateLimited {
+            retry_after_secs: *retry_after_secs,
+        },
+        CliError::Api(e) => match e.http_status {
+            429 | 408 => WfPollAction::RateLimited {
+                retry_after_secs: 0,
+            },
+            // All server errors are transient (matches the CLI classifier): a
+            // 500 during a long poll is a momentary backend blip, not permanent.
+            500..=599 => WfPollAction::RetryTransient,
+            _ => WfPollAction::Fatal(cli_err_to_result(err)),
+        },
+        CliError::Http(_) | CliError::Io(_) => WfPollAction::RetryTransient,
+        // Parse / config / auth(other) — and, conservatively, any future
+        // non-exhaustive variant — are surfaced rather than looped.
+        _ => WfPollAction::Fatal(cli_err_to_result(err)),
+    }
+}
+
 /// Read an optional JSON-array argument for a REST field the API expects as a
 /// JSON-array STRING (e.g. workflow `ops`, `apply_change_ids`). MCP clients
 /// commonly pass these as a native JSON array; accept that OR a serialized
@@ -11946,47 +11991,6 @@ fn step_occurrence_state(snapshot: &Value) -> Option<String> {
         .or_else(|| payload.get("state"))
         .and_then(Value::as_str)
         .map(str::to_owned)
-}
-
-/// How an MCP poll loop should react to an error from one poll tick.
-///
-/// Replaces the old `Err(_) => {}` (which silently looped to timeout on a
-/// 404/403/500). The 401 re-auth short-circuit is handled by the caller before
-/// this is reached.
-enum WfPollAction {
-    /// Server asked us to wait this many seconds (0 = no explicit interval).
-    RateLimited { retry_after_secs: u64 },
-    /// A transient failure worth another poll on the regular cadence.
-    RetryTransient,
-    /// A persistent error rendered for return (loop must stop and surface it).
-    Fatal(CallToolResult),
-}
-
-/// Classify a poll-tick [`CliError`] for an MCP wait/export loop.
-///
-/// Mirrors the CLI `classify_poll_error`: rate limits sleep their advertised
-/// interval; all 5xx (`500..=599`) / 408 / transport / I/O are transient; other
-/// 4xx, parse, and config are fatal and surfaced via [`cli_err_to_result`].
-fn classify_wf_poll_error(err: &fastio_cli::error::CliError) -> WfPollAction {
-    use fastio_cli::error::CliError;
-    match err {
-        CliError::RateLimit { retry_after_secs } => WfPollAction::RateLimited {
-            retry_after_secs: *retry_after_secs,
-        },
-        CliError::Api(e) => match e.http_status {
-            429 | 408 => WfPollAction::RateLimited {
-                retry_after_secs: 0,
-            },
-            // All server errors are transient (matches the CLI classifier): a
-            // 500 during a long poll is a momentary backend blip, not permanent.
-            500..=599 => WfPollAction::RetryTransient,
-            _ => WfPollAction::Fatal(cli_err_to_result(err)),
-        },
-        CliError::Http(_) | CliError::Io(_) => WfPollAction::RetryTransient,
-        // Parse / config / auth(other) — and, conservatively, any future
-        // non-exhaustive variant — are surfaced rather than looped.
-        _ => WfPollAction::Fatal(cli_err_to_result(err)),
-    }
 }
 
 /// Poll runtime state to a terminal lifecycle and return the final snapshot.

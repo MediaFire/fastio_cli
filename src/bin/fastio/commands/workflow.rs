@@ -42,6 +42,7 @@ use crate::cli::{
 
 use super::CommandContext;
 use super::secret_output::{extract_secret, redact_secret_field, write_secret_file};
+use super::{PollAction, classify_poll_error};
 
 /// Base seconds between `workflow wait` polls when unspecified.
 const DEFAULT_WAIT_INTERVAL_SECS: u64 = 3;
@@ -310,58 +311,6 @@ pub(crate) fn jittered(interval_secs: u64) -> Duration {
         }
     };
     Duration::from_secs(interval_secs) + Duration::from_millis(extra_ms)
-}
-
-/// How a poll loop should react to an error from one poll tick.
-///
-/// Distinguishes the three cases the previous `Err(_) => {}` collapsed into one
-/// (silent loop-to-timeout):
-/// - [`PollAction::RateLimited`] — honor the server's `retry_after`;
-/// - [`PollAction::RetryTransient`] — a 5xx / network / I/O blip; back off and
-///   retry on the next tick;
-/// - [`PollAction::Fatal`] — a persistent, non-transient error (404 / 403 /
-///   400 / parse / a non-rate-limit 4xx). Surface it instead of looping.
-///
-/// `pub(crate)` so the Ripley `ask`/`chat` and metadata `extract --wait` poll
-/// loops (CLI + MCP) reuse the SAME classification rather than each
-/// re-collapsing every error into a silent timeout.
-pub(crate) enum PollAction {
-    /// Server asked us to wait this many seconds before the next request.
-    RateLimited { retry_after_secs: u64 },
-    /// A transient failure worth one more poll on the regular cadence.
-    RetryTransient,
-    /// A persistent error the caller should see now (returned, not swallowed).
-    Fatal(CliError),
-}
-
-/// Classify a poll-tick [`CliError`] into a [`PollAction`].
-///
-/// The 401 re-auth short-circuit is handled by the caller before this is
-/// reached. Rate limits sleep their advertised interval; all 5xx (`500..=599`),
-/// request timeouts, transport, and I/O errors are transient; everything else
-/// (4xx other than 408/429, parse, config) is fatal so a 404/403 no longer
-/// loops silently to the deadline.
-///
-/// `pub(crate)` so the Ripley/metadata wait loops share this exact policy.
-pub(crate) fn classify_poll_error(err: CliError) -> PollAction {
-    match err {
-        CliError::RateLimit { retry_after_secs } => PollAction::RateLimited { retry_after_secs },
-        CliError::Api(ref e) => match e.http_status {
-            429 | 408 => PollAction::RateLimited {
-                retry_after_secs: 0,
-            },
-            // All server errors are transient — a 500 during a long-running
-            // workflow poll is typically a momentary backend blip, not a
-            // permanent condition, so it's worth another tick.
-            500..=599 => PollAction::RetryTransient,
-            _ => PollAction::Fatal(err),
-        },
-        // Transport/timeout and transient I/O are worth another tick.
-        CliError::Http(_) | CliError::Io(_) => PollAction::RetryTransient,
-        // Parse / config / auth(other) — and, conservatively, any future
-        // non-exhaustive variant — are surfaced rather than looped.
-        _ => PollAction::Fatal(err),
-    }
 }
 
 /// Read a workflow's lifecycle state from a `state` snapshot, if present.
@@ -3000,57 +2949,6 @@ mod tests {
             emit_terminal_notice(&ctx, &failed);
             emit_terminal_notice(&ctx, &running);
         }
-    }
-
-    fn api_err(http_status: u16) -> CliError {
-        CliError::Api(fastio_cli::error::ApiError::new(
-            0,
-            None,
-            "boom".to_owned(),
-            http_status,
-        ))
-    }
-
-    #[test]
-    fn classify_poll_error_rate_limit_uses_retry_after() {
-        match classify_poll_error(CliError::RateLimit {
-            retry_after_secs: 12,
-        }) {
-            PollAction::RateLimited { retry_after_secs } => assert_eq!(retry_after_secs, 12),
-            _ => panic!("rate limit must map to RateLimited"),
-        }
-        // A 429/408 Api error is also rate-limit-like.
-        assert!(matches!(
-            classify_poll_error(api_err(429)),
-            PollAction::RateLimited { .. }
-        ));
-        assert!(matches!(
-            classify_poll_error(api_err(408)),
-            PollAction::RateLimited { .. }
-        ));
-    }
-
-    #[test]
-    fn classify_poll_error_5xx_transient_4xx_fatal() {
-        // All 5xx (including 500) are transient — a momentary backend blip.
-        for s in [500u16, 502, 503, 504, 599] {
-            assert!(
-                matches!(classify_poll_error(api_err(s)), PollAction::RetryTransient),
-                "{s} should be transient"
-            );
-        }
-        // Persistent client errors must be surfaced, not looped.
-        for s in [400u16, 403, 404] {
-            assert!(
-                matches!(classify_poll_error(api_err(s)), PollAction::Fatal(_)),
-                "{s} should be fatal"
-            );
-        }
-        // Parse errors are fatal.
-        assert!(matches!(
-            classify_poll_error(CliError::Parse("x".to_owned())),
-            PollAction::Fatal(_)
-        ));
     }
 
     #[test]
