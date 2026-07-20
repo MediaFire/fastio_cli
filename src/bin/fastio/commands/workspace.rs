@@ -57,10 +57,6 @@ pub enum WorkspaceCommand {
         perm_join: Option<String>,
         /// Who can manage members (permission phrase).
         perm_member_manage: Option<String>,
-        /// AI obligation-summary enrichment toggle.
-        nl_summaries_enabled: Option<bool>,
-        /// AI enrichment daily cap (0-100000).
-        nl_summaries_daily_cap: Option<u32>,
         /// Brand accent color (JSON-encoded string).
         accent_color: Option<String>,
         /// Primary background color (JSON-encoded string).
@@ -134,8 +130,6 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
             intelligence,
             perm_join,
             perm_member_manage,
-            nl_summaries_enabled,
-            nl_summaries_daily_cap,
             accent_color,
             background_color1,
             background_color2,
@@ -151,8 +145,6 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
                     intelligence: *intelligence,
                     perm_join: perm_join.as_deref(),
                     perm_member_manage: perm_member_manage.as_deref(),
-                    nl_summaries_enabled: *nl_summaries_enabled,
-                    nl_summaries_daily_cap: *nl_summaries_daily_cap,
                     accent_color: accent_color.as_deref(),
                     background_color1: background_color1.as_deref(),
                     background_color2: background_color2.as_deref(),
@@ -246,10 +238,6 @@ struct WorkspaceUpdate<'a> {
     perm_join: Option<&'a str>,
     /// Who can manage members (permission phrase).
     perm_member_manage: Option<&'a str>,
-    /// AI obligation-summary enrichment toggle.
-    nl_summaries_enabled: Option<bool>,
-    /// AI enrichment daily cap (0-100000).
-    nl_summaries_daily_cap: Option<u32>,
     /// Brand accent color (JSON-encoded string).
     accent_color: Option<&'a str>,
     /// Primary background color (JSON-encoded string).
@@ -269,8 +257,6 @@ impl WorkspaceUpdate<'_> {
             && self.intelligence.is_none()
             && self.perm_join.is_none()
             && self.perm_member_manage.is_none()
-            && self.nl_summaries_enabled.is_none()
-            && self.nl_summaries_daily_cap.is_none()
             && self.accent_color.is_none()
             && self.background_color1.is_none()
             && self.background_color2.is_none()
@@ -280,10 +266,10 @@ impl WorkspaceUpdate<'_> {
 
 /// Build the form-field map for a workspace update from the provided options.
 ///
-/// Bool toggles (`intelligence`, `nl_summaries_enabled`) are serialized as the
-/// string `"true"`/`"false"` because the `/workspace/{id}/update/` endpoint
-/// takes them as string form fields (workspaces.txt). The brand-color and
-/// `owner_defined` fields are JSON-encoded strings forwarded verbatim.
+/// The `intelligence` bool toggle is serialized as the string `"true"`/`"false"`
+/// because the `/workspace/{id}/update/` endpoint takes it as a string form
+/// field (workspaces.txt). The brand-color and `owner_defined` fields are
+/// JSON-encoded strings forwarded verbatim.
 fn build_workspace_update_fields(u: &WorkspaceUpdate<'_>) -> HashMap<String, String> {
     let mut fields = HashMap::new();
     if let Some(v) = u.name {
@@ -303,12 +289,6 @@ fn build_workspace_update_fields(u: &WorkspaceUpdate<'_>) -> HashMap<String, Str
     }
     if let Some(v) = u.perm_member_manage {
         fields.insert("perm_member_manage".to_owned(), v.to_owned());
-    }
-    if let Some(v) = u.nl_summaries_enabled {
-        fields.insert("nl_summaries_enabled".to_owned(), v.to_string());
-    }
-    if let Some(v) = u.nl_summaries_daily_cap {
-        fields.insert("nl_summaries_daily_cap".to_owned(), v.to_string());
     }
     if let Some(v) = u.accent_color {
         fields.insert("accent_color".to_owned(), v.to_owned());
@@ -333,7 +313,7 @@ async fn update(
 ) -> Result<()> {
     anyhow::ensure!(
         !u.is_empty(),
-        "at least one update field is required (e.g. --name, --description, --perm-join, --nl-summaries-enabled, --accent-color, …)"
+        "at least one update field is required (e.g. --name, --description, --perm-join, --accent-color, …)"
     );
 
     let fields = build_workspace_update_fields(u);
@@ -449,8 +429,6 @@ mod tests {
         let fields = build_workspace_update_fields(&WorkspaceUpdate {
             perm_join: Some("Member or above"),
             perm_member_manage: Some("Admin or above"),
-            nl_summaries_enabled: Some(false),
-            nl_summaries_daily_cap: Some(250),
             accent_color: Some(r#"{"r":1}"#),
             background_color1: Some(r#"{"g":2}"#),
             background_color2: Some(r#"{"b":3}"#),
@@ -464,16 +442,6 @@ mod tests {
         assert_eq!(
             fields.get("perm_member_manage").map(String::as_str),
             Some("Admin or above")
-        );
-        // Bool → string.
-        assert_eq!(
-            fields.get("nl_summaries_enabled").map(String::as_str),
-            Some("false")
-        );
-        // Integer → string.
-        assert_eq!(
-            fields.get("nl_summaries_daily_cap").map(String::as_str),
-            Some("250")
         );
         assert_eq!(
             fields.get("accent_color").map(String::as_str),

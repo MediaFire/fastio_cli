@@ -30,7 +30,7 @@
 //!   parses into [`CliError::VersionConflict`] with the current version id.
 //! - **Secret tokens.** `ws-token` mints a realtime token that is REDACTED from
 //!   stdout and written 0600 to `--token-file`, reusing the shared
-//!   [`super::secret_output`] helpers (identical to the workflow command).
+//!   [`super::secret_output`] helpers.
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -1252,8 +1252,8 @@ fn resolve_token(ctx: &CommandContext<'_>) -> Result<String> {
 // ─── WebSocket token ────────────────────────────────────────────────────────
 
 /// Mint a realtime-channel WebSocket token. The token is REDACTED from stdout
-/// and written 0600 to `--token-file` (mirrors the workflow realtime-token
-/// command exactly, via the shared [`super::secret_output`] helpers).
+/// and written 0600 to `--token-file`, via the shared
+/// [`super::secret_output`] helpers.
 async fn ws_token(
     ctx: &CommandContext<'_>,
     fileshare_id: &str,

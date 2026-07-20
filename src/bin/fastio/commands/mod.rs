@@ -111,9 +111,9 @@ impl CommandContext<'_> {
 /// the JSON from a file (`@@` escapes a literal leading `@`).
 ///
 /// Shared by the command modules that accept inline `{json}` or `@file.json`
-/// object arguments (e.g. `comment create`'s `--reference` / `--properties` and
-/// `task comment post`), so the resolver stays in one place rather than being
-/// re-implemented per module. Returns `Ok(None)` when `raw` is absent.
+/// object arguments (e.g. `comment create`'s `--reference` / `--properties`), so
+/// the resolver stays in one place rather than being re-implemented per module.
+/// Returns `Ok(None)` when `raw` is absent.
 pub(crate) fn parse_json_object_arg(
     raw: Option<&str>,
     label: &str,
@@ -178,8 +178,8 @@ pub(crate) fn classify_poll_error(err: fastio_cli::error::CliError) -> PollActio
                 retry_after_secs: 0,
             },
             // All server errors are transient — a 500 during a long-running
-            // workflow poll is typically a momentary backend blip, not a
-            // permanent condition, so it's worth another tick.
+            // poll is typically a momentary backend blip, not a permanent
+            // condition, so it's worth another tick.
             500..=599 => PollAction::RetryTransient,
             _ => PollAction::Fatal(err),
         },

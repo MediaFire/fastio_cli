@@ -26,9 +26,8 @@ Heuristics for agents:
   summarize across content." Reserve the raw `files`/`storage`/`search` commands
   for deterministic, single-shot operations where you already know the IDs.
 - **Poll activity, not detail.** For anything that runs asynchronously (a Ripley
-  answer, a workflow run, a metadata extraction job), watch the activity/state
-  endpoint with a bounded wait — do **not** tight-loop a `--detail full` read.
-  The `ask`, `workflow wait`, `workflow instantiate-and-wait`, and
+  answer, a metadata extraction job), watch the activity/state endpoint with a
+  bounded wait — do **not** tight-loop a `--detail full` read. The `ask` and
   `metadata extract --wait` paths already do bounded activity-polling for you.
 
 `ripley` is the former `ai` group — **`ai` still works as a hidden alias** (CLI
@@ -93,21 +92,20 @@ Only note nodes and markdown files are supported; other file types are rejected.
 `fastio id info <ID>...` classifies one or more Fast.io `OpaqueId`s **offline**
 (no auth, no network) so you know what an id refers to before acting on it —
 handy when an id arrives in a webhook, event, or payload. It reads the
-self-describing length and type prefix: non-workflow ids are 29 chars (1-char
-type); workflow-family ids are 30 chars (a 2-char `w` type). It reports the
-`entity_type`, `family` (`workflow` / `non-workflow` / `unknown`), `surfacing`
-tier, and a `recognized` flag. Output is always an array of records, so
-`--format json|table|csv|markdown` and `--fields` all apply.
+self-describing length and type prefix: 1-char-type ids are 29 chars; 2-char-type
+ids are 30 chars (this includes the legacy workflow family under `w`, retired
+2026-07 but still decodable for ids minted before the sunset). It reports the
+`entity_type`, `family`, `surfacing` tier, and a `recognized` flag. Output is
+always an array of records, so `--format json|table|csv|markdown` and `--fields`
+all apply.
 
 ```bash
-fastio id info wa3jm5zqzfxpxdr2dx8z5bvnb3rpjf --format json   # → WorkflowStepOccurrence
 fastio id info 2yxh5-ojakx-r3mwz-ty6tv-k66cj-nqsw NODE_ID2    # → StorageNode (hyphens OK)
 ```
 
-Over MCP this is the `id` tool (`action: "info"`, params `id` or `ids`).
-Workflow ids are detected only by length-30 / leading-`w`; a 29-char id whose
-1-char code is unmapped is reported `unknown` (it may be a transitional code
-pending reassignment), never guessed as workflow.
+Over MCP this is the `id` tool (`action: "info"`, params `id` or `ids`). A
+29-char id whose 1-char code is unmapped is reported `unknown` (it may be a
+transitional code pending reassignment), never guessed.
 
 ## Important: Intelligence (AI indexing) Setting
 
@@ -127,8 +125,6 @@ fastio workspace create --org ORG_ID --name "Knowledge Base" --intelligence true
 fastio workspace update WS_ID --intelligence true
 ```
 
-Note: `workspace enable-workflow` / `disable-workflow` gate the **workflow
-orchestration feature**, not AI indexing. Use `--intelligence` (above) for indexing.
 
 ## Core Workflows
 
@@ -180,7 +176,7 @@ fastio ripley summary --workspace WS_ID NODE_ID1 NODE_ID2     # AI share
 ### Unified search
 
 `fastio search` runs one query across grouped result buckets (files, metadata,
-comments, workflows) for a workspace or share:
+comments) for a workspace or share:
 
 ```bash
 fastio search workspace WS_ID "query" --format json
@@ -189,108 +185,13 @@ fastio search share SHARE_ID "query" --only files,comments
 
 `fastio files search` remains the targeted file-only search.
 
-## Workflow Orchestration (the forward path)
+## E-signature (disabled by default)
 
-`fastio workflow` (alias `wf`) is the durable multi-step orchestration
-surface. New work should use `fastio workflow` for orchestration and
-`fastio task` for the Tasks API (task lists, tasks, comments, attachments).
-
-Groups under `fastio workflow`:
-
-- Runtime: `create`, `list`, `get`, `update`, `delete`, `purge`, `transfer`,
-  `instantiate`, `state`, `wait`, `pause`, `resume`, `cancel`,
-  `rotate-inbound-key`
-- `grant` (workflow access grants), `step` (CAS-guarded step drive),
-  `template` (immutable workflow templates), `trigger` (event triggers + fire /
-  dry-run), `trigger-alias`, `obligation` (human obligations + inbox),
-  `inbox`, `schema` (extraction schema), `audit` (events, signed export,
-  integrity check), `outbound` (webhook subscriptions), `pool`, `subject`,
-  `realtime` (websocket token mint), `review`
-
-```bash
-fastio workflow instantiate WF_ID --idempotency-key KEY
-fastio workflow wait WF_ID                       # bounded poll to a terminal state
-fastio workflow trigger fire TRIGGER_ID --idempotency-key KEY
-fastio workflow audit export start WF_ID
-fastio workflow audit check-integrity ...        # local integrity verification
-fastio workflow review active WS_ID              # hydrate in-flight reviews (badge files under review)
-```
-
-The `review` group is the v3.5b native content-approval surface attached to a
-workflow's approval steps. Its mutating / by-id endpoints (`create`, `get`,
-`asset`, `decision`, `admin-resolve`) are **CLI-binary-only** (not over MCP); the
-sole exception is the `active` hydration read, which is also exposed over MCP as
-the `workflow` tool's `review-active` action.
-`review active WS_ID` is a workspace hydration read — it returns the active
-(`arming` / `open`) reviews with their asset `node_id`s so files can be badged
-"under review" without per-file fetches. It accepts `--limit` (default 25, max
-100) and `--offset`, ordered oldest-first; active reviews per workspace are
-typically few, so one page usually covers it (otherwise page with `--offset`
-while `pagination.has_more` is true). Unlike the other review reads it is
-**not** flag-gated: a workspace member always gets a result (an empty list when
-nothing is in review); a non-member or unknown workspace id gets a `404`.
-
-`instantiate` and `trigger fire` **require** an `--idempotency-key` for replay
-safety (no silent auto-generation). Audit `check-integrity` verifies bundle
-**integrity** (chunk SHA-256 + content-hash chain + completeness) — it does NOT
-verify HMAC authenticity.
-
-### Over MCP
-
-The `workflow` MCP tool exposes **read + drive** actions and offers compound
-helpers `instantiate-and-wait`, `trigger-fire-and-wait`, and
-`audit-export-and-download` that run the full fire→poll→download loop for you.
-Admin / destructive / crypto operations — including the terminal **`cancel`**
-lifecycle mutation, plus create/purge/transfer, template & pool & trigger
-lifecycle, secret/key rotation, dual-control redaction, schema set/derive, and
-realtime-token mint — are **CLI-binary-only** and are NOT routable over MCP.
-
-## E-signature
-
-`fastio sign` drafts, sends, voids, and downloads `SignEnvelopes` (PDFs sent to
-recipients for electronic signature). **Every envelope is parented to a
-workspace** — the former org-parented surface was removed (old org routes 404).
-Signing is a paid-plan feature, and access also requires workspace membership.
-
-Every `sign` subcommand takes a required `--workspace WS_ID`. Outward-facing /
-terminal verbs (`send`, `void`) prompt interactively; pass `--yes` to run them
-non-interactively. There is no `delete` — envelopes are **voided**, not deleted.
-
-```bash
-fastio sign envelope create --workspace WS_ID --source-node-id NODE_ID --recipient-email signer@example.com
-fastio sign envelope list   --workspace WS_ID --status draft,sent --created-after "2026-06-01 00:00:00 UTC"
-fastio sign envelope send   --workspace WS_ID ENVELOPE_ID --yes
-fastio sign envelope void   --workspace WS_ID ENVELOPE_ID --reason "..." --yes
-fastio sign document download --workspace WS_ID ENVELOPE_ID DOCUMENT_ID -o ./doc.pdf
-fastio sign document preview  --workspace WS_ID ENVELOPE_ID DOCUMENT_ID -o ./preview.pdf
-fastio sign audit download    --workspace WS_ID ENVELOPE_ID -o ./audit.json
-```
-
-`envelope list` filters: `--status` (a single lifecycle status or a CSV of
-`draft,sent,in_progress,completed,declined,expired,voided,failed`),
-`--created-after` / `--created-before` (`Y-m-d H:i:s UTC`), `--limit`,
-`--offset`. An `envelope update` is a full recipient replacement —
-`--recipients-json` (≥1) is required.
-
-### Realtime / progress
-
-Envelope transitions are observable via `fastio event list --workspace WS_ID
---event sign_envelope_completed` (event types `sign_envelope_*`: drafted / sent /
-viewed / recipient_signed / completed / voided / …; `--event` filters by event
-name) and a workflow `wait_for_signing` step parks on an envelope until it
-reaches a terminal state. The CLI itself has no realtime watch; agents poll
-`fastio sign envelope get --workspace WS_ID ENVELOPE_ID` for artifact readiness:
-the signed PDF 404s until the envelope **completes**, and the audit certificate
-404s until the envelope reaches **any terminal state** (completed, declined, voided, expired, or failed).
-
-### Over MCP
-
-The `sign` MCP tool exposes **read + reversible-draft-drive** actions only
-(envelope-create/update/list/get, document/signed/audit download). The
-outward-facing / terminal actions — **`send`** (emails real recipients) and
-**`void`** — are **CLI-binary-only** and are NOT routable over MCP. There is no
-delete (envelopes are voided). `document-download` covers preview needs — its
-bytes are the source/preview PDF, so there is no separate MCP preview action.
+The e-signature surface (`fastio sign` and the `sign` MCP tool) is **disabled by
+default** as of the 2026-07 feature sunset. An operator re-enables it by setting
+`FASTIO_ENABLE_ESIGN=1`; signing must **also** be enabled for the organization
+server-side. While disabled, the `sign` subcommand is hidden from help and its
+execution is gated, and the `sign` MCP tool is filtered from the tool list.
 
 ## File Shares
 
@@ -362,8 +263,7 @@ with `clear_password=true` on `update`) is rejected explicitly. Two actions are
   run `fastio fileshare upload …`.
 - **`ws-token`** (realtime mint) — the token is a long-lived secret that must not
   be parked in an MCP transcript (the CLI redacts it and writes 0600); run
-  `fastio fileshare ws-token … --token-file <path>`. This mirrors how the
-  `workflow` tool keeps its realtime-token mint CLI-only.
+  `fastio fileshare ws-token … --token-file <path>`.
 
 `download` / `preview` write bytes to the agent's local filesystem (default under
 `.fastio/downloads/`, created 0700) and return a path + byte count. The
@@ -405,8 +305,8 @@ Storage endpoints (files) use cursor-based pagination:
 fastio files list --workspace WS_ID --page-size 100 --cursor NEXT_CURSOR
 ```
 
-Other endpoints use offset-based pagination (and a few — invoices, workflow
-grants — use cursor / `--starting-after`):
+Other endpoints use offset-based pagination (and a few — e.g. invoices — use
+cursor / `--starting-after`):
 
 ```bash
 fastio org members list ORG_ID --limit 50 --offset 0
@@ -434,8 +334,8 @@ fastio mcp
 ```
 
 It speaks MCP over stdio and exposes the CLI's operations as action-routed tools
-(`ripley`, `workflow`, `sign`, `fileshare`, `files`, `org`, `workspace`, …). Tool
-results are
+(`ripley`, `fileshare`, `files`, `org`, `workspace`, … plus `sign` only when
+E-Sign is enabled). Tool results are
 rendered as GitHub-flavored Markdown for compact, high-signal consumption. This
 same guide is available as the `skill://guide` MCP resource and via
 `fastio skill`.

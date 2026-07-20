@@ -123,6 +123,35 @@ impl FastioMcpServer {
             tool_router: ToolRouter::new(state),
         })
     }
+
+    /// Build the server intro `instructions` text.
+    ///
+    /// The e-signature (`sign`) mention is CONDITIONAL on the E-Sign kill-switch
+    /// (read once at router construction). When E-Sign is disabled the `sign`
+    /// tool is filtered from `list_tools`, so the intro must not advertise it.
+    fn instructions_text(&self) -> String {
+        let mut text = String::from(
+            "Fast.io MCP server -- files, workspaces, shares, uploads, downloads, \
+             and AI agent (Ripley) via the Fast.io REST API. OFFLOAD multi-step \
+             work: prefer asking the `ripley` tool (Fast.io's delegated AI agent, \
+             acting on your behalf) to find or do a task over hand-driving many \
+             primitives. ",
+        );
+        if self.tool_router.esign_enabled() {
+            text.push_str(
+                "The `sign` tool exposes READ + DRAFT-DRIVE actions only -- \
+                 destructive / terminal mutations (`send`/`void` -- envelopes are \
+                 voided, not deleted) are CLI-binary-only. ",
+            );
+        }
+        text.push_str(
+            "Tool results are rendered as GitHub-flavored Markdown (shape-compatible \
+             with the server-side `?output=markdown` contract) for compact, \
+             high-signal consumption. Run `fastio auth login` in a terminal first \
+             to authenticate.",
+        );
+        text
+    }
 }
 
 impl ServerHandler for FastioMcpServer {
@@ -139,23 +168,7 @@ impl ServerHandler for FastioMcpServer {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 ..Implementation::default()
             },
-            instructions: Some(
-                "Fast.io MCP server -- files, workspaces, shares, uploads, downloads, \
-                 AI agent (Ripley), Workflow Orchestration, and e-signature via the \
-                 Fast.io REST API. OFFLOAD multi-step work: prefer asking the `ripley` \
-                 tool (Fast.io's delegated AI agent, acting on your behalf) to find or \
-                 do a task over hand-driving many primitives, and prefer the `workflow` \
-                 tool's compound `*-and-wait` actions over tight detail-poll loops. \
-                 `workflow` and `sign` expose READ + DRIVE actions only -- destructive / \
-                 terminal mutations (workflow `cancel`; sign `send`/`void` -- envelopes are \
-                 voided, not deleted) are CLI-binary-only. The `task` tool is the Tasks API \
-                 (task lists, tasks, comments, attachments); `workflow` is the separate \
-                 durable orchestration surface. Tool results are rendered as \
-                 GitHub-flavored Markdown (shape-compatible with the server-side \
-                 `?output=markdown` contract) for compact, high-signal consumption. Run \
-                 `fastio auth login` in a terminal first to authenticate."
-                    .to_owned(),
-            ),
+            instructions: Some(self.instructions_text()),
         }
     }
 

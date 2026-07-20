@@ -4,15 +4,15 @@
 //!
 //! Maps to the Dashboard surface documented at `~/vividengine/llms/dashboard.txt`:
 //! a ranked, paginated feed of **actionable cards** for the calling workspace
-//! member (approvals, tasks, reviews, confirmations, @mentions, file activity,
-//! and pending signatures), plus per-member dismiss / snooze / undismiss of a
-//! card. Dismiss and snooze are **out-of-band**: they hide a card from the
-//! caller's own feed only and never advance, resolve, or otherwise change the
-//! underlying obligation, workflow, or signature.
+//! member (@mentions, file-added, file-version, and synthesis lanes, plus a
+//! signature lane only when E-Sign is enabled platform-side), plus per-member
+//! dismiss / snooze / undismiss of a card. Dismiss and snooze are
+//! **out-of-band**: they hide a card from the caller's own feed only and never
+//! advance, resolve, or otherwise change the underlying card subject.
 //!
-//! The signature-card primary action — minting the caller's own signing link —
-//! lives in [`crate::api::signing::my_sign_link`] (it is envelope-scoped) and is
-//! surfaced as `fastio sign envelope my-sign-link`.
+//! When E-Sign is enabled, a signature card's primary action — minting the
+//! caller's own signing link — lives in [`crate::api::signing::my_sign_link`]
+//! (it is envelope-scoped) and is surfaced as `fastio sign envelope my-sign-link`.
 
 use std::collections::HashMap;
 
@@ -85,8 +85,8 @@ fn card_dismiss_path(workspace_id: &str, card_key: &str) -> String {
 ///
 /// `POST /workspace/{workspace_id}/dashboard/cards/{card_key}/dismiss/`
 ///
-/// Out-of-band only — the underlying obligation, workflow, or signature is
-/// unaffected. When `snooze_until` is `Some`, a JSON body
+/// Out-of-band only — the underlying card subject is unaffected. When
+/// `snooze_until` is `Some`, a JSON body
 /// `{"snooze_until": "<ts>"}` is sent (the server validates the canonical
 /// `"YYYY-MM-DD HH:MM:SS UTC"` format and that it is in the future); when `None`
 /// the request carries no body at all (a permanent dismiss) — matching the

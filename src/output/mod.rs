@@ -231,89 +231,6 @@ impl OutputConfig {
             OutputFormat::Markdown => markdown::render(&filtered),
         }
     }
-
-    /// Render a single rich state-snapshot OBJECT faithfully.
-    ///
-    /// The workflow runtime-state snapshot (`fastio workflow state` / `wait`) is
-    /// one object carrying `state`/`workflow`, `progress`, `recent_steps`,
-    /// `credit_budget`, and an `active_steps` array that is empty on a terminal
-    /// workflow. The shared [`flatten_response`] table/CSV heuristic returns the
-    /// FIRST array field — `active_steps` — which renders an EMPTY table on a
-    /// completed workflow and silently drops every other field. This snapshot is
-    /// an object, not a list, so table/CSV here render its top-level fields as
-    /// `field`/`value` rows (nested arrays/objects shown compactly as JSON),
-    /// NOT via the first-array flatten.
-    ///
-    /// JSON and Markdown output are byte-identical to [`Self::render`]; only the
-    /// Table and CSV paths differ, and only for this snapshot shape. The shared
-    /// `flatten_response` heuristic is untouched (other commands depend on it).
-    pub fn render_state_snapshot(&self, value: &Value) -> Result<(), std::io::Error> {
-        if self.quiet {
-            return Ok(());
-        }
-
-        // JSON / Markdown are unchanged — delegate to the standard path so
-        // those byte streams stay identical to every other command.
-        if matches!(self.format, OutputFormat::Json | OutputFormat::Markdown) {
-            return self.render(value);
-        }
-
-        let filtered = format::filter_fields(value, self.fields.as_deref());
-
-        // Peel a `response` wrapper if present (mirrors how the snapshot's
-        // lifecycle state is read elsewhere), then render the object's
-        // top-level fields as `field`/`value` rows. Metadata/envelope keys are
-        // skipped so a stray `result` doesn't masquerade as snapshot data.
-        let snapshot = match &filtered {
-            Value::Object(map) => match map.get("response") {
-                Some(Value::Object(_)) => &filtered["response"],
-                _ => &filtered,
-            },
-            _ => &filtered,
-        };
-
-        let rows = state_snapshot_rows(snapshot);
-        match self.format {
-            OutputFormat::Table => table::render(&rows, self.no_color),
-            OutputFormat::Csv => csv_output::render(&rows),
-            // JSON / Markdown handled above.
-            OutputFormat::Json | OutputFormat::Markdown => self.render(value),
-        }
-    }
-}
-
-/// Build the `[{"field": <name>, "value": <compact>}, …]` row array used by
-/// [`OutputConfig::render_state_snapshot`] for table/CSV.
-///
-/// Each top-level field of the snapshot object becomes one row. Scalars render
-/// as themselves; nested objects and arrays render compactly (their JSON), so
-/// no field is dropped and the table never collapses to an empty
-/// `active_steps`. Envelope/metadata keys ([`METADATA_KEYS`]) are skipped. A
-/// non-object snapshot is wrapped in a single `value` row so the caller always
-/// gets a renderable array.
-fn state_snapshot_rows(snapshot: &Value) -> Value {
-    let Value::Object(map) = snapshot else {
-        return Value::Array(vec![serde_json::json!({"value": compact_value(snapshot)})]);
-    };
-    let rows: Vec<Value> = map
-        .iter()
-        .filter(|(k, _)| !METADATA_KEYS.contains(&k.as_str()))
-        .map(|(k, v)| serde_json::json!({"field": k, "value": compact_value(v)}))
-        .collect();
-    Value::Array(rows)
-}
-
-/// Render a snapshot field value compactly for a `field`/`value` row: scalars
-/// pass through; objects and arrays are compact-serialized to JSON so a nested
-/// `progress` / `credit_budget` / `recent_steps` shows its content on one line
-/// rather than being dropped.
-fn compact_value(value: &Value) -> Value {
-    match value {
-        Value::Object(_) | Value::Array(_) => {
-            Value::String(serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}")))
-        }
-        other => other.clone(),
-    }
 }
 
 /// Render a unified-search `buckets` map (one bucket per result type) as a
@@ -655,72 +572,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn state_snapshot_rows_surfaces_terminal_fields_not_empty_active_steps() {
-        // A terminal snapshot: `active_steps` is empty (the field the shared
-        // `flatten_response` would pick and render as an empty table), while the
-        // meaningful fields live elsewhere.
-        let snap = json!({
-            "result": true,
-            "state": "completed",
-            "active_steps": [],
-            "recent_steps": [{"id": "s1", "state": "completed"}],
-            "progress": {"completed_occurrences": 6, "known_total_occurrences": 6},
-            "credit_budget": {"cap": 20000, "spent_so_far": 245},
-        });
-
-        let rows = state_snapshot_rows(&snap);
-        let arr = rows.as_array().expect("rows is an array");
-        // Not empty (the bug rendered an empty table), and `result` (metadata)
-        // is filtered out.
-        assert!(!arr.is_empty(), "snapshot rows must not be empty");
-        assert!(
-            arr.iter().all(|r| r["field"] != "result"),
-            "envelope `result` must be filtered out"
-        );
-
-        // Build a field->value map for assertions.
-        let mut fields = std::collections::HashMap::new();
-        for r in arr {
-            let name = r["field"].as_str().expect("field name").to_owned();
-            fields.insert(name, r["value"].clone());
-        }
-
-        // `state` and `progress` are surfaced (the dropped fields in the bug).
-        assert_eq!(
-            fields.get("state").and_then(Value::as_str),
-            Some("completed")
-        );
-        let progress = fields.get("progress").and_then(Value::as_str).unwrap_or("");
-        assert!(
-            progress.contains("completed_occurrences"),
-            "progress must be surfaced compactly: {progress}"
-        );
-        // `credit_budget` and `recent_steps` are also surfaced.
-        assert!(fields.contains_key("credit_budget"));
-        let recent = fields
-            .get("recent_steps")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        assert!(recent.contains("\"state\":\"completed\""), "got: {recent}");
-        // `active_steps` is present (empty array compacted), NOT the whole table.
-        assert_eq!(
-            fields.get("active_steps").and_then(Value::as_str),
-            Some("[]")
-        );
-    }
-
-    #[test]
-    fn state_snapshot_rows_peels_response_wrapper() {
-        // render_state_snapshot peels a `response` wrapper before row-building;
-        // assert the inner-object path is what state_snapshot_rows operates on.
-        let inner = json!({"state": "active", "progress": {"x": 1}});
-        let rows = state_snapshot_rows(&inner);
-        let arr = rows.as_array().expect("array");
-        assert!(arr.iter().any(|r| r["field"] == "state"));
-        assert!(arr.iter().any(|r| r["field"] == "progress"));
-    }
-
-    #[test]
     fn flatten_extracts_top_level_array() {
         let input = json!({
             "orgs": [{"id": "1", "name": "Acme"}, {"id": "2", "name": "Beta"}],
@@ -830,7 +681,9 @@ mod tests {
                 "offset": 0, "limit": 5, "total": 1, "total_relation": "eq",
                 "has_more": false, "status": "ok"
             },
-            "workflows": {
+            // A synthetic extra bucket exercising the degraded + empty render
+            // path — the renderer is bucket-name-agnostic.
+            "extra": {
                 "items": [],
                 "offset": 0, "limit": 25, "total": 0, "total_relation": "eq",
                 "has_more": false, "status": "degraded"
@@ -846,7 +699,7 @@ mod tests {
         // bucket but `files`. The bucket-aware renderer must emit ALL of them.
         let buckets = multi_bucket_fixture();
         let md = buckets_to_markdown(&buckets);
-        for name in ["files", "metadata", "comments", "workflows"] {
+        for name in ["files", "metadata", "comments", "extra"] {
             assert!(
                 md.contains(&format!("## {name}")),
                 "missing bucket: {name}\n{md}"
@@ -865,7 +718,7 @@ mod tests {
         assert!(md.contains("degraded"), "degraded notice missing:\n{md}");
         assert!(md.contains("lower bound"), "gte notice missing:\n{md}");
         // The empty degraded bucket still renders its heading + a no-results line.
-        assert!(md.contains("## workflows"), "{md}");
+        assert!(md.contains("## extra"), "{md}");
         assert!(md.contains("_No results._"), "{md}");
     }
 
@@ -888,7 +741,7 @@ mod tests {
         // The four bucket keys survive as object keys, but as a single flat
         // object the renderer cannot label/paginate them as sections; the
         // dedicated bucket renderer (asserted above) is required.
-        assert!(obj.contains_key("files") && obj.contains_key("workflows"));
+        assert!(obj.contains_key("files") && obj.contains_key("extra"));
     }
 
     #[test]
@@ -977,12 +830,12 @@ mod tests {
         let arr = rows.as_array().expect("array of rows");
 
         // Every bucket is represented: files/metadata/comments have one item
-        // each; the empty degraded `workflows` bucket gets a sentinel row.
+        // each; the empty degraded `extra` bucket gets a sentinel row.
         let bucket_names: Vec<&str> = arr
             .iter()
             .filter_map(|r| r.get("bucket").and_then(Value::as_str))
             .collect();
-        for name in ["files", "metadata", "comments", "workflows"] {
+        for name in ["files", "metadata", "comments", "extra"] {
             assert!(bucket_names.contains(&name), "missing bucket {name}");
         }
 
@@ -994,14 +847,14 @@ mod tests {
         }
 
         // The degraded empty bucket carries a status + note sentinel.
-        let workflows = arr
+        let extra = arr
             .iter()
-            .find(|r| r.get("bucket").and_then(Value::as_str) == Some("workflows"))
-            .expect("workflows row");
-        assert_eq!(workflows["status"], "degraded");
+            .find(|r| r.get("bucket").and_then(Value::as_str) == Some("extra"))
+            .expect("extra row");
+        assert_eq!(extra["status"], "degraded");
         assert!(
-            workflows["note"].as_str().unwrap().contains("degraded"),
-            "{workflows}"
+            extra["note"].as_str().unwrap().contains("degraded"),
+            "{extra}"
         );
 
         // Render through the real CSV writer and re-parse it: exactly ONE

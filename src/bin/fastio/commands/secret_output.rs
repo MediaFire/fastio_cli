@@ -1,7 +1,7 @@
 //! Shared helpers for handling one-time secrets in command output.
 //!
 //! A few commands mint or return a secret value (an outbound webhook HMAC
-//! secret, a workflow realtime token, a File Share WebSocket token). Those
+//! secret, a File Share WebSocket token). Those
 //! secrets must NEVER be echoed to stdout (where they would leak into logs),
 //! but the user still needs a way to capture them. The pattern, shared here so
 //! it cannot drift between command modules, is:
@@ -14,9 +14,9 @@
 //!    a placeholder that names the capture flag (`--secret-file` /
 //!    `--token-file`), so what reaches stdout never carries the value.
 //!
-//! These were originally private to the workflow command module; they were
-//! promoted here so the File Share `ws-token` command reuses the exact same
-//! (tested) behavior rather than a weaker hand-rolled copy.
+//! These live here as shared helpers so the File Share `ws-token` command
+//! (and any future secret-minting command) reuses the exact same tested
+//! behavior rather than a weaker hand-rolled copy.
 
 use std::path::Path;
 

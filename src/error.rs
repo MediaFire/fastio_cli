@@ -199,7 +199,7 @@ impl CliError {
 
 /// Shared "no active plan / credits exhausted" upgrade hint.
 ///
-/// Single source of truth so billing, signing, Ripley, and workflow all emit
+/// Single source of truth so billing, signing, and Ripley all emit
 /// a consistent recovery path for HTTP 402 and code `1688`. Plan IDs/names are
 /// deliberately NOT hardcoded here — callers drive them off
 /// `GET /org/billing/plan/list/`. References only commands that exist in the
@@ -220,7 +220,7 @@ pub const HINT_CREDIT_LIMIT: &str =
 /// Shared generic "access restricted" hint (code `1670`).
 ///
 /// Code `1670` is a GENERAL-purpose restricted/access-denied code in this API
-/// (2FA restrictions, workspace/share/upload limits, workflow availability,
+/// (2FA restrictions, workspace/share/upload limits, feature availability,
 /// etc.), so this hint is deliberately resource-agnostic. The server's own
 /// `error.text` carries the specifics.
 pub const HINT_RESTRICTED: &str =
@@ -229,7 +229,7 @@ pub const HINT_RESTRICTED: &str =
 /// Shared generic "feature/plan limit reached" hint (code `1685`).
 ///
 /// Code `1685` is a GENERAL-purpose feature-limit / precondition-failed code in
-/// this API (workspace/share/upload limits, workflow availability, etc.), so
+/// this API (workspace/share/upload limits, feature availability, etc.), so
 /// this hint is deliberately resource-agnostic.
 pub const HINT_FEATURE_LIMIT: &str =
     "A plan or feature limit was reached for this operation; a higher plan tier may be required.";
@@ -302,8 +302,8 @@ pub const HINT_INVALID_INPUT: &str = "The server rejected a value in this reques
 
 /// Shared "a reason/comment is required" hint (server 422 `ERR_REASON_REQUIRED`).
 ///
-/// A workflow-review `reject` / `request_changes` decision (and any other
-/// decision the server gates the same way) MUST carry a non-empty reason; the
+/// A `reject` / `request_changes` decision (and any other decision the server
+/// gates the same way) MUST carry a non-empty reason; the
 /// CLI guards this client-side, but a caller that bypasses the guard (e.g. an
 /// MCP client, or a value that slips past it) gets a bare 422 whose generic
 /// status hint is unhelpful. This hint names the actionable fix. Kept
@@ -385,7 +385,7 @@ impl ApiError {
             return Some(HINT_REASON_REQUIRED);
         }
         // Billing / entitlement codes share centrally-defined hint strings so
-        // billing, signing, Ripley, and workflow stay consistent. These are
+        // billing, signing, and Ripley stay consistent. These are
         // checked before the HTTP-status fallback because several map onto
         // 402/403 where the generic status hint is less actionable.
         match self.code {
@@ -473,8 +473,8 @@ fn render_details(f: &mut fmt::Formatter<'_>, details: &serde_json::Value) -> fm
     // `params` (400 / 409): two shapes.
     //   - An ARRAY of per-field validation failures (the modern replacement for
     //     the retired per-field integer codes; `name`/`kind`/`code`/`message`).
-    //   - An OBJECT of structured diagnostics for a single conflict — e.g. the
-    //     workflow-review / CAS 409 carries `{code, reason, current_round_id}`.
+    //   - An OBJECT of structured diagnostics for a single conflict — e.g. a
+    //     decision CAS 409 carries `{code, reason, current_round_id}`.
     //     Without the object arm, that payload reaches `ApiError::details` but is
     //     silently dropped from `Display`, so the user never sees WHY the write
     //     was rejected or which round is current.
@@ -949,7 +949,7 @@ mod tests {
 
     #[test]
     fn display_renders_object_valued_params() {
-        // The workflow-review / CAS 409 carries an OBJECT-valued `error.params`
+        // A decision CAS 409 carries an OBJECT-valued `error.params`
         // ({code, reason, current_round_id}), not an array. Each field must
         // surface in Display so the user sees WHY the decision was rejected and
         // which round is current — not just a bare 409.
@@ -1037,7 +1037,7 @@ mod tests {
                 {"name": "visibility", "kind": "enum"},
             ],
             "documentation_url": "https://api.fast.io/docs",
-            "resource": "workflow/123",
+            "resource": "decision/123",
         });
         let e = ApiError {
             code: 1640,
@@ -1057,13 +1057,13 @@ mod tests {
             "got: {rendered}"
         );
         assert!(rendered.contains("see: https://api.fast.io/docs"));
-        assert!(rendered.contains("resource: workflow/123"));
+        assert!(rendered.contains("resource: decision/123"));
     }
 
     #[test]
     fn display_bounds_doc_url_resource_and_param_count() {
         let long_url = format!("https://api.fast.io/docs/{}", "u".repeat(1000));
-        let long_resource = format!("workflow/{}", "r".repeat(1000));
+        let long_resource = format!("decision/{}", "r".repeat(1000));
         // 25 params — well past the MAX_RENDERED_PARAMS cap of 10.
         let params: Vec<_> = (0..25)
             .map(|i| serde_json::json!({"name": format!("field_{i}"), "message": "bad"}))

@@ -749,16 +749,6 @@ const TOOL_DEFS: &[ToolDef] = &[
                 false,
             ),
             (
-                "nl_summaries_enabled",
-                "Toggle AI obligation-summary enrichment — boolean (update)",
-                false,
-            ),
-            (
-                "nl_summaries_daily_cap",
-                "AI enrichment daily cap, 0-100000 (update)",
-                false,
-            ),
-            (
                 "accent_color",
                 "Accent color as JSON string (update)",
                 false,
@@ -1559,7 +1549,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "dashboard",
-        description: "Per-workspace dashboard: the calling member's ranked, paginated feed of ACTIONABLE cards (approvals, tasks, reviews, confirmations, @mentions, file activity, pending signatures). Actions: get (read the feed; paginate with limit 1-200 / offset), dismiss (hide a card from YOUR feed — permanently, or snooze it until a future time via snooze_until 'YYYY-MM-DD HH:MM:SS UTC'), undismiss (restore a card; idempotent). Dismiss / snooze / undismiss are PER-MEMBER and OUT-OF-BAND — they change only YOUR view and never advance, resolve, or modify the underlying obligation, workflow, or signature. card_key comes from a card's card_key field (URL-encoding is handled for you). A signature card's primary action — minting YOUR own signing link — is the `sign` tool's envelope-my-sign-link action (envelope_id = the signature card's target.id).",
+        description: "Per-workspace dashboard: the calling member's ranked, paginated feed of ACTIONABLE cards (@mentions, file activity, file versions, synthesis, and — when E-Sign is enabled — pending signatures). Actions: get (read the feed; paginate with limit 1-200 / offset), dismiss (hide a card from YOUR feed — permanently, or snooze it until a future time via snooze_until 'YYYY-MM-DD HH:MM:SS UTC'), undismiss (restore a card; idempotent). Dismiss / snooze / undismiss are PER-MEMBER and OUT-OF-BAND — they change only YOUR view and never advance, resolve, or modify the underlying card subject. card_key comes from a card's card_key field (URL-encoding is handled for you). Signature cards carry a sign-ceremony link for their primary action (requires E-Sign to be enabled).",
         actions: &["get", "dismiss", "undismiss"],
         params: &[
             (
@@ -1882,7 +1872,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "sign",
-        description: "E-signature (SignEnvelope): draft and drive electronic-signature envelopes (PDFs sent to recipients). Every envelope is parented to a workspace (workspace_id; the former org surface was removed). This tool exposes READ, reversible-DRAFT-drive, and idempotent-RECOVERY actions: envelope-create (creates a DRAFT — reversible), envelope-update (draft-only; recipients are a full replacement; expires_at/policy_json are DECLARATIVE — omitting them CLEARS those fields, re-send to retain), envelope-list (filter via envelope_status / created_after / created_before), envelope-get, envelope-retry (re-drives a STUCK envelope through self-healing recovery — admin; idempotent + no-op-success; notifies no one; a permanent failure cascades to Failed), envelope-my-sign-link (mints YOUR OWN signing link for an envelope — the dashboard signature-card primary action; reversible/idempotent and notifies no one; requires a WRITE-scope token, so a read-only token is rejected with 10754; the structured result tells you the state — sign_url non-null = sign now, is_terminal = completed/void/declined, reauth_required = re-authenticate first, else you are blocked by routing order per blocked_signers), document-download (covers preview needs — the download bytes ARE the source/preview PDF, so there is no separate MCP preview action), signed-download, audit-download, describe. SIGN TEMPLATES (reusable envelope blueprints, template id sa…): template-list, template-details, and template-instantiate (resolves recipient_bindings/documents against the blueprint and creates a reversible DRAFT envelope) are exposed over MCP (reads + reversible draft creation); template-create, template-update, and template-delete are intentionally CLI-binary-only (`fastio sign template create|update|delete …`) and are NOT routable over MCP (mirrors the send/void boundary). The OUTWARD-FACING / TERMINAL actions — send (EMAILS REAL RECIPIENTS) and void (terminal) — are intentionally CLI-binary-only (`fastio sign envelope send|void …`) and are NOT routable over MCP (mirrors how the workflow tool keeps cancel CLI-only). Envelopes are voided, not deleted — there is no delete action. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Signing is a paid-plan feature (a non-entitled org returns 1670; access also requires workspace membership). Call action='describe' for the authoritative per-action reference.",
+        description: "E-signature (SignEnvelope): draft and drive electronic-signature envelopes (PDFs sent to recipients). Every envelope is parented to a workspace (workspace_id; the former org surface was removed). This tool exposes READ, reversible-DRAFT-drive, and idempotent-RECOVERY actions: envelope-create (creates a DRAFT — reversible), envelope-update (draft-only; recipients are a full replacement; expires_at/policy_json are DECLARATIVE — omitting them CLEARS those fields, re-send to retain), envelope-list (filter via envelope_status / created_after / created_before), envelope-get, envelope-retry (re-drives a STUCK envelope through self-healing recovery — admin; idempotent + no-op-success; notifies no one; a permanent failure cascades to Failed), envelope-my-sign-link (mints YOUR OWN signing link for an envelope — the dashboard signature-card primary action; reversible/idempotent and notifies no one; requires a WRITE-scope token, so a read-only token is rejected with 10754; the structured result tells you the state — sign_url non-null = sign now, is_terminal = completed/void/declined, reauth_required = re-authenticate first, else you are blocked by routing order per blocked_signers), document-download (covers preview needs — the download bytes ARE the source/preview PDF, so there is no separate MCP preview action), signed-download, audit-download, describe. SIGN TEMPLATES (reusable envelope blueprints, template id sa…): template-list, template-details, and template-instantiate (resolves recipient_bindings/documents against the blueprint and creates a reversible DRAFT envelope) are exposed over MCP (reads + reversible draft creation); template-create, template-update, and template-delete are intentionally CLI-binary-only (`fastio sign template create|update|delete …`) and are NOT routable over MCP (mirrors the send/void boundary). The OUTWARD-FACING / TERMINAL actions — send (EMAILS REAL RECIPIENTS) and void (terminal) — are intentionally CLI-binary-only (`fastio sign envelope send|void …`) and are NOT routable over MCP. Envelopes are voided, not deleted — there is no delete action. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Signing is a paid-plan feature (a non-entitled org returns 1670; access also requires workspace membership). Call action='describe' for the authoritative per-action reference.",
         actions: &[
             "describe",
             "envelope-create",
@@ -1902,7 +1892,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             // Required for every action EXCEPT describe / send / void / delete,
             // which short-circuit before workspace extraction. Marked schema-
             // optional (false) — matching the registry convention for
-            // multi-action tools (e.g. `workflow`, `apps`) — with the real
+            // multi-action tools (e.g. `apps`) — with the real
             // per-action requirements communicated via action='describe'
             // (common_required + each action's `required` list). A schema-strict
             // MCP client would otherwise reject action='describe' for lacking
@@ -2028,7 +2018,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "fileshare",
-        description: "File Shares: durable, link-shareable views of a SINGLE workspace file — the replacement for the retired QuickShare (use this tool's 'create' action). A File Share binds one file node and serves it via a stable link with optional password protection, an access option (named_people / anyone_with_link / …), an expiry, and per-user grants (view < download < edit). This tool exposes READ + DRIVE actions: create, list, info (details + effective_capability), update, grants-list, grants-add, versions, download (streams the bound file to the agent's local fs), preview (streams a derived preview asset), activity (single poll), describe. CONFIRM-GATED destructive actions: 'delete' REQUIRES confirm_delete=true (revokes the link + cascades grants; the bound file is untouched); 'grants-remove' REQUIRES confirm_revoke=true. CLI-BINARY-ONLY actions (NOT routable over MCP): 'upload' — the write-back that pushes a NEW VERSION of the bound file — needs the local file bytes and is destructive, so run `fastio fileshare upload …`; and 'ws-token' — the realtime WebSocket-token mint — is CLI-only because the token is a long-lived secret that must NOT be parked in an MCP transcript (run `fastio fileshare ws-token --token-file <path>`; mirrors how the workflow tool keeps its realtime-token mint CLI-only). The 'password' arg protects/authorizes a link (travels only in the x-ve-password header; NEVER logged or echoed in results/errors). info/download/versions/preview may be ANONYMOUS on a public (anyone_with_link) share. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Call action='describe' for the authoritative per-action reference.",
+        description: "File Shares: durable, link-shareable views of a SINGLE workspace file — the replacement for the retired QuickShare (use this tool's 'create' action). A File Share binds one file node and serves it via a stable link with optional password protection, an access option (named_people / anyone_with_link / …), an expiry, and per-user grants (view < download < edit). This tool exposes READ + DRIVE actions: create, list, info (details + effective_capability), update, grants-list, grants-add, versions, download (streams the bound file to the agent's local fs), preview (streams a derived preview asset), activity (single poll), describe. CONFIRM-GATED destructive actions: 'delete' REQUIRES confirm_delete=true (revokes the link + cascades grants; the bound file is untouched); 'grants-remove' REQUIRES confirm_revoke=true. CLI-BINARY-ONLY actions (NOT routable over MCP): 'upload' — the write-back that pushes a NEW VERSION of the bound file — needs the local file bytes and is destructive, so run `fastio fileshare upload …`; and 'ws-token' — the realtime WebSocket-token mint — is CLI-only because the token is a long-lived secret that must NOT be parked in an MCP transcript (run `fastio fileshare ws-token --token-file <path>`). The 'password' arg protects/authorizes a link (travels only in the x-ve-password header; NEVER logged or echoed in results/errors). info/download/versions/preview may be ANONYMOUS on a public (anyone_with_link) share. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Call action='describe' for the authoritative per-action reference.",
         actions: &[
             "describe",
             "create",
@@ -2236,6 +2226,13 @@ impl ToolRouter {
     /// callable surface `call_tool` gates on the same field.
     pub fn list_tools(&self) -> ListToolsResult {
         Self::list_tools_with(self.esign_enabled)
+    }
+
+    /// Whether the E-Sign surface is enabled for this router (kill-switch read
+    /// once at construction). Used by the server's `get_info` instructions so a
+    /// disabled server does not advertise the `sign` tool in its intro text.
+    pub fn esign_enabled(&self) -> bool {
+        self.esign_enabled
     }
 
     /// Core of [`Self::list_tools`], parameterized on the E-Sign flag so tests
@@ -4110,13 +4107,6 @@ fn build_workspace_update_fields(
     if let Some(v) = optional_str(args, "perm_member_manage") {
         fields.insert("perm_member_manage".to_owned(), v.to_owned());
     }
-    if let Some(v) = optional_bool(args, "nl_summaries_enabled") {
-        fields.insert("nl_summaries_enabled".to_owned(), v.to_string());
-    }
-    if let Some(v) = optional_u32(args, "nl_summaries_daily_cap") {
-        fields.insert("nl_summaries_daily_cap".to_owned(), v.to_string());
-    }
-
     if let Some(v) = optional_str(args, "accent_color") {
         fields.insert("accent_color".to_owned(), v.to_owned());
     }
@@ -7796,9 +7786,8 @@ async fn handle_comment_reply(
 
 /// `comment` update action: edit a comment's body by id.
 ///
-/// This is the generic comment-edit path — it also edits TASK comments by their
-/// comment id (the `task` tool posts/lists task comments, but editing is reached
-/// here). The new body accepts either `text` (preferred) or `body` (alias).
+/// This is the generic comment-edit path — it edits any comment by its comment
+/// id. The new body accepts either `text` (preferred) or `body` (alias).
 async fn handle_comment_update(
     state: &McpState,
     args: &Map<String, Value>,
@@ -8692,17 +8681,15 @@ fn classify_wf_poll_error(err: &fastio_cli::error::CliError) -> WfPollAction {
     }
 }
 
-/// Read an optional JSON-array argument for a REST field the API expects as a
-/// JSON-array STRING (e.g. comment `target_ids`, `comment_ids`). MCP clients
-/// commonly pass these as a native JSON array; accept that OR a serialized
-/// JSON-array string and return the serialized form. A missing/null key is
-/// `None`; anything that is not (or does not parse to) a **non-empty** JSON array
-/// is rejected rather than silently dropped.
+/// Read a list-of-ids argument that may arrive either as a native JSON array of
+/// strings or as a comma-separated string (the established CSV form for id-list
+/// params). Returns the collected ids — the caller enforces non-empty and any cap.
 ///
-/// An explicit EMPTY array is rejected on purpose: the workflow API treats an
-/// empty/omitted `apply_change_ids` as "apply ALL pending changes", so accepting
-/// `[]` would turn an apply-nothing / empty-selection request into an apply-ALL
-/// one. To apply all, OMIT the field; to apply a subset, pass a non-empty array.
+/// The two forms are treated differently on purpose, because these feed mutating
+/// / destructive callers (attach, bulk-delete): a native JSON array is machine
+/// built, so a blank or non-string entry signals a generation bug and is
+/// **rejected** (fail closed); a comma-separated string is loose human/CLI input,
+/// so stray/trailing commas are tolerated by trimming and dropping blank tokens.
 fn string_list_arg(args: &Map<String, Value>, key: &str) -> Result<Vec<String>, CallToolResult> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(Vec::new()),
@@ -10204,9 +10191,8 @@ fn sign_describe() -> CallToolResult {
 
 /// E-signature tool handler — READ + reversible-DRAFT-drive actions only. The
 /// outward-facing / terminal actions (send / void) are CLI-binary-only and are
-/// routed to a guidance message BEFORE auth/workspace extraction (mirrors how
-/// the `workflow` tool keeps `cancel` CLI-only). Envelopes are voided, not
-/// deleted; a `delete` request is reported as unsupported.
+/// routed to a guidance message BEFORE auth/workspace extraction. Envelopes are
+/// voided, not deleted; a `delete` request is reported as unsupported.
 #[allow(clippy::too_many_lines)] // a flat dispatch over the envelope lifecycle surface
 async fn handle_sign(
     state: &McpState,
@@ -11070,8 +11056,8 @@ fn fileshare_describe() -> CallToolResult {
                            available over MCP (it needs local file bytes and is destructive).",
             "ws_token": "To mint a realtime WebSocket token, run the CLI: `fastio fileshare \
                          ws-token <id> --token-file <path>` (0600). NOT exposed over MCP — the \
-                         token is a long-lived secret (mirrors the workflow tool's CLI-only \
-                         realtime-token mint).",
+                         token is a long-lived secret that must not be parked in an MCP \
+                         transcript.",
             "cli_only_actions": cli_only,
         },
         "actions": Value::Object(action_map),
@@ -11113,8 +11099,7 @@ async fn handle_fileshare(
     }
     // `ws-token` (realtime WebSocket-token mint) is CLI-binary-only: the token is
     // a long-lived secret that must not be parked in an MCP transcript. The CLI
-    // redacts it from stdout and writes it 0600 to --token-file (mirrors how the
-    // workflow tool keeps its realtime-token mint CLI-only).
+    // redacts it from stdout and writes it 0600 to --token-file.
     if matches!(action, "ws-token" | "websocket" | "realtime-token") {
         return Ok(error_text(
             "fileshare ws-token (realtime WebSocket-token mint) is CLI-binary-only: the token is \
@@ -12012,7 +11997,7 @@ mod ripley_tool_tests {
     fn user_tool_omits_irreversible_account_close() {
         // Account `close` permanently closes the user's account (irreversible),
         // so it is CLI-binary-only and MUST NOT be advertised over MCP — like the
-        // workflow `cancel` / sign `send` carve-outs.
+        // sign `send` carve-out.
         let actions = user_tool_actions();
         assert!(
             !actions.contains(&"close"),
@@ -13322,7 +13307,7 @@ mod ripley_tool_tests {
             );
         }
         // workspace_id is SCHEMA-OPTIONAL (false), matching the registry
-        // convention for multi-action tools (e.g. `workflow`, `apps`): the
+        // convention for multi-action tools (e.g. `apps`): the
         // describe / send / void / delete actions short-circuit BEFORE workspace
         // extraction, so marking it required=true would make a schema-strict MCP
         // client reject action='describe'. The real per-action requirement is

@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
 /// the pure decision behind that rendering, factored out so it can be
 /// unit-tested without capturing stderr.
 ///
-/// The subtlety it handles: command handlers attach signing / workflow / etc.
+/// The subtlety it handles: command handlers attach signing / upload / etc.
 /// framing via `anyhow::Error::context(...)` ON TOP OF a `CliError`. anyhow's
 /// `.context()` preserves downcastability, so `downcast_ref::<CliError>()` still
 /// succeeds — but [`CliError::render_stderr`] only prints the bare `CliError`
@@ -826,8 +826,6 @@ fn map_workspace_command(cmd: cli::WorkspaceCommands) -> WorkspaceCommand {
             intelligence,
             perm_join,
             perm_member_manage,
-            nl_summaries_enabled,
-            nl_summaries_daily_cap,
             accent_color,
             background_color1,
             background_color2,
@@ -840,8 +838,6 @@ fn map_workspace_command(cmd: cli::WorkspaceCommands) -> WorkspaceCommand {
             intelligence,
             perm_join,
             perm_member_manage,
-            nl_summaries_enabled,
-            nl_summaries_daily_cap,
             accent_color,
             background_color1,
             background_color2,

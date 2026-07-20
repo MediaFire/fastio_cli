@@ -78,22 +78,19 @@ Use the `workspace` tool with `action: \"list\"` and provide your org_id.
 Use the `files` tool with `action: \"list\"` and provide your workspace_id —
 or skip the manual browse and let `ripley` `ask` answer over the content.
 
-## Orchestration, signing, and the rest
-- `workflow` — durable multi-step orchestration; prefer the compound
-  `instantiate-and-wait` / `trigger-fire-and-wait` actions over tight poll loops.
-  (Read + drive only; `cancel` and other admin/destructive actions are
-  CLI-binary-only.)
-- `sign` — e-signature envelopes (workspace-scoped; read + draft-drive only;
-  `send`/`void` are CLI-binary-only — envelopes are voided, not deleted).
-- `task` — Tasks API (task lists, tasks, comments, attachments); a separate
-  surface from `workflow` orchestration.
+## E-signature
+E-sign tools appear only when enabled by the operator (feature sunset 2026-07;
+set `FASTIO_ENABLE_ESIGN=1`, and signing must also be enabled for the org). When
+enabled, the `sign` tool drives workspace-scoped e-signature envelopes (read +
+draft-drive only; `send`/`void` are CLI-binary-only — envelopes are voided, not
+deleted).
 
 ## Available Tool Domains
 - auth, user, org, workspace, files, upload, download, share
 - ripley, member, comment, event, invitation, preview, asset
-- workflow, sign, metadata, system
-- task
+- metadata, system
+- sign (only when E-Sign is enabled)
 
-Each tool uses an `action` parameter to select the operation; call
-`action: \"describe\"` on the `workflow` or `sign` tool for its authoritative
-per-action reference.";
+Each tool uses an `action` parameter to select the operation; the
+fileshare and id tools (and sign, when E-Sign is enabled) support
+`action: \"describe\"` for an authoritative per-action reference.";

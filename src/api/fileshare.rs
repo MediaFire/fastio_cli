@@ -238,8 +238,8 @@ pub fn storage_version_read_path(fileshare_id: &str, version_id: &str) -> Result
 
 /// Build the WebSocket-auth token path `/websocket/auth/{id}`.
 ///
-/// NOTE: NO trailing slash — this matches the `orchestration::realtime_token`
-/// precedent (`/websocket/auth/{workflow_id}`) and the local llms docs.
+/// NOTE: NO trailing slash — this matches the realtime websocket-auth
+/// convention (`/websocket/auth/{id}`) and the local llms docs.
 /// `FILE_SHARING.md:97` shows a trailing slash; that conflict is flagged for
 /// live-verify (try no-slash first, record any variance).
 ///
@@ -1105,7 +1105,7 @@ mod tests {
             storage_version_read_path("999", "v7").expect("ids"),
             "/fileshare/999/storage/versions/v7/read/"
         );
-        // WebSocket auth has NO trailing slash (orchestration precedent).
+        // WebSocket auth has NO trailing slash (websocket-auth convention).
         assert_eq!(
             websocket_auth_path("999").expect("id"),
             "/websocket/auth/999"

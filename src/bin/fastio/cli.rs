@@ -9,7 +9,7 @@
 //
 //   * `#[command(visible_alias = "<new>")]` — an additional accepted name
 //     that ALSO appears in `--help` and completions. Use for surfacing a new
-//     short form alongside the canonical one (e.g. `workflow` / `wf`).
+//     short form alongside the canonical one (e.g. `how-to` / `howto`).
 //   * `#[command(alias = "<old>")]` — an accepted-but-HIDDEN back-compat
 //     name (does not show in `--help`/completions). Use to keep old
 //     invocations working after a rename, e.g. `ai` -> `ripley`,
@@ -163,10 +163,10 @@ pub enum Commands {
     #[command(subcommand)]
     Event(EventCommands),
     /// Per-workspace dashboard: the calling member's ranked, actionable card
-    /// feed (approvals, tasks, reviews, confirmations, @mentions, file activity,
-    /// pending signatures). Dismiss / snooze / undismiss are per-member and
-    /// out-of-band — they only hide a card from your own feed, never resolving
-    /// the underlying obligation, workflow, or signature.
+    /// feed (@mentions, file activity, file versions, synthesis; signature cards
+    /// only when E-Sign is enabled platform-side). Dismiss / snooze / undismiss
+    /// are per-member and out-of-band — they only hide a card from your own feed,
+    /// never resolving the underlying card subject.
     #[command(subcommand)]
     Dashboard(DashboardCommands),
     /// File previews.
@@ -2338,12 +2338,6 @@ pub enum WorkspaceCommands {
         /// Who can manage members (permission phrase).
         #[arg(long)]
         perm_member_manage: Option<String>,
-        /// Toggle AI obligation-summary enrichment.
-        #[arg(long)]
-        nl_summaries_enabled: Option<bool>,
-        /// AI enrichment daily cap (0-100000).
-        #[arg(long, value_parser = clap::value_parser!(u32).range(0..=100_000))]
-        nl_summaries_daily_cap: Option<u32>,
         /// Brand accent color as a JSON string (pass `null` to clear).
         #[arg(long)]
         accent_color: Option<String>,
@@ -3844,8 +3838,7 @@ pub enum CommentCommands {
         #[arg(long)]
         entity_id: String,
     },
-    /// Edit a comment's text (author-only; works for any comment by ID,
-    /// including task comments).
+    /// Edit a comment's text (author-only; works for any comment by ID).
     Edit {
         /// Comment ID.
         comment_id: String,
@@ -4100,9 +4093,8 @@ pub enum DashboardCommands {
     /// Dismiss a card permanently, or snooze it until a future time.
     ///
     /// Per-member and out-of-band: this only hides the card from your own feed
-    /// — it never advances, resolves, or changes the underlying obligation,
-    /// workflow, or signature. Pass `--snooze-until` to snooze instead of
-    /// permanently dismissing.
+    /// — it never advances, resolves, or changes the underlying card subject.
+    /// Pass `--snooze-until` to snooze instead of permanently dismissing.
     Dismiss {
         /// Card key from the feed (e.g. `obligation:123…`). URL-encoding is
         /// handled for you.
