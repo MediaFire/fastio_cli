@@ -191,6 +191,16 @@ async fn run() -> Result<()> {
         colored::control::set_override(false);
     }
 
+    // E-Sign kill-switch (feature sunset 2026-07): gate the sign surface here,
+    // BEFORE config/profile resolution, so the disabled error always wins over
+    // any config/auth error. Enabled only via `FASTIO_ENABLE_ESIGN=1`; the
+    // platform enforces its own org-level flag server-side as well.
+    if matches!(cli.command, Commands::Sign(_)) && !commands::sign::esign_enabled() {
+        anyhow::bail!(
+            "E-Sign is currently disabled. Set FASTIO_ENABLE_ESIGN=1 to use sign commands (signing must also be enabled for your organization)."
+        );
+    }
+
     // Load configuration
     let config = Config::load().context("failed to load configuration")?;
 

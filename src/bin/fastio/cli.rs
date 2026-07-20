@@ -243,7 +243,12 @@ pub enum Commands {
     /// to recipients for electronic signature). Every envelope is parented to a
     /// workspace (each subcommand takes a required `--workspace <id>`). Signing
     /// is a paid-plan feature.
-    #[command(subcommand)]
+    ///
+    /// Disabled by default (feature sunset 2026-07): the runtime kill-switch in
+    /// `main.rs` blocks execution unless `FASTIO_ENABLE_ESIGN=1`, and `hide =
+    /// true` keeps the surface out of top-level `--help`. The env var does not
+    /// un-hide the entry (hide is static); only execution is gated.
+    #[command(subcommand, hide = true)]
     Sign(SignCommands),
 
     /// File Shares: durable, link-shareable views of a single workspace file

@@ -43,6 +43,22 @@ use crate::cli::{
 
 use super::CommandContext;
 
+// ─── E-Sign kill-switch ─────────────────────────────────────────────────────
+
+/// E-Sign kill-switch: the sign surface is disabled by default (feature
+/// sunset 2026-07); `FASTIO_ENABLE_ESIGN=1` re-enables it for operators.
+/// The platform enforces its own org-level flag server-side (HTTP 403
+/// "Signing is not enabled for this organization.") — this local switch is
+/// belt-and-braces and controls only surface visibility/dispatch.
+pub(crate) fn esign_enabled() -> bool {
+    esign_enabled_from(std::env::var("FASTIO_ENABLE_ESIGN").ok().as_deref())
+}
+
+/// Testable core: enabled iff the value is exactly "1".
+pub(crate) fn esign_enabled_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 // ─── @file JSON resolution ──────────────────────────────────────────────────
 
 /// Resolve a JSON-string argument, supporting an `@path` form that reads the
@@ -1146,6 +1162,15 @@ fn download_ctx(what: &str) -> (&'static str, SignOp) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn esign_enabled_from_requires_exact_one() {
+        assert!(esign_enabled_from(Some("1")));
+        assert!(!esign_enabled_from(Some("true")));
+        assert!(!esign_enabled_from(Some("0")));
+        assert!(!esign_enabled_from(Some("")));
+        assert!(!esign_enabled_from(None));
+    }
 
     #[test]
     fn resolve_json_value_literal_and_escape() {

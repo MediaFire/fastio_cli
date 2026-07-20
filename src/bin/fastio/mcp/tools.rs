@@ -2199,18 +2199,53 @@ const TOOL_DEFS: &[ToolDef] = &[
 #[derive(Clone)]
 pub struct ToolRouter {
     state: Arc<McpState>,
+    /// E-Sign kill-switch (feature sunset 2026-07): read ONCE at construction
+    /// via [`crate::commands::sign::esign_enabled`]. When false the `sign` tool
+    /// is filtered out of `list_tools` and its `call_tool` arm returns the
+    /// disabled error before any auth/client/arg work.
+    esign_enabled: bool,
 }
 
 impl ToolRouter {
     /// Create a new tool router with shared state.
+    ///
+    /// Reads the E-Sign kill-switch (`FASTIO_ENABLE_ESIGN=1`) once here so the
+    /// flag is fixed for the lifetime of the server rather than re-read per call.
     pub fn new(state: Arc<McpState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            esign_enabled: crate::commands::sign::esign_enabled(),
+        }
     }
 
-    /// List all registered tools as MCP `Tool` descriptors.
-    pub fn list_tools() -> ListToolsResult {
+    /// Construct a router with an explicit E-Sign flag, for unit tests that
+    /// must assert both the enabled and disabled surfaces without mutating the
+    /// process environment (unsafe under Rust 2024 and process-global).
+    #[cfg(test)]
+    pub fn new_with_esign(state: Arc<McpState>, esign_enabled: bool) -> Self {
+        Self {
+            state,
+            esign_enabled,
+        }
+    }
+
+    /// List all registered tools as MCP `Tool` descriptors, honoring the E-Sign
+    /// kill-switch captured at router construction. This instance method is the
+    /// sole production listing path: it reads `self.esign_enabled` (fixed at
+    /// construction), so the advertised tool surface can never diverge from the
+    /// callable surface `call_tool` gates on the same field.
+    pub fn list_tools(&self) -> ListToolsResult {
+        Self::list_tools_with(self.esign_enabled)
+    }
+
+    /// Core of [`Self::list_tools`], parameterized on the E-Sign flag so tests
+    /// can exercise both surfaces without touching the process environment.
+    /// When `esign_enabled` is false the `sign` tool is filtered out; the
+    /// `TOOL_DEFS` static array is left intact.
+    pub fn list_tools_with(esign_enabled: bool) -> ListToolsResult {
         let tools = TOOL_DEFS
             .iter()
+            .filter(|def| esign_enabled || def.name != "sign")
             .map(|def| {
                 Tool::new(
                     def.name,
@@ -2262,6 +2297,9 @@ impl ToolRouter {
             "import" => handle_import(&self.state, action, &args).await,
             "lock" => handle_lock(&self.state, action, &args).await,
             "metadata" => handle_metadata(&self.state, action, &args).await,
+            "sign" if !self.esign_enabled => Ok(error_text(
+                "E-Sign is currently disabled. Set FASTIO_ENABLE_ESIGN=1 to use sign commands (signing must also be enabled for your organization).",
+            )),
             "sign" => handle_sign(&self.state, action, &args).await,
             "fileshare" => handle_fileshare(&self.state, action, &args).await,
             "system" => handle_system(&self.state, action, &args).await,
@@ -11906,9 +11944,16 @@ mod ripley_tool_tests {
     }
 
     fn unauthed_router() -> ToolRouter {
-        ToolRouter::new(Arc::new(McpState::new_unauthenticated_for_test(
-            "https://api.fast.io/current",
-        )))
+        // Inject `esign_enabled = true` so the existing `sign` dispatch tests
+        // exercise the real handler without mutating the process environment
+        // (unsafe under Rust 2024). The kill-switch's own gate is covered by the
+        // dedicated `sign_*_disabled` tests below.
+        ToolRouter::new_with_esign(
+            Arc::new(McpState::new_unauthenticated_for_test(
+                "https://api.fast.io/current",
+            )),
+            true,
+        )
     }
 
     /// An authenticated router whose client points at an unroutable base URL.
@@ -11920,12 +11965,12 @@ mod ripley_tool_tests {
             "https://api.fast.io/current",
         ));
         state.set_token("test-token".to_owned()).await;
-        ToolRouter::new(state)
+        ToolRouter::new_with_esign(state, true)
     }
 
     #[test]
     fn list_tools_advertises_ripley_not_ai() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(names.contains(&"ripley"), "ripley tool must be advertised");
         assert!(
@@ -12090,7 +12135,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn dashboard_and_howto_tools_are_advertised() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(
             names.contains(&"dashboard"),
@@ -12242,7 +12287,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn ripley_tool_description_leads_with_offload_framing() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let ripley = tools
             .iter()
             .find(|t| t.name.as_ref() == "ripley")
@@ -12358,7 +12403,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn ripley_tool_advertises_phase2_actions() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let ripley = tools
             .iter()
             .find(|t| t.name.as_ref() == "ripley")
@@ -12382,7 +12427,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn metadata_tool_advertises_extract_and_wait_action() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let metadata = tools
             .iter()
             .find(|t| t.name.as_ref() == "metadata")
@@ -12414,7 +12459,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn workspace_tool_advertises_metadata_extract_and_wait_action() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let workspace = tools
             .iter()
             .find(|t| t.name.as_ref() == "workspace")
@@ -12479,7 +12524,7 @@ mod ripley_tool_tests {
         // FIX 2: the workspace tool exposes the workspace-level saved-view
         // actions (incl. the new `metadata-view-get`) and the `config` param
         // (form field for view-save); the retired `view_id` param is gone.
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let workspace = tools
             .iter()
             .find(|t| t.name.as_ref() == "workspace")
@@ -12861,7 +12906,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn workspace_and_metadata_schemas_advertise_confirm_ai_spend() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         for tool_name in ["workspace", "metadata"] {
             let tool = tools
                 .iter()
@@ -13087,7 +13132,11 @@ mod ripley_tool_tests {
 
     #[test]
     fn sign_tool_is_registered_and_read_draft_oriented() {
-        let tools = ToolRouter::list_tools().tools;
+        // Explicitly list with E-Sign enabled: the production `list_tools()`
+        // reads the construction-time flag (disabled unless FASTIO_ENABLE_ESIGN=1
+        // at server startup) and would omit `sign`. The disabled surface is
+        // covered by `sign_*_disabled` below.
+        let tools = ToolRouter::list_tools_with(true).tools;
         let sign = tools
             .iter()
             .find(|t| t.name.as_ref() == "sign")
@@ -13102,6 +13151,105 @@ mod ripley_tool_tests {
         assert!(
             desc.to_lowercase().contains("workspace"),
             "sign tool description must be workspace-scoped, got: {desc}"
+        );
+    }
+
+    // ─── E-Sign kill-switch (feature sunset 2026-07) ─────────────────────────
+
+    /// The disabled surface (`list_tools_with(false)`) drops `sign` while every
+    /// other tool is untouched — the filter is sign-specific, not a truncation.
+    #[test]
+    fn list_tools_disabled_omits_sign_only() {
+        let disabled = ToolRouter::list_tools_with(false).tools;
+        let has = |name: &str| disabled.iter().any(|t| t.name.as_ref() == name);
+        assert!(
+            !has("sign"),
+            "sign must be filtered out when E-Sign is disabled"
+        );
+        // Every other registered tool is still present — only `sign` was dropped.
+        for def in TOOL_DEFS {
+            if def.name == "sign" {
+                continue;
+            }
+            assert!(
+                has(def.name),
+                "non-sign tool '{}' must remain when E-Sign is disabled",
+                def.name
+            );
+        }
+        assert_eq!(
+            ToolRouter::list_tools_with(true).tools.len(),
+            disabled.len() + 1,
+            "disabling E-Sign removes exactly one tool (sign)"
+        );
+    }
+
+    /// The enabled surface (`list_tools_with(true)`) advertises `sign`.
+    #[test]
+    fn list_tools_enabled_contains_sign() {
+        let tools = ToolRouter::list_tools_with(true).tools;
+        assert!(
+            tools.iter().any(|t| t.name.as_ref() == "sign"),
+            "sign must be advertised when E-Sign is enabled"
+        );
+    }
+
+    /// A disabled router's `sign` dispatch returns the kill-switch error text
+    /// BEFORE any auth/client/arg work — a tool-level error, not an auth error.
+    #[tokio::test]
+    async fn call_tool_sign_disabled_returns_disabled_error() {
+        let router = ToolRouter::new_with_esign(
+            Arc::new(McpState::new_unauthenticated_for_test(
+                "https://api.fast.io/current",
+            )),
+            false,
+        );
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("envelope-list".to_owned()),
+        );
+        args.insert("workspace_id".to_owned(), Value::String("1".to_owned()));
+        let res = router.call_tool("sign", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains(
+                "E-Sign is currently disabled. Set FASTIO_ENABLE_ESIGN=1 to use sign commands"
+            ),
+            "disabled sign call must return the kill-switch error, got: {text}"
+        );
+        // It is the kill-switch error, not the auth gate — the gate wins first.
+        assert!(
+            !text.contains("Not authenticated"),
+            "disabled sign gate must win over the auth gate, got: {text}"
+        );
+    }
+
+    /// Disabling E-Sign does NOT affect any other tool: `howto` still routes to
+    /// its own handler (reaching the auth gate) rather than the sign gate.
+    #[tokio::test]
+    async fn call_tool_disabled_sign_does_not_affect_other_tools() {
+        let router = ToolRouter::new_with_esign(
+            Arc::new(McpState::new_unauthenticated_for_test(
+                "https://api.fast.io/current",
+            )),
+            false,
+        );
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("ask".to_owned()));
+        args.insert(
+            "question".to_owned(),
+            Value::String("How do I create a share?".to_owned()),
+        );
+        let res = router.call_tool("howto", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("Not authenticated"),
+            "howto must reach its own handler, got: {text}"
+        );
+        assert!(
+            !text.contains("E-Sign is currently disabled"),
+            "the E-Sign gate must not leak into other tools, got: {text}"
         );
     }
 
@@ -14191,7 +14339,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn fileshare_tool_is_registered_and_drive_oriented() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let fs = tools
             .iter()
             .find(|t| t.name.as_ref() == "fileshare")

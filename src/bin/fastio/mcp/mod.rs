@@ -196,7 +196,7 @@ impl ServerHandler for FastioMcpServer {
         _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ToolRouter::list_tools())
+        Ok(self.tool_router.list_tools())
     }
 
     async fn call_tool(
