@@ -86,9 +86,15 @@ draft-drive only; `send`/`void` are CLI-binary-only — envelopes are voided, no
 deleted).
 
 ## Available Tool Domains
-- auth, user, org, workspace, files, upload, download, share
-- ripley, member, comment, event, invitation, preview, asset
-- metadata, system
+This is the FULL default surface; the operator may restrict it by starting the
+server with `fastio mcp --tools <a,b,...>`, in which case `list_tools` (and the
+server intro `instructions`) reflect only the enabled subset — call `list_tools`
+for the authoritative live set.
+- auth, user, org, workspace
+- files, upload, download, share, fileshare
+- ripley, member, comment, event, invitation, dashboard
+- preview, asset, apps, import, lock, metadata
+- system, id, howto
 - sign (only when E-Sign is enabled)
 
 Each tool uses an `action` parameter to select the operation; the

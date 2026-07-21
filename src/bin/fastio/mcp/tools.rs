@@ -43,6 +43,26 @@ fn error_text(msg: &str) -> CallToolResult {
     CallToolResult::error(vec![Content::text(msg.to_owned())])
 }
 
+/// Resolve a tool name (possibly a hidden dispatch alias) to its canonical
+/// `TOOL_DEFS` name — the name a caller passes to `--tools` and the name that
+/// appears in `list_tools`.
+///
+/// The router accepts two back-compat aliases that route to a renamed handler:
+/// `ai` → `ripley` and `how-to` → `howto`. The `--tools` allow-list is validated
+/// against `TOOL_DEFS` names (which carry the canonical spellings only), so the
+/// filter gate must map an alias to its canonical name before checking
+/// membership — otherwise `--tools ripley` would wrongly reject a legacy `ai`
+/// call. It is also applied when normalizing the raw `--tools` list so a caller
+/// may spell the allow-list entry as either the alias or the canonical name. Any
+/// name that is not a known alias is returned unchanged.
+pub fn canonical_tool_name(name: &str) -> &str {
+    match name {
+        "ai" => "ripley",
+        "how-to" => "howto",
+        other => other,
+    }
+}
+
 /// Extract a required string parameter.
 fn required_str<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str, CallToolResult> {
     args.get(key).and_then(Value::as_str).ok_or_else(|| {
@@ -353,6 +373,17 @@ struct ToolDef {
     actions: &'static [&'static str],
     /// Extra parameters: (name, description, always-required).
     params: &'static [(&'static str, &'static str, bool)],
+}
+
+/// The canonical names of every registered tool, in `TOOL_DEFS` order.
+///
+/// The single source of truth for validating the `--tools` allow-list (the
+/// `serve()` entry point drops any requested name not in this set, with a
+/// startup warning). Includes `sign` regardless of the E-Sign kill-switch — a
+/// `--tools sign` on a disabled server is a KNOWN name (so it is not warned
+/// about as unknown); the E-Sign gate then hides/refuses it at runtime.
+pub fn known_tool_names() -> impl Iterator<Item = &'static str> {
+    TOOL_DEFS.iter().map(|def| def.name)
 }
 
 const TOOL_DEFS: &[ToolDef] = &[
@@ -2194,51 +2225,152 @@ pub struct ToolRouter {
     /// is filtered out of `list_tools` and its `call_tool` arm returns the
     /// disabled error before any auth/client/arg work.
     esign_enabled: bool,
+    /// Optional `--tools` allow-list captured at server startup. `None` means
+    /// "all tools" (the default). When `Some`, a tool is advertised in
+    /// `list_tools` and callable in `call_tool` ONLY if its name is in the set;
+    /// every other tool is hidden and its dispatch returns a not-enabled error.
+    /// The E-Sign rule composes with this: `sign` requires BOTH E-Sign enabled
+    /// AND (filter is None or contains "sign"). The set contains only names that
+    /// match a [`TOOL_DEFS`] entry (unknown names are dropped, with a startup
+    /// warning, before the router is built).
+    tools_filter: Option<std::collections::HashSet<String>>,
 }
 
 impl ToolRouter {
-    /// Create a new tool router with shared state.
+    /// Create a new tool router with shared state and an optional `--tools`
+    /// allow-list.
     ///
     /// Reads the E-Sign kill-switch (`FASTIO_ENABLE_ESIGN=1`) once here so the
     /// flag is fixed for the lifetime of the server rather than re-read per call.
-    pub fn new(state: Arc<McpState>) -> Self {
+    /// `tools_filter` is `None` for the default (all tools) or the validated
+    /// allow-list set built by the `serve()` entry point.
+    pub fn new(
+        state: Arc<McpState>,
+        tools_filter: Option<std::collections::HashSet<String>>,
+    ) -> Self {
         Self {
             state,
             esign_enabled: crate::commands::sign::esign_enabled(),
+            tools_filter,
         }
     }
 
-    /// Construct a router with an explicit E-Sign flag, for unit tests that
-    /// must assert both the enabled and disabled surfaces without mutating the
-    /// process environment (unsafe under Rust 2024 and process-global).
+    /// Construct a router with an explicit E-Sign flag (no `--tools` filter),
+    /// for unit tests that must assert both the enabled and disabled surfaces
+    /// without mutating the process environment (unsafe under Rust 2024 and
+    /// process-global).
     #[cfg(test)]
     pub fn new_with_esign(state: Arc<McpState>, esign_enabled: bool) -> Self {
         Self {
             state,
             esign_enabled,
+            tools_filter: None,
+        }
+    }
+
+    /// Construct a router with an explicit E-Sign flag AND a `--tools`
+    /// allow-list, for the filter unit tests.
+    #[cfg(test)]
+    pub fn new_with_filter(
+        state: Arc<McpState>,
+        esign_enabled: bool,
+        tools_filter: Option<std::collections::HashSet<String>>,
+    ) -> Self {
+        Self {
+            state,
+            esign_enabled,
+            tools_filter,
         }
     }
 
     /// List all registered tools as MCP `Tool` descriptors, honoring the E-Sign
-    /// kill-switch captured at router construction. This instance method is the
-    /// sole production listing path: it reads `self.esign_enabled` (fixed at
-    /// construction), so the advertised tool surface can never diverge from the
-    /// callable surface `call_tool` gates on the same field.
+    /// kill-switch AND the `--tools` allow-list captured at router construction.
+    /// This instance method is the sole production listing path: it reads
+    /// `self.esign_enabled` and `self.tools_filter` (both fixed at construction),
+    /// so the advertised tool surface can never diverge from the callable surface
+    /// `call_tool` gates on the same fields.
     pub fn list_tools(&self) -> ListToolsResult {
-        Self::list_tools_with(self.esign_enabled)
+        let tools = TOOL_DEFS
+            .iter()
+            .filter(|def| self.tool_visible(def.name))
+            .map(|def| {
+                Tool::new(
+                    def.name,
+                    def.description,
+                    action_schema(def.actions, def.params),
+                )
+            })
+            .collect();
+        ListToolsResult {
+            tools,
+            next_cursor: None,
+            meta: None,
+        }
     }
 
-    /// Whether the E-Sign surface is enabled for this router (kill-switch read
-    /// once at construction). Used by the server's `get_info` instructions so a
-    /// disabled server does not advertise the `sign` tool in its intro text.
-    pub fn esign_enabled(&self) -> bool {
-        self.esign_enabled
+    /// Whether the `--tools` allow-list admits `name` (a CANONICAL tool name).
+    /// `None` filter = admits everything. Shared by [`Self::tool_visible`] (the
+    /// listing gate) and [`Self::call_tool`] (the dispatch gate) so the allow-list
+    /// half is defined exactly once and the advertised set can never diverge from
+    /// the callable set. The E-Sign rule is applied ALONGSIDE this (see
+    /// `tool_visible` / the `sign` match arm), not inside it, because the two
+    /// gates surface DIFFERENT refuse messages (not-enabled vs E-Sign-disabled).
+    fn filter_admits(&self, name: &str) -> bool {
+        match &self.tools_filter {
+            None => true,
+            Some(set) => set.contains(name),
+        }
     }
 
-    /// Core of [`Self::list_tools`], parameterized on the E-Sign flag so tests
-    /// can exercise both surfaces without touching the process environment.
-    /// When `esign_enabled` is false the `sign` tool is filtered out; the
-    /// `TOOL_DEFS` static array is left intact.
+    /// Whether a tool `name` is exposed in `list_tools` (the advertised set). A
+    /// tool is visible iff the E-Sign rule allows it (`sign` requires
+    /// `esign_enabled`) AND the `--tools` allow-list admits it
+    /// ([`Self::filter_admits`]). `call_tool` applies the SAME two rules at
+    /// dispatch time (allow-list via `filter_admits`, E-Sign via its `sign` match
+    /// arm), so advertised and callable stay in lockstep.
+    fn tool_visible(&self, name: &str) -> bool {
+        if name == "sign" && !self.esign_enabled {
+            return false;
+        }
+        self.filter_admits(name)
+    }
+
+    /// Whether, after applying BOTH the E-Sign rule and the `--tools` allow-list,
+    /// any tool at all remains visible. Used at startup to refuse a server that
+    /// would advertise an empty tool surface (e.g. `--tools sign` with E-Sign
+    /// disabled — `sign` is a known name so name-validation passes, but the
+    /// effective surface is empty).
+    pub fn has_visible_tools(&self) -> bool {
+        TOOL_DEFS.iter().any(|def| self.tool_visible(def.name))
+    }
+
+    /// Whether a `--tools` allow-list is active on this router (i.e. the surface
+    /// is a strict subset of all tools). Used by the server intro so the
+    /// `instructions` text only enumerates the allowed tools when a filter is in
+    /// effect, instead of pitching the full default surface.
+    pub fn has_tools_filter(&self) -> bool {
+        self.tools_filter.is_some()
+    }
+
+    /// The canonical names of the tools currently VISIBLE on this router (both
+    /// the E-Sign rule and the `--tools` allow-list applied), in `TOOL_DEFS`
+    /// order. The advertised set `list_tools` returns, as names — used by the
+    /// server intro to enumerate a filtered surface honestly.
+    pub fn visible_tool_names(&self) -> Vec<&'static str> {
+        TOOL_DEFS
+            .iter()
+            .map(|def| def.name)
+            .filter(|name| self.tool_visible(name))
+            .collect()
+    }
+
+    /// Core of the legacy `list_tools`, parameterized on the E-Sign flag so
+    /// tests can exercise both surfaces without touching the process environment
+    /// or a `--tools` filter. When `esign_enabled` is false the `sign` tool is
+    /// filtered out; the `TOOL_DEFS` static array is left intact. (The
+    /// production listing path is the instance [`Self::list_tools`], which also
+    /// applies the `--tools` allow-list.)
+    #[cfg(test)]
     pub fn list_tools_with(esign_enabled: bool) -> ListToolsResult {
         let tools = TOOL_DEFS
             .iter()
@@ -2265,6 +2397,19 @@ impl ToolRouter {
         args: Map<String, Value>,
     ) -> Result<CallToolResult, McpError> {
         let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+
+        // `--tools` allow-list gate: refuse a tool the server was not started
+        // with, BEFORE any dispatch. The check uses the CANONICAL tool name (via
+        // the SAME `filter_admits` predicate `list_tools` uses) so the hidden
+        // aliases (`ai` → `ripley`, `how-to` → `howto`) are gated by the name a
+        // caller would pass to `--tools`. The E-Sign `sign` gate stays below; a
+        // `sign` call must satisfy BOTH the filter and the flag.
+        let canonical = canonical_tool_name(name);
+        if !self.filter_admits(canonical) {
+            return Ok(error_text(&format!(
+                "Tool '{canonical}' is not enabled on this server (started with --tools)."
+            )));
+        }
 
         match name {
             "auth" => handle_auth(&self.state, action, &args).await,
@@ -13196,6 +13341,13 @@ mod ripley_tool_tests {
         );
         args.insert("workspace_id".to_owned(), Value::String("1".to_owned()));
         let res = router.call_tool("sign", args).await.expect("call_tool ok");
+        // The disabled gate returns an ERROR result (is_error == Some(true)), not
+        // a success payload.
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "disabled sign call must be an error result"
+        );
         let text = result_to_string(&res);
         assert!(
             text.contains(
@@ -13207,6 +13359,308 @@ mod ripley_tool_tests {
         assert!(
             !text.contains("Not authenticated"),
             "disabled sign gate must win over the auth gate, got: {text}"
+        );
+    }
+
+    /// D4: the disabled INSTANCE listing path (`list_tools()` on a router built
+    /// with E-Sign disabled) omits `sign` — this exercises the production
+    /// instance method, not just the parameterized `list_tools_with(false)`.
+    #[test]
+    fn instance_list_tools_disabled_omits_sign() {
+        let router = ToolRouter::new_with_esign(
+            Arc::new(McpState::new_unauthenticated_for_test(
+                "https://api.fast.io/current",
+            )),
+            false,
+        );
+        let tools = router.list_tools().tools;
+        assert!(
+            !tools.iter().any(|t| t.name.as_ref() == "sign"),
+            "disabled instance list_tools() must omit sign"
+        );
+        // Every other registered tool is still advertised.
+        for def in TOOL_DEFS {
+            if def.name == "sign" {
+                continue;
+            }
+            assert!(
+                tools.iter().any(|t| t.name.as_ref() == def.name),
+                "non-sign tool '{}' must remain on a disabled instance",
+                def.name
+            );
+        }
+    }
+
+    /// D4: the disabled `sign` gate beats ARG EXTRACTION, not just auth — a call
+    /// with only `action` (no `workspace_id`, which the handler would otherwise
+    /// require) still returns the disabled error, proving the gate short-circuits
+    /// before any parameter validation.
+    #[tokio::test]
+    async fn call_tool_sign_disabled_beats_arg_extraction() {
+        let router = ToolRouter::new_with_esign(
+            Arc::new(McpState::new_unauthenticated_for_test(
+                "https://api.fast.io/current",
+            )),
+            false,
+        );
+        let mut args = Map::new();
+        // Minimal args: action only, deliberately NO workspace_id.
+        args.insert(
+            "action".to_owned(),
+            Value::String("envelope-list".to_owned()),
+        );
+        let res = router.call_tool("sign", args).await.expect("call_tool ok");
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "disabled sign call must be an error result"
+        );
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("E-Sign is currently disabled"),
+            "gate must win over arg extraction, got: {text}"
+        );
+        // Not a missing-parameter error — the gate ran before arg extraction.
+        assert!(
+            !text.contains("workspace_id"),
+            "the disabled gate must short-circuit before requiring workspace_id, got: {text}"
+        );
+    }
+
+    // ─── `--tools` allow-list filter (P1) ────────────────────────────────────
+
+    fn filter_of(names: &[&str]) -> Option<std::collections::HashSet<String>> {
+        Some(names.iter().map(|s| (*s).to_owned()).collect())
+    }
+
+    fn filtered_router(
+        esign_enabled: bool,
+        filter: Option<std::collections::HashSet<String>>,
+    ) -> ToolRouter {
+        ToolRouter::new_with_filter(
+            Arc::new(McpState::new_unauthenticated_for_test(
+                "https://api.fast.io/current",
+            )),
+            esign_enabled,
+            filter,
+        )
+    }
+
+    /// A `--tools` allow-list advertises EXACTLY the requested (known) tools —
+    /// no more, no fewer — in `list_tools`.
+    #[test]
+    fn filter_list_tools_shows_exactly_allowed() {
+        let router = filtered_router(true, filter_of(&["howto", "id"]));
+        let names: std::collections::HashSet<String> = router
+            .list_tools()
+            .tools
+            .iter()
+            .map(|t| t.name.as_ref().to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["howto", "id"].iter().map(|s| (*s).to_owned()).collect(),
+            "list_tools must show exactly the allow-listed tools, got: {names:?}"
+        );
+    }
+
+    /// Calling a tool EXCLUDED by the filter returns the not-enabled error
+    /// (is_error == Some(true)), before any dispatch.
+    #[tokio::test]
+    async fn filter_call_excluded_tool_is_not_enabled_error() {
+        let router = filtered_router(true, filter_of(&["howto", "id"]));
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("list".to_owned()));
+        // `org` is not in the allow-list.
+        let res = router.call_tool("org", args).await.expect("call_tool ok");
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "excluded tool call must be an error result"
+        );
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("Tool 'org' is not enabled on this server"),
+            "excluded tool must return the not-enabled error, got: {text}"
+        );
+    }
+
+    /// An INCLUDED tool still dispatches normally under a filter — it reaches its
+    /// own handler (here, the auth gate) rather than the not-enabled error.
+    #[tokio::test]
+    async fn filter_included_tool_dispatches() {
+        let router = filtered_router(true, filter_of(&["org", "id"]));
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("list".to_owned()));
+        let res = router.call_tool("org", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("is not enabled on this server"),
+            "an allow-listed tool must dispatch, not be filtered, got: {text}"
+        );
+    }
+
+    /// The hidden `ai` alias is gated by its CANONICAL name `ripley`: a filter of
+    /// `{ripley}` admits an `ai` call (routes through), and a filter WITHOUT
+    /// `ripley` rejects it.
+    #[tokio::test]
+    async fn filter_gates_alias_by_canonical_name() {
+        // `ripley` in the allow-list → the `ai` alias is admitted (reaches its
+        // handler / auth gate, not the not-enabled error).
+        let admits = filtered_router(true, filter_of(&["ripley"]));
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("ask".to_owned()));
+        args.insert("question".to_owned(), Value::String("hi".to_owned()));
+        let res = admits.call_tool("ai", args.clone()).await.expect("ok");
+        assert!(
+            !result_to_string(&res).contains("is not enabled on this server"),
+            "ai alias must be admitted when the canonical `ripley` is allow-listed"
+        );
+
+        // A filter WITHOUT `ripley` → the `ai` alias is rejected under its
+        // canonical name.
+        let rejects = filtered_router(true, filter_of(&["org"]));
+        let res = rejects.call_tool("ai", args).await.expect("ok");
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            result_to_string(&res).contains("Tool 'ripley' is not enabled on this server"),
+            "ai alias must reject under its canonical name `ripley`"
+        );
+    }
+
+    /// The `how-to` alias is gated by its canonical name `howto` — the symmetric
+    /// path to `ai`→`ripley`. A filter of `{howto}` admits a `how-to` call; a
+    /// filter without `howto` rejects it under the canonical name.
+    #[tokio::test]
+    async fn filter_gates_how_to_alias_by_canonical_name() {
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("ask".to_owned()));
+        args.insert("question".to_owned(), Value::String("hi".to_owned()));
+
+        // `howto` allow-listed → `how-to` alias admitted.
+        let admits = filtered_router(true, filter_of(&["howto"]));
+        let res = admits.call_tool("how-to", args.clone()).await.expect("ok");
+        assert!(
+            !result_to_string(&res).contains("is not enabled on this server"),
+            "how-to alias must be admitted when the canonical `howto` is allow-listed"
+        );
+
+        // `howto` absent → `how-to` alias rejected under `howto`.
+        let rejects = filtered_router(true, filter_of(&["org"]));
+        let res = rejects.call_tool("how-to", args).await.expect("ok");
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            result_to_string(&res).contains("Tool 'howto' is not enabled on this server"),
+            "how-to alias must reject under its canonical name `howto`"
+        );
+    }
+
+    /// `has_visible_tools` reflects BOTH gates: a filter of only `sign` with
+    /// E-Sign disabled leaves zero visible tools (the empty-effective-surface
+    /// case `serve` refuses), whereas any other allow-listed tool keeps it true.
+    #[test]
+    fn has_visible_tools_reflects_esign_and_filter() {
+        let sign_only_disabled = filtered_router(false, filter_of(&["sign"]));
+        assert!(
+            !sign_only_disabled.has_visible_tools(),
+            "sign-only + E-Sign disabled has no visible tools"
+        );
+        let sign_only_enabled = filtered_router(true, filter_of(&["sign"]));
+        assert!(
+            sign_only_enabled.has_visible_tools(),
+            "sign-only + E-Sign enabled has a visible tool"
+        );
+        let org_only = filtered_router(false, filter_of(&["org"]));
+        assert!(
+            org_only.has_visible_tools(),
+            "org is visible regardless of E-Sign"
+        );
+        assert!(
+            filtered_router(false, None).has_visible_tools(),
+            "unfiltered surface is always non-empty"
+        );
+    }
+
+    /// `visible_tool_names` returns exactly the advertised set (canonical names,
+    /// `TOOL_DEFS` order), honoring both gates — the source the server intro uses
+    /// to enumerate a filtered surface.
+    #[test]
+    fn visible_tool_names_matches_list_tools() {
+        let router = filtered_router(true, filter_of(&["org", "howto", "id"]));
+        let from_names: std::collections::HashSet<&str> =
+            router.visible_tool_names().into_iter().collect();
+        let from_list: std::collections::HashSet<String> = router
+            .list_tools()
+            .tools
+            .iter()
+            .map(|t| t.name.as_ref().to_owned())
+            .collect();
+        assert_eq!(
+            from_names.len(),
+            from_list.len(),
+            "visible_tool_names must match list_tools cardinality"
+        );
+        for n in &from_names {
+            assert!(
+                from_list.contains(*n),
+                "visible_tool_names / list_tools mismatch on {n}"
+            );
+        }
+    }
+
+    /// A filter that includes `sign` still respects the E-Sign kill-switch: with
+    /// E-Sign disabled, `sign` is neither advertised nor callable even when it is
+    /// in the allow-list (BOTH gates must pass).
+    #[tokio::test]
+    async fn filter_sign_still_gated_by_esign_flag() {
+        let router = filtered_router(false, filter_of(&["sign", "org"]));
+        // Not advertised: E-Sign disabled overrides the allow-list inclusion.
+        assert!(
+            !router
+                .list_tools()
+                .tools
+                .iter()
+                .any(|t| t.name.as_ref() == "sign"),
+            "sign must stay hidden when E-Sign is disabled, even if allow-listed"
+        );
+        // Not callable: returns the E-Sign disabled error (the filter admits it,
+        // then the E-Sign gate refuses it).
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("envelope-list".to_owned()),
+        );
+        let res = router.call_tool("sign", args).await.expect("ok");
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            result_to_string(&res).contains("E-Sign is currently disabled"),
+            "an allow-listed sign is still refused by the E-Sign gate when disabled"
+        );
+    }
+
+    /// A `None` filter (the default) leaves the full surface intact — every
+    /// registered tool (sign included, since E-Sign is enabled here) is
+    /// advertised, matching the un-filtered production behavior.
+    #[test]
+    fn filter_none_is_full_surface() {
+        let router = filtered_router(true, None);
+        let names: std::collections::HashSet<String> = router
+            .list_tools()
+            .tools
+            .iter()
+            .map(|t| t.name.as_ref().to_owned())
+            .collect();
+        for def in TOOL_DEFS {
+            assert!(
+                names.contains(def.name),
+                "None filter must advertise every tool; missing '{}'",
+                def.name
+            );
+        }
+        assert_eq!(
+            names.len(),
+            TOOL_DEFS.len(),
+            "None filter advertises exactly the full TOOL_DEFS surface"
         );
     }
 
@@ -14511,9 +14965,12 @@ mod ripley_tool_tests {
     /// and fails with a NETWORK error (never "Not authenticated"). Proves the
     /// anonymous link-access path is wired.
     fn anon_router_bogus_base() -> ToolRouter {
-        ToolRouter::new(Arc::new(McpState::new_unauthenticated_for_test(
-            "http://127.0.0.1:1/current",
-        )))
+        ToolRouter::new(
+            Arc::new(McpState::new_unauthenticated_for_test(
+                "http://127.0.0.1:1/current",
+            )),
+            None,
+        )
     }
 
     #[tokio::test]
@@ -14614,7 +15071,7 @@ mod ripley_tool_tests {
             "http://127.0.0.1:1/current",
         ));
         state.set_token("test-token".to_owned()).await;
-        let router = ToolRouter::new(state);
+        let router = ToolRouter::new(state, None);
 
         let mut args = Map::new();
         args.insert("action".to_owned(), Value::String("add-file".to_owned()));

@@ -100,11 +100,16 @@ pub struct FastioMcpServer {
 
 impl FastioMcpServer {
     /// Create a new MCP server, resolving credentials from the standard chain.
+    ///
+    /// `tools_filter` is the validated `--tools` allow-list (`None` = all tools),
+    /// threaded into the [`ToolRouter`] so `list_tools` / `call_tool` expose only
+    /// the allowed set.
     fn new(
         api_base: &str,
         token_override: Option<&str>,
         profile_name: &str,
         config_dir: &std::path::Path,
+        tools_filter: Option<std::collections::HashSet<String>>,
     ) -> Result<Self> {
         let token = resolve_token(token_override, profile_name, config_dir)
             .ok()
@@ -120,8 +125,15 @@ impl FastioMcpServer {
 
         Ok(Self {
             state: Arc::clone(&state),
-            tool_router: ToolRouter::new(state),
+            tool_router: ToolRouter::new(state, tools_filter),
         })
+    }
+
+    /// Whether any tool is visible after applying BOTH the E-Sign rule and the
+    /// `--tools` allow-list. Delegates to the router; used by `serve` to refuse a
+    /// server that would start with an empty effective tool surface.
+    fn has_visible_tools(&self) -> bool {
+        self.tool_router.has_visible_tools()
     }
 
     /// Build the server intro `instructions` text.
@@ -129,15 +141,41 @@ impl FastioMcpServer {
     /// The e-signature (`sign`) mention is CONDITIONAL on the E-Sign kill-switch
     /// (read once at router construction). When E-Sign is disabled the `sign`
     /// tool is filtered from `list_tools`, so the intro must not advertise it.
+    ///
+    /// When a `--tools` allow-list is active the intro enumerates ONLY the
+    /// visible tools instead of pitching the full default surface, so a client
+    /// that trusts `instructions` never sees a tool it cannot call
+    /// (advertised-vs-callable drift). The Ripley-offload nudge and the `sign`
+    /// blurb are included only when those tools are actually visible.
     fn instructions_text(&self) -> String {
-        let mut text = String::from(
-            "Fast.io MCP server -- files, workspaces, shares, uploads, downloads, \
-             and AI agent (Ripley) via the Fast.io REST API. OFFLOAD multi-step \
-             work: prefer asking the `ripley` tool (Fast.io's delegated AI agent, \
-             acting on your behalf) to find or do a task over hand-driving many \
-             primitives. ",
-        );
-        if self.tool_router.esign_enabled() {
+        // Compute the visible surface ONCE — router state is immutable after
+        // construction, so a single snapshot drives the intro pitch, the Ripley
+        // nudge, and the `sign` blurb consistently.
+        let visible = self.tool_router.visible_tool_names();
+        let mut text = if self.tool_router.has_tools_filter() {
+            // Filtered server: honestly list only what is callable.
+            format!(
+                "Fast.io MCP server (via the Fast.io REST API), started with a \
+                 restricted tool set. Available tools: {}. ",
+                visible.join(", ")
+            )
+        } else {
+            String::from(
+                "Fast.io MCP server -- files, workspaces, shares, uploads, downloads, \
+                 and AI agent (Ripley) via the Fast.io REST API. ",
+            )
+        };
+        // The Ripley-offload nudge only makes sense when `ripley` is visible.
+        if visible.contains(&"ripley") {
+            text.push_str(
+                "OFFLOAD multi-step work: prefer asking the `ripley` tool \
+                 (Fast.io's delegated AI agent, acting on your behalf) to find or \
+                 do a task over hand-driving many primitives. ",
+            );
+        }
+        // The `sign` blurb requires `sign` to be visible, which already implies
+        // E-Sign is enabled (`tool_visible` hides `sign` when it is off).
+        if visible.contains(&"sign") {
             text.push_str(
                 "The `sign` tool exposes READ + DRAFT-DRIVE actions only -- \
                  destructive / terminal mutations (`send`/`void` -- envelopes are \
@@ -223,16 +261,89 @@ impl ServerHandler for FastioMcpServer {
     }
 }
 
+/// Outcome of normalizing a raw `--tools` allow-list against the known tool set.
+///
+/// `known` is the deduped set of requested names that match a registered tool
+/// (the allow-list threaded into the router); `unknown` is the requested names
+/// that match nothing (warned about at startup, in first-seen order).
+struct NormalizedToolsFilter {
+    known: std::collections::HashSet<String>,
+    unknown: Vec<String>,
+}
+
+/// Normalize a raw `--tools` list into a validated allow-list.
+///
+/// Trims each entry, drops empties, maps hidden aliases to their canonical name
+/// (`ai` → `ripley`, `how-to` → `howto`, via [`tools::canonical_tool_name`]) so
+/// either spelling is accepted, dedupes on the canonical name (case-sensitive
+/// exact match against the registered tool names), and partitions the requested
+/// names into those that match a known tool and those that do not. Pure and
+/// env-free so the validation is unit-testable; the caller (`serve`) decides what
+/// to do with the two buckets (warn on `unknown`, fail fast if `known` is empty).
+/// `unknown` carries the name as the user typed it, so the warning echoes their
+/// input.
+fn normalize_tools_filter(raw: &[String]) -> NormalizedToolsFilter {
+    let known_names: std::collections::HashSet<&'static str> = tools::known_tool_names().collect();
+    let mut known = std::collections::HashSet::new();
+    let mut unknown = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry in raw {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let canonical = tools::canonical_tool_name(trimmed);
+        // Dedupe on the CANONICAL name so `ai` and `ripley` (or a repeat) collapse.
+        if !seen.insert(canonical.to_owned()) {
+            continue;
+        }
+        if known_names.contains(canonical) {
+            known.insert(canonical.to_owned());
+        } else {
+            // Echo the name the user typed (not the canonical) in the warning.
+            unknown.push(trimmed.to_owned());
+        }
+    }
+    NormalizedToolsFilter { known, unknown }
+}
+
 /// Start the MCP server over stdio transport.
 ///
 /// This is the main entry point called from `main.rs` when `fastio mcp` runs.
+///
+/// `tools_filter` is the raw `--tools` value (comma-split by the caller). When
+/// present it is normalized into an allow-list: unknown names are warned about
+/// on STDERR (stdout stays clean for JSON-RPC), and if NO requested name matches
+/// a registered tool the server fails fast rather than starting with an empty
+/// surface.
 pub async fn serve(
     tools_filter: Option<Vec<String>>,
     api_base_override: Option<&str>,
     token_override: Option<&str>,
     profile_override: Option<&str>,
 ) -> Result<()> {
-    let _ = tools_filter; // reserved for future --tools filter
+    // Validate the `--tools` allow-list BEFORE stdio starts. Warnings go to
+    // STDERR (stdout is the JSON-RPC channel); an all-unknown filter is a
+    // fail-fast error so the operator learns immediately instead of getting an
+    // empty tool surface.
+    let allow_list = match &tools_filter {
+        None => None,
+        Some(raw) => {
+            let normalized = normalize_tools_filter(raw);
+            for name in &normalized.unknown {
+                eprintln!("warning: --tools: '{name}' is not a known tool; ignoring it.");
+            }
+            if normalized.known.is_empty() {
+                let mut known: Vec<&str> = tools::known_tool_names().collect();
+                known.sort_unstable();
+                anyhow::bail!(
+                    "--tools matched no known tools; known: {}",
+                    known.join(", ")
+                );
+            }
+            Some(normalized.known)
+        }
+    };
 
     let config = Config::load().unwrap_or_default();
     // Honor the global --profile / --api-base / --token overrides, mirroring the
@@ -256,7 +367,23 @@ pub async fn serve(
         token_override,
         profile_name,
         &config.config_dir,
+        allow_list,
     )?;
+
+    // Refuse to start with an empty EFFECTIVE tool surface — BEFORE stdio. This
+    // catches the case name-validation alone cannot: `--tools sign` with E-Sign
+    // disabled passes the all-unknown check (`sign` is a known name) yet the
+    // E-Sign rule hides it, leaving zero visible tools. Failing here (rather than
+    // starting a live server that advertises nothing) mirrors the all-unknown
+    // fail-fast and gives the operator an actionable hint.
+    if tools_filter.is_some() && !server.has_visible_tools() {
+        anyhow::bail!(
+            "--tools left no tools visible on this server. If you requested only \
+             `sign`, set FASTIO_ENABLE_ESIGN=1 (and enable signing for your org); \
+             otherwise include at least one enabled tool."
+        );
+    }
+
     let service = server
         .serve(stdio())
         .await
@@ -282,6 +409,7 @@ mod tests {
             Some("override-token"),
             "default",
             Path::new("/nonexistent-config-dir-for-test"),
+            None,
         )
         .expect("server constructs with a token override");
         assert_eq!(server.state.api_base(), "http://example.test/api/current");
@@ -316,6 +444,132 @@ mod tests {
             state.client().read().await.get_token(),
             None,
             "in-memory token must be dropped after clear_token"
+        );
+    }
+
+    /// `normalize_tools_filter` trims, drops empties, dedupes, and partitions
+    /// requested names into known (registered) vs unknown (warned + ignored).
+    #[test]
+    fn normalize_tools_filter_partitions_known_and_unknown() {
+        let raw = vec![
+            "  files  ".to_owned(),  // trimmed → known
+            "org".to_owned(),        // known
+            "files".to_owned(),      // dup of the trimmed entry → dropped
+            String::new(),           // empty → dropped
+            "  ".to_owned(),         // whitespace-only → dropped
+            "nosuchtool".to_owned(), // unknown
+        ];
+        let out = super::normalize_tools_filter(&raw);
+        assert!(out.known.contains("files"), "trimmed known name kept");
+        assert!(out.known.contains("org"), "known name kept");
+        assert_eq!(
+            out.known.len(),
+            2,
+            "dedup + empties dropped: {:?}",
+            out.known
+        );
+        assert_eq!(
+            out.unknown,
+            vec!["nosuchtool".to_owned()],
+            "unknown name surfaced for a startup warning"
+        );
+    }
+
+    /// A filter of only unknown names yields an empty known set — the signal
+    /// `serve` uses to fail fast rather than start with no tools.
+    #[test]
+    fn normalize_tools_filter_all_unknown_is_empty() {
+        let out = super::normalize_tools_filter(&["nope".to_owned(), "zzz".to_owned()]);
+        assert!(
+            out.known.is_empty(),
+            "no known tools when every name is unknown"
+        );
+        assert_eq!(out.unknown.len(), 2, "both unknown names surfaced");
+    }
+
+    /// `sign` is a KNOWN name even though it is gated by the E-Sign kill-switch:
+    /// `--tools sign` must not be warned about as unknown (the runtime E-Sign
+    /// gate hides/refuses it separately).
+    #[test]
+    fn normalize_tools_filter_sign_is_known() {
+        let out = super::normalize_tools_filter(&["sign".to_owned()]);
+        assert!(out.known.contains("sign"), "sign is a registered tool name");
+        assert!(out.unknown.is_empty(), "sign must not be flagged unknown");
+    }
+
+    /// Hidden aliases in the raw `--tools` list are canonicalized: `ai` →
+    /// `ripley`, `how-to` → `howto`, and an alias + its canonical name collapse
+    /// to one known entry (deduped on the canonical name).
+    #[test]
+    fn normalize_tools_filter_canonicalizes_aliases() {
+        let out = super::normalize_tools_filter(&[
+            "ai".to_owned(),     // → ripley
+            "how-to".to_owned(), // → howto
+            "ripley".to_owned(), // dup of the `ai` alias → dropped
+        ]);
+        assert!(out.known.contains("ripley"), "ai canonicalized to ripley");
+        assert!(out.known.contains("howto"), "how-to canonicalized to howto");
+        assert_eq!(
+            out.known.len(),
+            2,
+            "alias + canonical collapse to one entry: {:?}",
+            out.known
+        );
+        assert!(
+            out.unknown.is_empty(),
+            "known aliases are not flagged unknown"
+        );
+    }
+
+    /// The server intro `instructions` enumerate ONLY the visible tools when a
+    /// `--tools` filter is active, so a client trusting the intro never sees a
+    /// tool it cannot call.
+    #[test]
+    fn instructions_text_reflects_tools_filter() {
+        let state = Arc::new(McpState::new_unauthenticated_for_test(
+            "http://example.test/api/current",
+        ));
+        let filter: std::collections::HashSet<String> =
+            ["org", "id"].iter().map(|s| (*s).to_owned()).collect();
+        let server = FastioMcpServer {
+            state: Arc::clone(&state),
+            tool_router: tools::ToolRouter::new_with_filter(state, false, Some(filter)),
+        };
+        let text = server.instructions_text();
+        assert!(
+            text.contains("restricted tool set"),
+            "filtered intro must state it is restricted: {text}"
+        );
+        assert!(
+            text.contains("org") && text.contains("id"),
+            "filtered intro must enumerate the allowed tools: {text}"
+        );
+        // A tool NOT in the filter must not be pitched — `ripley` is excluded, so
+        // the Ripley-offload nudge is absent.
+        assert!(
+            !text.contains("OFFLOAD multi-step work"),
+            "filtered intro must not pitch an excluded tool (ripley): {text}"
+        );
+    }
+
+    /// The unfiltered intro keeps the full default pitch (Ripley nudge present).
+    #[test]
+    fn instructions_text_unfiltered_is_full_pitch() {
+        let state = Arc::new(McpState::new_unauthenticated_for_test(
+            "http://example.test/api/current",
+        ));
+        let server = FastioMcpServer {
+            state: Arc::clone(&state),
+            tool_router: tools::ToolRouter::new_with_filter(state, false, None),
+        };
+        let text = server.instructions_text();
+        assert!(
+            !text.contains("restricted tool set"),
+            "unfiltered intro must not claim restriction: {text}"
+        );
+        assert!(
+            text.contains("OFFLOAD multi-step work"),
+            "unfiltered intro pitches the Ripley offload: {text}"
         );
     }
 }

@@ -179,8 +179,8 @@ Each module handles one command group, orchestrating API calls and output render
 #### `mod.rs`
 - `FastioMcpServer` implementing rmcp `ServerHandler` trait
 - Stdio transport via `rmcp::transport::stdio`
-- Tool registration with `--tools` filtering
-- `list_tools` also filters out the `sign` tool when the E-Sign kill-switch is off (read once at `ToolRouter` construction); the intro `instructions` advertise `sign` only when enabled
+- `--tools` allow-list: a validated set (unknown names warned to stderr and ignored; an all-unknown list is a fail-fast error) threaded into `ToolRouter` and enforced in BOTH `list_tools` (advertised set) and `call_tool` (callable set), so the two never diverge; `None` = all tools. Hidden aliases (`ai`→`ripley`, `how-to`→`howto`) are gated by their canonical name
+- `list_tools` also filters out the `sign` tool when the E-Sign kill-switch is off (read once at `ToolRouter` construction); the intro `instructions` advertise `sign` only when enabled. `sign` requires BOTH the E-Sign flag AND allow-list inclusion
 - Auth resolved at startup from credential chain
 - In-session token updates via `auth` tool's `signin`/`set-api-key` actions
 - Tracing disabled to keep stdout clean for JSON-RPC

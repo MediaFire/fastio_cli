@@ -279,7 +279,9 @@ pub enum Commands {
 
     /// Start the MCP (Model Context Protocol) server over stdio.
     Mcp {
-        /// Optional comma-separated list of tools to enable (default: all).
+        /// Optional comma-separated allow-list of tools to enable (default: all).
+        /// Only the named tools are advertised and callable; unknown names are
+        /// warned about and ignored, and an all-unknown list is rejected.
         #[arg(long)]
         tools: Option<String>,
     },
