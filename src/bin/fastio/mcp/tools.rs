@@ -43,6 +43,26 @@ fn error_text(msg: &str) -> CallToolResult {
     CallToolResult::error(vec![Content::text(msg.to_owned())])
 }
 
+/// Resolve a tool name (possibly a hidden dispatch alias) to its canonical
+/// `TOOL_DEFS` name — the name a caller passes to `--tools` and the name that
+/// appears in `list_tools`.
+///
+/// The router accepts two back-compat aliases that route to a renamed handler:
+/// `ai` → `ripley` and `how-to` → `howto`. The `--tools` allow-list is validated
+/// against `TOOL_DEFS` names (which carry the canonical spellings only), so the
+/// filter gate must map an alias to its canonical name before checking
+/// membership — otherwise `--tools ripley` would wrongly reject a legacy `ai`
+/// call. It is also applied when normalizing the raw `--tools` list so a caller
+/// may spell the allow-list entry as either the alias or the canonical name. Any
+/// name that is not a known alias is returned unchanged.
+pub fn canonical_tool_name(name: &str) -> &str {
+    match name {
+        "ai" => "ripley",
+        "how-to" => "howto",
+        other => other,
+    }
+}
+
 /// Extract a required string parameter.
 fn required_str<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str, CallToolResult> {
     args.get(key).and_then(Value::as_str).ok_or_else(|| {
@@ -194,11 +214,6 @@ const PREVIEW_TYPES: &[&str] = &[
     "mp4",
 ];
 
-/// Valid `linked_entity_type` values for `comment` link/linked actions. The
-/// CLI restricts this via a clap `value_parser`; MCP enforces the same set so
-/// the old, now-invalid `approval` value never reaches the server.
-const LINKED_ENTITY_TYPES: &[&str] = &["task", "workflow_review"];
-
 /// Valid `sort` values for the `comment` list / list-all actions. The CLI
 /// restricts this via a clap `value_parser = ["asc", "desc"]`; MCP enforces the
 /// same set so a bad sort gets a clear error instead of reaching the server.
@@ -231,18 +246,6 @@ const WEB_UPLOAD_STATUSES: &[&str] = &[
     "failed",
     "canceled",
 ];
-
-/// Valid `archived` filter values for the `workflow list` action. The CLI
-/// restricts this via a clap `value_parser`; MCP enforces the same set so a
-/// present-but-invalid value (e.g. `archived: "maybe"`) gets a clear error
-/// instead of silently forwarding to the server.
-const WORKFLOW_ARCHIVED_FILTERS: &[&str] = &["true", "false", "all"];
-
-/// Valid `usage` filter values for the `workflow template-list` action. The
-/// CLI restricts this via a clap `value_parser`; MCP enforces the same set so a
-/// present-but-invalid value gets a clear error instead of silently forwarding
-/// to the server.
-const WORKFLOW_TEMPLATE_USAGE_FILTERS: &[&str] = &["library", "one_off", "all"];
 
 /// Pure predicate: has the caller explicitly opted into AI credit spend via
 /// `confirm_ai_spend=true`? Accepts a native bool or the string `"true"`.
@@ -370,6 +373,17 @@ struct ToolDef {
     actions: &'static [&'static str],
     /// Extra parameters: (name, description, always-required).
     params: &'static [(&'static str, &'static str, bool)],
+}
+
+/// The canonical names of every registered tool, in `TOOL_DEFS` order.
+///
+/// The single source of truth for validating the `--tools` allow-list (the
+/// `serve()` entry point drops any requested name not in this set, with a
+/// startup warning). Includes `sign` regardless of the E-Sign kill-switch — a
+/// `--tools sign` on a disabled server is a KNOWN name (so it is not warned
+/// about as unknown); the E-Sign gate then hides/refuses it at runtime.
+pub fn known_tool_names() -> impl Iterator<Item = &'static str> {
+    TOOL_DEFS.iter().map(|def| def.name)
 }
 
 const TOOL_DEFS: &[ToolDef] = &[
@@ -690,11 +704,6 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "Enable AI intelligence on the new workspace (create-workspace; default false) — boolean (true/false)",
                 false,
             ),
-            (
-                "workflow",
-                "Enable workflow features on the new workspace (create-workspace) — boolean (true/false)",
-                false,
-            ),
             ("accent_color", "Accent color (create-workspace)", false),
             (
                 "background_color1",
@@ -711,15 +720,13 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "workspace",
-        description: "Workspaces: list, create, view, update, delete, archive/unarchive, members, shares, notes, metadata, import/export, workflow. SIDE EFFECTS — these metadata actions SPEND AI CREDITS: 'metadata-template-preview-match', 'metadata-template-suggest-fields', 'metadata-extract', 'metadata-extract-and-wait'. 'metadata-extract-and-wait' enqueues a single-file extraction and polls workspace jobs-status to a terminal state before returning.",
+        description: "Workspaces: list, create, view, update, delete, archive/unarchive, members, shares, notes, metadata, import/export. SIDE EFFECTS — these metadata actions SPEND AI CREDITS: 'metadata-template-preview-match', 'metadata-template-suggest-fields', 'metadata-extract', 'metadata-extract-and-wait'. 'metadata-extract-and-wait' enqueues a single-file extraction and polls workspace jobs-status to a terminal state before returning.",
         actions: &[
             "list",
             "create",
             "info",
             "update",
             "delete",
-            "enable-workflow",
-            "disable-workflow",
             "jobs-status",
             "search",
             "limits",
@@ -770,21 +777,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             (
                 "perm_member_manage",
                 "Who can manage members — permission phrase (update)",
-                false,
-            ),
-            (
-                "nl_summaries_enabled",
-                "Toggle AI obligation-summary enrichment — boolean (update)",
-                false,
-            ),
-            (
-                "nl_summaries_daily_cap",
-                "AI enrichment daily cap, 0-100000 (update)",
-                false,
-            ),
-            (
-                "workflow_approval_native_enabled",
-                "Native workflow-review tier: disabled/mvs/extended (update)",
                 false,
             ),
             (
@@ -1139,7 +1131,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "share",
-        description: "Shares (data rooms): list, create, view, update, delete, archive/unarchive, password-auth, guest-auth, workflow, discovery.",
+        description: "Shares (data rooms): list, create, view, update, delete, archive/unarchive, password-auth, guest-auth, discovery.",
         actions: &[
             "list",
             "create",
@@ -1156,8 +1148,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             "guest-auth",
             "available",
             "check-name",
-            "enable-workflow",
-            "disable-workflow",
         ],
         params: &[
             ("share_id", "Share ID", false),
@@ -1462,7 +1452,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "comment",
-        description: "Comments: list, list-all, create, reply, update, delete, bulk-delete, details, reaction-add, reaction-remove, link, unlink, linked, list-attachments, attach, detach. create accepts an optional anchoring reference + properties metadata and inline attachment(s) (target_id / target_ids, ≤25). attach/detach/list-attachments are author-only and rejected on workflow-review comments (the server enforces). This generic tool also edits/deletes/reacts to TASK comments by comment_id (use the `task` tool to post/list them).",
+        description: "Comments: list, list-all, create, reply, update, delete, bulk-delete, details, reaction-add, reaction-remove, list-attachments, attach, detach. create accepts an optional anchoring reference + properties metadata and inline attachment(s) (target_id / target_ids, ≤25). attach/detach/list-attachments are author-only (the server enforces).",
         actions: &[
             "list",
             "list-all",
@@ -1474,9 +1464,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             "details",
             "reaction-add",
             "reaction-remove",
-            "link",
-            "unlink",
-            "linked",
             "list-attachments",
             "attach",
             "detach",
@@ -1493,12 +1480,6 @@ const TOOL_DEFS: &[ToolDef] = &[
                 false,
             ),
             ("emoji", "Emoji character (reaction-add)", false),
-            (
-                "linked_entity_type",
-                "Linked entity type: task or workflow_review",
-                false,
-            ),
-            ("linked_entity_id", "Linked entity ID", false),
             (
                 "reference",
                 "Anchoring reference as a JSON object (create)",
@@ -1599,7 +1580,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "dashboard",
-        description: "Per-workspace dashboard: the calling member's ranked, paginated feed of ACTIONABLE cards (approvals, tasks, reviews, confirmations, @mentions, file activity, pending signatures). Actions: get (read the feed; paginate with limit 1-200 / offset), dismiss (hide a card from YOUR feed — permanently, or snooze it until a future time via snooze_until 'YYYY-MM-DD HH:MM:SS UTC'), undismiss (restore a card; idempotent). Dismiss / snooze / undismiss are PER-MEMBER and OUT-OF-BAND — they change only YOUR view and never advance, resolve, or modify the underlying obligation, workflow, or signature. card_key comes from a card's card_key field (URL-encoding is handled for you). A signature card's primary action — minting YOUR own signing link — is the `sign` tool's envelope-my-sign-link action (envelope_id = the signature card's target.id).",
+        description: "Per-workspace dashboard: the calling member's ranked, paginated feed of ACTIONABLE cards (@mentions, file activity, file versions, synthesis, and — when E-Sign is enabled — pending signatures). Actions: get (read the feed; paginate with limit 1-200 / offset), dismiss (hide a card from YOUR feed — permanently, or snooze it until a future time via snooze_until 'YYYY-MM-DD HH:MM:SS UTC'), undismiss (restore a card; idempotent). Dismiss / snooze / undismiss are PER-MEMBER and OUT-OF-BAND — they change only YOUR view and never advance, resolve, or modify the underlying card subject. card_key comes from a card's card_key field (URL-encoding is handled for you). Signature cards carry a sign-ceremony link for their primary action (requires E-Sign to be enabled).",
         actions: &["get", "dismiss", "undismiss"],
         params: &[
             (
@@ -1609,7 +1590,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             (
                 "card_key",
-                "Card key from the feed (dismiss / undismiss), e.g. obligation:123…",
+                "Card key from the feed (dismiss / undismiss), e.g. mention:123…",
                 false,
             ),
             (
@@ -1739,102 +1720,6 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             ("entity_id", "Entity ID", false),
             ("asset_type", "Asset type name (remove)", false),
-        ],
-    },
-    ToolDef {
-        name: "task",
-        description: "Tasks API: manage task lists and tasks. list-lists, create-list, list-details, update-list, delete-list, list-tasks, create-task, task-details, update-task, delete-task, change-status, assign-task, bulk-status, move-task, reorder-tasks, reorder-lists, filter, summary, list-comments, post-comment, list-attachments, attach, detach. Task comments are private to the task; to EDIT, DELETE, or REACT to a task comment use the generic `comment` tool by comment_id.",
-        actions: &[
-            "list-lists",
-            "create-list",
-            "list-details",
-            "update-list",
-            "delete-list",
-            "list-tasks",
-            "create-task",
-            "task-details",
-            "update-task",
-            "delete-task",
-            "change-status",
-            "assign-task",
-            "bulk-status",
-            "move-task",
-            "reorder-tasks",
-            "reorder-lists",
-            "filter",
-            "summary",
-            "list-comments",
-            "post-comment",
-            "list-attachments",
-            "attach",
-            "detach",
-        ],
-        params: &[
-            ("profile_type", "Profile type: workspace or share", false),
-            (
-                "profile_id",
-                "Profile ID (list-lists, create-list, reorder-lists)",
-                false,
-            ),
-            ("list_id", "Task list ID", false),
-            ("task_id", "Task ID", false),
-            ("title", "Task title", false),
-            ("description", "Description", false),
-            (
-                "status",
-                "Status: pending, in_progress, complete, blocked",
-                false,
-            ),
-            ("priority", "Priority (0-4)", false),
-            ("assignee_id", "Assignee user ID", false),
-            ("name", "Task list name", false),
-            (
-                "task_ids",
-                "Comma-separated task IDs (bulk-status, reorder-tasks)",
-                false,
-            ),
-            (
-                "list_ids",
-                "Comma-separated list IDs (reorder-lists)",
-                false,
-            ),
-            ("target_task_list_id", "Target list ID (move-task)", false),
-            ("sort_order", "Sort order (move-task)", false),
-            (
-                "node_id",
-                "Node ID to link (create-task, update-task; empty string clears the link on update-task)",
-                false,
-            ),
-            (
-                "filter",
-                "Filter: assigned, created, status (filter action)",
-                false,
-            ),
-            ("text", "Comment body (post-comment; alias: body)", false),
-            ("body", "Comment body (post-comment; alias of text)", false),
-            (
-                "parent_id",
-                "Parent comment ID for a threaded reply (post-comment)",
-                false,
-            ),
-            (
-                "reference",
-                "Anchoring reference as a JSON object string (post-comment)",
-                false,
-            ),
-            (
-                "properties",
-                "Arbitrary metadata as a JSON object string (post-comment)",
-                false,
-            ),
-            (
-                "target_ids",
-                "Comma-separated object IDs to attach, 1-100 (attach)",
-                false,
-            ),
-            ("target_id", "Single object ID to detach (detach)", false),
-            ("limit", "Pagination limit (integer)", false),
-            ("offset", "Pagination offset (integer)", false),
         ],
     },
     ToolDef {
@@ -2017,261 +1902,8 @@ const TOOL_DEFS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "workflow",
-        description: "Workflow Orchestration (v3.2): the durable multi-step runtime — distinct from the Tasks API (the `task` tool). OFFLOAD multi-step orchestration here instead of hand-driving primitives: the compound actions 'instantiate-and-wait', 'trigger-fire-and-wait', and 'audit-export-and-download' do the full fire→poll→download loop for you. This tool exposes READ + DRIVE actions only; admin/destructive/crypto operations (workflow cancel + purge, template/pool/trigger create+lifecycle, outbound subscription management, secret/key rotation, dual-control redaction, schema set/derive, realtime token mint) are intentionally CLI-binary-only (`fastio workflow …`) — including the terminal 'cancel' lifecycle mutation, which is NOT available over MCP. Mid-run editing is exposed (modification-propose/-list/-get/-apply/-cancel: propose AUTO-PAUSES the run, apply finalizes + resumes; needs workflow ADMIN + the workflow_mid_run_edit plan capability). The built-in system template gallery is browsable over MCP (template-gallery, template-gallery-get); instantiating a gallery template (from_system, a template-create) is CLI-only (`fastio workflow template from-system`), consistent with the template-create boundary above. 'step-agent-trace' is the read-only reasoning+commentary companion to 'step-agent-activity' (never the final answer/citations). Call action='describe' for the authoritative action/param reference. Idempotency keys for instantiate/fire are REQUIRED for replay safety and have no MCP auto-generate. CAS step output/advance surfaces 409 conflicts by default. The audit 'check-integrity' is integrity-only (chunk SHA-256 + content-hash chain + completeness), NOT HMAC authenticity. The v3.5b review surface is otherwise CLI-binary-only, but its workspace hydration READ is exposed here as 'review-active' (lists active arming/open review surfaces + their asset node_ids so you can badge files as under review without per-file fetches; not flag-gated). The mutating review actions (create/decision/admin-resolve) and the by-id review reads remain CLI-only.",
-        actions: &[
-            "describe",
-            "get",
-            "list",
-            "state",
-            "instantiate",
-            "instantiate-and-wait",
-            "pause",
-            "resume",
-            "grant-list",
-            "step-get",
-            "step-output",
-            "step-advance",
-            "step-occurrences",
-            "step-agent-activity",
-            "step-agent-trace",
-            "step-files",
-            "step-complete",
-            "step-reassign",
-            "modification-propose",
-            "modification-list",
-            "modification-get",
-            "modification-apply",
-            "modification-cancel",
-            "template-list",
-            "template-get",
-            "template-gallery",
-            "template-gallery-get",
-            "agent-template-list",
-            "agent-template-get",
-            "trigger-list",
-            "trigger-get",
-            "trigger-fire",
-            "trigger-fire-and-wait",
-            "trigger-dry-run",
-            "obligation-list",
-            "obligation-get",
-            "obligation-claim",
-            "obligation-release",
-            "obligation-resolve",
-            "inbox-me",
-            "inbox-workspace",
-            "inbox-pool",
-            "schema-get",
-            "audit-events",
-            "audit-export-start",
-            "audit-export-list",
-            "audit-export-get",
-            "audit-export-and-download",
-            "subject-workflows",
-            "review-active",
-        ],
-        params: &[
-            ("workspace_id", "Workspace ID (19-digit)", false),
-            ("workflow_id", "Workflow ID (19-digit profile id)", false),
-            ("template_id", "Template revision OpaqueId", false),
-            ("trigger_id", "Trigger OpaqueId", false),
-            ("job_id", "Audit export job OpaqueId", false),
-            ("step_occurrence_id", "Step occurrence OpaqueId", false),
-            ("step_id", "Step definition OpaqueId", false),
-            (
-                "obligation_id",
-                "Obligation id (plain numeric sequence)",
-                false,
-            ),
-            ("subject_id", "External-subject correlation handle", false),
-            ("pool_key", "Concurrency pool key", false),
-            (
-                "idempotency_key",
-                "REQUIRED for instantiate / instantiate-and-wait / trigger-fire / trigger-fire-and-wait — replay-safe key. There is NO MCP auto-generate.",
-                false,
-            ),
-            (
-                "trigger_payload",
-                "Resolved input bindings as a JSON string (instantiate / trigger-fire)",
-                false,
-            ),
-            (
-                "external_subject_id",
-                "Integrator correlation handle (instantiate)",
-                false,
-            ),
-            (
-                "output",
-                "Step output envelope as a JSON string (step-output / step-advance)",
-                false,
-            ),
-            (
-                "retry_on_conflict",
-                "Re-read and retry once on a CAS 409 (step-output / step-advance); default false surfaces the conflict",
-                false,
-            ),
-            (
-                "role",
-                "Grant role: viewer / participant / admin (grant-add — CLI only)",
-                false,
-            ),
-            (
-                "status",
-                "Obligation status filter (obligation-list)",
-                false,
-            ),
-            (
-                "assigned_user_id",
-                "Assigned-user filter (obligation-list)",
-                false,
-            ),
-            (
-                "resolution_payload",
-                "Resolution payload as a JSON string (obligation-resolve)",
-                false,
-            ),
-            (
-                "enabled_filter",
-                "Trigger filter: true / false / all (trigger-list)",
-                false,
-            ),
-            (
-                "include_payload",
-                "Inline audit event payload (audit-events)",
-                false,
-            ),
-            ("include_body", "Inline template_body (template-get)", false),
-            (
-                "scope",
-                "Audit export scope, e.g. full (audit-export-*)",
-                false,
-            ),
-            (
-                "include_overlays",
-                "Include redaction overlays (audit-export-*)",
-                false,
-            ),
-            (
-                "redaction_pin_strategy",
-                "Redaction pin strategy (audit-export-*)",
-                false,
-            ),
-            (
-                "window_days",
-                "Backtest window in days, ≤90 (trigger-dry-run)",
-                false,
-            ),
-            ("sample_limit", "Sample-match cap (trigger-dry-run)", false),
-            (
-                "apply_guards",
-                "Apply guard checks during a backtest (trigger-dry-run)",
-                false,
-            ),
-            (
-                "output_path",
-                "Destination directory for downloaded bundle files (audit-export-and-download; default .fastio/downloads/)",
-                false,
-            ),
-            (
-                "poll_interval",
-                "Seconds between polls, 1-60, default 3 (instantiate-and-wait / trigger-fire-and-wait)",
-                false,
-            ),
-            ("limit", "Pagination limit (integer)", false),
-            ("offset", "Pagination offset (integer)", false),
-            (
-                "cursor",
-                "Opaque keyset cursor: pass back the prior response's pagination.next_cursor verbatim (list keyset pagination; also grant-list pagination)",
-                false,
-            ),
-            (
-                "page_size",
-                "Opt-in keyset page size 1-100, server default 50 (list). Setting page_size / cursor / bucket switches the response to the keyset shape (pagination + counts).",
-                false,
-            ),
-            (
-                "bucket",
-                "Execution-status bucket filter (list): one of in_flight, completed, paused, failed",
-                false,
-            ),
-            (
-                "modification_id",
-                "Mid-run modification proposal OpaqueId (modification-get / -apply / -cancel)",
-                false,
-            ),
-            (
-                "ops",
-                "Mid-run modification operations as a JSON ARRAY string, max 50 (modification-propose)",
-                false,
-            ),
-            ("reason", "Reason note (modification-propose)", false),
-            (
-                "expires_in_seconds",
-                "Proposal lifetime in seconds, max/default 604800 (modification-propose)",
-                false,
-            ),
-            (
-                "apply_change_ids",
-                "JSON ARRAY (or JSON-array string) of change ids to apply; omit to apply all (modification-apply)",
-                false,
-            ),
-            (
-                "confirm_removes_human_gate",
-                "Required true to apply a skip that removes a human gate (modification-apply)",
-                false,
-            ),
-            (
-                "handle",
-                "System gallery template handle (template-gallery-get)",
-                false,
-            ),
-            (
-                "node_ids",
-                "Existing storage-node ids to provide to a waiting wait_for_files step (step-files); a JSON array of strings or a comma-separated string",
-                false,
-            ),
-            (
-                "new_assignee_user_id",
-                "New assignee user id, 19-digit string (step-reassign)",
-                false,
-            ),
-            (
-                "step_seeds",
-                "Run-start file seeds as a JSON object string {\"<reminted_step_id>\":[\"<node_id>\",...]} to pre-seed wait_for_files steps (instantiate / instantiate-and-wait)",
-                false,
-            ),
-            ("state", "Filter by a single lifecycle state (list)", false),
-            (
-                "archived",
-                "Archived filter: true / false / all (list)",
-                false,
-            ),
-            (
-                "created_by_me",
-                "Only runs you manually started — sends created_by=me (list)",
-                false,
-            ),
-            (
-                "participant_me",
-                "Only runs where you hold an actionable obligation — sends participant=me (list)",
-                false,
-            ),
-            (
-                "include",
-                "Per-item enrichment CSV: run_summary / run_meta (list)",
-                false,
-            ),
-            (
-                "usage",
-                "Template usage filter: library / one_off / all (template-list)",
-                false,
-            ),
-        ],
-    },
-    ToolDef {
         name: "sign",
-        description: "E-signature (SignEnvelope): draft and drive electronic-signature envelopes (PDFs sent to recipients). Every envelope is parented to a workspace (workspace_id; the former org surface was removed). This tool exposes READ, reversible-DRAFT-drive, and idempotent-RECOVERY actions: envelope-create (creates a DRAFT — reversible), envelope-update (draft-only; recipients are a full replacement; expires_at/policy_json are DECLARATIVE — omitting them CLEARS those fields, re-send to retain), envelope-list (filter via envelope_status / created_after / created_before), envelope-get, envelope-retry (re-drives a STUCK envelope through self-healing recovery — admin; idempotent + no-op-success; notifies no one; a permanent failure cascades to Failed), envelope-my-sign-link (mints YOUR OWN signing link for an envelope — the dashboard signature-card primary action; reversible/idempotent and notifies no one; requires a WRITE-scope token, so a read-only token is rejected with 10754; the structured result tells you the state — sign_url non-null = sign now, is_terminal = completed/void/declined, reauth_required = re-authenticate first, else you are blocked by routing order per blocked_signers), document-download (covers preview needs — the download bytes ARE the source/preview PDF, so there is no separate MCP preview action), signed-download, audit-download, describe. SIGN TEMPLATES (reusable envelope blueprints, template id sa…): template-list, template-details, and template-instantiate (resolves recipient_bindings/documents against the blueprint and creates a reversible DRAFT envelope) are exposed over MCP (reads + reversible draft creation); template-create, template-update, and template-delete are intentionally CLI-binary-only (`fastio sign template create|update|delete …`) and are NOT routable over MCP (mirrors the send/void boundary). The OUTWARD-FACING / TERMINAL actions — send (EMAILS REAL RECIPIENTS) and void (terminal) — are intentionally CLI-binary-only (`fastio sign envelope send|void …`) and are NOT routable over MCP (mirrors how the workflow tool keeps cancel CLI-only). Envelopes are voided, not deleted — there is no delete action. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Signing is a paid-plan feature (a non-entitled org returns 1670; access also requires workspace membership). Call action='describe' for the authoritative per-action reference.",
+        description: "E-signature (SignEnvelope): draft and drive electronic-signature envelopes (PDFs sent to recipients). Every envelope is parented to a workspace (workspace_id; the former org surface was removed). This tool exposes READ, reversible-DRAFT-drive, and idempotent-RECOVERY actions: envelope-create (creates a DRAFT — reversible), envelope-update (draft-only; recipients are a full replacement; expires_at/policy_json are DECLARATIVE — omitting them CLEARS those fields, re-send to retain), envelope-list (filter via envelope_status / created_after / created_before), envelope-get, envelope-retry (re-drives a STUCK envelope through self-healing recovery — admin; idempotent + no-op-success; notifies no one; a permanent failure cascades to Failed), envelope-my-sign-link (mints YOUR OWN signing link for an envelope — the dashboard signature-card primary action; reversible/idempotent and notifies no one; requires a WRITE-scope token, so a read-only token is rejected with 10754; the structured result tells you the state — sign_url non-null = sign now, is_terminal = completed/void/declined, reauth_required = re-authenticate first, else you are blocked by routing order per blocked_signers), document-download (covers preview needs — the download bytes ARE the source/preview PDF, so there is no separate MCP preview action), signed-download, audit-download, describe. SIGN TEMPLATES (reusable envelope blueprints, template id sa…): template-list, template-details, and template-instantiate (resolves recipient_bindings/documents against the blueprint and creates a reversible DRAFT envelope) are exposed over MCP (reads + reversible draft creation); template-create, template-update, and template-delete are intentionally CLI-binary-only (`fastio sign template create|update|delete …`) and are NOT routable over MCP (mirrors the send/void boundary). The OUTWARD-FACING / TERMINAL actions — send (EMAILS REAL RECIPIENTS) and void (terminal) — are intentionally CLI-binary-only (`fastio sign envelope send|void …`) and are NOT routable over MCP. Envelopes are voided, not deleted — there is no delete action. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Signing is a paid-plan feature (a non-entitled org returns 1670; access also requires workspace membership). Call action='describe' for the authoritative per-action reference.",
         actions: &[
             "describe",
             "envelope-create",
@@ -2291,7 +1923,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             // Required for every action EXCEPT describe / send / void / delete,
             // which short-circuit before workspace extraction. Marked schema-
             // optional (false) — matching the registry convention for
-            // multi-action tools (e.g. `workflow`, `apps`) — with the real
+            // multi-action tools (e.g. `apps`) — with the real
             // per-action requirements communicated via action='describe'
             // (common_required + each action's `required` list). A schema-strict
             // MCP client would otherwise reject action='describe' for lacking
@@ -2417,7 +2049,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "fileshare",
-        description: "File Shares: durable, link-shareable views of a SINGLE workspace file — the replacement for the retired QuickShare (use this tool's 'create' action). A File Share binds one file node and serves it via a stable link with optional password protection, an access option (named_people / anyone_with_link / …), an expiry, and per-user grants (view < download < edit). This tool exposes READ + DRIVE actions: create, list, info (details + effective_capability), update, grants-list, grants-add, versions, download (streams the bound file to the agent's local fs), preview (streams a derived preview asset), activity (single poll), describe. CONFIRM-GATED destructive actions: 'delete' REQUIRES confirm_delete=true (revokes the link + cascades grants; the bound file is untouched); 'grants-remove' REQUIRES confirm_revoke=true. CLI-BINARY-ONLY actions (NOT routable over MCP): 'upload' — the write-back that pushes a NEW VERSION of the bound file — needs the local file bytes and is destructive, so run `fastio fileshare upload …`; and 'ws-token' — the realtime WebSocket-token mint — is CLI-only because the token is a long-lived secret that must NOT be parked in an MCP transcript (run `fastio fileshare ws-token --token-file <path>`; mirrors how the workflow tool keeps its realtime-token mint CLI-only). The 'password' arg protects/authorizes a link (travels only in the x-ve-password header; NEVER logged or echoed in results/errors). info/download/versions/preview may be ANONYMOUS on a public (anyone_with_link) share. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Call action='describe' for the authoritative per-action reference.",
+        description: "File Shares: durable, link-shareable views of a SINGLE workspace file — the replacement for the retired QuickShare (use this tool's 'create' action). A File Share binds one file node and serves it via a stable link with optional password protection, an access option (named_people / anyone_with_link / …), an expiry, and per-user grants (view < download < edit). This tool exposes READ + DRIVE actions: create, list, info (details + effective_capability), update, grants-list, grants-add, versions, download (streams the bound file to the agent's local fs), preview (streams a derived preview asset), activity (single poll), describe. CONFIRM-GATED destructive actions: 'delete' REQUIRES confirm_delete=true (revokes the link + cascades grants; the bound file is untouched); 'grants-remove' REQUIRES confirm_revoke=true. CLI-BINARY-ONLY actions (NOT routable over MCP): 'upload' — the write-back that pushes a NEW VERSION of the bound file — needs the local file bytes and is destructive, so run `fastio fileshare upload …`; and 'ws-token' — the realtime WebSocket-token mint — is CLI-only because the token is a long-lived secret that must NOT be parked in an MCP transcript (run `fastio fileshare ws-token --token-file <path>`). The 'password' arg protects/authorizes a link (travels only in the x-ve-password header; NEVER logged or echoed in results/errors). info/download/versions/preview may be ANONYMOUS on a public (anyone_with_link) share. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Call action='describe' for the authoritative per-action reference.",
         actions: &[
             "describe",
             "create",
@@ -2588,18 +2220,161 @@ const TOOL_DEFS: &[ToolDef] = &[
 #[derive(Clone)]
 pub struct ToolRouter {
     state: Arc<McpState>,
+    /// E-Sign kill-switch (feature sunset 2026-07): read ONCE at construction
+    /// via [`crate::commands::sign::esign_enabled`]. When false the `sign` tool
+    /// is filtered out of `list_tools` and its `call_tool` arm returns the
+    /// disabled error before any auth/client/arg work.
+    esign_enabled: bool,
+    /// Optional `--tools` allow-list captured at server startup. `None` means
+    /// "all tools" (the default). When `Some`, a tool is advertised in
+    /// `list_tools` and callable in `call_tool` ONLY if its name is in the set;
+    /// every other tool is hidden and its dispatch returns a not-enabled error.
+    /// The E-Sign rule composes with this: `sign` requires BOTH E-Sign enabled
+    /// AND (filter is None or contains "sign"). The set contains only names that
+    /// match a [`TOOL_DEFS`] entry (unknown names are dropped, with a startup
+    /// warning, before the router is built).
+    tools_filter: Option<std::collections::HashSet<String>>,
 }
 
 impl ToolRouter {
-    /// Create a new tool router with shared state.
-    pub fn new(state: Arc<McpState>) -> Self {
-        Self { state }
+    /// Create a new tool router with shared state and an optional `--tools`
+    /// allow-list.
+    ///
+    /// Reads the E-Sign kill-switch (`FASTIO_ENABLE_ESIGN=1`) once here so the
+    /// flag is fixed for the lifetime of the server rather than re-read per call.
+    /// `tools_filter` is `None` for the default (all tools) or the validated
+    /// allow-list set built by the `serve()` entry point.
+    pub fn new(
+        state: Arc<McpState>,
+        tools_filter: Option<std::collections::HashSet<String>>,
+    ) -> Self {
+        Self {
+            state,
+            esign_enabled: crate::commands::sign::esign_enabled(),
+            tools_filter,
+        }
     }
 
-    /// List all registered tools as MCP `Tool` descriptors.
-    pub fn list_tools() -> ListToolsResult {
+    /// Construct a router with an explicit E-Sign flag (no `--tools` filter),
+    /// for unit tests that must assert both the enabled and disabled surfaces
+    /// without mutating the process environment (unsafe under Rust 2024 and
+    /// process-global).
+    #[cfg(test)]
+    pub fn new_with_esign(state: Arc<McpState>, esign_enabled: bool) -> Self {
+        Self {
+            state,
+            esign_enabled,
+            tools_filter: None,
+        }
+    }
+
+    /// Construct a router with an explicit E-Sign flag AND a `--tools`
+    /// allow-list, for the filter unit tests.
+    #[cfg(test)]
+    pub fn new_with_filter(
+        state: Arc<McpState>,
+        esign_enabled: bool,
+        tools_filter: Option<std::collections::HashSet<String>>,
+    ) -> Self {
+        Self {
+            state,
+            esign_enabled,
+            tools_filter,
+        }
+    }
+
+    /// List all registered tools as MCP `Tool` descriptors, honoring the E-Sign
+    /// kill-switch AND the `--tools` allow-list captured at router construction.
+    /// This instance method is the sole production listing path: it reads
+    /// `self.esign_enabled` and `self.tools_filter` (both fixed at construction),
+    /// so the advertised tool surface can never diverge from the callable surface
+    /// `call_tool` gates on the same fields.
+    pub fn list_tools(&self) -> ListToolsResult {
         let tools = TOOL_DEFS
             .iter()
+            .filter(|def| self.tool_visible(def.name))
+            .map(|def| {
+                Tool::new(
+                    def.name,
+                    def.description,
+                    action_schema(def.actions, def.params),
+                )
+            })
+            .collect();
+        ListToolsResult {
+            tools,
+            next_cursor: None,
+            meta: None,
+        }
+    }
+
+    /// Whether the `--tools` allow-list admits `name` (a CANONICAL tool name).
+    /// `None` filter = admits everything. Shared by [`Self::tool_visible`] (the
+    /// listing gate) and [`Self::call_tool`] (the dispatch gate) so the allow-list
+    /// half is defined exactly once and the advertised set can never diverge from
+    /// the callable set. The E-Sign rule is applied ALONGSIDE this (see
+    /// `tool_visible` / the `sign` match arm), not inside it, because the two
+    /// gates surface DIFFERENT refuse messages (not-enabled vs E-Sign-disabled).
+    fn filter_admits(&self, name: &str) -> bool {
+        match &self.tools_filter {
+            None => true,
+            Some(set) => set.contains(name),
+        }
+    }
+
+    /// Whether a tool `name` is exposed in `list_tools` (the advertised set). A
+    /// tool is visible iff the E-Sign rule allows it (`sign` requires
+    /// `esign_enabled`) AND the `--tools` allow-list admits it
+    /// ([`Self::filter_admits`]). `call_tool` applies the SAME two rules at
+    /// dispatch time (allow-list via `filter_admits`, E-Sign via its `sign` match
+    /// arm), so advertised and callable stay in lockstep.
+    fn tool_visible(&self, name: &str) -> bool {
+        if name == "sign" && !self.esign_enabled {
+            return false;
+        }
+        self.filter_admits(name)
+    }
+
+    /// Whether, after applying BOTH the E-Sign rule and the `--tools` allow-list,
+    /// any tool at all remains visible. Used at startup to refuse a server that
+    /// would advertise an empty tool surface (e.g. `--tools sign` with E-Sign
+    /// disabled — `sign` is a known name so name-validation passes, but the
+    /// effective surface is empty).
+    pub fn has_visible_tools(&self) -> bool {
+        TOOL_DEFS.iter().any(|def| self.tool_visible(def.name))
+    }
+
+    /// Whether a `--tools` allow-list is active on this router (i.e. the surface
+    /// is a strict subset of all tools). Used by the server intro so the
+    /// `instructions` text only enumerates the allowed tools when a filter is in
+    /// effect, instead of pitching the full default surface.
+    pub fn has_tools_filter(&self) -> bool {
+        self.tools_filter.is_some()
+    }
+
+    /// The canonical names of the tools currently VISIBLE on this router (both
+    /// the E-Sign rule and the `--tools` allow-list applied), in `TOOL_DEFS`
+    /// order. The advertised set `list_tools` returns, as names — used by the
+    /// server intro to enumerate a filtered surface honestly.
+    pub fn visible_tool_names(&self) -> Vec<&'static str> {
+        TOOL_DEFS
+            .iter()
+            .map(|def| def.name)
+            .filter(|name| self.tool_visible(name))
+            .collect()
+    }
+
+    /// Core of the legacy `list_tools`, parameterized on the E-Sign flag so
+    /// tests can exercise both surfaces without touching the process environment
+    /// or a `--tools` filter. When `esign_enabled` is false the `sign` tool is
+    /// filtered out; the `TOOL_DEFS` static array is left intact. (The
+    /// production listing path is the instance [`Self::list_tools`], which also
+    /// applies the `--tools` allow-list.)
+    #[cfg(test)]
+    pub fn list_tools_with(esign_enabled: bool) -> ListToolsResult {
+        let tools = TOOL_DEFS
+            .iter()
+            .filter(|def| esign_enabled || def.name != "sign")
             .map(|def| {
                 Tool::new(
                     def.name,
@@ -2622,6 +2397,19 @@ impl ToolRouter {
         args: Map<String, Value>,
     ) -> Result<CallToolResult, McpError> {
         let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+
+        // `--tools` allow-list gate: refuse a tool the server was not started
+        // with, BEFORE any dispatch. The check uses the CANONICAL tool name (via
+        // the SAME `filter_admits` predicate `list_tools` uses) so the hidden
+        // aliases (`ai` → `ripley`, `how-to` → `howto`) are gated by the name a
+        // caller would pass to `--tools`. The E-Sign `sign` gate stays below; a
+        // `sign` call must satisfy BOTH the filter and the flag.
+        let canonical = canonical_tool_name(name);
+        if !self.filter_admits(canonical) {
+            return Ok(error_text(&format!(
+                "Tool '{canonical}' is not enabled on this server (started with --tools)."
+            )));
+        }
 
         match name {
             "auth" => handle_auth(&self.state, action, &args).await,
@@ -2647,12 +2435,13 @@ impl ToolRouter {
             "invitation" => handle_invitation(&self.state, action, &args).await,
             "preview" => handle_preview(&self.state, action, &args).await,
             "asset" => handle_asset(&self.state, action, &args).await,
-            "task" => handle_task(&self.state, action, &args).await,
             "apps" => handle_apps(&self.state, action, &args).await,
             "import" => handle_import(&self.state, action, &args).await,
             "lock" => handle_lock(&self.state, action, &args).await,
             "metadata" => handle_metadata(&self.state, action, &args).await,
-            "workflow" => handle_workflow(&self.state, action, &args).await,
+            "sign" if !self.esign_enabled => Ok(error_text(
+                "E-Sign is currently disabled. Set FASTIO_ENABLE_ESIGN=1 to use sign commands (signing must also be enabled for your organization).",
+            )),
             "sign" => handle_sign(&self.state, action, &args).await,
             "fileshare" => handle_fileshare(&self.state, action, &args).await,
             "system" => handle_system(&self.state, action, &args).await,
@@ -4411,10 +4200,6 @@ async fn handle_org_create_workspace(
         Ok(v) => v.unwrap_or(false),
         Err(e) => return Ok(e),
     };
-    let workflow = match optional_bool_strict(args, "workflow") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
     let params = api::org::CreateWorkspaceParams {
         folder_name,
         name,
@@ -4422,7 +4207,6 @@ async fn handle_org_create_workspace(
         perm_member_manage,
         intelligence,
         description: optional_str(args, "description"),
-        workflow,
         accent_color: optional_str(args, "accent_color"),
         background_color1: optional_str(args, "background_color1"),
         background_color2: optional_str(args, "background_color2"),
@@ -4467,15 +4251,6 @@ fn build_workspace_update_fields(
     }
     if let Some(v) = optional_str(args, "perm_member_manage") {
         fields.insert("perm_member_manage".to_owned(), v.to_owned());
-    }
-    if let Some(v) = optional_bool(args, "nl_summaries_enabled") {
-        fields.insert("nl_summaries_enabled".to_owned(), v.to_string());
-    }
-    if let Some(v) = optional_u32(args, "nl_summaries_daily_cap") {
-        fields.insert("nl_summaries_daily_cap".to_owned(), v.to_string());
-    }
-    if let Some(v) = optional_str(args, "workflow_approval_native_enabled") {
-        fields.insert("workflow_approval_native_enabled".to_owned(), v.to_owned());
     }
     if let Some(v) = optional_str(args, "accent_color") {
         fields.insert("accent_color".to_owned(), v.to_owned());
@@ -4572,16 +4347,6 @@ async fn handle_workspace(
                 Err(e) => return Ok(e),
             };
             match api::workspace::delete_workspace(&client, ws_id, confirm).await {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "enable-workflow" => {
-            let ws_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workspace::enable_workflow(&client, ws_id).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -4761,16 +4526,6 @@ async fn handle_workspace(
             )
             .await
             {
-                Ok(v) => Ok(success_json(&v)),
-                Err(e) => Ok(cli_err_to_result(&e)),
-            }
-        }
-        "disable-workflow" => {
-            let ws_id = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            match api::workspace::disable_workflow(&client, ws_id).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }
@@ -6550,8 +6305,6 @@ async fn handle_share(
         "guest-auth" => handle_share_guest_auth(state, args).await,
         "available" => handle_share_available(state, args).await,
         "check-name" => handle_share_check_name(state, args).await,
-        "enable-workflow" => handle_share_enable_workflow(state, args).await,
-        "disable-workflow" => handle_share_disable_workflow(state, args).await,
         _ => Ok(error_text(&format!("Unknown share action: {action}"))),
     }
 }
@@ -6911,36 +6664,6 @@ async fn handle_share_check_name(
         Err(e) => return Ok(e),
     };
     match api::share::check_share_name(&client, name).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_share_enable_workflow(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let share_id = match required_str(args, "share_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::share::enable_share_workflow(&client, share_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_share_disable_workflow(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let share_id = match required_str(args, "share_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::share::disable_share_workflow(&client, share_id).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -8045,9 +7768,6 @@ async fn handle_comment(
         "bulk-delete" => handle_comment_bulk_delete(state, args).await,
         "reaction-add" => handle_comment_reaction_add(state, args).await,
         "reaction-remove" => handle_comment_reaction_remove(state, args).await,
-        "link" => handle_comment_link(state, args).await,
-        "unlink" => handle_comment_unlink(state, args).await,
-        "linked" => handle_comment_linked(state, args).await,
         "list-attachments" => handle_comment_list_attachments(state, args).await,
         "attach" => handle_comment_attach(state, args).await,
         "detach" => handle_comment_detach(state, args).await,
@@ -8211,9 +7931,8 @@ async fn handle_comment_reply(
 
 /// `comment` update action: edit a comment's body by id.
 ///
-/// This is the generic comment-edit path — it also edits TASK comments by their
-/// comment id (the `task` tool posts/lists task comments, but editing is reached
-/// here). The new body accepts either `text` (preferred) or `body` (alias).
+/// This is the generic comment-edit path — it edits any comment by its comment
+/// id. The new body accepts either `text` (preferred) or `body` (alias).
 async fn handle_comment_update(
     state: &McpState,
     args: &Map<String, Value>,
@@ -8354,81 +8073,6 @@ async fn handle_comment_reaction_remove(
     }
 }
 
-async fn handle_comment_link(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let comment_id = match required_str(args, "comment_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let etype = match required_str(args, "linked_entity_type") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    if !LINKED_ENTITY_TYPES.contains(&etype) {
-        return Ok(error_text(&format!(
-            "Invalid linked_entity_type '{etype}' (one of: task, workflow_review)"
-        )));
-    }
-    let eid = match required_str(args, "linked_entity_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::comment::link_comment(&client, comment_id, etype, eid).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_comment_unlink(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let comment_id = match required_str(args, "comment_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::comment::unlink_comment(&client, comment_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_comment_linked(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let etype = match required_str(args, "linked_entity_type") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    if !LINKED_ENTITY_TYPES.contains(&etype) {
-        return Ok(error_text(&format!(
-            "Invalid linked_entity_type '{etype}' (one of: task, workflow_review)"
-        )));
-    }
-    let eid = match required_str(args, "linked_entity_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::comment::linked_comments(
-        &client,
-        etype,
-        eid,
-        optional_u32(args, "limit"),
-        optional_u32(args, "offset"),
-    )
-    .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
 /// `comment` list-attachments action: list a comment's attachments (hydrated,
 /// access-gated).
 async fn handle_comment_list_attachments(
@@ -8448,8 +8092,7 @@ async fn handle_comment_list_attachments(
 
 /// `comment` attach action: attach one object (`target_id`) or many
 /// (`target_ids`, ≤25) to a comment. The two are mutually exclusive; exactly one
-/// must be supplied. Author-only and rejected on workflow-review comments — the
-/// server enforces both.
+/// must be supplied. Author-only — the server enforces it.
 async fn handle_comment_attach(
     state: &McpState,
     args: &Map<String, Value>,
@@ -9119,616 +8762,6 @@ async fn handle_asset(
     }
 }
 
-/// Task tool handler.
-async fn handle_task(
-    state: &McpState,
-    action: &str,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    if let Err(e) = require_auth(state).await {
-        return Ok(e);
-    }
-    match action {
-        "list-tasks" => handle_task_list_tasks(state, args).await,
-        "create-task" => handle_task_create_task(state, args).await,
-        "task-details" => handle_task_task_details(state, args).await,
-        "update-task" => handle_task_update_task(state, args).await,
-        "delete-task" => handle_task_delete_task(state, args).await,
-        "assign-task" => handle_task_assign_task(state, args).await,
-        "change-status" => handle_task_change_status(state, args).await,
-        "list-lists" => handle_task_list_lists(state, args).await,
-        "create-list" => handle_task_create_list(state, args).await,
-        "list-details" => handle_task_list_details(state, args).await,
-        "update-list" => handle_task_update_list(state, args).await,
-        "delete-list" => handle_task_delete_list(state, args).await,
-        "bulk-status" => handle_task_bulk_status(state, args).await,
-        "move-task" => handle_task_move_task(state, args).await,
-        "reorder-tasks" => handle_task_reorder_tasks(state, args).await,
-        "reorder-lists" => handle_task_reorder_lists(state, args).await,
-        "filter" => handle_task_filter(state, args).await,
-        "summary" => handle_task_summary(state, args).await,
-        "list-comments" => handle_task_list_comments(state, args).await,
-        "post-comment" => handle_task_post_comment(state, args).await,
-        "list-attachments" => handle_task_list_attachments(state, args).await,
-        "attach" => handle_task_attach(state, args).await,
-        "detach" => handle_task_detach(state, args).await,
-        _ => Ok(error_text(&format!("Unknown task action: {action}"))),
-    }
-}
-
-/// `task` filter action: filtered task list for a workspace or share.
-async fn handle_task_filter(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
-    let profile_id = match required_str(args, "profile_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let filter = match required_str(args, "filter") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let query = api::workflow::FilterQuery {
-        limit: optional_u32(args, "limit"),
-        offset: optional_u32(args, "offset"),
-        status: optional_str(args, "status"),
-    };
-    match api::workflow::list_tasks_filtered(&client, profile_type, profile_id, filter, &query)
-        .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-/// `task` summary action: task count summary for a workspace or share.
-async fn handle_task_summary(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let profile_type = optional_str(args, "profile_type").unwrap_or("workspace");
-    let profile_id = match required_str(args, "profile_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::tasks_summary(&client, profile_type, profile_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_list_tasks(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::list_tasks(
-        &client,
-        list_id,
-        optional_u32(args, "limit"),
-        optional_u32(args, "offset"),
-    )
-    .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_create_task(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let title = match required_str(args, "title") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::create_task(
-        &client,
-        &api::workflow::CreateTaskParams {
-            list_id,
-            title,
-            description: optional_str(args, "description"),
-            status: optional_str(args, "status"),
-            priority: optional_u8(args, "priority"),
-            assignee_id: optional_str(args, "assignee_id"),
-            node_id: optional_str(args, "node_id"),
-        },
-    )
-    .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_task_details(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let task_id = match required_str(args, "task_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::get_task(&client, list_id, task_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_update_task(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let task_id = match required_str(args, "task_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::update_task(
-        &client,
-        &api::workflow::UpdateTaskParams {
-            list_id,
-            task_id,
-            title: optional_str(args, "title"),
-            description: optional_str(args, "description"),
-            status: optional_str(args, "status"),
-            priority: optional_u8(args, "priority"),
-            assignee_id: optional_str(args, "assignee_id"),
-            node_id: optional_str(args, "node_id"),
-        },
-    )
-    .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_delete_task(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let task_id = match required_str(args, "task_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::delete_task(&client, list_id, task_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_assign_task(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let task_id = match required_str(args, "task_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::assign_task(&client, list_id, task_id, optional_str(args, "assignee_id"))
-        .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_change_status(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let task_id = match required_str(args, "task_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let status = match required_str(args, "status") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::change_task_status(&client, list_id, task_id, status).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_list_lists(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let pt = optional_str(args, "profile_type").unwrap_or("workspace");
-    let pid = match required_str(args, "profile_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::list_task_lists_ctx(
-        &client,
-        pt,
-        pid,
-        optional_u32(args, "limit"),
-        optional_u32(args, "offset"),
-    )
-    .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_create_list(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let pt = optional_str(args, "profile_type").unwrap_or("workspace");
-    let pid = match required_str(args, "profile_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let name = match required_str(args, "name") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::create_task_list_ctx(
-        &client,
-        pt,
-        pid,
-        name,
-        optional_str(args, "description"),
-    )
-    .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_list_details(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::get_task_list(&client, list_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_update_list(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::update_task_list(
-        &client,
-        list_id,
-        optional_str(args, "name"),
-        optional_str(args, "description"),
-    )
-    .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_delete_list(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::delete_task_list(&client, list_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_bulk_status(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let ids_str = match required_str(args, "task_ids") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let status = match required_str(args, "status") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let ids: Vec<String> = ids_str.split(',').map(|s| s.trim().to_owned()).collect();
-    match api::workflow::bulk_status_tasks(&client, list_id, &ids, status).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_move_task(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let task_id = match required_str(args, "task_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let target = match required_str(args, "target_task_list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::move_task(
-        &client,
-        list_id,
-        task_id,
-        target,
-        optional_u32(args, "sort_order"),
-    )
-    .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_reorder_tasks(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let ids_str = match required_str(args, "task_ids") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let ids: Vec<String> = ids_str.split(',').map(|s| s.trim().to_owned()).collect();
-    match api::workflow::reorder_tasks(&client, list_id, &ids).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-async fn handle_task_reorder_lists(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let pt = optional_str(args, "profile_type").unwrap_or("workspace");
-    let pid = match required_str(args, "profile_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let ids_str = match required_str(args, "list_ids") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let ids: Vec<String> = ids_str.split(',').map(|s| s.trim().to_owned()).collect();
-    match api::workflow::reorder_task_lists(&client, pt, pid, &ids).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-/// `task` list-comments action: read a task's private comment thread.
-async fn handle_task_list_comments(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let task_id = match required_str(args, "task_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::list_task_comments(
-        &client,
-        list_id,
-        task_id,
-        optional_u32(args, "limit"),
-        optional_u32(args, "offset"),
-    )
-    .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-/// `task` post-comment action: post a comment (or threaded reply) on a task.
-///
-/// `reference` and `properties` are optional JSON objects (accepted as a JSON
-/// object directly or as a JSON-object string) parsed via the shared
-/// [`json_object_arg`] helper and passed by reference; the comment body accepts
-/// either `text` (preferred) or `body` (alias). Editing/deleting a task comment
-/// is reached through the generic `comment` tool by comment id.
-async fn handle_task_post_comment(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let task_id = match required_str(args, "task_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let Some(body) = optional_str(args, "text").or_else(|| optional_str(args, "body")) else {
-        return Ok(error_text("Missing required parameter: text (or body)"));
-    };
-    let reference = match json_object_arg(args, "reference") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let properties = match json_object_arg(args, "properties") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::post_task_comment(
-        &client,
-        &api::workflow::PostTaskCommentParams {
-            list_id,
-            task_id,
-            body,
-            parent_id: optional_str(args, "parent_id"),
-            reference: reference.as_ref(),
-            properties: properties.as_ref(),
-        },
-    )
-    .await
-    {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-/// `task` list-attachments action: list a task's attachments (hydrated).
-async fn handle_task_list_attachments(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let task_id = match required_str(args, "task_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::list_task_attachments(&client, list_id, task_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-/// `task` attach action: attach one or more objects to a task (atomic,
-/// idempotent, cap 100). `target_ids` is a comma-separated list, split the same
-/// way as the `bulk-status` / `reorder-tasks` id params.
-async fn handle_task_attach(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let task_id = match required_str(args, "task_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let ids = match string_list_arg(args, "target_ids") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    if ids.is_empty() {
-        return Ok(error_text(
-            "target_ids must contain at least one non-empty object ID",
-        ));
-    }
-    if ids.len() > 100 {
-        return Ok(error_text(&format!(
-            "a single attach call accepts at most 100 target ids (got {})",
-            ids.len()
-        )));
-    }
-    match api::workflow::attach_to_task(&client, list_id, task_id, &ids).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-/// `task` detach action: detach a single object from a task (single only — there
-/// is no batch detach).
-async fn handle_task_detach(
-    state: &McpState,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    let client = state.client().read().await;
-    let list_id = match required_str(args, "list_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let task_id = match required_str(args, "task_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let target_id = match required_str(args, "target_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    match api::workflow::detach_from_task(&client, list_id, task_id, target_id).await {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
 /// Read an optional JSON-object argument that may arrive either as a JSON object
 /// directly (the common MCP-client shape) or as a serialized JSON-object string.
 /// A missing/null key is `None`; any value that is not (or does not parse to) a
@@ -9749,40 +8782,47 @@ fn json_object_arg(args: &Map<String, Value>, key: &str) -> Result<Option<Value>
     }
 }
 
-/// Read an optional JSON-array argument for a REST field the API expects as a
-/// JSON-array STRING (e.g. workflow `ops`, `apply_change_ids`). MCP clients
-/// commonly pass these as a native JSON array; accept that OR a serialized
-/// JSON-array string and return the serialized form. A missing/null key is
-/// `None`; anything that is not (or does not parse to) a **non-empty** JSON array
-/// is rejected rather than silently dropped.
+/// Shared poll-tick error classification for the KEPT MCP wait loops
+/// (Ripley `ask` polling and metadata `extract` polling).
 ///
-/// An explicit EMPTY array is rejected on purpose: the workflow API treats an
-/// empty/omitted `apply_change_ids` as "apply ALL pending changes", so accepting
-/// `[]` would turn an apply-nothing / empty-selection request into an apply-ALL
-/// one. To apply all, OMIT the field; to apply a subset, pass a non-empty array.
-fn json_array_string_arg(
-    args: &Map<String, Value>,
-    key: &str,
-) -> Result<Option<String>, CallToolResult> {
-    let empty_err = || {
-        error_text(&format!(
-            "{key} must be a non-empty JSON array (omit it entirely to apply all)"
-        ))
-    };
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Array(arr)) if arr.is_empty() => Err(empty_err()),
-        Some(arr @ Value::Array(_)) => Ok(Some(arr.to_string())),
-        Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw) {
-            Ok(Value::Array(arr)) if arr.is_empty() => Err(empty_err()),
-            Ok(Value::Array(_)) => Ok(Some(raw.clone())),
-            _ => Err(error_text(&format!(
-                "{key} must be a JSON array (or a JSON-array string)"
-            ))),
+/// How an MCP poll loop should react to an error from one poll tick.
+///
+/// Replaces the old `Err(_) => {}` (which silently looped to timeout on a
+/// 404/403/500). The 401 re-auth short-circuit is handled by the caller before
+/// this is reached.
+enum WfPollAction {
+    /// Server asked us to wait this many seconds (0 = no explicit interval).
+    RateLimited { retry_after_secs: u64 },
+    /// A transient failure worth another poll on the regular cadence.
+    RetryTransient,
+    /// A persistent error rendered for return (loop must stop and surface it).
+    Fatal(CallToolResult),
+}
+
+/// Classify a poll-tick [`CliError`] for an MCP wait/export loop.
+///
+/// Mirrors the CLI `classify_poll_error`: rate limits sleep their advertised
+/// interval; all 5xx (`500..=599`) / 408 / transport / I/O are transient; other
+/// 4xx, parse, and config are fatal and surfaced via [`cli_err_to_result`].
+fn classify_wf_poll_error(err: &fastio_cli::error::CliError) -> WfPollAction {
+    use fastio_cli::error::CliError;
+    match err {
+        CliError::RateLimit { retry_after_secs } => WfPollAction::RateLimited {
+            retry_after_secs: *retry_after_secs,
         },
-        Some(_) => Err(error_text(&format!(
-            "{key} must be a JSON array (or a JSON-array string)"
-        ))),
+        CliError::Api(e) => match e.http_status {
+            429 | 408 => WfPollAction::RateLimited {
+                retry_after_secs: 0,
+            },
+            // All server errors are transient (matches the CLI classifier): a
+            // 500 during a long poll is a momentary backend blip, not permanent.
+            500..=599 => WfPollAction::RetryTransient,
+            _ => WfPollAction::Fatal(cli_err_to_result(err)),
+        },
+        CliError::Http(_) | CliError::Io(_) => WfPollAction::RetryTransient,
+        // Parse / config / auth(other) — and, conservatively, any future
+        // non-exhaustive variant — are surfaced rather than looped.
+        _ => WfPollAction::Fatal(cli_err_to_result(err)),
     }
 }
 
@@ -10793,1436 +9833,6 @@ async fn metadata_extract_and_wait(
     }
 }
 
-// ─── Workflow Orchestration tool ──────────────────────────────────────────────
-
-/// Default seconds between `workflow` compound-wait polls.
-const WORKFLOW_WAIT_POLL_DEFAULT_SECS: u64 = 3;
-/// Lower bound on the `workflow` compound-wait poll interval.
-const WORKFLOW_WAIT_POLL_MIN_SECS: u64 = 1;
-/// Upper bound on the `workflow` compound-wait poll interval.
-const WORKFLOW_WAIT_POLL_MAX_SECS: u64 = 60;
-/// Hard ceiling on the `workflow` compound-wait poll loop (well under the
-/// ~1-hour JWT lifetime).
-const WORKFLOW_WAIT_MAX_SECS: u64 = 600;
-
-/// The structured `describe` payload for the `workflow` tool — the
-/// authoritative per-action reference. Admin/destructive/crypto actions are
-/// intentionally ABSENT from this tool (they are CLI-binary-only); the
-/// `cli_only_actions` field names them so an agent knows where they live.
-// The length is a flat action-spec table, not branching logic.
-#[allow(clippy::too_many_lines)]
-fn workflow_describe() -> CallToolResult {
-    // (action, required[], optional[], note). Built programmatically to keep
-    // the `json!` macro shallow (a single deeply-nested literal blows the
-    // macro recursion limit).
-    let actions: &[(&str, &[&str], &[&str], &str)] = &[
-        ("describe", &[], &[], ""),
-        ("get", &["workflow_id"], &[], ""),
-        (
-            "list",
-            &["workspace_id"],
-            &[
-                "limit",
-                "offset",
-                "template_id",
-                "state",
-                "archived",
-                "created_by_me",
-                "participant_me",
-                "include",
-                "page_size",
-                "cursor",
-                "bucket",
-            ],
-            "filters narrow BEFORE pagination and compose (AND). created_by_me → created_by=me; \
-             participant_me → participant=me. include is a CSV of run_summary / run_meta. \
-             OPT-IN keyset pagination: page_size (1-100) + cursor (the prior response's \
-             pagination.next_cursor) and the execution-status bucket (in_flight / completed / \
-             paused / failed) switch the response to the keyset shape (pagination + counts); \
-             limit / offset are the legacy offset path.",
-        ),
-        ("state", &["workflow_id"], &[], ""),
-        (
-            "instantiate",
-            &["workflow_id", "idempotency_key"],
-            &[
-                "trigger_payload",
-                "external_subject_id",
-                "pool_key",
-                "step_seeds",
-            ],
-            "step_seeds is a JSON OBJECT string keyed by the workflow's reminted DEFINITION step \
-             ids (from from_system's system_gallery.step_id_map, or /state/) → arrays of node ids; \
-             a seed keyed by a gallery-fixed step id is silently dropped.",
-        ),
-        (
-            "instantiate-and-wait",
-            &["workflow_id", "idempotency_key"],
-            &[
-                "trigger_payload",
-                "external_subject_id",
-                "pool_key",
-                "step_seeds",
-                "poll_interval",
-            ],
-            "fires then polls to a terminal lifecycle",
-        ),
-        ("pause", &["workflow_id"], &[], ""),
-        ("resume", &["workflow_id"], &[], ""),
-        // NOTE: `cancel` is intentionally NOT an MCP action — it is a terminal,
-        // irreversible lifecycle mutation and is listed under cli_only below.
-        (
-            "grant-list",
-            &["workflow_id"],
-            &["limit", "cursor"],
-            "cursor-paginated",
-        ),
-        ("step-get", &["workflow_id", "step_occurrence_id"], &[], ""),
-        (
-            "step-output",
-            &["workflow_id", "step_occurrence_id", "output"],
-            &["retry_on_conflict"],
-            "CAS-guarded; 409 surfaced unless retry_on_conflict=true",
-        ),
-        (
-            "step-advance",
-            &["workflow_id", "step_occurrence_id"],
-            &["output", "retry_on_conflict"],
-            "CAS-guarded",
-        ),
-        (
-            "step-occurrences",
-            &["workflow_id", "step_id"],
-            &["limit", "offset"],
-            "",
-        ),
-        (
-            "step-agent-activity",
-            &["workflow_id", "step_occurrence_id"],
-            &[],
-            "read-only action feed of an AI-agent step (cards: seq, label, state, \
-             affected_refs, started_at, ended_at; ascending seq). Same shape live or \
-             finished — poll while the step runs. available:false + empty actions = \
-             no readable feed yet (neutral, NOT an error); a non-agent occurrence \
-             returns 404. Never contains tool ids, arguments, results, or reasoning.",
-        ),
-        (
-            "step-agent-trace",
-            &["workflow_id", "step_occurrence_id"],
-            &[],
-            "read-only reasoning + narration commentary of an AI-agent step (companion \
-             to step-agent-activity). Returns the interim reasoning and the commentary \
-             the agent emits while working; NEVER the final answer or citations. Poll \
-             while the step runs. available:false = no readable trace yet (neutral, NOT \
-             an error); a non-agent occurrence returns 404.",
-        ),
-        (
-            "step-files",
-            &["workflow_id", "step_occurrence_id", "node_ids"],
-            &[],
-            "provide EXISTING file node ids (in place; no move/copy) to a WAITING wait_for_files \
-             step, then re-evaluate it. node_ids is a JSON array of strings or a comma-separated \
-             string. Workflow admin. 409 if the step is not waiting / not a wait_for_files step; \
-             422 over the per-step submitted-id limit.",
-        ),
-        (
-            "step-complete",
-            &["workflow_id", "step_occurrence_id"],
-            &[],
-            "explicitly advance a manual-completion (manual_completion:true) ad-hoc wait_for_files \
-             step once the required file count has been provided (no body; returns the updated \
-             occurrence). Workflow admin. 422 until the minimum is reached; a retryable 409 right \
-             after a step-files submit; 409 if the step is not a manual ad-hoc wait_for_files in \
-             the waiting state.",
-        ),
-        (
-            "step-reassign",
-            &["workflow_id", "step_occurrence_id", "new_assignee_user_id"],
-            &[],
-            "reassign a WAITING task step to a new assignee. Workflow admin OR the current \
-             assignee; the new assignee must be a workspace member. Rejected 409 while a \
-             modification proposal is open.",
-        ),
-        (
-            "modification-propose",
-            &["workflow_id", "ops"],
-            &["reason", "expires_in_seconds"],
-            "ops is a JSON ARRAY string (each {op, target_step_occurrence_id, …}; op ∈ \
-             skip|reassign|patch; max 50). Proposing AUTO-PAUSES the run; only one open \
-             proposal per workflow (409 otherwise). Requires workflow ADMIN + the \
-             workflow_mid_run_edit plan capability (403 otherwise).",
-        ),
-        (
-            "modification-list",
-            &["workflow_id"],
-            &["status"],
-            "member-or-above (a share-guest is excluded)",
-        ),
-        (
-            "modification-get",
-            &["workflow_id", "modification_id"],
-            &[],
-            "changes + before/after diff; member-or-above (a share-guest is excluded)",
-        ),
-        (
-            "modification-apply",
-            &["workflow_id", "modification_id"],
-            &["apply_change_ids", "confirm_removes_human_gate"],
-            "applies then finalizes + resumes. Omit apply_change_ids to apply ALL pending \
-             changes; otherwise a JSON ARRAY string covering all pending changes (a partial \
-             selection is rejected). A skip that removes a human gate requires \
-             confirm_removes_human_gate=true (else 403). Workflow ADMIN.",
-        ),
-        (
-            "modification-cancel",
-            &["workflow_id", "modification_id"],
-            &[],
-            "cancels the proposal and resumes the run unchanged. Workflow ADMIN.",
-        ),
-        (
-            "template-list",
-            &["workspace_id"],
-            &["limit", "offset", "usage"],
-            "usage filter: library (non-one-off) / one_off / all (default)",
-        ),
-        ("template-get", &["template_id"], &["include_body"], ""),
-        (
-            "template-gallery",
-            &[],
-            &[],
-            "list the built-in system template gallery (metadata only); any authenticated \
-             user, no workspace scope or plan gate; whole bounded list, no pagination",
-        ),
-        (
-            "template-gallery-get",
-            &["handle"],
-            &[],
-            "one gallery template: metadata + full definition body (incl. the setup block \
-             describing inputs to collect before instantiating); 404 for an unknown handle",
-        ),
-        (
-            "agent-template-list",
-            &["workspace_id"],
-            &[],
-            "list a workspace's v3.5 agent templates (persona = instruction prompt + tool \
-             allowlist); workspace view. Create/update/delete are CLI-only (workspace admin).",
-        ),
-        (
-            "agent-template-get",
-            &["workspace_id", "template_id"],
-            &[],
-            "read one agent template; workspace view",
-        ),
-        ("trigger-list", &["workspace_id"], &["enabled_filter"], ""),
-        ("trigger-get", &["trigger_id"], &[], ""),
-        (
-            "trigger-fire",
-            &["trigger_id", "idempotency_key"],
-            &["trigger_payload"],
-            "409 carries a stable reason",
-        ),
-        (
-            "trigger-fire-and-wait",
-            &["trigger_id", "idempotency_key"],
-            &["trigger_payload", "poll_interval"],
-            "",
-        ),
-        (
-            "trigger-dry-run",
-            &["trigger_id"],
-            &["window_days", "sample_limit", "apply_guards"],
-            "",
-        ),
-        (
-            "obligation-list",
-            &["workflow_id"],
-            &["status", "assigned_user_id", "limit", "offset"],
-            "workflow_id is the required authz anchor",
-        ),
-        ("obligation-get", &["obligation_id"], &[], ""),
-        ("obligation-claim", &["obligation_id"], &[], ""),
-        ("obligation-release", &["obligation_id"], &[], ""),
-        (
-            "obligation-resolve",
-            &["obligation_id"],
-            &["resolution_payload"],
-            "",
-        ),
-        ("inbox-me", &[], &[], ""),
-        ("inbox-workspace", &["workspace_id"], &[], ""),
-        ("inbox-pool", &["workspace_id", "pool_key"], &[], ""),
-        ("schema-get", &["workflow_id"], &[], ""),
-        (
-            "audit-events",
-            &["workflow_id"],
-            &["include_payload", "limit", "offset"],
-            "",
-        ),
-        (
-            "audit-export-start",
-            &["workflow_id"],
-            &["scope", "include_overlays", "redaction_pin_strategy"],
-            "",
-        ),
-        (
-            "audit-export-list",
-            &["workspace_id"],
-            &["limit", "offset"],
-            "",
-        ),
-        ("audit-export-get", &["job_id"], &[], ""),
-        (
-            "audit-export-and-download",
-            &["workflow_id"],
-            &[
-                "scope",
-                "include_overlays",
-                "redaction_pin_strategy",
-                "output_path",
-                "poll_interval",
-            ],
-            "starts the export, polls to completed, streams manifest + all chunks to output_path",
-        ),
-        (
-            "subject-workflows",
-            &["workspace_id", "subject_id"],
-            &[],
-            "",
-        ),
-        (
-            "review-active",
-            &["workspace_id"],
-            &["limit", "offset"],
-            "v3.5b workspace hydration read: lists active (arming/open) review \
-             surfaces + their asset node_ids so files can be badged under review; \
-             NOT flag-gated (always returns for a workspace member). The other \
-             review actions (create/get/asset/decision/admin-resolve) are \
-             CLI-binary-only.",
-        ),
-    ];
-
-    let mut action_map = serde_json::Map::new();
-    for (name, required, optional, note) in actions {
-        let mut spec = serde_json::Map::new();
-        spec.insert(
-            "required".to_owned(),
-            Value::Array(
-                required
-                    .iter()
-                    .map(|s| Value::String((*s).to_owned()))
-                    .collect(),
-            ),
-        );
-        spec.insert(
-            "optional".to_owned(),
-            Value::Array(
-                optional
-                    .iter()
-                    .map(|s| Value::String((*s).to_owned()))
-                    .collect(),
-            ),
-        );
-        if !note.is_empty() {
-            spec.insert("note".to_owned(), Value::String((*note).to_owned()));
-        }
-        action_map.insert((*name).to_owned(), Value::Object(spec));
-    }
-
-    let cli_only: Vec<Value> = [
-        "cancel",
-        "create",
-        "update",
-        "delete",
-        "purge",
-        "transfer",
-        "rotate-inbound-key",
-        "grant add/revoke",
-        "step cancel",
-        "template create/publish/withdraw/deprecate",
-        "trigger create/update/delete/purge/dry-run-draft/rotate-inbound-key",
-        "trigger-alias get/set/remove",
-        "schema set/derive",
-        "audit redaction request/confirm/get",
-        "audit check-integrity",
-        "outbound create/update/delete/rotate-secret",
-        "pool create/delete",
-        "realtime token",
-        "review create/get/asset/decision/admin-resolve (review-active read IS on MCP)",
-    ]
-    .iter()
-    .map(|s| Value::String((*s).to_owned()))
-    .collect();
-
-    let payload = serde_json::json!({
-        "tool": "workflow",
-        "summary": "Workflow Orchestration v3.2 — durable runtime, templates, triggers, \
-                    obligations, signed audit, pools. Offload-oriented: prefer the compound \
-                    *-and-wait / *-and-download actions over hand-driven poll loops.",
-        "destructive_actions": [],
-        "side_effects": "instantiate / trigger-fire (+ their *-and-wait variants) START runtime \
-                         work and consume the workflow's credit budget. step-output / step-advance \
-                         drive the runtime forward and are CAS-guarded (a 409 surfaces by default; \
-                         pass retry_on_conflict=true to re-read and retry once). instantiate / \
-                         trigger-fire REQUIRE an idempotency_key for replay safety — there is NO \
-                         MCP auto-generate. The terminal 'cancel' lifecycle mutation is CLI-only \
-                         (see cli_only_actions) and is NOT exposed over MCP.",
-        "guidance": {
-            "offload": "To run a workflow end-to-end, use instantiate-and-wait (or \
-                        trigger-fire-and-wait). To obtain a verifiable audit bundle, use \
-                        audit-export-and-download.",
-            "integrity": "After audit-export-and-download, run `fastio workflow audit \
-                          check-integrity` (CLI) — INTEGRITY only; HMAC authenticity is not \
-                          implemented (deferred).",
-            "cli_only_actions": cli_only,
-        },
-        "actions": Value::Object(action_map),
-    });
-    success_json(&payload)
-}
-
-/// Resolve the idempotency key for an MCP instantiate/fire action. The MCP
-/// surface has NO auto-generate (unlike the CLI's explicit opt-in): a missing
-/// key is a hard error so replay safety is never silently dropped.
-fn require_idempotency_key(args: &Map<String, Value>) -> Result<&str, CallToolResult> {
-    match optional_str(args, "idempotency_key").filter(|s| !s.trim().is_empty()) {
-        Some(k) => Ok(k),
-        None => Err(error_text(
-            "idempotency_key is required for replay-safe instantiation/firing. The MCP surface \
-             does not auto-generate one — supply a stable, caller-chosen key.",
-        )),
-    }
-}
-
-/// Workflow Orchestration tool handler (read + drive actions; offload-oriented
-/// compounds). Admin/destructive/crypto actions are CLI-binary-only and absent.
-// Justification: this is a single flat `match action { … }` dispatch over the
-// ~35 read+drive workflow actions. Each arm is a few lines of arg extraction +
-// one orchestration call; splitting it into sub-handlers would scatter the
-// action surface across many functions and obscure the one-place action list
-// that mirrors the tool's advertised `actions`. The length is inherent to the
-// dispatch breadth, not accidental complexity — same pattern as the other
-// per-tool handlers in this module.
-#[allow(clippy::too_many_lines)]
-async fn handle_workflow(
-    state: &McpState,
-    action: &str,
-    args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    use fastio_cli::api::orchestration as wf;
-
-    // `describe` needs no auth.
-    if action == "describe" {
-        return Ok(workflow_describe());
-    }
-    if let Err(e) = require_auth(state).await {
-        return Ok(e);
-    }
-    let client = state.client().read().await;
-
-    match action {
-        "get" => {
-            let id = match required_str(args, "workflow_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(wf::get_workflow(&client, id).await)
-        }
-        "list" => {
-            let ws = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let archived = optional_str(args, "archived").map(str::to_owned);
-            if let Some(v) = archived.as_deref()
-                && !WORKFLOW_ARCHIVED_FILTERS.contains(&v)
-            {
-                return Ok(error_text(&format!(
-                    "Invalid archived '{v}' (one of: true, false, all)"
-                )));
-            }
-            // Strict bools: a present-but-malformed value (e.g. "me", "yes")
-            // errors rather than being silently dropped to an unfiltered list.
-            let created_by_me = match optional_bool_strict(args, "created_by_me") {
-                Ok(v) => v == Some(true),
-                Err(e) => return Ok(e),
-            };
-            let participant_me = match optional_bool_strict(args, "participant_me") {
-                Ok(v) => v == Some(true),
-                Err(e) => return Ok(e),
-            };
-            let params = wf::ListWorkflowsParams::new()
-                .limit(optional_u32(args, "limit"))
-                .offset(optional_u32(args, "offset"))
-                .template_id(optional_str(args, "template_id").map(str::to_owned))
-                .state(optional_str(args, "state").map(str::to_owned))
-                .archived(archived)
-                .created_by_me(created_by_me)
-                .participant_me(participant_me)
-                .include(optional_str(args, "include").map(str::to_owned))
-                // Opt-in keyset pagination + execution-status bucket, passed
-                // through verbatim (the server validates the bucket value).
-                .page_size(optional_u32(args, "page_size"))
-                .cursor(optional_str(args, "cursor").map(str::to_owned))
-                .bucket(optional_str(args, "bucket").map(str::to_owned));
-            wf_render(wf::list_workflows(&client, ws, &params).await)
-        }
-        "state" => {
-            let id = match required_str(args, "workflow_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(wf::get_workflow_state(&client, id).await)
-        }
-        // The one review action exposed over MCP: a read-only workspace
-        // hydration list (active review surfaces + asset node_ids for
-        // under-review file badging). The mutating / by-id review endpoints
-        // (create / get / asset / decision / admin-resolve) stay CLI-only and
-        // fall through to the CLI-only fallback below.
-        "review-active" => {
-            let ws = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(
-                wf::review_workspace_active(
-                    &client,
-                    ws,
-                    optional_u32(args, "limit"),
-                    optional_u32(args, "offset"),
-                )
-                .await,
-            )
-        }
-        "instantiate" => {
-            let id = match required_str(args, "workflow_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let key = match require_idempotency_key(args) {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let params = wf::InstantiateParams::new(key.to_owned())
-                .trigger_payload(optional_str(args, "trigger_payload").map(str::to_owned))
-                .external_subject_id(optional_str(args, "external_subject_id").map(str::to_owned))
-                .pool_key(optional_str(args, "pool_key").map(str::to_owned))
-                .step_seeds(optional_str(args, "step_seeds").map(str::to_owned));
-            wf_render(wf::instantiate_workflow(&client, id, &params).await)
-        }
-        "instantiate-and-wait" => {
-            let id = match required_str(args, "workflow_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let key = match require_idempotency_key(args) {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let params = wf::InstantiateParams::new(key.to_owned())
-                .trigger_payload(optional_str(args, "trigger_payload").map(str::to_owned))
-                .external_subject_id(optional_str(args, "external_subject_id").map(str::to_owned))
-                .pool_key(optional_str(args, "pool_key").map(str::to_owned))
-                .step_seeds(optional_str(args, "step_seeds").map(str::to_owned));
-            if let Err(e) = wf::instantiate_workflow(&client, id, &params).await {
-                return Ok(cli_err_to_result(&e));
-            }
-            Ok(workflow_wait_for_terminal(&client, id, optional_u64(args, "poll_interval")).await)
-        }
-        "pause" => {
-            let id = match required_str(args, "workflow_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(wf::pause_workflow(&client, id).await)
-        }
-        "resume" => {
-            let id = match required_str(args, "workflow_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(wf::resume_workflow(&client, id).await)
-        }
-        // `cancel` is intentionally ABSENT from MCP: it is a terminal lifecycle
-        // mutation (cascades to sync sub-children, irreversible). It falls
-        // through to the CLI-only fallback below — run `fastio workflow cancel`.
-        "grant-list" => {
-            let id = match required_str(args, "workflow_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(
-                wf::list_grants(
-                    &client,
-                    id,
-                    optional_u32(args, "limit"),
-                    optional_str(args, "cursor"),
-                )
-                .await,
-            )
-        }
-        "step-get" => {
-            let (wid, oid) = match (
-                required_str(args, "workflow_id"),
-                required_str(args, "step_occurrence_id"),
-            ) {
-                (Ok(w), Ok(o)) => (w, o),
-                (Err(e), _) | (_, Err(e)) => return Ok(e),
-            };
-            wf_render(wf::get_step_occurrence(&client, wid, oid).await)
-        }
-        "step-output" => {
-            let (wid, oid) = match (
-                required_str(args, "workflow_id"),
-                required_str(args, "step_occurrence_id"),
-            ) {
-                (Ok(w), Ok(o)) => (w, o),
-                (Err(e), _) | (_, Err(e)) => return Ok(e),
-            };
-            let output = match required_str(args, "output") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let retry = optional_bool(args, "retry_on_conflict") == Some(true);
-            Ok(wf_step_cas(&client, wid, oid, retry, || {
-                wf::submit_step_output(&client, wid, oid, output)
-            })
-            .await)
-        }
-        "step-advance" => {
-            let (wid, oid) = match (
-                required_str(args, "workflow_id"),
-                required_str(args, "step_occurrence_id"),
-            ) {
-                (Ok(w), Ok(o)) => (w, o),
-                (Err(e), _) | (_, Err(e)) => return Ok(e),
-            };
-            let output = optional_str(args, "output");
-            let retry = optional_bool(args, "retry_on_conflict") == Some(true);
-            Ok(wf_step_cas(&client, wid, oid, retry, || {
-                wf::advance_step(&client, wid, oid, output)
-            })
-            .await)
-        }
-        "step-occurrences" => {
-            let (wid, sid) = match (
-                required_str(args, "workflow_id"),
-                required_str(args, "step_id"),
-            ) {
-                (Ok(w), Ok(s)) => (w, s),
-                (Err(e), _) | (_, Err(e)) => return Ok(e),
-            };
-            wf_render(
-                wf::list_step_occurrences(
-                    &client,
-                    wid,
-                    sid,
-                    optional_u32(args, "limit"),
-                    optional_u32(args, "offset"),
-                )
-                .await,
-            )
-        }
-        "step-agent-activity" => {
-            let (wid, oid) = match (
-                required_str(args, "workflow_id"),
-                required_str(args, "step_occurrence_id"),
-            ) {
-                (Ok(w), Ok(o)) => (w, o),
-                (Err(e), _) | (_, Err(e)) => return Ok(e),
-            };
-            wf_render(wf::get_step_agent_activity(&client, wid, oid).await)
-        }
-        "step-agent-trace" => {
-            let (wid, oid) = match (
-                required_str(args, "workflow_id"),
-                required_str(args, "step_occurrence_id"),
-            ) {
-                (Ok(w), Ok(o)) => (w, o),
-                (Err(e), _) | (_, Err(e)) => return Ok(e),
-            };
-            wf_render(wf::get_step_agent_trace(&client, wid, oid).await)
-        }
-        "step-files" => {
-            let (wid, oid) = match (
-                required_str(args, "workflow_id"),
-                required_str(args, "step_occurrence_id"),
-            ) {
-                (Ok(w), Ok(o)) => (w, o),
-                (Err(e), _) | (_, Err(e)) => return Ok(e),
-            };
-            let node_ids = match string_list_arg(args, "node_ids") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            if node_ids.is_empty() {
-                return Ok(error_text(
-                    "node_ids is required and must contain at least one node id (step-files)",
-                ));
-            }
-            wf_render(wf::submit_step_files(&client, wid, oid, &node_ids).await)
-        }
-        "step-complete" => {
-            let (wid, oid) = match (
-                required_str(args, "workflow_id"),
-                required_str(args, "step_occurrence_id"),
-            ) {
-                (Ok(w), Ok(o)) => (w, o),
-                (Err(e), _) | (_, Err(e)) => return Ok(e),
-            };
-            wf_render(wf::complete_step(&client, wid, oid).await)
-        }
-        "step-reassign" => {
-            let (wid, oid) = match (
-                required_str(args, "workflow_id"),
-                required_str(args, "step_occurrence_id"),
-            ) {
-                (Ok(w), Ok(o)) => (w, o),
-                (Err(e), _) | (_, Err(e)) => return Ok(e),
-            };
-            let new_assignee = match required_str(args, "new_assignee_user_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(wf::reassign_step(&client, wid, oid, new_assignee).await)
-        }
-        "modification-propose" => {
-            let wid = match required_str(args, "workflow_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let ops = match json_array_string_arg(args, "ops") {
-                Ok(Some(s)) => s,
-                Ok(None) => {
-                    return Ok(error_text("Missing required parameter: ops (a JSON array)"));
-                }
-                Err(e) => return Ok(e),
-            };
-            wf_render(
-                wf::propose_modification(
-                    &client,
-                    wid,
-                    &ops,
-                    optional_str(args, "reason"),
-                    optional_u64(args, "expires_in_seconds"),
-                )
-                .await,
-            )
-        }
-        "modification-list" => {
-            let wid = match required_str(args, "workflow_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(wf::list_modifications(&client, wid, optional_str(args, "status")).await)
-        }
-        "modification-get" => {
-            let (wid, mid) = match (
-                required_str(args, "workflow_id"),
-                required_str(args, "modification_id"),
-            ) {
-                (Ok(w), Ok(m)) => (w, m),
-                (Err(e), _) | (_, Err(e)) => return Ok(e),
-            };
-            wf_render(wf::get_modification(&client, wid, mid).await)
-        }
-        "modification-apply" => {
-            let (wid, mid) = match (
-                required_str(args, "workflow_id"),
-                required_str(args, "modification_id"),
-            ) {
-                (Ok(w), Ok(m)) => (w, m),
-                (Err(e), _) | (_, Err(e)) => return Ok(e),
-            };
-            let apply_change_ids = match json_array_string_arg(args, "apply_change_ids") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(
-                wf::apply_modification(
-                    &client,
-                    wid,
-                    mid,
-                    apply_change_ids.as_deref(),
-                    optional_bool(args, "confirm_removes_human_gate") == Some(true),
-                )
-                .await,
-            )
-        }
-        "modification-cancel" => {
-            let (wid, mid) = match (
-                required_str(args, "workflow_id"),
-                required_str(args, "modification_id"),
-            ) {
-                (Ok(w), Ok(m)) => (w, m),
-                (Err(e), _) | (_, Err(e)) => return Ok(e),
-            };
-            wf_render(wf::cancel_modification(&client, wid, mid).await)
-        }
-        "template-list" => {
-            let ws = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let usage = optional_str(args, "usage");
-            if let Some(v) = usage
-                && !WORKFLOW_TEMPLATE_USAGE_FILTERS.contains(&v)
-            {
-                return Ok(error_text(&format!(
-                    "Invalid usage '{v}' (one of: library, one_off, all)"
-                )));
-            }
-            wf_render(
-                wf::list_templates(
-                    &client,
-                    ws,
-                    optional_u32(args, "limit"),
-                    optional_u32(args, "offset"),
-                    usage,
-                )
-                .await,
-            )
-        }
-        "template-get" => {
-            let id = match required_str(args, "template_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(
-                wf::get_template(
-                    &client,
-                    id,
-                    optional_bool(args, "include_body") == Some(true),
-                )
-                .await,
-            )
-        }
-        "template-gallery" => wf_render(wf::list_system_templates(&client).await),
-        "template-gallery-get" => {
-            let handle = match required_str(args, "handle") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(wf::get_system_template(&client, handle).await)
-        }
-        "agent-template-list" => {
-            let ws = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(wf::list_agent_templates(&client, ws).await)
-        }
-        "agent-template-get" => {
-            let (ws, tid) = match (
-                required_str(args, "workspace_id"),
-                required_str(args, "template_id"),
-            ) {
-                (Ok(w), Ok(t)) => (w, t),
-                (Err(e), _) | (_, Err(e)) => return Ok(e),
-            };
-            wf_render(wf::get_agent_template(&client, ws, tid).await)
-        }
-        "trigger-list" => {
-            let ws = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(wf::list_triggers(&client, ws, optional_str(args, "enabled_filter")).await)
-        }
-        "trigger-get" => {
-            let id = match required_str(args, "trigger_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(wf::get_trigger(&client, id).await)
-        }
-        "trigger-fire" => {
-            let id = match required_str(args, "trigger_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let key = match require_idempotency_key(args) {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(
-                wf::fire_trigger(&client, id, key, optional_str(args, "trigger_payload")).await,
-            )
-        }
-        "trigger-fire-and-wait" => {
-            let id = match required_str(args, "trigger_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let key = match require_idempotency_key(args) {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            let fired =
-                match wf::fire_trigger(&client, id, key, optional_str(args, "trigger_payload"))
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => return Ok(cli_err_to_result(&e)),
-                };
-            // Resolve the instantiated workflow id from the fire response.
-            let payload = fired.get("response").unwrap_or(&fired);
-            let wid = payload
-                .get("trigger_fire")
-                .and_then(|t| t.get("instantiated_run").or_else(|| t.get("job_id")))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            match wid {
-                Some(w) => Ok(workflow_wait_for_terminal(
-                    &client,
-                    &w,
-                    optional_u64(args, "poll_interval"),
-                )
-                .await),
-                None => Ok(success_json(&fired)),
-            }
-        }
-        "trigger-dry-run" => {
-            let id = match required_str(args, "trigger_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(
-                wf::dry_run_trigger(
-                    &client,
-                    id,
-                    optional_u64(args, "window_days"),
-                    optional_u64(args, "sample_limit"),
-                    optional_bool(args, "apply_guards"),
-                )
-                .await,
-            )
-        }
-        "obligation-list" => {
-            let wid = match required_str(args, "workflow_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(
-                wf::list_obligations(
-                    &client,
-                    wid,
-                    optional_str(args, "status"),
-                    optional_str(args, "assigned_user_id"),
-                    optional_u32(args, "limit"),
-                    optional_u32(args, "offset"),
-                )
-                .await,
-            )
-        }
-        "obligation-get" => wf_render_oblig(&client, args, "get").await,
-        "obligation-claim" => wf_render_oblig(&client, args, "claim").await,
-        "obligation-release" => wf_render_oblig(&client, args, "release").await,
-        "obligation-resolve" => {
-            let id = match required_str(args, "obligation_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(
-                wf::resolve_obligation(&client, id, optional_str(args, "resolution_payload")).await,
-            )
-        }
-        "inbox-me" => wf_render(wf::inbox(&client).await),
-        "inbox-workspace" => {
-            let ws = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(wf::inbox_workspace(&client, ws).await)
-        }
-        "inbox-pool" => {
-            let (ws, pk) = match (
-                required_str(args, "workspace_id"),
-                required_str(args, "pool_key"),
-            ) {
-                (Ok(w), Ok(p)) => (w, p),
-                (Err(e), _) | (_, Err(e)) => return Ok(e),
-            };
-            wf_render(wf::inbox_pool(&client, ws, pk).await)
-        }
-        "schema-get" => {
-            let id = match required_str(args, "workflow_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(wf::get_extraction_schema(&client, id).await)
-        }
-        "audit-events" => {
-            let id = match required_str(args, "workflow_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(
-                wf::audit_events(
-                    &client,
-                    id,
-                    optional_bool(args, "include_payload") == Some(true),
-                    optional_u32(args, "limit"),
-                    optional_u32(args, "offset"),
-                )
-                .await,
-            )
-        }
-        "audit-export-start" => {
-            let id = match required_str(args, "workflow_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(
-                wf::start_audit_export(
-                    &client,
-                    id,
-                    optional_str(args, "scope"),
-                    optional_bool(args, "include_overlays"),
-                    optional_str(args, "redaction_pin_strategy"),
-                )
-                .await,
-            )
-        }
-        "audit-export-list" => {
-            let ws = match required_str(args, "workspace_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(
-                wf::list_audit_export_jobs(
-                    &client,
-                    ws,
-                    optional_u32(args, "limit"),
-                    optional_u32(args, "offset"),
-                )
-                .await,
-            )
-        }
-        "audit-export-get" => {
-            let id = match required_str(args, "job_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            wf_render(wf::get_audit_export_job(&client, id).await)
-        }
-        "audit-export-and-download" => {
-            let id = match required_str(args, "workflow_id") {
-                Ok(v) => v,
-                Err(e) => return Ok(e),
-            };
-            Ok(workflow_export_and_download(&client, args, id).await)
-        }
-        "subject-workflows" => {
-            let (ws, sid) = match (
-                required_str(args, "workspace_id"),
-                required_str(args, "subject_id"),
-            ) {
-                (Ok(w), Ok(s)) => (w, s),
-                (Err(e), _) | (_, Err(e)) => return Ok(e),
-            };
-            wf_render(wf::subject_workflows(&client, ws, sid).await)
-        }
-        _ => Ok(error_text(&format!(
-            "Unknown or CLI-only workflow action: {action}. Admin/destructive operations \
-             (cancel, create/update/delete/purge, template/pool/trigger lifecycle, secret/key \
-             rotation, redaction, schema set/derive, realtime token) are CLI-binary-only — run \
-             them via `fastio workflow …` (e.g. `fastio workflow cancel <id>`). Call \
-             action='describe' for the full MCP action list."
-        ))),
-    }
-}
-
-/// Render an orchestration `Result<Value>` as an MCP result.
-///
-/// Returns `Result<CallToolResult, McpError>` (never `Err`) so the ~20
-/// `handle_workflow` match arms can return it directly as the handler's
-/// `Result`-typed value without wrapping each in `Ok(...)`. The `McpError`
-/// arm is structurally unreachable here — an API failure becomes a successful
-/// tool result carrying `is_error`, matching every other handler in this
-/// module.
-#[allow(clippy::unnecessary_wraps)]
-fn wf_render(
-    result: Result<Value, fastio_cli::error::CliError>,
-) -> Result<CallToolResult, McpError> {
-    match result {
-        Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
-    }
-}
-
-/// Run an obligation lifecycle action that takes only `obligation_id`.
-async fn wf_render_oblig(
-    client: &fastio_cli::client::ApiClient,
-    args: &Map<String, Value>,
-    op: &str,
-) -> Result<CallToolResult, McpError> {
-    use fastio_cli::api::orchestration as wf;
-    let id = match required_str(args, "obligation_id") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let result = match op {
-        "get" => wf::get_obligation(client, id).await,
-        "claim" => wf::claim_obligation(client, id).await,
-        "release" => wf::release_obligation(client, id).await,
-        _ => return Ok(error_text("internal: unknown obligation op")),
-    };
-    wf_render(result)
-}
-
-/// Run a CAS-guarded step mutation, surfacing a 409 by default and retrying
-/// once (after a re-read) only when `retry_on_conflict` is set.
-///
-/// On a 409 with `retry_on_conflict=true`, the re-read is load-bearing (mirrors
-/// the CLI `run_step_mutation_with_cas`): a failed re-read is surfaced rather
-/// than blind-retried, and a re-read showing a terminal/non-mutable `state`
-/// abandons the retry (it would only 409 again). The step endpoints take no
-/// client-supplied CAS version, so the fresh value is used as a mutability gate
-/// rather than threaded into the retry body.
-async fn wf_step_cas<F, Fut>(
-    client: &fastio_cli::client::ApiClient,
-    workflow_id: &str,
-    step_occurrence_id: &str,
-    retry_on_conflict: bool,
-    op: F,
-) -> CallToolResult
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<Value, fastio_cli::error::CliError>>,
-{
-    use fastio_cli::api::orchestration as wf;
-    match op().await {
-        Ok(v) => success_json(&v),
-        Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 409 => {
-            if !retry_on_conflict {
-                return error_text(
-                    "step mutation hit a CAS conflict (409): the occurrence was modified \
-                     concurrently. Re-read it (step-get) and retry, or pass retry_on_conflict=true \
-                     to re-read and retry once automatically.",
-                );
-            }
-            // The re-read must succeed before retrying; surface its failure.
-            let snapshot = match wf::get_step_occurrence(client, workflow_id, step_occurrence_id)
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    return error_text(&format!(
-                        "CAS conflict (409): re-reading the step occurrence failed, so the retry \
-                         was abandoned: {e}"
-                    ));
-                }
-            };
-            // A terminal/non-mutable state means the retry would just 409 again.
-            if let Some(state) = step_occurrence_state(&snapshot)
-                && matches!(
-                    state.as_str(),
-                    "completed" | "failed" | "skipped" | "cancelled"
-                )
-            {
-                return error_text(&format!(
-                    "CAS conflict (409): the step occurrence is now in terminal state '{state}' \
-                     and can no longer be mutated; not retrying."
-                ));
-            }
-            match op().await {
-                Ok(v) => success_json(&v),
-                Err(e) => error_text(&format!(
-                    "step mutation still conflicted after one retry (CAS 409): {e}"
-                )),
-            }
-        }
-        Err(e) => cli_err_to_result(&e),
-    }
-}
-
-/// Read a step occurrence's lifecycle `state` from a get-occurrence snapshot
-/// (enveloped or flat shape).
-fn step_occurrence_state(snapshot: &Value) -> Option<String> {
-    let payload = snapshot.get("response").unwrap_or(snapshot);
-    payload
-        .get("step_occurrence")
-        .and_then(|o| o.get("state"))
-        .or_else(|| payload.get("state"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-/// How an MCP poll loop should react to an error from one poll tick.
-///
-/// Replaces the old `Err(_) => {}` (which silently looped to timeout on a
-/// 404/403/500). The 401 re-auth short-circuit is handled by the caller before
-/// this is reached.
-enum WfPollAction {
-    /// Server asked us to wait this many seconds (0 = no explicit interval).
-    RateLimited { retry_after_secs: u64 },
-    /// A transient failure worth another poll on the regular cadence.
-    RetryTransient,
-    /// A persistent error rendered for return (loop must stop and surface it).
-    Fatal(CallToolResult),
-}
-
-/// Classify a poll-tick [`CliError`] for an MCP wait/export loop.
-///
-/// Mirrors the CLI `classify_poll_error`: rate limits sleep their advertised
-/// interval; all 5xx (`500..=599`) / 408 / transport / I/O are transient; other
-/// 4xx, parse, and config are fatal and surfaced via [`cli_err_to_result`].
-fn classify_wf_poll_error(err: &fastio_cli::error::CliError) -> WfPollAction {
-    use fastio_cli::error::CliError;
-    match err {
-        CliError::RateLimit { retry_after_secs } => WfPollAction::RateLimited {
-            retry_after_secs: *retry_after_secs,
-        },
-        CliError::Api(e) => match e.http_status {
-            429 | 408 => WfPollAction::RateLimited {
-                retry_after_secs: 0,
-            },
-            // All server errors are transient (matches the CLI classifier): a
-            // 500 during a long poll is a momentary backend blip, not permanent.
-            500..=599 => WfPollAction::RetryTransient,
-            _ => WfPollAction::Fatal(cli_err_to_result(err)),
-        },
-        CliError::Http(_) | CliError::Io(_) => WfPollAction::RetryTransient,
-        // Parse / config / auth(other) — and, conservatively, any future
-        // non-exhaustive variant — are surfaced rather than looped.
-        _ => WfPollAction::Fatal(cli_err_to_result(err)),
-    }
-}
-
-/// Poll runtime state to a terminal lifecycle and return the final snapshot.
-async fn workflow_wait_for_terminal(
-    client: &fastio_cli::client::ApiClient,
-    workflow_id: &str,
-    poll_interval: Option<u64>,
-) -> CallToolResult {
-    use fastio_cli::api::orchestration as wf;
-    let interval = poll_interval
-        .unwrap_or(WORKFLOW_WAIT_POLL_DEFAULT_SECS)
-        .clamp(WORKFLOW_WAIT_POLL_MIN_SECS, WORKFLOW_WAIT_POLL_MAX_SECS);
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(WORKFLOW_WAIT_MAX_SECS);
-    loop {
-        // Re-check the deadline at the TOP of every iteration, before issuing
-        // the next state GET. The sleep below is clamped to the remaining wait
-        // (and a 429 clamp can land exactly on the deadline); without this check
-        // a woken iteration would issue one more request that could add the
-        // client's request timeout and overrun WORKFLOW_WAIT_MAX_SECS. Mirrors
-        // the `mcp_ask_wait` top-of-loop check.
-        if tokio::time::Instant::now() >= deadline {
-            return error_text(&format!(
-                "timed out after ~{WORKFLOW_WAIT_MAX_SECS}s waiting for workflow {workflow_id} to \
-                 reach a terminal state; it may still be running. Use action='state' to poll."
-            ));
-        }
-        // Default cadence is the fixed interval; rate limits and transient
-        // errors override it below (transient errors use the SAME bounded
-        // jittered backoff as the CLI `wait`).
-        let mut next_sleep = std::time::Duration::from_secs(interval);
-        match wf::get_workflow_state(client, workflow_id).await {
-            Ok(snapshot) => {
-                let state = snapshot
-                    .get("response")
-                    .unwrap_or(&snapshot)
-                    .get("workflow")
-                    .and_then(|w| w.get("state"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                if state.as_deref().is_some_and(|s| {
-                    matches!(s, "completed" | "cancelled" | "archived" | "deleted")
-                }) {
-                    return success_json(&snapshot);
-                }
-            }
-            Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 401 => {
-                return error_text(&format!(
-                    "authentication expired while waiting for workflow {workflow_id}; it may still \
-                     be running. Re-authenticate and use action='state'."
-                ));
-            }
-            Err(other) => match classify_wf_poll_error(&other) {
-                WfPollAction::RateLimited { retry_after_secs } => {
-                    if retry_after_secs > 0 {
-                        next_sleep = std::time::Duration::from_secs(
-                            retry_after_secs
-                                .clamp(WORKFLOW_WAIT_POLL_MIN_SECS, WORKFLOW_WAIT_POLL_MAX_SECS),
-                        );
-                    }
-                }
-                // Transient blip: back off with bounded CSPRNG jitter (shared
-                // CLI helper; jitter failure falls back to no jitter).
-                WfPollAction::RetryTransient => {
-                    next_sleep = crate::commands::workflow::jittered(interval);
-                }
-                // Persistent, non-transient: surface it rather than loop.
-                WfPollAction::Fatal(result) => return result,
-            },
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return error_text(&format!(
-                "timed out after ~{WORKFLOW_WAIT_MAX_SECS}s waiting for workflow {workflow_id} to \
-                 reach a terminal state; it may still be running. Use action='state' to poll."
-            ));
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        tokio::time::sleep(remaining.min(next_sleep)).await;
-    }
-}
-
-/// Compound: start an audit export, poll the job to completed, then stream the
-/// manifest and every chunk to `output_path` via the streaming download helper.
-// Justification: this is one linear offload pipeline — start export → resolve
-// job_id → bounded/rate-limit-aware poll loop → resolve output dir → stream
-// manifest + N chunks. Splitting the poll loop or the streaming step into
-// helpers would fragment a single sequential flow whose stages share local
-// state (job_id, deadline, out_dir), so the modest overage is kept inline.
-#[allow(clippy::too_many_lines)]
-async fn workflow_export_and_download(
-    client: &fastio_cli::client::ApiClient,
-    args: &Map<String, Value>,
-    workflow_id: &str,
-) -> CallToolResult {
-    use fastio_cli::api::orchestration as wf;
-
-    let start = match wf::start_audit_export(
-        client,
-        workflow_id,
-        optional_str(args, "scope"),
-        optional_bool(args, "include_overlays"),
-        optional_str(args, "redaction_pin_strategy"),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => return cli_err_to_result(&e),
-    };
-    let payload = start.get("response").unwrap_or(&start);
-    let Some(job_id) = payload
-        .get("job_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-    else {
-        return error_text("audit export did not return a job_id");
-    };
-
-    let interval = optional_u64(args, "poll_interval")
-        .unwrap_or(WORKFLOW_WAIT_POLL_DEFAULT_SECS)
-        .clamp(WORKFLOW_WAIT_POLL_MIN_SECS, WORKFLOW_WAIT_POLL_MAX_SECS);
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(WORKFLOW_WAIT_MAX_SECS);
-
-    // Poll the job to completed (or terminal failure).
-    let job = loop {
-        // Re-check the deadline at the TOP of every iteration, before issuing
-        // the next job-status GET. The sleep below is clamped to the remaining
-        // wait (and a 429 clamp can land exactly on the deadline); without this
-        // check a woken iteration would issue one more request that could add
-        // the client's request timeout and overrun WORKFLOW_WAIT_MAX_SECS.
-        // Mirrors the `mcp_ask_wait` top-of-loop check.
-        if tokio::time::Instant::now() >= deadline {
-            return error_text(&format!(
-                "timed out after ~{WORKFLOW_WAIT_MAX_SECS}s waiting for export job {job_id}"
-            ));
-        }
-        // Default cadence is the fixed interval; rate limits and transient
-        // errors override it below (transient errors use the SAME bounded
-        // jittered backoff as the CLI `wait`).
-        let mut next_sleep = std::time::Duration::from_secs(interval);
-        match wf::get_audit_export_job(client, &job_id).await {
-            Ok(j) => {
-                let status = j
-                    .get("response")
-                    .unwrap_or(&j)
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if status == "completed" {
-                    break j;
-                }
-                if matches!(status, "failed" | "errored" | "cancelled") {
-                    return error_text(&format!("audit export job {job_id} ended in '{status}'"));
-                }
-            }
-            Err(fastio_cli::error::CliError::Api(e)) if e.http_status == 401 => {
-                return error_text("authentication expired while waiting for the export job");
-            }
-            Err(other) => match classify_wf_poll_error(&other) {
-                WfPollAction::RateLimited { retry_after_secs } => {
-                    if retry_after_secs > 0 {
-                        next_sleep = std::time::Duration::from_secs(
-                            retry_after_secs
-                                .clamp(WORKFLOW_WAIT_POLL_MIN_SECS, WORKFLOW_WAIT_POLL_MAX_SECS),
-                        );
-                    }
-                }
-                // Transient blip: back off with bounded CSPRNG jitter (shared
-                // CLI helper; jitter failure falls back to no jitter).
-                WfPollAction::RetryTransient => {
-                    next_sleep = crate::commands::workflow::jittered(interval);
-                }
-                WfPollAction::Fatal(result) => return result,
-            },
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return error_text(&format!(
-                "timed out after ~{WORKFLOW_WAIT_MAX_SECS}s waiting for export job {job_id}"
-            ));
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        tokio::time::sleep(remaining.min(next_sleep)).await;
-    };
-
-    let job_payload = job.get("response").unwrap_or(&job);
-    let total_chunks = job_payload
-        .get("total_chunks")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-
-    // Resolve the output directory (default .fastio/downloads/). Create it 0700
-    // (private) — the audit bundle can carry sensitive workflow data, and this
-    // mirrors the sign-download path's `create_dir_all_private` for the SAME
-    // default dir.
-    let out_dir =
-        std::path::PathBuf::from(optional_str(args, "output_path").unwrap_or(".fastio/downloads"));
-    if let Err(e) = create_dir_all_private(&out_dir) {
-        return error_text(&format!(
-            "failed to create output directory '{}': {e}",
-            out_dir.display()
-        ));
-    }
-
-    // Stream the manifest, then each chunk, to disk (NEVER buffer).
-    let mut written = Vec::new();
-    let manifest_path = out_dir.join("manifest.json");
-    let manifest_api_path = wf::audit_bundle_chunk_path(&job_id, "manifest");
-    if let Err(e) = client
-        .download_file_stream(&manifest_api_path, &manifest_path)
-        .await
-    {
-        return error_text(&format!("failed to download manifest: {e}"));
-    }
-    written.push(manifest_path.display().to_string());
-
-    for i in 0..total_chunks {
-        let chunk_path = out_dir.join(format!("chunk_{i:04}.jsonl"));
-        let api_path = wf::audit_bundle_chunk_path(&job_id, &i.to_string());
-        if let Err(e) = client.download_file_stream(&api_path, &chunk_path).await {
-            return error_text(&format!("failed to download chunk {i}: {e}"));
-        }
-        written.push(chunk_path.display().to_string());
-    }
-
-    let result = serde_json::json!({
-        "result": "yes",
-        "job_id": job_id,
-        "total_chunks": total_chunks,
-        "downloaded": written,
-        "next_step": "Run `fastio workflow audit check-integrity --manifest <manifest> --chunk <0> …` \
-                      to verify chunk hashes + the content-hash chain + completeness. (HMAC \
-                      authenticity verification is not implemented.)",
-    });
-    success_json(&result)
-}
-
 // ─── Sign (E-Signature) ─────────────────────────────────────────────────────
 
 /// Discriminates an async-artifact FETCH (signed PDF / audit certificate) from
@@ -12524,8 +10134,7 @@ fn sign_parse_fields(
 
 /// The authoritative per-action describe payload for the `sign` tool. Names the
 /// CLI-only outward/destructive/terminal actions under `cli_only_actions`.
-// The length is a flat action-spec table, not branching logic (mirrors
-// `workflow_describe`).
+// The length is a flat action-spec table, not branching logic.
 #[allow(clippy::too_many_lines)]
 fn sign_describe() -> CallToolResult {
     let actions: &[(&str, &[&str], &[&str], &str)] = &[
@@ -12727,9 +10336,8 @@ fn sign_describe() -> CallToolResult {
 
 /// E-signature tool handler — READ + reversible-DRAFT-drive actions only. The
 /// outward-facing / terminal actions (send / void) are CLI-binary-only and are
-/// routed to a guidance message BEFORE auth/workspace extraction (mirrors how
-/// the `workflow` tool keeps `cancel` CLI-only). Envelopes are voided, not
-/// deleted; a `delete` request is reported as unsupported.
+/// routed to a guidance message BEFORE auth/workspace extraction. Envelopes are
+/// voided, not deleted; a `delete` request is reported as unsupported.
 #[allow(clippy::too_many_lines)] // a flat dispatch over the envelope lifecycle surface
 async fn handle_sign(
     state: &McpState,
@@ -13593,8 +11201,8 @@ fn fileshare_describe() -> CallToolResult {
                            available over MCP (it needs local file bytes and is destructive).",
             "ws_token": "To mint a realtime WebSocket token, run the CLI: `fastio fileshare \
                          ws-token <id> --token-file <path>` (0600). NOT exposed over MCP — the \
-                         token is a long-lived secret (mirrors the workflow tool's CLI-only \
-                         realtime-token mint).",
+                         token is a long-lived secret that must not be parked in an MCP \
+                         transcript.",
             "cli_only_actions": cli_only,
         },
         "actions": Value::Object(action_map),
@@ -13636,8 +11244,7 @@ async fn handle_fileshare(
     }
     // `ws-token` (realtime WebSocket-token mint) is CLI-binary-only: the token is
     // a long-lived secret that must not be parked in an MCP transcript. The CLI
-    // redacts it from stdout and writes it 0600 to --token-file (mirrors how the
-    // workflow tool keeps its realtime-token mint CLI-only).
+    // redacts it from stdout and writes it 0600 to --token-file.
     if matches!(action, "ws-token" | "websocket" | "realtime-token") {
         return Ok(error_text(
             "fileshare ws-token (realtime WebSocket-token mint) is CLI-binary-only: the token is \
@@ -14467,9 +12074,16 @@ mod ripley_tool_tests {
     }
 
     fn unauthed_router() -> ToolRouter {
-        ToolRouter::new(Arc::new(McpState::new_unauthenticated_for_test(
-            "https://api.fast.io/current",
-        )))
+        // Inject `esign_enabled = true` so the existing `sign` dispatch tests
+        // exercise the real handler without mutating the process environment
+        // (unsafe under Rust 2024). The kill-switch's own gate is covered by the
+        // dedicated `sign_*_disabled` tests below.
+        ToolRouter::new_with_esign(
+            Arc::new(McpState::new_unauthenticated_for_test(
+                "https://api.fast.io/current",
+            )),
+            true,
+        )
     }
 
     /// An authenticated router whose client points at an unroutable base URL.
@@ -14481,12 +12095,12 @@ mod ripley_tool_tests {
             "https://api.fast.io/current",
         ));
         state.set_token("test-token".to_owned()).await;
-        ToolRouter::new(state)
+        ToolRouter::new_with_esign(state, true)
     }
 
     #[test]
     fn list_tools_advertises_ripley_not_ai() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(names.contains(&"ripley"), "ripley tool must be advertised");
         assert!(
@@ -14528,7 +12142,7 @@ mod ripley_tool_tests {
     fn user_tool_omits_irreversible_account_close() {
         // Account `close` permanently closes the user's account (irreversible),
         // so it is CLI-binary-only and MUST NOT be advertised over MCP — like the
-        // workflow `cancel` / sign `send` carve-outs.
+        // sign `send` carve-out.
         let actions = user_tool_actions();
         assert!(
             !actions.contains(&"close"),
@@ -14651,7 +12265,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn dashboard_and_howto_tools_are_advertised() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(
             names.contains(&"dashboard"),
@@ -14803,7 +12417,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn ripley_tool_description_leads_with_offload_framing() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let ripley = tools
             .iter()
             .find(|t| t.name.as_ref() == "ripley")
@@ -14919,7 +12533,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn ripley_tool_advertises_phase2_actions() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let ripley = tools
             .iter()
             .find(|t| t.name.as_ref() == "ripley")
@@ -14943,7 +12557,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn metadata_tool_advertises_extract_and_wait_action() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let metadata = tools
             .iter()
             .find(|t| t.name.as_ref() == "metadata")
@@ -14975,7 +12589,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn workspace_tool_advertises_metadata_extract_and_wait_action() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let workspace = tools
             .iter()
             .find(|t| t.name.as_ref() == "workspace")
@@ -15040,7 +12654,7 @@ mod ripley_tool_tests {
         // FIX 2: the workspace tool exposes the workspace-level saved-view
         // actions (incl. the new `metadata-view-get`) and the `config` param
         // (form field for view-save); the retired `view_id` param is gone.
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let workspace = tools
             .iter()
             .find(|t| t.name.as_ref() == "workspace")
@@ -15422,7 +13036,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn workspace_and_metadata_schemas_advertise_confirm_ai_spend() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         for tool_name in ["workspace", "metadata"] {
             let tool = tools
                 .iter()
@@ -15584,47 +13198,6 @@ mod ripley_tool_tests {
     }
 
     #[test]
-    fn json_array_string_arg_accepts_array_or_string_rejects_empty_and_nonarray() {
-        // Native JSON array → serialized form preserved.
-        let mut a = Map::new();
-        a.insert("ops".to_owned(), json!([{"op": "skip"}]));
-        let got = super::json_array_string_arg(&a, "ops").expect("array ok");
-        assert_eq!(got.as_deref(), Some(r#"[{"op":"skip"}]"#));
-
-        // JSON-array string → passed through verbatim.
-        let mut s = Map::new();
-        s.insert("ops".to_owned(), Value::String(r#"["c1","c2"]"#.to_owned()));
-        let got = super::json_array_string_arg(&s, "ops").expect("string ok");
-        assert_eq!(got.as_deref(), Some(r#"["c1","c2"]"#));
-
-        // Absent → None (the documented apply-all signal for apply_change_ids).
-        assert!(
-            super::json_array_string_arg(&Map::new(), "apply_change_ids")
-                .expect("absent ok")
-                .is_none()
-        );
-
-        // Explicit empty array (native or string) is REJECTED — must omit to apply all.
-        let mut empty = Map::new();
-        empty.insert("apply_change_ids".to_owned(), json!([]));
-        assert!(super::json_array_string_arg(&empty, "apply_change_ids").is_err());
-        let mut empty_s = Map::new();
-        empty_s.insert(
-            "apply_change_ids".to_owned(),
-            Value::String("[]".to_owned()),
-        );
-        assert!(super::json_array_string_arg(&empty_s, "apply_change_ids").is_err());
-
-        // A non-array (object / scalar / non-array string) is rejected.
-        let mut obj = Map::new();
-        obj.insert("ops".to_owned(), json!({"op": "skip"}));
-        assert!(super::json_array_string_arg(&obj, "ops").is_err());
-        let mut scalar = Map::new();
-        scalar.insert("ops".to_owned(), json!(5));
-        assert!(super::json_array_string_arg(&scalar, "ops").is_err());
-    }
-
-    #[test]
     fn string_list_arg_filters_csv_blanks_but_rejects_array_blanks() {
         // CSV string: trims and drops stray/trailing-comma blanks (loose human input).
         let mut csv = Map::new();
@@ -15676,278 +13249,6 @@ mod ripley_tool_tests {
         assert!(!super::build_workspace_update_fields(&Map::new()).contains_key("intelligence"));
     }
 
-    // ─── Workflow Orchestration MCP tool ────────────────────────────────────
-
-    /// The set of action names the `workflow` tool advertises in its registry.
-    fn workflow_tool_actions() -> Vec<&'static str> {
-        super::TOOL_DEFS
-            .iter()
-            .find(|d| d.name == "workflow")
-            .expect("workflow tool registered")
-            .actions
-            .to_vec()
-    }
-
-    #[test]
-    fn workflow_tool_is_registered_and_offload_oriented() {
-        let tools = ToolRouter::list_tools().tools;
-        let wf = tools
-            .iter()
-            .find(|t| t.name.as_ref() == "workflow")
-            .expect("workflow tool present");
-        let desc = wf.description.as_deref().unwrap_or_default();
-        // Offload framing + the integrity-vs-authenticity caveat must be present.
-        assert!(
-            desc.contains("OFFLOAD"),
-            "description should steer to offload: {desc}"
-        );
-        assert!(desc.contains("integrity-only") || desc.contains("integrity"));
-    }
-
-    #[test]
-    fn workflow_tool_advertises_read_and_drive_actions() {
-        let actions = workflow_tool_actions();
-        for expected in [
-            "describe",
-            "state",
-            "instantiate",
-            "instantiate-and-wait",
-            "trigger-fire-and-wait",
-            "audit-export-and-download",
-            "obligation-resolve",
-            "step-output",
-            "step-agent-activity",
-        ] {
-            assert!(
-                actions.contains(&expected),
-                "workflow tool must advertise '{expected}'"
-            );
-        }
-    }
-
-    #[test]
-    fn workflow_tool_omits_admin_destructive_and_crypto_actions() {
-        // These admin/destructive/crypto actions are CLI-binary-only and MUST
-        // NOT be reachable through the MCP tool.
-        let actions = workflow_tool_actions();
-        for forbidden in [
-            "cancel",
-            "create",
-            "update",
-            "delete",
-            "purge",
-            "transfer",
-            "rotate-inbound-key",
-            "grant-add",
-            "grant-revoke",
-            "step-cancel",
-            "template-create",
-            "template-publish",
-            "template-withdraw",
-            "template-deprecate",
-            "trigger-create",
-            "trigger-update",
-            "trigger-delete",
-            "trigger-purge",
-            "schema-set",
-            "schema-derive",
-            "redaction-request",
-            "redaction-confirm",
-            "outbound-create",
-            "outbound-rotate-secret",
-            "pool-create",
-            "pool-delete",
-            "realtime-token",
-            "review-decision",
-            "audit-check-integrity",
-        ] {
-            assert!(
-                !actions.contains(&forbidden),
-                "workflow MCP tool must NOT advertise admin/destructive/crypto action '{forbidden}'"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn workflow_describe_needs_no_auth_and_lists_actions() {
-        // `describe` must work unauthenticated and enumerate every advertised
-        // action with required/optional params.
-        let router = unauthed_router();
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("describe".to_owned()));
-        let res = router.call_tool("workflow", args).await.expect("ok");
-        let text = result_to_string(&res);
-        // The describe payload (rendered markdown) names key actions and the
-        // CLI-only carve-out.
-        assert!(
-            text.contains("instantiate-and-wait"),
-            "describe should list compounds: {text}"
-        );
-        assert!(
-            text.contains("cli_only_actions") || text.contains("cli only"),
-            "describe should name CLI-only ops"
-        );
-        // describe accuracy: every advertised action appears in the payload.
-        for action in workflow_tool_actions() {
-            assert!(
-                text.contains(action),
-                "describe payload must document advertised action '{action}'"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn workflow_unknown_action_points_to_cli_for_admin_ops() {
-        let router = authed_router().await;
-        let mut args = Map::new();
-        // An admin action that is intentionally not handled here.
-        args.insert("action".to_owned(), Value::String("create".to_owned()));
-        let res = router.call_tool("workflow", args).await.expect("ok");
-        let text = result_to_string(&res);
-        assert!(
-            text.contains("CLI-only workflow action") && text.contains("CLI-binary-only"),
-            "admin actions must be rejected with a CLI pointer, got: {text}"
-        );
-    }
-
-    #[test]
-    fn workflow_review_active_advertised_but_mutating_review_stays_cli_only() {
-        // review-active (the workspace hydration READ) is the one review action
-        // exposed over MCP; the mutating / by-id review actions are not.
-        let actions = workflow_tool_actions();
-        assert!(
-            actions.contains(&"review-active"),
-            "review-active read must be advertised over MCP"
-        );
-        for cli_only in ["review-create", "review-decision", "review-admin-resolve"] {
-            assert!(
-                !actions.contains(&cli_only),
-                "mutating/by-id review action '{cli_only}' must stay CLI-only"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn workflow_review_active_routes_to_handler_not_cli_only() {
-        // Calling review-active without workspace_id must surface the handler's
-        // missing-param error, proving it routes to the handler rather than the
-        // CLI-only fallback the other review actions hit.
-        let router = authed_router().await;
-        let mut args = Map::new();
-        args.insert(
-            "action".to_owned(),
-            Value::String("review-active".to_owned()),
-        );
-        let res = router.call_tool("workflow", args).await.expect("ok");
-        let text = result_to_string(&res);
-        assert!(
-            !text.contains("CLI-only workflow action"),
-            "review-active must route to the handler, not the CLI-only fallback: {text}"
-        );
-        assert!(
-            text.contains("workspace_id"),
-            "review-active without workspace_id must report the missing param: {text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn workflow_step_agent_activity_routes_to_handler_not_cli_only() {
-        // step-agent-activity (the AI-agent step's read-only action feed) is an
-        // MCP read action: calling it without its required params must surface
-        // the handler's missing-param error, proving it routes to the handler
-        // rather than the CLI-only fallback.
-        let router = authed_router().await;
-        let mut args = Map::new();
-        args.insert(
-            "action".to_owned(),
-            Value::String("step-agent-activity".to_owned()),
-        );
-        let res = router.call_tool("workflow", args).await.expect("ok");
-        let text = result_to_string(&res);
-        assert!(
-            !text.contains("CLI-only workflow action"),
-            "step-agent-activity must route to the handler, not the CLI-only fallback: {text}"
-        );
-        assert!(
-            text.contains("workflow_id"),
-            "step-agent-activity without workflow_id must report the missing param: {text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn workflow_cancel_is_cli_only() {
-        // `cancel` is a terminal lifecycle mutation: it must NOT be reachable
-        // over MCP and must route to the CLI-only fallback with a clear pointer.
-        let router = authed_router().await;
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("cancel".to_owned()));
-        args.insert(
-            "workflow_id".to_owned(),
-            Value::String("4011234567890123456".to_owned()),
-        );
-        let res = router.call_tool("workflow", args).await.expect("ok");
-        let text = result_to_string(&res);
-        assert!(
-            text.contains("CLI-only workflow action") && text.contains("fastio workflow cancel"),
-            "cancel must be rejected over MCP with a CLI pointer, got: {text}"
-        );
-        // And cancel must not be advertised as an MCP action.
-        assert!(
-            !workflow_tool_actions().contains(&"cancel"),
-            "cancel must not appear in the workflow MCP action list"
-        );
-    }
-
-    #[tokio::test]
-    async fn workflow_instantiate_requires_idempotency_key() {
-        // The MCP surface has NO auto-generate; a missing key is a hard error
-        // before any network call.
-        let router = authed_router().await;
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("instantiate".to_owned()));
-        args.insert(
-            "workflow_id".to_owned(),
-            Value::String("4011234567890123456".to_owned()),
-        );
-        let res = router.call_tool("workflow", args).await.expect("ok");
-        let text = result_to_string(&res);
-        assert!(
-            text.contains("idempotency_key is required"),
-            "instantiate without a key must be rejected, got: {text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn workflow_trigger_fire_requires_idempotency_key() {
-        let router = authed_router().await;
-        let mut args = Map::new();
-        args.insert(
-            "action".to_owned(),
-            Value::String("trigger-fire".to_owned()),
-        );
-        args.insert("trigger_id".to_owned(), Value::String("trabc-1".to_owned()));
-        let res = router.call_tool("workflow", args).await.expect("ok");
-        let text = result_to_string(&res);
-        assert!(text.contains("idempotency_key is required"), "got: {text}");
-    }
-
-    #[tokio::test]
-    async fn workflow_obligation_list_requires_workflow_id_anchor() {
-        // workflow_id is the required authz anchor for obligation listing.
-        let router = authed_router().await;
-        let mut args = Map::new();
-        args.insert(
-            "action".to_owned(),
-            Value::String("obligation-list".to_owned()),
-        );
-        let res = router.call_tool("workflow", args).await.expect("ok");
-        let text = result_to_string(&res);
-        assert!(
-            text.contains("Missing required parameter: workflow_id"),
-            "obligation-list must require workflow_id, got: {text}"
-        );
-    }
-
     // ─── Sign (E-Signature) MCP discipline ────────────────────────────────────
 
     fn sign_tool_actions() -> Vec<&'static str> {
@@ -15961,7 +13262,11 @@ mod ripley_tool_tests {
 
     #[test]
     fn sign_tool_is_registered_and_read_draft_oriented() {
-        let tools = ToolRouter::list_tools().tools;
+        // Explicitly list with E-Sign enabled: the production `list_tools()`
+        // reads the construction-time flag (disabled unless FASTIO_ENABLE_ESIGN=1
+        // at server startup) and would omit `sign`. The disabled surface is
+        // covered by `sign_*_disabled` below.
+        let tools = ToolRouter::list_tools_with(true).tools;
         let sign = tools
             .iter()
             .find(|t| t.name.as_ref() == "sign")
@@ -15976,6 +13281,414 @@ mod ripley_tool_tests {
         assert!(
             desc.to_lowercase().contains("workspace"),
             "sign tool description must be workspace-scoped, got: {desc}"
+        );
+    }
+
+    // ─── E-Sign kill-switch (feature sunset 2026-07) ─────────────────────────
+
+    /// The disabled surface (`list_tools_with(false)`) drops `sign` while every
+    /// other tool is untouched — the filter is sign-specific, not a truncation.
+    #[test]
+    fn list_tools_disabled_omits_sign_only() {
+        let disabled = ToolRouter::list_tools_with(false).tools;
+        let has = |name: &str| disabled.iter().any(|t| t.name.as_ref() == name);
+        assert!(
+            !has("sign"),
+            "sign must be filtered out when E-Sign is disabled"
+        );
+        // Every other registered tool is still present — only `sign` was dropped.
+        for def in TOOL_DEFS {
+            if def.name == "sign" {
+                continue;
+            }
+            assert!(
+                has(def.name),
+                "non-sign tool '{}' must remain when E-Sign is disabled",
+                def.name
+            );
+        }
+        assert_eq!(
+            ToolRouter::list_tools_with(true).tools.len(),
+            disabled.len() + 1,
+            "disabling E-Sign removes exactly one tool (sign)"
+        );
+    }
+
+    /// The enabled surface (`list_tools_with(true)`) advertises `sign`.
+    #[test]
+    fn list_tools_enabled_contains_sign() {
+        let tools = ToolRouter::list_tools_with(true).tools;
+        assert!(
+            tools.iter().any(|t| t.name.as_ref() == "sign"),
+            "sign must be advertised when E-Sign is enabled"
+        );
+    }
+
+    /// A disabled router's `sign` dispatch returns the kill-switch error text
+    /// BEFORE any auth/client/arg work — a tool-level error, not an auth error.
+    #[tokio::test]
+    async fn call_tool_sign_disabled_returns_disabled_error() {
+        let router = ToolRouter::new_with_esign(
+            Arc::new(McpState::new_unauthenticated_for_test(
+                "https://api.fast.io/current",
+            )),
+            false,
+        );
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("envelope-list".to_owned()),
+        );
+        args.insert("workspace_id".to_owned(), Value::String("1".to_owned()));
+        let res = router.call_tool("sign", args).await.expect("call_tool ok");
+        // The disabled gate returns an ERROR result (is_error == Some(true)), not
+        // a success payload.
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "disabled sign call must be an error result"
+        );
+        let text = result_to_string(&res);
+        assert!(
+            text.contains(
+                "E-Sign is currently disabled. Set FASTIO_ENABLE_ESIGN=1 to use sign commands"
+            ),
+            "disabled sign call must return the kill-switch error, got: {text}"
+        );
+        // It is the kill-switch error, not the auth gate — the gate wins first.
+        assert!(
+            !text.contains("Not authenticated"),
+            "disabled sign gate must win over the auth gate, got: {text}"
+        );
+    }
+
+    /// D4: the disabled INSTANCE listing path (`list_tools()` on a router built
+    /// with E-Sign disabled) omits `sign` — this exercises the production
+    /// instance method, not just the parameterized `list_tools_with(false)`.
+    #[test]
+    fn instance_list_tools_disabled_omits_sign() {
+        let router = ToolRouter::new_with_esign(
+            Arc::new(McpState::new_unauthenticated_for_test(
+                "https://api.fast.io/current",
+            )),
+            false,
+        );
+        let tools = router.list_tools().tools;
+        assert!(
+            !tools.iter().any(|t| t.name.as_ref() == "sign"),
+            "disabled instance list_tools() must omit sign"
+        );
+        // Every other registered tool is still advertised.
+        for def in TOOL_DEFS {
+            if def.name == "sign" {
+                continue;
+            }
+            assert!(
+                tools.iter().any(|t| t.name.as_ref() == def.name),
+                "non-sign tool '{}' must remain on a disabled instance",
+                def.name
+            );
+        }
+    }
+
+    /// D4: the disabled `sign` gate beats ARG EXTRACTION, not just auth — a call
+    /// with only `action` (no `workspace_id`, which the handler would otherwise
+    /// require) still returns the disabled error, proving the gate short-circuits
+    /// before any parameter validation.
+    #[tokio::test]
+    async fn call_tool_sign_disabled_beats_arg_extraction() {
+        let router = ToolRouter::new_with_esign(
+            Arc::new(McpState::new_unauthenticated_for_test(
+                "https://api.fast.io/current",
+            )),
+            false,
+        );
+        let mut args = Map::new();
+        // Minimal args: action only, deliberately NO workspace_id.
+        args.insert(
+            "action".to_owned(),
+            Value::String("envelope-list".to_owned()),
+        );
+        let res = router.call_tool("sign", args).await.expect("call_tool ok");
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "disabled sign call must be an error result"
+        );
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("E-Sign is currently disabled"),
+            "gate must win over arg extraction, got: {text}"
+        );
+        // Not a missing-parameter error — the gate ran before arg extraction.
+        assert!(
+            !text.contains("workspace_id"),
+            "the disabled gate must short-circuit before requiring workspace_id, got: {text}"
+        );
+    }
+
+    // ─── `--tools` allow-list filter (P1) ────────────────────────────────────
+
+    fn filter_of(names: &[&str]) -> Option<std::collections::HashSet<String>> {
+        Some(names.iter().map(|s| (*s).to_owned()).collect())
+    }
+
+    fn filtered_router(
+        esign_enabled: bool,
+        filter: Option<std::collections::HashSet<String>>,
+    ) -> ToolRouter {
+        ToolRouter::new_with_filter(
+            Arc::new(McpState::new_unauthenticated_for_test(
+                "https://api.fast.io/current",
+            )),
+            esign_enabled,
+            filter,
+        )
+    }
+
+    /// A `--tools` allow-list advertises EXACTLY the requested (known) tools —
+    /// no more, no fewer — in `list_tools`.
+    #[test]
+    fn filter_list_tools_shows_exactly_allowed() {
+        let router = filtered_router(true, filter_of(&["howto", "id"]));
+        let names: std::collections::HashSet<String> = router
+            .list_tools()
+            .tools
+            .iter()
+            .map(|t| t.name.as_ref().to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["howto", "id"].iter().map(|s| (*s).to_owned()).collect(),
+            "list_tools must show exactly the allow-listed tools, got: {names:?}"
+        );
+    }
+
+    /// Calling a tool EXCLUDED by the filter returns the not-enabled error
+    /// (is_error == Some(true)), before any dispatch.
+    #[tokio::test]
+    async fn filter_call_excluded_tool_is_not_enabled_error() {
+        let router = filtered_router(true, filter_of(&["howto", "id"]));
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("list".to_owned()));
+        // `org` is not in the allow-list.
+        let res = router.call_tool("org", args).await.expect("call_tool ok");
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "excluded tool call must be an error result"
+        );
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("Tool 'org' is not enabled on this server"),
+            "excluded tool must return the not-enabled error, got: {text}"
+        );
+    }
+
+    /// An INCLUDED tool still dispatches normally under a filter — it reaches its
+    /// own handler (here, the auth gate) rather than the not-enabled error.
+    #[tokio::test]
+    async fn filter_included_tool_dispatches() {
+        let router = filtered_router(true, filter_of(&["org", "id"]));
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("list".to_owned()));
+        let res = router.call_tool("org", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("is not enabled on this server"),
+            "an allow-listed tool must dispatch, not be filtered, got: {text}"
+        );
+    }
+
+    /// The hidden `ai` alias is gated by its CANONICAL name `ripley`: a filter of
+    /// `{ripley}` admits an `ai` call (routes through), and a filter WITHOUT
+    /// `ripley` rejects it.
+    #[tokio::test]
+    async fn filter_gates_alias_by_canonical_name() {
+        // `ripley` in the allow-list → the `ai` alias is admitted (reaches its
+        // handler / auth gate, not the not-enabled error).
+        let admits = filtered_router(true, filter_of(&["ripley"]));
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("ask".to_owned()));
+        args.insert("question".to_owned(), Value::String("hi".to_owned()));
+        let res = admits.call_tool("ai", args.clone()).await.expect("ok");
+        assert!(
+            !result_to_string(&res).contains("is not enabled on this server"),
+            "ai alias must be admitted when the canonical `ripley` is allow-listed"
+        );
+
+        // A filter WITHOUT `ripley` → the `ai` alias is rejected under its
+        // canonical name.
+        let rejects = filtered_router(true, filter_of(&["org"]));
+        let res = rejects.call_tool("ai", args).await.expect("ok");
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            result_to_string(&res).contains("Tool 'ripley' is not enabled on this server"),
+            "ai alias must reject under its canonical name `ripley`"
+        );
+    }
+
+    /// The `how-to` alias is gated by its canonical name `howto` — the symmetric
+    /// path to `ai`→`ripley`. A filter of `{howto}` admits a `how-to` call; a
+    /// filter without `howto` rejects it under the canonical name.
+    #[tokio::test]
+    async fn filter_gates_how_to_alias_by_canonical_name() {
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("ask".to_owned()));
+        args.insert("question".to_owned(), Value::String("hi".to_owned()));
+
+        // `howto` allow-listed → `how-to` alias admitted.
+        let admits = filtered_router(true, filter_of(&["howto"]));
+        let res = admits.call_tool("how-to", args.clone()).await.expect("ok");
+        assert!(
+            !result_to_string(&res).contains("is not enabled on this server"),
+            "how-to alias must be admitted when the canonical `howto` is allow-listed"
+        );
+
+        // `howto` absent → `how-to` alias rejected under `howto`.
+        let rejects = filtered_router(true, filter_of(&["org"]));
+        let res = rejects.call_tool("how-to", args).await.expect("ok");
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            result_to_string(&res).contains("Tool 'howto' is not enabled on this server"),
+            "how-to alias must reject under its canonical name `howto`"
+        );
+    }
+
+    /// `has_visible_tools` reflects BOTH gates: a filter of only `sign` with
+    /// E-Sign disabled leaves zero visible tools (the empty-effective-surface
+    /// case `serve` refuses), whereas any other allow-listed tool keeps it true.
+    #[test]
+    fn has_visible_tools_reflects_esign_and_filter() {
+        let sign_only_disabled = filtered_router(false, filter_of(&["sign"]));
+        assert!(
+            !sign_only_disabled.has_visible_tools(),
+            "sign-only + E-Sign disabled has no visible tools"
+        );
+        let sign_only_enabled = filtered_router(true, filter_of(&["sign"]));
+        assert!(
+            sign_only_enabled.has_visible_tools(),
+            "sign-only + E-Sign enabled has a visible tool"
+        );
+        let org_only = filtered_router(false, filter_of(&["org"]));
+        assert!(
+            org_only.has_visible_tools(),
+            "org is visible regardless of E-Sign"
+        );
+        assert!(
+            filtered_router(false, None).has_visible_tools(),
+            "unfiltered surface is always non-empty"
+        );
+    }
+
+    /// `visible_tool_names` returns exactly the advertised set (canonical names,
+    /// `TOOL_DEFS` order), honoring both gates — the source the server intro uses
+    /// to enumerate a filtered surface.
+    #[test]
+    fn visible_tool_names_matches_list_tools() {
+        let router = filtered_router(true, filter_of(&["org", "howto", "id"]));
+        let from_names: std::collections::HashSet<&str> =
+            router.visible_tool_names().into_iter().collect();
+        let from_list: std::collections::HashSet<String> = router
+            .list_tools()
+            .tools
+            .iter()
+            .map(|t| t.name.as_ref().to_owned())
+            .collect();
+        assert_eq!(
+            from_names.len(),
+            from_list.len(),
+            "visible_tool_names must match list_tools cardinality"
+        );
+        for n in &from_names {
+            assert!(
+                from_list.contains(*n),
+                "visible_tool_names / list_tools mismatch on {n}"
+            );
+        }
+    }
+
+    /// A filter that includes `sign` still respects the E-Sign kill-switch: with
+    /// E-Sign disabled, `sign` is neither advertised nor callable even when it is
+    /// in the allow-list (BOTH gates must pass).
+    #[tokio::test]
+    async fn filter_sign_still_gated_by_esign_flag() {
+        let router = filtered_router(false, filter_of(&["sign", "org"]));
+        // Not advertised: E-Sign disabled overrides the allow-list inclusion.
+        assert!(
+            !router
+                .list_tools()
+                .tools
+                .iter()
+                .any(|t| t.name.as_ref() == "sign"),
+            "sign must stay hidden when E-Sign is disabled, even if allow-listed"
+        );
+        // Not callable: returns the E-Sign disabled error (the filter admits it,
+        // then the E-Sign gate refuses it).
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("envelope-list".to_owned()),
+        );
+        let res = router.call_tool("sign", args).await.expect("ok");
+        assert_eq!(res.is_error, Some(true));
+        assert!(
+            result_to_string(&res).contains("E-Sign is currently disabled"),
+            "an allow-listed sign is still refused by the E-Sign gate when disabled"
+        );
+    }
+
+    /// A `None` filter (the default) leaves the full surface intact — every
+    /// registered tool (sign included, since E-Sign is enabled here) is
+    /// advertised, matching the un-filtered production behavior.
+    #[test]
+    fn filter_none_is_full_surface() {
+        let router = filtered_router(true, None);
+        let names: std::collections::HashSet<String> = router
+            .list_tools()
+            .tools
+            .iter()
+            .map(|t| t.name.as_ref().to_owned())
+            .collect();
+        for def in TOOL_DEFS {
+            assert!(
+                names.contains(def.name),
+                "None filter must advertise every tool; missing '{}'",
+                def.name
+            );
+        }
+        assert_eq!(
+            names.len(),
+            TOOL_DEFS.len(),
+            "None filter advertises exactly the full TOOL_DEFS surface"
+        );
+    }
+
+    /// Disabling E-Sign does NOT affect any other tool: `howto` still routes to
+    /// its own handler (reaching the auth gate) rather than the sign gate.
+    #[tokio::test]
+    async fn call_tool_disabled_sign_does_not_affect_other_tools() {
+        let router = ToolRouter::new_with_esign(
+            Arc::new(McpState::new_unauthenticated_for_test(
+                "https://api.fast.io/current",
+            )),
+            false,
+        );
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("ask".to_owned()));
+        args.insert(
+            "question".to_owned(),
+            Value::String("How do I create a share?".to_owned()),
+        );
+        let res = router.call_tool("howto", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("Not authenticated"),
+            "howto must reach its own handler, got: {text}"
+        );
+        assert!(
+            !text.contains("E-Sign is currently disabled"),
+            "the E-Sign gate must not leak into other tools, got: {text}"
         );
     }
 
@@ -16048,7 +13761,7 @@ mod ripley_tool_tests {
             );
         }
         // workspace_id is SCHEMA-OPTIONAL (false), matching the registry
-        // convention for multi-action tools (e.g. `workflow`, `apps`): the
+        // convention for multi-action tools (e.g. `apps`): the
         // describe / send / void / delete actions short-circuit BEFORE workspace
         // extraction, so marking it required=true would make a schema-strict MCP
         // client reject action='describe'. The real per-action requirement is
@@ -17065,7 +14778,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn fileshare_tool_is_registered_and_drive_oriented() {
-        let tools = ToolRouter::list_tools().tools;
+        let tools = ToolRouter::list_tools_with(true).tools;
         let fs = tools
             .iter()
             .find(|t| t.name.as_ref() == "fileshare")
@@ -17252,9 +14965,12 @@ mod ripley_tool_tests {
     /// and fails with a NETWORK error (never "Not authenticated"). Proves the
     /// anonymous link-access path is wired.
     fn anon_router_bogus_base() -> ToolRouter {
-        ToolRouter::new(Arc::new(McpState::new_unauthenticated_for_test(
-            "http://127.0.0.1:1/current",
-        )))
+        ToolRouter::new(
+            Arc::new(McpState::new_unauthenticated_for_test(
+                "http://127.0.0.1:1/current",
+            )),
+            None,
+        )
     }
 
     #[tokio::test]
@@ -17355,7 +15071,7 @@ mod ripley_tool_tests {
             "http://127.0.0.1:1/current",
         ));
         state.set_token("test-token".to_owned()).await;
-        let router = ToolRouter::new(state);
+        let router = ToolRouter::new(state, None);
 
         let mut args = Map::new();
         args.insert("action".to_owned(), Value::String("add-file".to_owned()));
@@ -18251,79 +15967,6 @@ mod ripley_tool_tests {
         assert!(
             text.contains("Invalid status") && text.contains("cancelled"),
             "an invalid web-list status must be rejected before the call: {text}"
-        );
-    }
-
-    /// The MCP `workflow list` handler uses the strict bool helper for
-    /// `created_by_me` — a present-but-malformed value (e.g. `"me"`) must error
-    /// rather than be silently dropped to an unfiltered list.
-    #[tokio::test]
-    async fn workflow_list_rejects_malformed_created_by_me() {
-        let router = authed_router().await;
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("list".to_owned()));
-        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
-        args.insert("created_by_me".to_owned(), json!("me")); // not a bool
-        let result = router
-            .call_tool("workflow", args)
-            .await
-            .expect("call_tool ok");
-        let text = result_to_string(&result);
-        assert!(
-            text.contains("created_by_me") && text.contains("boolean"),
-            "a malformed created_by_me must be rejected, not silently dropped: {text}"
-        );
-    }
-
-    /// The MCP `workflow list` handler validates `archived` against the same
-    /// closed set the CLI's clap `value_parser` enforces — a present-but-invalid
-    /// value must error before reaching the server.
-    #[tokio::test]
-    async fn workflow_list_rejects_invalid_archived() {
-        use super::WORKFLOW_ARCHIVED_FILTERS;
-        assert_eq!(WORKFLOW_ARCHIVED_FILTERS, &["true", "false", "all"]);
-        let router = authed_router().await;
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("list".to_owned()));
-        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
-        args.insert("archived".to_owned(), json!("maybe"));
-        let result = router
-            .call_tool("workflow", args)
-            .await
-            .expect("call_tool ok");
-        let text = result_to_string(&result);
-        assert!(
-            text.contains("Invalid archived") && text.contains("maybe"),
-            "an invalid archived filter must be rejected before the call: {text}"
-        );
-    }
-
-    /// The MCP `workflow template-list` handler validates `usage` against the
-    /// same closed set the CLI's clap `value_parser` enforces — a
-    /// present-but-invalid value must error before reaching the server.
-    #[tokio::test]
-    async fn workflow_template_list_rejects_invalid_usage() {
-        use super::WORKFLOW_TEMPLATE_USAGE_FILTERS;
-        assert_eq!(
-            WORKFLOW_TEMPLATE_USAGE_FILTERS,
-            &["library", "one_off", "all"]
-        );
-        let router = authed_router().await;
-        let mut args = Map::new();
-        args.insert(
-            "action".to_owned(),
-            Value::String("template-list".to_owned()),
-        );
-        args.insert("workspace_id".to_owned(), Value::String("ws1".to_owned()));
-        args.insert("usage".to_owned(), json!("bogus"));
-        let result = router
-            .call_tool("workflow", args)
-            .await
-            .expect("call_tool ok");
-        let text = result_to_string(&result);
-        assert!(
-            text.contains("Invalid usage") && text.contains("bogus"),
-            "an invalid usage filter must be rejected before the call: {text}"
         );
     }
 

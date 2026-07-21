@@ -4,15 +4,15 @@
 //!
 //! Maps to the Dashboard surface documented at `~/vividengine/llms/dashboard.txt`:
 //! a ranked, paginated feed of **actionable cards** for the calling workspace
-//! member (approvals, tasks, reviews, confirmations, @mentions, file activity,
-//! and pending signatures), plus per-member dismiss / snooze / undismiss of a
-//! card. Dismiss and snooze are **out-of-band**: they hide a card from the
-//! caller's own feed only and never advance, resolve, or otherwise change the
-//! underlying obligation, workflow, or signature.
+//! member (@mentions, file-added, file-version, and synthesis lanes, plus a
+//! signature lane only when E-Sign is enabled platform-side), plus per-member
+//! dismiss / snooze / undismiss of a card. Dismiss and snooze are
+//! **out-of-band**: they hide a card from the caller's own feed only and never
+//! advance, resolve, or otherwise change the underlying card subject.
 //!
-//! The signature-card primary action — minting the caller's own signing link —
-//! lives in [`crate::api::signing::my_sign_link`] (it is envelope-scoped) and is
-//! surfaced as `fastio sign envelope my-sign-link`.
+//! When E-Sign is enabled, a signature card's primary action — minting the
+//! caller's own signing link — lives in [`crate::api::signing::my_sign_link`]
+//! (it is envelope-scoped) and is surfaced as `fastio sign envelope my-sign-link`.
 
 use std::collections::HashMap;
 
@@ -70,8 +70,8 @@ pub async fn get_dashboard(
 
 /// Build the `/cards/{card_key}/dismiss/` action path for a dashboard card.
 ///
-/// The `card_key` contains a `:` separator (e.g. `obligation:123…`) and MUST be
-/// URL-encoded (`obligation%3A123…`) per dashboard.txt:192. Both ids are
+/// The `card_key` contains a `:` separator (e.g. `mention:123…`) and MUST be
+/// URL-encoded (`mention%3A123…`) per dashboard.txt:192. Both ids are
 /// URL-encoded.
 fn card_dismiss_path(workspace_id: &str, card_key: &str) -> String {
     format!(
@@ -85,8 +85,8 @@ fn card_dismiss_path(workspace_id: &str, card_key: &str) -> String {
 ///
 /// `POST /workspace/{workspace_id}/dashboard/cards/{card_key}/dismiss/`
 ///
-/// Out-of-band only — the underlying obligation, workflow, or signature is
-/// unaffected. When `snooze_until` is `Some`, a JSON body
+/// Out-of-band only — the underlying card subject is unaffected. When
+/// `snooze_until` is `Some`, a JSON body
 /// `{"snooze_until": "<ts>"}` is sent (the server validates the canonical
 /// `"YYYY-MM-DD HH:MM:SS UTC"` format and that it is in the future); when `None`
 /// the request carries no body at all (a permanent dismiss) — matching the
@@ -135,10 +135,10 @@ mod tests {
 
     #[test]
     fn dismiss_path_urlencodes_card_key_colon() {
-        let path = card_dismiss_path("1234567890123456789", "obligation:9876543210987654321");
+        let path = card_dismiss_path("1234567890123456789", "mention:9876543210987654321");
         assert_eq!(
             path,
-            "/workspace/1234567890123456789/dashboard/cards/obligation%3A9876543210987654321/dismiss/"
+            "/workspace/1234567890123456789/dashboard/cards/mention%3A9876543210987654321/dismiss/"
         );
     }
 
@@ -154,7 +154,7 @@ mod tests {
     fn validate_card_key_rejects_blank() {
         assert!(validate_card_key("").is_err());
         assert!(validate_card_key("   ").is_err());
-        assert!(validate_card_key("obligation:1").is_ok());
+        assert!(validate_card_key("mention:1").is_ok());
     }
 
     #[test]

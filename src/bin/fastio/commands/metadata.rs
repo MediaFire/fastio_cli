@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use super::CommandContext;
-use super::workflow::{PollAction, classify_poll_error};
+use super::{PollAction, classify_poll_error};
 use fastio_cli::api;
 use fastio_cli::api::metadata::ExtractJobState;
 use fastio_cli::error::CliError;

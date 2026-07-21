@@ -20,7 +20,7 @@ use colored::Colorize;
 
 /// Process-global set of legacy group keys that have already emitted a notice.
 ///
-/// Keyed by the static group name (e.g. `"task"`). Wrapped in a [`Mutex`] for
+/// Keyed by the static group name (e.g. `"ripley-search"`). Wrapped in a [`Mutex`] for
 /// thread-safe concurrent access from both CLI dispatch and MCP handlers.
 static WARNED_GROUPS: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
 
@@ -44,7 +44,7 @@ fn mark_warned(group: &'static str) -> bool {
 /// Emit a one-time `[legacy]` deprecation notice for `group` to stderr.
 ///
 /// The notice fires at most once per `group` per process and points the user
-/// at `replacement` (a short hint such as `"fastio workflow"`). It is:
+/// at `replacement` (a short hint such as `"fastio ripley"`). It is:
 ///
 /// - **Suppressed under `--quiet`** (`quiet == true`) — no notice, and the
 ///   once-per-key gate is NOT consumed, so a later non-quiet call still warns.
@@ -84,7 +84,7 @@ pub fn warn_legacy(group: &'static str, replacement: &str, quiet: bool) -> bool 
 /// for whole command groups), this lets a caller supply its own wording —
 /// used for individual re-pointed commands such as `ripley search`, whose
 /// notice steers to `files search` / `ripley ask` rather than to
-/// `fastio workflow`. Same guarantees: at most once per `key` per process,
+/// `fastio ripley`. Same guarantees: at most once per `key` per process,
 /// suppressed under `quiet` (and the gate is not consumed when suppressed),
 /// stderr-only so machine-readable stdout is never corrupted, thread-safe.
 ///
@@ -134,15 +134,15 @@ mod tests {
     fn warn_legacy_fires_once_per_key() {
         fresh_key("once-test");
         assert!(
-            warn_legacy("once-test", "fastio workflow", false),
+            warn_legacy("once-test", "fastio ripley", false),
             "first call should print"
         );
         assert!(
-            !warn_legacy("once-test", "fastio workflow", false),
+            !warn_legacy("once-test", "fastio ripley", false),
             "second call should be suppressed"
         );
         assert!(
-            !warn_legacy("once-test", "fastio workflow", false),
+            !warn_legacy("once-test", "fastio ripley", false),
             "third call should be suppressed"
         );
     }
@@ -151,13 +151,13 @@ mod tests {
     fn warn_legacy_silent_under_quiet() {
         fresh_key("quiet-test");
         assert!(
-            !warn_legacy("quiet-test", "fastio workflow", true),
+            !warn_legacy("quiet-test", "fastio ripley", true),
             "quiet call must not print"
         );
         // The quiet call must NOT consume the once-gate, so a later
         // non-quiet call still warns.
         assert!(
-            warn_legacy("quiet-test", "fastio workflow", false),
+            warn_legacy("quiet-test", "fastio ripley", false),
             "non-quiet call after a quiet one should still print"
         );
     }
@@ -184,7 +184,7 @@ mod tests {
             let printed = std::sync::Arc::clone(&printed);
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
-                if warn_legacy("concurrent-test", "fastio workflow", false) {
+                if warn_legacy("concurrent-test", "fastio ripley", false) {
                     printed.fetch_add(1, Ordering::SeqCst);
                 }
             }));
@@ -214,8 +214,8 @@ mod tests {
         assert!(result.is_err(), "the panic should have unwound");
         assert!(mutex.is_poisoned(), "mutex should be poisoned");
         // Must not panic despite the poisoned lock.
-        let first = warn_legacy("poison-test", "fastio workflow", false);
-        let second = warn_legacy("poison-test", "fastio workflow", false);
+        let first = warn_legacy("poison-test", "fastio ripley", false);
+        let second = warn_legacy("poison-test", "fastio ripley", false);
         assert!(first, "first post-poison call should print");
         assert!(!second, "second post-poison call should be suppressed");
     }

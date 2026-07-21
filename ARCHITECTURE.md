@@ -21,8 +21,9 @@ Both modes share a common API layer, ensuring zero code duplication.
 +----------------+   +------------------+     +------------------+
 |  cli.rs        |   |  commands/       |     |  mcp/            |
 |  Clap derive   |   |  29 command      |     |  MCP server      |
-|  definitions   |   |  modules         |     |  25 tools        |
-+----------------+   +------------------+     +------------------+
+|  definitions   |   |  modules         |     |  24 tools (25    |
++----------------+   +------------------+     |  w/ E-Sign)      |
+                                              +------------------+
                           |         |               |
                     +-----+         +--------+      |
                     v                        v      |
@@ -66,8 +67,8 @@ Both modes share a common API layer, ensuring zero code duplication.
 ### `cli.rs`
 - Defines `Cli` struct with `#[derive(Parser)]`
 - Global flags: `--format`, `--fields`, `--no-color`, `--quiet`, `--verbose`, `--profile`, `--token`, `--api-base`
-- `Commands` enum with 31 top-level subcommands (incl. hidden legacy aliases)
-- Nested subcommand enums for complex groups (org billing, org members, share files, task lists, etc.)
+- `Commands` enum with 31 top-level subcommands (the `sign` subcommand is hidden by the E-Sign kill-switch, feature sunset 2026-07)
+- Nested subcommand enums for complex groups (org billing, org members, share files, etc.)
 
 ### `error.rs`
 - `CliError` enum using `thiserror` with variants: `Api`, `Auth`, `Config`, `Io`, `Http`, `Parse`, `RateLimit`, `ArtifactNotReady`, `InvalidHeaderValue` (secret can't form an HTTP header), `MappedApi` (command-layer hint override wrapper), `VersionConflict` (CAS write-back conflict)
@@ -131,18 +132,17 @@ Each module contains typed functions mapping to Fast.io REST endpoints:
 | `download.rs` | 2 functions | Token-based downloads, ZIP |
 | `share.rs` | 16 functions | CRUD, storage, members, password |
 | `ai.rs` | 14 functions | Chat CRUD, messages, search, summarize |
-| `comment.rs` | 12 functions | CRUD, reactions, linking |
+| `comment.rs` | 12 functions | CRUD, reactions |
 | `event.rs` | 5 functions | Search, summarize, details, polling |
 | `member.rs` | 9 functions | Add, remove, transfer, leave, join |
-| `workflow.rs` | 25 functions | Tasks API: task lists, tasks, comments, attachments |
 | `apps.rs` | 4 functions | List, details, launch, tool-apps |
 | `import.rs` | 22 functions | Providers, identities, sources, jobs, writebacks |
 | `locking.rs` | 3 functions | Acquire, status, release |
-| `signing.rs` | 14 functions | E-signature (SignEnvelope) — workspace-only CRUD/lifecycle, document/preview/signed/audit download paths |
+| `signing.rs` | 14 functions | E-signature (SignEnvelope) — workspace-only CRUD/lifecycle, document/preview/signed/audit download paths. Disabled by default (E-Sign kill-switch, `FASTIO_ENABLE_ESIGN=1` re-enables) |
 | `fileshare.rs` | 10 functions | File Shares — durable single-file link shares (replacing the retired QuickShare): management create/list/update/delete + grants, password-capable anonymous consumption (details/versions), write-back path builders, websocket-auth token, named-key extractors |
 | `types.rs` | — | Shared response structs |
 
-### `commands/` — 32 Modules
+### `commands/` — 30 Modules
 
 Count convention: **29 command modules** = `src/bin/fastio/commands/*.rs` excluding `mod.rs` (declarations); there is no `types.rs` here. (Note: `secret_output.rs` is a shared HELPER module, not a command group — it is counted here because the convention counts every `*.rs` under `commands/` except `mod.rs`.) The table below lists representative modules, not all 29.
 
@@ -165,13 +165,12 @@ Each module handles one command group, orchestrating API calls and output render
 | `invitation.rs` | 4 | Invitation management |
 | `preview.rs` | 3 | Preview URLs and transforms |
 | `asset.rs` | 3 | Asset management |
-| `task.rs` | 16 | Tasks and task lists |
 | `apps.rs` | 4 | App integration |
 | `import.rs` | 22 | Cloud import/sync |
 | `lock.rs` | 3 | File locking |
-| `sign.rs` | 10 | E-signature (workspace-only): envelope create/list/get/update/send/void, document download/preview/signed, audit download |
+| `sign.rs` | 10 | E-signature (workspace-only): envelope create/list/get/update/send/void, document download/preview/signed, audit download. Disabled by default (E-Sign kill-switch, `FASTIO_ENABLE_ESIGN=1` re-enables) |
 | `fileshare.rs` | 12 | File Shares: create/list/info/update/delete, grants list/add/remove, download/versions/preview, upload (write-back, CAS), activity, ws-token. `map_fileshare_error` + anonymous-capable consumption client |
-| `secret_output.rs` | — | Shared helper (not a command group): `extract_secret` / `write_secret_file` (0600) / `redact_secret_field` for realtime / ws tokens (used by `workflow` and `fileshare`) |
+| `secret_output.rs` | — | Shared helper (not a command group): `extract_secret` / `write_secret_file` (0600) / `redact_secret_field` for realtime / ws tokens (used by `fileshare`) |
 | `configure.rs` | 4 | CLI configuration |
 | `mod.rs` | — | Module declarations |
 
@@ -180,13 +179,14 @@ Each module handles one command group, orchestrating API calls and output render
 #### `mod.rs`
 - `FastioMcpServer` implementing rmcp `ServerHandler` trait
 - Stdio transport via `rmcp::transport::stdio`
-- Tool registration with `--tools` filtering
+- `--tools` allow-list: a validated set (unknown names warned to stderr and ignored; an all-unknown list is a fail-fast error) threaded into `ToolRouter` and enforced in BOTH `list_tools` (advertised set) and `call_tool` (callable set), so the two never diverge; `None` = all tools. Hidden aliases (`ai`→`ripley`, `how-to`→`howto`) are gated by their canonical name
+- `list_tools` also filters out the `sign` tool when the E-Sign kill-switch is off (read once at `ToolRouter` construction); the intro `instructions` advertise `sign` only when enabled. `sign` requires BOTH the E-Sign flag AND allow-list inclusion
 - Auth resolved at startup from credential chain
 - In-session token updates via `auth` tool's `signin`/`set-api-key` actions
 - Tracing disabled to keep stdout clean for JSON-RPC
 
 #### `tools.rs`
-- 25 action-routed tools (each multiplexes many actions via its `action` parameter)
+- 24 action-routed tools by default, 25 with E-Sign enabled (from 25 `TOOL_DEFS`, with the `sign` tool filtered from `list_tools` when the kill-switch is off); each multiplexes many actions via its `action` parameter
 - Each tool has an `action` parameter for routing (mirrors the remote MCP server pattern)
 - All handlers call existing `src/api/` functions — zero duplicated API logic
 - Returns MCP text content blocks with markdown-formatted data,
@@ -308,7 +308,7 @@ The `ApiClient::handle_response()` method:
 
 1. **Direct REST API** — calls `api.fast.io` directly, not through the MCP server, for single-hop latency
 2. **Shared API layer** — both CLI and MCP modes use `src/api/`, ensuring feature parity
-3. **Action-based MCP tools** — mirrors the remote MCP server's consolidated tool pattern (25 action-routed tools rather than one tool per individual action)
+3. **Action-based MCP tools** — mirrors the remote MCP server's consolidated tool pattern (24 action-routed tools by default, 25 with E-Sign enabled, rather than one tool per individual action)
 4. **Form-encoded POST bodies** — matches the Fast.io API convention (not JSON, unless specifically required)
 5. **Cursor-based pagination** — for storage endpoints; offset-based for other list endpoints
 6. **CSPRNG for PKCE** — `getrandom` crate, not `HashMap::RandomState`

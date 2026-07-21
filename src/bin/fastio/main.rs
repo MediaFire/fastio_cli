@@ -35,7 +35,6 @@ use commands::share::{
     ShareUpdateArgs,
 };
 use commands::system::SystemCommand;
-use commands::task::{TaskCommand, TaskCommentCommand, TaskListCommand};
 use commands::upload::UploadCommand;
 use commands::user::{
     AvatarCommand, SettingsCommand, UserAssetCommand, UserCommand, UserEmailChangeCommand,
@@ -69,7 +68,7 @@ async fn main() -> Result<()> {
 /// the pure decision behind that rendering, factored out so it can be
 /// unit-tested without capturing stderr.
 ///
-/// The subtlety it handles: command handlers attach signing / workflow / etc.
+/// The subtlety it handles: command handlers attach signing / upload / etc.
 /// framing via `anyhow::Error::context(...)` ON TOP OF a `CliError`. anyhow's
 /// `.context()` preserves downcastability, so `downcast_ref::<CliError>()` still
 /// succeeds — but [`CliError::render_stderr`] only prints the bare `CliError`
@@ -150,6 +149,17 @@ fn render_chain_dedup(err: &anyhow::Error) -> String {
     out
 }
 
+/// Whether the E-Sign kill-switch should block this command.
+///
+/// Factored out of `run()` so the gate predicate is unit-testable WITHOUT
+/// mutating the process environment (`FASTIO_ENABLE_ESIGN` is process-global and
+/// unsafe to set under Rust 2024): `esign_enabled` is passed in. Blocks iff the
+/// command is a `sign` subcommand AND E-Sign is not enabled; every non-sign
+/// command passes regardless of the flag.
+fn sign_gate_blocks(command: &Commands, esign_enabled: bool) -> bool {
+    matches!(command, Commands::Sign(_)) && !esign_enabled
+}
+
 /// Core logic extracted so we can intercept errors in `main()`.
 async fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -190,6 +200,20 @@ async fn run() -> Result<()> {
     // Disable colors if requested
     if cli.no_color {
         colored::control::set_override(false);
+    }
+
+    // E-Sign kill-switch (feature sunset 2026-07): gate the sign surface here,
+    // BEFORE config/profile resolution, so the disabled error always wins over
+    // any config/auth error. Enabled only via `FASTIO_ENABLE_ESIGN=1`; the
+    // platform enforces its own org-level flag server-side as well. Returning a
+    // `CliError::FeatureDisabled` (rather than a bare `anyhow::bail!`) routes the
+    // failure through `main`'s red `error:` + yellow `hint:` render.
+    if sign_gate_blocks(&cli.command, commands::sign::esign_enabled()) {
+        return Err(fastio_cli::error::CliError::FeatureDisabled {
+            message: "E-Sign is currently disabled.",
+            hint: "Set FASTIO_ENABLE_ESIGN=1 to use sign commands (signing must also be enabled for your organization).",
+        }
+        .into());
     }
 
     // Load configuration
@@ -248,7 +272,6 @@ async fn dispatch(
         Commands::Preview(c) => commands::preview::execute(&map_preview_command(c), ctx).await,
         Commands::Asset(c) => commands::asset::execute(&map_asset_command(c), ctx).await,
         Commands::Ripley(c) => commands::ai::execute(&map_ripley_command(c), ctx).await,
-        Commands::Task(c) => commands::task::execute(&map_task_command(c), ctx).await,
         Commands::Apps(c) => commands::apps::execute(&map_apps_command(&c), ctx).await,
         Commands::Import(c) => commands::import::execute(&map_import_command(&c), ctx).await,
         Commands::Lock(c) => commands::lock::execute(&map_lock_command(&c), ctx).await,
@@ -278,7 +301,6 @@ async fn dispatch(
             context,
         } => commands::howto::execute(ctx, &question, surface.as_deref(), context.as_deref()).await,
         Commands::Metadata(c) => commands::metadata::execute(&map_metadata_command(c), ctx).await,
-        Commands::Workflow(c) => commands::workflow::execute(c, ctx).await,
         Commands::Sign(c) => commands::sign::execute(c, ctx).await,
         Commands::Fileshare(c) => commands::fileshare::execute(c, ctx).await,
         Commands::System(c) => commands::system::execute(&map_system_command(&c), ctx).await,
@@ -628,7 +650,6 @@ fn map_org_command(cmd: cli::OrgCommands) -> OrgCommand {
             perm_join,
             perm_member_manage,
             intelligence,
-            workflow,
         } => OrgCommand::CreateWorkspace {
             org_id,
             name,
@@ -637,7 +658,6 @@ fn map_org_command(cmd: cli::OrgCommands) -> OrgCommand {
             perm_join,
             perm_member_manage,
             intelligence,
-            workflow,
         },
     }
 }
@@ -821,9 +841,6 @@ fn map_workspace_command(cmd: cli::WorkspaceCommands) -> WorkspaceCommand {
             intelligence,
             perm_join,
             perm_member_manage,
-            nl_summaries_enabled,
-            nl_summaries_daily_cap,
-            workflow_approval_native_enabled,
             accent_color,
             background_color1,
             background_color2,
@@ -836,9 +853,6 @@ fn map_workspace_command(cmd: cli::WorkspaceCommands) -> WorkspaceCommand {
             intelligence,
             perm_join,
             perm_member_manage,
-            nl_summaries_enabled,
-            nl_summaries_daily_cap,
-            workflow_approval_native_enabled,
             accent_color,
             background_color1,
             background_color2,
@@ -851,12 +865,6 @@ fn map_workspace_command(cmd: cli::WorkspaceCommands) -> WorkspaceCommand {
             workspace_id,
             confirm,
         },
-        cli::WorkspaceCommands::EnableWorkflow { workspace_id } => {
-            WorkspaceCommand::EnableWorkflow { workspace_id }
-        }
-        cli::WorkspaceCommands::DisableWorkflow { workspace_id } => {
-            WorkspaceCommand::DisableWorkflow { workspace_id }
-        }
         cli::WorkspaceCommands::JobsStatus { workspace_id } => {
             WorkspaceCommand::JobsStatus { workspace_id }
         }
@@ -1501,12 +1509,6 @@ fn map_share_command(cmd: cli::ShareCommands) -> ShareCommand {
         cli::ShareCommands::PublicInfo { share_id } => ShareCommand::PublicInfo { share_id },
         cli::ShareCommands::Available => ShareCommand::Available,
         cli::ShareCommands::CheckName { name } => ShareCommand::CheckName { name },
-        cli::ShareCommands::WorkflowEnable { share_id } => {
-            ShareCommand::WorkflowEnable { share_id }
-        }
-        cli::ShareCommands::WorkflowDisable { share_id } => {
-            ShareCommand::WorkflowDisable { share_id }
-        }
         cli::ShareCommands::Files(f) => ShareCommand::Files(map_share_files_command(f)),
         cli::ShareCommands::Members(m) => ShareCommand::Members(map_share_members_command(m)),
         cli::ShareCommands::Invitation(i) => {
@@ -1713,27 +1715,6 @@ fn map_comment_command(cmd: cli::CommentCommands) -> CommentCommand {
         cli::CommentCommands::BulkDelete { comment_ids } => {
             CommentCommand::BulkDelete { comment_ids }
         }
-        cli::CommentCommands::Link {
-            comment_id,
-            entity_type,
-            entity_id,
-        } => CommentCommand::Link {
-            comment_id,
-            entity_type,
-            entity_id,
-        },
-        cli::CommentCommands::Unlink { comment_id } => CommentCommand::Unlink { comment_id },
-        cli::CommentCommands::Linked {
-            entity_type,
-            entity_id,
-            limit,
-            offset,
-        } => CommentCommand::Linked {
-            entity_type,
-            entity_id,
-            limit,
-            offset,
-        },
         cli::CommentCommands::Attachments { comment_id } => {
             CommentCommand::Attachments { comment_id }
         }
@@ -2140,240 +2121,6 @@ fn map_ripley_command(cmd: cli::RipleyCommands) -> AiCommand {
     }
 }
 
-/// Convert clap-parsed task commands to the internal enum.
-#[allow(clippy::too_many_lines)]
-fn map_task_command(cmd: cli::TaskCommands) -> TaskCommand {
-    match cmd {
-        cli::TaskCommands::List {
-            workspace,
-            list_id,
-            limit,
-            offset,
-        } => TaskCommand::List {
-            workspace,
-            list_id,
-            limit,
-            offset,
-        },
-        cli::TaskCommands::Create {
-            workspace,
-            list_id,
-            title,
-            description,
-            status,
-            priority,
-            assignee_id,
-            node_id,
-        } => TaskCommand::Create {
-            workspace,
-            list_id,
-            title,
-            description,
-            status,
-            priority,
-            assignee_id,
-            node_id,
-        },
-        cli::TaskCommands::Info { list_id, task_id } => TaskCommand::Info { list_id, task_id },
-        cli::TaskCommands::Update {
-            list_id,
-            task_id,
-            title,
-            description,
-            status,
-            priority,
-            assignee_id,
-            node_id,
-        } => TaskCommand::Update {
-            list_id,
-            task_id,
-            title,
-            description,
-            status,
-            priority,
-            assignee_id,
-            node_id,
-        },
-        cli::TaskCommands::Delete { list_id, task_id } => TaskCommand::Delete { list_id, task_id },
-        cli::TaskCommands::Assign {
-            list_id,
-            task_id,
-            assignee_id,
-        } => TaskCommand::Assign {
-            list_id,
-            task_id,
-            assignee_id,
-        },
-        cli::TaskCommands::Complete { list_id, task_id } => {
-            TaskCommand::Complete { list_id, task_id }
-        }
-        cli::TaskCommands::Move {
-            list_id,
-            task_id,
-            target_list_id,
-            sort_order,
-        } => TaskCommand::Move {
-            list_id,
-            task_id,
-            target_list_id,
-            sort_order,
-        },
-        cli::TaskCommands::BulkStatus {
-            list_id,
-            task_ids,
-            status,
-        } => TaskCommand::BulkStatus {
-            list_id,
-            task_ids,
-            status,
-        },
-        cli::TaskCommands::Reorder { list_id, task_ids } => {
-            TaskCommand::Reorder { list_id, task_ids }
-        }
-        cli::TaskCommands::ReorderLists {
-            profile_type,
-            profile_id,
-            list_ids,
-        } => TaskCommand::ReorderLists {
-            profile_type,
-            profile_id,
-            list_ids,
-        },
-        cli::TaskCommands::Filter {
-            profile_type,
-            profile_id,
-            filter,
-            status,
-            limit,
-            offset,
-        } => TaskCommand::Filter {
-            profile_type,
-            profile_id,
-            filter,
-            status,
-            limit,
-            offset,
-        },
-        cli::TaskCommands::Summary {
-            profile_type,
-            profile_id,
-        } => TaskCommand::Summary {
-            profile_type,
-            profile_id,
-        },
-        cli::TaskCommands::Attachments { list_id, task_id } => {
-            TaskCommand::Attachments { list_id, task_id }
-        }
-        cli::TaskCommands::Attach {
-            list_id,
-            task_id,
-            target_ids,
-        } => TaskCommand::Attach {
-            list_id,
-            task_id,
-            target_ids,
-        },
-        cli::TaskCommands::Detach {
-            list_id,
-            task_id,
-            target_id,
-        } => TaskCommand::Detach {
-            list_id,
-            task_id,
-            target_id,
-        },
-        cli::TaskCommands::Comment(comment_cmd) => {
-            TaskCommand::Comment(map_task_comment_command(comment_cmd))
-        }
-        cli::TaskCommands::Lists(lists_cmd) => TaskCommand::Lists(map_task_list_command(lists_cmd)),
-    }
-}
-
-/// Convert clap-parsed task comment commands to the internal enum.
-fn map_task_comment_command(cmd: cli::TaskCommentCommands) -> TaskCommentCommand {
-    match cmd {
-        cli::TaskCommentCommands::List {
-            list_id,
-            task_id,
-            limit,
-            offset,
-        } => TaskCommentCommand::List {
-            list_id,
-            task_id,
-            limit,
-            offset,
-        },
-        cli::TaskCommentCommands::Post {
-            list_id,
-            task_id,
-            text,
-            parent_id,
-            reference,
-            properties,
-        } => TaskCommentCommand::Post {
-            list_id,
-            task_id,
-            text,
-            parent_id,
-            reference,
-            properties,
-        },
-        cli::TaskCommentCommands::Edit { comment_id, text } => {
-            TaskCommentCommand::Edit { comment_id, text }
-        }
-        cli::TaskCommentCommands::Delete { comment_id } => {
-            TaskCommentCommand::Delete { comment_id }
-        }
-        cli::TaskCommentCommands::React { comment_id, emoji } => {
-            TaskCommentCommand::React { comment_id, emoji }
-        }
-        cli::TaskCommentCommands::Unreact { comment_id } => {
-            TaskCommentCommand::Unreact { comment_id }
-        }
-    }
-}
-
-/// Convert clap-parsed task list commands to the internal enum.
-fn map_task_list_command(cmd: cli::TaskListCommands) -> TaskListCommand {
-    match cmd {
-        cli::TaskListCommands::List {
-            workspace,
-            share,
-            limit,
-            offset,
-        } => {
-            let (profile_type, profile_id) = resolve_workspace_or_share_profile(workspace, share);
-            TaskListCommand::List {
-                profile_type,
-                profile_id,
-                limit,
-                offset,
-            }
-        }
-        cli::TaskListCommands::Create {
-            profile_type,
-            profile_id,
-            name,
-            description,
-        } => TaskListCommand::Create {
-            profile_type,
-            profile_id,
-            name,
-            description,
-        },
-        cli::TaskListCommands::Update {
-            list_id,
-            name,
-            description,
-        } => TaskListCommand::Update {
-            list_id,
-            name,
-            description,
-        },
-        cli::TaskListCommands::Delete { list_id } => TaskListCommand::Delete { list_id },
-    }
-}
-
 /// Resolve workspace/share options into a `(profile_type, profile_id)` pair.
 ///
 /// Clap ensures at least one of `workspace` or `share` is present via
@@ -2639,8 +2386,6 @@ fn map_search_command(cmd: cli::SearchCommands) -> SearchCommand {
             metadata_offset,
             comments_limit,
             comments_offset,
-            workflows_limit,
-            workflows_offset,
             only,
         } => SearchCommand::Workspace {
             workspace_id,
@@ -2648,8 +2393,7 @@ fn map_search_command(cmd: cli::SearchCommands) -> SearchCommand {
             params: UnifiedSearchParams::new()
                 .files(files_offset, files_limit)
                 .metadata(metadata_offset, metadata_limit)
-                .comments(comments_offset, comments_limit)
-                .workflows(workflows_offset, workflows_limit),
+                .comments(comments_offset, comments_limit),
             only,
         },
         cli::SearchCommands::Share {
@@ -3010,6 +2754,75 @@ mod tests {
         assert!(
             hint.to_lowercase().contains("poll") || hint.to_lowercase().contains("not ready"),
             "not-ready hint must steer to poll-and-retry: {hint}"
+        );
+    }
+
+    /// D3: the E-Sign kill-switch failure is a `CliError::FeatureDisabled`, so
+    /// it renders through the same red `error:` + yellow `hint:` path as every
+    /// other `CliError`. The headline is the message (no
+    /// "Configuration/Authentication error:" prefix), and the hint is the
+    /// re-enable guidance.
+    #[test]
+    fn feature_disabled_renders_message_and_hint_without_prefix() {
+        let cli_err = CliError::FeatureDisabled {
+            message: "E-Sign is currently disabled.",
+            hint: "Set FASTIO_ENABLE_ESIGN=1 to use sign commands (signing must also be enabled for your organization).",
+        };
+        let err = anyhow::Error::from(CliError::FeatureDisabled {
+            message: "E-Sign is currently disabled.",
+            hint: "Set FASTIO_ENABLE_ESIGN=1 to use sign commands (signing must also be enabled for your organization).",
+        });
+        let (headline, hint) = cli_error_render(&err, &cli_err);
+        // The headline is the message verbatim — NO "Configuration error:" /
+        // "Authentication error:" prefix (those come from other variants).
+        assert_eq!(headline, "E-Sign is currently disabled.");
+        assert!(
+            !headline.contains("Configuration error:")
+                && !headline.contains("Authentication error:"),
+            "FeatureDisabled headline must carry no variant prefix: {headline}"
+        );
+        // The hint line is the re-enable guidance.
+        let hint = hint.unwrap_or_default();
+        assert!(
+            hint.contains("FASTIO_ENABLE_ESIGN=1"),
+            "hint must steer to the enable flag: {hint}"
+        );
+    }
+
+    /// D1: the E-Sign gate predicate blocks a `sign` command iff E-Sign is
+    /// disabled, and never blocks a non-sign command — exercised without
+    /// mutating the process environment by passing the flag in and parsing the
+    /// command via clap (sign parses even though it is hidden).
+    #[test]
+    fn sign_gate_blocks_only_sign_when_disabled() {
+        use super::sign_gate_blocks;
+        use crate::cli::Cli;
+        use clap::Parser;
+
+        let sign = Cli::try_parse_from(["fastio", "sign", "envelope", "list", "--workspace", "1"])
+            .expect("sign command parses even though hidden")
+            .command;
+        // Disabled → the sign command is blocked; enabled → it passes.
+        assert!(
+            sign_gate_blocks(&sign, false),
+            "sign must be blocked when E-Sign is disabled"
+        );
+        assert!(
+            !sign_gate_blocks(&sign, true),
+            "sign must pass when E-Sign is enabled"
+        );
+
+        // A non-sign command is never blocked, regardless of the flag.
+        let non_sign = Cli::try_parse_from(["fastio", "org", "list"])
+            .expect("org list parses")
+            .command;
+        assert!(
+            !sign_gate_blocks(&non_sign, false),
+            "non-sign command must never be blocked (E-Sign disabled)"
+        );
+        assert!(
+            !sign_gate_blocks(&non_sign, true),
+            "non-sign command must never be blocked (E-Sign enabled)"
         );
     }
 

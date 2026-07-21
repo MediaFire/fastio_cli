@@ -106,31 +106,6 @@ pub enum CommentCommand {
         /// Comment IDs to delete.
         comment_ids: Vec<String>,
     },
-    /// Link a comment to a workflow entity (task or `workflow_review`).
-    Link {
-        /// Comment ID.
-        comment_id: String,
-        /// Workflow entity type (task or `workflow_review`).
-        entity_type: String,
-        /// Workflow entity ID.
-        entity_id: String,
-    },
-    /// Remove a comment's link to its workflow entity.
-    Unlink {
-        /// Comment ID.
-        comment_id: String,
-    },
-    /// List comments linked to a workflow entity (task or `workflow_review`).
-    Linked {
-        /// Workflow entity type (task or `workflow_review`).
-        entity_type: String,
-        /// Workflow entity ID.
-        entity_id: String,
-        /// Max results.
-        limit: Option<u32>,
-        /// Offset for pagination.
-        offset: Option<u32>,
-    },
     /// List the objects attached to a comment.
     Attachments {
         /// Comment ID.
@@ -257,18 +232,6 @@ pub async fn execute(command: &CommentCommand, ctx: &CommandContext<'_>) -> Resu
         CommentCommand::React { comment_id, emoji } => react(ctx, comment_id, emoji).await,
         CommentCommand::Unreact { comment_id } => unreact(ctx, comment_id).await,
         CommentCommand::BulkDelete { comment_ids } => bulk_delete(ctx, comment_ids).await,
-        CommentCommand::Link {
-            comment_id,
-            entity_type,
-            entity_id,
-        } => link(ctx, comment_id, entity_type, entity_id).await,
-        CommentCommand::Unlink { comment_id } => unlink(ctx, comment_id).await,
-        CommentCommand::Linked {
-            entity_type,
-            entity_id,
-            limit,
-            offset,
-        } => linked(ctx, entity_type, entity_id, *limit, *offset).await,
         CommentCommand::Attachments { comment_id } => attachments(ctx, comment_id).await,
         CommentCommand::Attach {
             comment_id,
@@ -476,47 +439,6 @@ async fn bulk_delete(ctx: &CommandContext<'_>, comment_ids: &[String]) -> Result
     let value = api::comment::bulk_delete_comments(&client, &ids)
         .await
         .context("failed to bulk-delete comments")?;
-    ctx.output.render(&value)?;
-    Ok(())
-}
-
-/// Link a comment to a workflow entity (task or `workflow_review`).
-async fn link(
-    ctx: &CommandContext<'_>,
-    comment_id: &str,
-    entity_type: &str,
-    entity_id: &str,
-) -> Result<()> {
-    let client = ctx.build_client()?;
-    let value = api::comment::link_comment(&client, comment_id, entity_type, entity_id)
-        .await
-        .context("failed to link comment")?;
-    ctx.output.render(&value)?;
-    Ok(())
-}
-
-/// Remove a comment's link to its workflow entity.
-async fn unlink(ctx: &CommandContext<'_>, comment_id: &str) -> Result<()> {
-    let client = ctx.build_client()?;
-    let value = api::comment::unlink_comment(&client, comment_id)
-        .await
-        .context("failed to unlink comment")?;
-    ctx.output.render(&value)?;
-    Ok(())
-}
-
-/// List comments linked to a workflow entity (task or `workflow_review`).
-async fn linked(
-    ctx: &CommandContext<'_>,
-    entity_type: &str,
-    entity_id: &str,
-    limit: Option<u32>,
-    offset: Option<u32>,
-) -> Result<()> {
-    let client = ctx.build_client()?;
-    let value = api::comment::linked_comments(&client, entity_type, entity_id, limit, offset)
-        .await
-        .context("failed to list linked comments")?;
     ctx.output.render(&value)?;
     Ok(())
 }

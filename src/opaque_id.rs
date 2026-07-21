@@ -20,6 +20,12 @@
 //! type-prefix → entity map. It performs no network or disk I/O and is shared by
 //! the `fastio id info` CLI command and the MCP `id` tool.
 //!
+//! **Legacy type codes (retired 2026-07).** The Task (`ta`/`tb`/`tc`) and
+//! workflow-family (`w*`, incl. `wt`) product surfaces were sunset, but their id
+//! codes are kept in the maps below so ids minted before the sunset still decode
+//! (existing datasets and historical payloads remain classifiable). No entries
+//! are removed; the codes are simply legacy.
+//!
 //! ## The §4 contract (load-bearing)
 //!
 //! A length-30 id is classified by its 2-char prefix against a combined map:

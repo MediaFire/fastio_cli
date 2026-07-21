@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use super::CommandContext;
-use super::workflow::{PollAction, classify_poll_error};
+use super::{PollAction, classify_poll_error};
 use fastio_cli::api;
 use fastio_cli::api::ai::{ChatCreateOptions, ChatScope};
 use fastio_cli::error::CliError;

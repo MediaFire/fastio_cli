@@ -33,14 +33,6 @@ pub mod locking;
 pub mod member;
 /// Metadata extraction and template management endpoints.
 pub mod metadata;
-/// Workflow Orchestration (v3.2) durable-runtime endpoints.
-///
-/// Distinct from the Tasks API in [`workflow`]: this surface ships the
-/// workflow profile + runtime, immutable templates, triggers, obligations,
-/// extraction schemas, the signed audit chain, outbound webhook
-/// subscriptions, concurrency pools, external subjects, the realtime-token
-/// mint, and the v3.5b review surface.
-pub mod orchestration;
 /// Organization management endpoints.
 pub mod org;
 /// File preview endpoints.
@@ -61,7 +53,5 @@ pub mod types;
 pub mod upload;
 /// User profile endpoints.
 pub mod user;
-/// Tasks API endpoints (task lists, tasks, comments, attachments).
-pub mod workflow;
 /// Workspace management endpoints.
 pub mod workspace;

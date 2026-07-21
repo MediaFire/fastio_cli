@@ -191,17 +191,16 @@ Pipelines that need machine-parseable output can opt back in with
 |-------|-------------|
 | `share` | Share CRUD, files, members, password auth |
 | `fileshare` | File Shares — durable single-file link shares (replaces the retired QuickShare): create/list/info/update/delete, grants, download/versions/preview, upload write-back, activity, ws-token |
-| `comment` | Comments, replies, reactions, linking |
+| `comment` | Comments, replies, reactions, attachments |
 | `event` | Activity events, search, polling |
 | `preview` | File preview URLs and transforms |
 | `asset` | Org/workspace/user asset management |
 
-### AI & Workflow
+### AI
 
 | Group | Description |
 |-------|-------------|
-| `ai` | Chat, search, history, message management, summarize |
-| `task` | Tasks API: task lists, tasks, assignment, status changes, comments, attachments |
+| `ripley` | Fast.io's delegated AI agent — ask, chat, search, history, message management, summarize (`ai` is a hidden alias) |
 
 ### Platform
 
@@ -220,7 +219,7 @@ The CLI includes a built-in [Model Context Protocol](https://modelcontextprotoco
 fastio mcp
 ```
 
-This exposes all CLI functionality as MCP tools over stdio, compatible with Claude Desktop, VS Code, and other MCP-compatible clients.
+This exposes the CLI's action-routed tool surface as MCP tools over stdio, compatible with Claude Desktop, VS Code, and other MCP-compatible clients. A few high-risk or local-byte operations (sign send/void, fileshare upload write-back and ws-token) remain CLI-only, and the sign tool appears only when E-Sign is enabled.
 
 Tool responses are rendered as GitHub-flavored Markdown by default,
 byte-equivalent to the Fast.io API's `?output=markdown` output.

@@ -897,8 +897,6 @@ pub struct CreateWorkspaceParams<'a> {
     pub intelligence: bool,
     /// Optional workspace description.
     pub description: Option<&'a str>,
-    /// Optional `BooleanString` workflow toggle (`"true"`/`"false"`).
-    pub workflow: Option<bool>,
     /// Optional accent color.
     pub accent_color: Option<&'a str>,
     /// Optional background color 1.
@@ -911,8 +909,8 @@ pub struct CreateWorkspaceParams<'a> {
 ///
 /// `POST /org/{org_id}/create/workspace/` — `org_id` is a URL **path** segment
 /// (not a body field). The required body fields are `folder_name`, `name`,
-/// `perm_join`, `perm_member_manage`, and `intelligence`; `description`,
-/// `workflow`, and the three color fields are optional. (The legacy flat
+/// `perm_join`, `perm_member_manage`, and `intelligence`; `description` and
+/// the three color fields are optional. (The legacy flat
 /// `POST /workspace/create/` route is gone.)
 pub async fn create_workspace(
     client: &ApiClient,
@@ -930,9 +928,6 @@ pub async fn create_workspace(
     form.insert("intelligence".to_owned(), params.intelligence.to_string());
     if let Some(d) = params.description {
         form.insert("description".to_owned(), d.to_owned());
-    }
-    if let Some(w) = params.workflow {
-        form.insert("workflow".to_owned(), w.to_string());
     }
     if let Some(c) = params.accent_color {
         form.insert("accent_color".to_owned(), c.to_owned());

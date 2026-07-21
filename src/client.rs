@@ -2883,7 +2883,7 @@ mod tests {
                 "validation_report": {"ok": false, "fields": ["name"]},
                 "reason": {"type": "fire_conflict", "detail": "already firing"},
                 "documentation_url": "https://docs.fast.io/x",
-                "resource": "workflow:123",
+                "resource": "decision:123",
             },
         });
         let err = ApiClient::extract_error(&body, 409);
@@ -2900,7 +2900,7 @@ mod tests {
         );
         assert_eq!(
             details.get("resource").and_then(Value::as_str),
-            Some("workflow:123"),
+            Some("decision:123"),
         );
     }
 
