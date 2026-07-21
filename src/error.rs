@@ -141,6 +141,28 @@ pub enum CliError {
         hint: Option<&'static str>,
     },
 
+    /// A local CLI feature is currently disabled (e.g. behind a kill-switch /
+    /// feature-flag env var), so the command was refused BEFORE any
+    /// config/auth/network work.
+    ///
+    /// This is a purely CLIENT-side gate — it does NOT wrap a server
+    /// [`ApiError`] (which is why [`CliError::MappedApi`] is the wrong vehicle:
+    /// that variant carries an HTTP status / code from the server). Both the
+    /// `message` and the `hint` are static, caller-supplied strings so the
+    /// variant stays resource-agnostic — the feature-specific wording lives at
+    /// the gate that constructs it (e.g. the E-Sign kill-switch in `main.rs`),
+    /// not here. Rendering flows through the same red `error:` + yellow `hint:`
+    /// path as every other `CliError`, via [`CliError::suggestion`].
+    #[error("{message}")]
+    FeatureDisabled {
+        /// The user-facing headline (e.g. "E-Sign is currently disabled."). A
+        /// static string owned by the gate that constructs the variant.
+        message: &'static str,
+        /// The recovery hint rendered on the yellow `hint:` line (e.g. how to
+        /// re-enable the feature). A static string owned by the gate.
+        hint: &'static str,
+    },
+
     /// A compare-and-swap (optimistic-concurrency) write was rejected because
     /// the target moved on since the version the caller based their change on.
     ///
@@ -179,6 +201,8 @@ impl CliError {
             // inner ApiError's generic status hint; `None` suppresses it entirely.
             Self::MappedApi { hint, .. } => *hint,
             Self::ArtifactNotReady { .. } => Some(HINT_ARTIFACT_NOT_READY),
+            // The gate that constructs the variant owns the recovery hint.
+            Self::FeatureDisabled { hint, .. } => Some(hint),
             Self::InvalidHeaderValue { .. } => Some(HINT_INVALID_HEADER_VALUE),
             Self::VersionConflict { .. } => Some(HINT_VERSION_CONFLICT),
             Self::Http(_) => {

@@ -149,6 +149,17 @@ fn render_chain_dedup(err: &anyhow::Error) -> String {
     out
 }
 
+/// Whether the E-Sign kill-switch should block this command.
+///
+/// Factored out of `run()` so the gate predicate is unit-testable WITHOUT
+/// mutating the process environment (`FASTIO_ENABLE_ESIGN` is process-global and
+/// unsafe to set under Rust 2024): `esign_enabled` is passed in. Blocks iff the
+/// command is a `sign` subcommand AND E-Sign is not enabled; every non-sign
+/// command passes regardless of the flag.
+fn sign_gate_blocks(command: &Commands, esign_enabled: bool) -> bool {
+    matches!(command, Commands::Sign(_)) && !esign_enabled
+}
+
 /// Core logic extracted so we can intercept errors in `main()`.
 async fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -194,11 +205,15 @@ async fn run() -> Result<()> {
     // E-Sign kill-switch (feature sunset 2026-07): gate the sign surface here,
     // BEFORE config/profile resolution, so the disabled error always wins over
     // any config/auth error. Enabled only via `FASTIO_ENABLE_ESIGN=1`; the
-    // platform enforces its own org-level flag server-side as well.
-    if matches!(cli.command, Commands::Sign(_)) && !commands::sign::esign_enabled() {
-        anyhow::bail!(
-            "E-Sign is currently disabled. Set FASTIO_ENABLE_ESIGN=1 to use sign commands (signing must also be enabled for your organization)."
-        );
+    // platform enforces its own org-level flag server-side as well. Returning a
+    // `CliError::FeatureDisabled` (rather than a bare `anyhow::bail!`) routes the
+    // failure through `main`'s red `error:` + yellow `hint:` render.
+    if sign_gate_blocks(&cli.command, commands::sign::esign_enabled()) {
+        return Err(fastio_cli::error::CliError::FeatureDisabled {
+            message: "E-Sign is currently disabled.",
+            hint: "Set FASTIO_ENABLE_ESIGN=1 to use sign commands (signing must also be enabled for your organization).",
+        }
+        .into());
     }
 
     // Load configuration
@@ -2739,6 +2754,75 @@ mod tests {
         assert!(
             hint.to_lowercase().contains("poll") || hint.to_lowercase().contains("not ready"),
             "not-ready hint must steer to poll-and-retry: {hint}"
+        );
+    }
+
+    /// D3: the E-Sign kill-switch failure is a `CliError::FeatureDisabled`, so
+    /// it renders through the same red `error:` + yellow `hint:` path as every
+    /// other `CliError`. The headline is the message (no
+    /// "Configuration/Authentication error:" prefix), and the hint is the
+    /// re-enable guidance.
+    #[test]
+    fn feature_disabled_renders_message_and_hint_without_prefix() {
+        let cli_err = CliError::FeatureDisabled {
+            message: "E-Sign is currently disabled.",
+            hint: "Set FASTIO_ENABLE_ESIGN=1 to use sign commands (signing must also be enabled for your organization).",
+        };
+        let err = anyhow::Error::from(CliError::FeatureDisabled {
+            message: "E-Sign is currently disabled.",
+            hint: "Set FASTIO_ENABLE_ESIGN=1 to use sign commands (signing must also be enabled for your organization).",
+        });
+        let (headline, hint) = cli_error_render(&err, &cli_err);
+        // The headline is the message verbatim — NO "Configuration error:" /
+        // "Authentication error:" prefix (those come from other variants).
+        assert_eq!(headline, "E-Sign is currently disabled.");
+        assert!(
+            !headline.contains("Configuration error:")
+                && !headline.contains("Authentication error:"),
+            "FeatureDisabled headline must carry no variant prefix: {headline}"
+        );
+        // The hint line is the re-enable guidance.
+        let hint = hint.unwrap_or_default();
+        assert!(
+            hint.contains("FASTIO_ENABLE_ESIGN=1"),
+            "hint must steer to the enable flag: {hint}"
+        );
+    }
+
+    /// D1: the E-Sign gate predicate blocks a `sign` command iff E-Sign is
+    /// disabled, and never blocks a non-sign command — exercised without
+    /// mutating the process environment by passing the flag in and parsing the
+    /// command via clap (sign parses even though it is hidden).
+    #[test]
+    fn sign_gate_blocks_only_sign_when_disabled() {
+        use super::sign_gate_blocks;
+        use crate::cli::Cli;
+        use clap::Parser;
+
+        let sign = Cli::try_parse_from(["fastio", "sign", "envelope", "list", "--workspace", "1"])
+            .expect("sign command parses even though hidden")
+            .command;
+        // Disabled → the sign command is blocked; enabled → it passes.
+        assert!(
+            sign_gate_blocks(&sign, false),
+            "sign must be blocked when E-Sign is disabled"
+        );
+        assert!(
+            !sign_gate_blocks(&sign, true),
+            "sign must pass when E-Sign is enabled"
+        );
+
+        // A non-sign command is never blocked, regardless of the flag.
+        let non_sign = Cli::try_parse_from(["fastio", "org", "list"])
+            .expect("org list parses")
+            .command;
+        assert!(
+            !sign_gate_blocks(&non_sign, false),
+            "non-sign command must never be blocked (E-Sign disabled)"
+        );
+        assert!(
+            !sign_gate_blocks(&non_sign, true),
+            "non-sign command must never be blocked (E-Sign enabled)"
         );
     }
 
