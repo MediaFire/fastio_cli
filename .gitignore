@@ -1,0 +1,43 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+# macOS Spotlight indexing marker (load-bearing — ignore, never delete)
+.metadata_never_index
+
+# Tool scratch & caches
+.antigravitycli/
+cache/
+temp/
+
+# Environment
+.env
+.env.local
+
+# Temp
+*.log
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# Development artifacts
+changelogs/
+phases/
+plan.md
+.api-docs/
+.mcp.json
+
+# Local working notes (never published)
+DECISIONS.md
+RESUME.md
+DEFERRED.md

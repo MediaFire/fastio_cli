@@ -1,0 +1,59 @@
+//! API endpoint builders for the Fast.io REST API.
+//!
+//! Each sub-module provides functions that call the HTTP client
+//! and return typed responses for a specific API domain.
+
+/// AI chat and prompt endpoints.
+pub mod ai;
+/// Connected-app management endpoints.
+pub mod apps;
+/// Asset metadata and transformation endpoints.
+pub mod asset;
+/// Authentication and token endpoints.
+pub mod auth;
+/// File and folder comment endpoints.
+pub mod comment;
+/// Per-workspace Dashboard (actionable card feed) endpoints.
+pub mod dashboard;
+/// Download session endpoints.
+pub mod download;
+/// Audit and activity event endpoints.
+pub mod event;
+/// File Share (durable single-file link) management + consumption endpoints.
+pub mod fileshare;
+/// How-To (grounded product-guidance) endpoint.
+pub mod howto;
+/// External storage import endpoints.
+pub mod import;
+/// Agent Intents endpoints — short-lived workspace-scoped "what I am doing" slots.
+pub mod intents;
+/// Workspace invitation endpoints.
+pub mod invitation;
+/// File locking endpoints.
+pub mod locking;
+/// Organization and workspace member endpoints.
+pub mod member;
+/// Metadata extraction, details, and search endpoints.
+pub mod metadata;
+/// Organization management endpoints.
+pub mod org;
+/// File preview endpoints.
+pub mod preview;
+/// Unified (grouped-bucket) search endpoints across a workspace or share.
+pub mod search;
+/// Share link management endpoints.
+pub mod share;
+/// E-signature (SignEnvelope) endpoints (workspace-parented).
+pub mod signing;
+/// Low-level storage node endpoints.
+pub mod storage;
+/// System health and status endpoints.
+pub mod system;
+/// Shared API response and request types.
+pub mod types;
+/// Upload session endpoints.
+pub mod upload;
+/// User profile endpoints.
+pub mod user;
+/// Workspace management endpoints.
+pub mod workspace;

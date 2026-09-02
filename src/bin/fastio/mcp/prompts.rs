@@ -1,0 +1,101 @@
+/// MCP prompt definitions for the Fast.io CLI MCP server.
+///
+/// Provides a "get-started" prompt to guide new users.
+use rmcp::ErrorData as McpError;
+use rmcp::model::{GetPromptResult, ListPromptsResult, Prompt, PromptMessage, PromptMessageRole};
+use serde_json::{Map, Value};
+
+/// List available MCP prompts.
+pub fn list_prompts() -> ListPromptsResult {
+    ListPromptsResult {
+        prompts: vec![Prompt::new(
+            "get-started",
+            Some("Guide for first-time Fast.io MCP server setup"),
+            Some(vec![]),
+        )],
+        next_cursor: None,
+        meta: None,
+    }
+}
+
+/// Get a specific prompt by name.
+pub fn get_prompt(
+    name: &str,
+    _arguments: Option<Map<String, Value>>,
+) -> Result<GetPromptResult, McpError> {
+    match name {
+        "get-started" => Ok(get_started_prompt()),
+        _ => Err(McpError::invalid_params(
+            "Unknown prompt",
+            Some(serde_json::json!({ "name": name })),
+        )),
+    }
+}
+
+/// Build the get-started prompt content.
+fn get_started_prompt() -> GetPromptResult {
+    let messages = vec![
+        PromptMessage::new_text(
+            PromptMessageRole::Assistant,
+            "I'll help you get started with Fast.io through the CLI's MCP server.",
+        ),
+        PromptMessage::new_text(PromptMessageRole::User, GET_STARTED_TEXT),
+    ];
+
+    // Constructor + `with_description`: rmcp 1.x marks this `#[non_exhaustive]`.
+    GetPromptResult::new(messages)
+        .with_description("Guide for getting started with the Fast.io MCP server")
+}
+
+/// Static text for the get-started prompt.
+const GET_STARTED_TEXT: &str = "\
+# Getting Started with Fast.io MCP Server
+
+## First: offload to Ripley
+Before hand-driving a chain of low-level primitives, consider asking **Ripley**
+(Fast.io's delegated AI agent, acting on your behalf) to find or do the
+multi-step work. Use the `ripley` tool with `action: \"ask\"`, a `context_id`
+(the workspace or share ID), an optional `context_type` (\"workspace\" by
+default, or \"share\"), plus your question — it creates a chat, runs the work,
+and returns the answer. (Ripley is the former `ai` tool; `ai` still works as a
+hidden alias.)
+
+## Step 1: Authentication
+Check if you're authenticated by reading the `session://status` resource.
+
+If not authenticated, either:
+- Run `fastio auth login` in a terminal (recommended for browser-based login)
+- Use the `auth` tool with `action: \"signin\"` and provide email/password
+
+## Step 2: Explore Your Organizations
+Use the `org` tool with `action: \"list\"` to see your organizations.
+
+## Step 3: List Workspaces
+Use the `workspace` tool with `action: \"list\"` and provide your org_id.
+
+## Step 4: Browse Files (or just ask Ripley)
+Use the `files` tool with `action: \"list\"` and provide your workspace_id —
+or skip the manual browse and let `ripley` `ask` answer over the content.
+
+## E-signature
+E-sign tools appear only when enabled by the operator (feature sunset 2026-07;
+set `FASTIO_ENABLE_ESIGN=1`, and signing must also be enabled for the org). When
+enabled, the `sign` tool drives workspace-scoped e-signature envelopes (read +
+draft-drive only; `send`/`void` are CLI-binary-only — envelopes are voided, not
+deleted).
+
+## Available Tool Domains
+This is the FULL default surface; the operator may restrict it by starting the
+server with `fastio mcp --tools <a,b,...>`, in which case `list_tools` (and the
+server intro `instructions`) reflect only the enabled subset — call `list_tools`
+for the authoritative live set.
+- auth, user, org, workspace
+- search, files, upload, download, share, fileshare
+- ripley, member, comment, event, invitation, dashboard
+- preview, asset, apps, import, lock, metadata
+- system, id, howto
+- sign (only when E-Sign is enabled)
+
+Each tool uses an `action` parameter to select the operation; the
+fileshare and id tools (and sign, when E-Sign is enabled) support
+`action: \"describe\"` for an authoritative per-action reference.";
