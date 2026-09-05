@@ -839,6 +839,7 @@ fn map_org_command(cmd: cli::OrgCommands) -> OrgCommand {
             perm_join,
             perm_member_manage,
             intelligence,
+            metadata_extraction,
         } => OrgCommand::CreateWorkspace {
             org_id,
             name,
@@ -847,6 +848,7 @@ fn map_org_command(cmd: cli::OrgCommands) -> OrgCommand {
             perm_join,
             perm_member_manage,
             intelligence,
+            metadata_extraction,
         },
     }
 }
@@ -1020,12 +1022,14 @@ fn map_workspace_command(cmd: cli::WorkspaceCommands) -> WorkspaceCommand {
             folder_name,
             description,
             intelligence,
+            metadata_extraction,
         } => WorkspaceCommand::Create {
             org_id: org,
             name,
             folder_name,
             description,
             intelligence,
+            metadata_extraction,
         },
         cli::WorkspaceCommands::Info { workspace_id } => WorkspaceCommand::Info { workspace_id },
         cli::WorkspaceCommands::Update {
@@ -1034,6 +1038,7 @@ fn map_workspace_command(cmd: cli::WorkspaceCommands) -> WorkspaceCommand {
             description,
             folder_name,
             intelligence,
+            metadata_extraction,
             perm_join,
             perm_member_manage,
             accent_color,
@@ -1046,6 +1051,7 @@ fn map_workspace_command(cmd: cli::WorkspaceCommands) -> WorkspaceCommand {
             description,
             folder_name,
             intelligence,
+            metadata_extraction,
             perm_join,
             perm_member_manage,
             accent_color,
@@ -1432,6 +1438,31 @@ fn map_files_command(cmd: cli::FilesCommands) -> FilesCommand {
             workspace,
             share,
             node_id,
+        },
+        cli::FilesCommands::Content {
+            workspace,
+            share,
+            node_id,
+            nodes,
+            query,
+            page,
+            chunk_from,
+            chunk_to,
+            cursor,
+            limit,
+            max_bytes,
+        } => FilesCommand::Content {
+            workspace,
+            share,
+            node_id,
+            nodes,
+            query,
+            page,
+            chunk_from,
+            chunk_to,
+            cursor,
+            limit,
+            max_bytes,
         },
     }
 }
@@ -2736,6 +2767,7 @@ fn map_search_command(cmd: cli::SearchCommands) -> SearchCommand {
             comments_limit,
             comments_offset,
             only,
+            details,
             modes,
         } => SearchCommand::Workspace {
             workspace_id,
@@ -2744,6 +2776,7 @@ fn map_search_command(cmd: cli::SearchCommands) -> SearchCommand {
                 .files(files_offset, files_limit)
                 .metadata(metadata_offset, metadata_limit)
                 .comments(comments_offset, comments_limit)
+                .details(details)
                 .modes(modes.to_params()),
             only,
         },
@@ -2755,13 +2788,18 @@ fn map_search_command(cmd: cli::SearchCommands) -> SearchCommand {
             comments_limit,
             comments_offset,
             only,
+            details,
             modes,
         } => SearchCommand::Share {
             share_id,
             query,
+            // Sent on the share leg too: the parameter is accepted there and
+            // simply never yields facts. Suppressing it client-side would be a
+            // second, divergent rule for a route the server already handles.
             params: UnifiedSearchParams::new()
                 .files(files_offset, files_limit)
                 .comments(comments_offset, comments_limit)
+                .details(details)
                 .modes(modes.to_params()),
             only,
         },

@@ -127,7 +127,7 @@ Each module contains typed functions mapping to Fast.io REST endpoints:
 | `user.rs` | 16 functions | Profile, search, assets, invitations |
 | `org.rs` | 42 functions | CRUD, billing, members, transfer, discovery, assets |
 | `workspace.rs` | 35 functions | CRUD, metadata, notes, archiving |
-| `storage.rs` | 22 functions | File/folder CRUD, versions, locks, search |
+| `storage.rs` | 24 functions | File/folder CRUD, versions, locks, search, extracted-text reads (`/content/` single-file windows and the workspace-only multi-file relevance read) |
 | `upload.rs` | 17 functions | Sessions, chunks, finalize, web import, limits |
 | `download.rs` | 2 functions | Token-based downloads, ZIP |
 | `share.rs` | 16 functions | CRUD, storage, members, password |
@@ -155,7 +155,7 @@ Each module handles one command group, orchestrating API calls and output render
 | `user.rs` | 16 | Profile, search, assets, invitations |
 | `org.rs` | 42 | Full org management with nested billing/members/invitations/transfer/assets |
 | `workspace.rs` | 24 | CRUD, metadata, notes |
-| `files.rs` | 22 | Storage operations, locking |
+| `files.rs` | 23 | Storage operations, locking, `content` (extracted-text chunk reads) |
 | `upload.rs` | 18 | Chunked upload with progress bars, session management |
 | `download.rs` | 3 | Streaming download with progress bars |
 | `share.rs` | 17 | Share management with nested files/members |

@@ -438,6 +438,10 @@ pub enum SearchCommands {
         /// Client-side filter only; the server still searches every bucket.
         #[arg(long)]
         only: Option<String>,
+        /// Add extracted metadata facts to file/note items in the files bucket
+        /// (workspace only; ignored on shares).
+        #[arg(long)]
+        details: bool,
         /// Search-mode flags. These scope the FILES bucket only — the metadata
         /// and comments buckets ignore them.
         #[command(flatten)]
@@ -465,6 +469,10 @@ pub enum SearchCommands {
         /// Client-side filter only; the server still searches every bucket.
         #[arg(long)]
         only: Option<String>,
+        /// Add extracted metadata facts to file/note items in the files bucket
+        /// (workspace only — a share accepts the flag and never returns facts).
+        #[arg(long)]
+        details: bool,
         /// Search-mode flags. These scope the FILES bucket only.
         #[command(flatten)]
         modes: SearchModeArgs,
@@ -2018,6 +2026,13 @@ pub enum OrgCommands {
         /// `false`.
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         intelligence: Option<bool>,
+        /// Automatic metadata extraction for newly uploaded files. An OPT-OUT
+        /// layered under --intelligence: omit to take the platform default,
+        /// which is ON, and pass `--metadata-extraction false` to withhold
+        /// automatic extraction. Explicit per-file extraction requests are
+        /// unaffected.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        metadata_extraction: Option<bool>,
     },
 }
 
@@ -2167,6 +2182,7 @@ impl fmt::Debug for OrgCommands {
                 perm_join,
                 perm_member_manage,
                 intelligence,
+                metadata_extraction,
             } => f
                 .debug_struct("CreateWorkspace")
                 .field("org_id", org_id)
@@ -2176,6 +2192,7 @@ impl fmt::Debug for OrgCommands {
                 .field("perm_join", perm_join)
                 .field("perm_member_manage", perm_member_manage)
                 .field("intelligence", intelligence)
+                .field("metadata_extraction", metadata_extraction)
                 .finish(),
         }
     }
@@ -2480,6 +2497,12 @@ pub enum WorkspaceCommands {
         /// Enable AI intelligence features.
         #[arg(long)]
         intelligence: Option<bool>,
+        /// Automatic metadata extraction for newly uploaded files. An OPT-OUT
+        /// layered under --intelligence: omit to take the platform default,
+        /// which is on, and pass `false` to withhold automatic extraction.
+        /// Explicit per-file extraction requests are unaffected.
+        #[arg(long)]
+        metadata_extraction: Option<bool>,
     },
     /// Get workspace details.
     Info {
@@ -2504,6 +2527,13 @@ pub enum WorkspaceCommands {
         /// embeddings and re-enabling re-indexes (costs AI credits).
         #[arg(long)]
         intelligence: Option<bool>,
+        /// Automatic metadata extraction for newly uploaded files. An OPT-OUT
+        /// layered under --intelligence: it can withhold extraction, never
+        /// enable it where intelligence or the plan does not allow it. Unlike
+        /// --intelligence it deletes nothing and is not rate-limited. Explicit
+        /// per-file extraction requests are unaffected.
+        #[arg(long)]
+        metadata_extraction: Option<bool>,
         /// Who can self-join the workspace (permission phrase).
         #[arg(long)]
         perm_join: Option<String>,
@@ -3158,6 +3188,89 @@ pub enum FilesCommands {
         share: Option<String>,
         /// Node ID.
         node_id: String,
+    },
+    /// Read a file's extracted text as ordered chunks (the text the platform
+    /// indexed for search and AI).
+    ///
+    /// `files read` returns the file's RAW BYTES; this returns the extracted
+    /// TEXT with chunk addresses, so it is the way to read a PDF's words
+    /// rather than its container.
+    ///
+    /// The unit is a chunk, not a page: a chunk can span two pages or split
+    /// one, so --page returns whole chunks that OVERLAP that page and only
+    /// works on formats the response reports as `page_addressable`. A chunk's
+    /// address is its `position`.
+    ///
+    /// Pick at most ONE window: --query (relevance over this file's own
+    /// chunks, full text, no byte budget), --page, or --chunk-from/--chunk-to
+    /// (positions). With none, the read starts at the beginning of the file.
+    /// Walk onwards with --cursor, passing the previous response's
+    /// `next_cursor` verbatim; it is done when that is null.
+    ///
+    /// To locate and quote a passage: run `files search --detail standard`,
+    /// take the hit's `best_chunk.position` P and `best_chunk.indexed_version_id`,
+    /// read it here with `--chunk-from P-1 --chunk-to P+1`, then confirm the
+    /// `indexed_version_id` in this response matches before quoting — if it
+    /// differs the file was re-indexed and the search should be re-run. A hit
+    /// whose `best_chunk.position` is null has no address (transcripts, or a
+    /// passage the index could not resolve): read it with --query instead.
+    ///
+    /// Chunk verbosity follows the global --detail flag: `--detail terse`
+    /// returns the chunk map (positions, page ranges, `chars`) with no text.
+    ///
+    /// `indexed: false` is a normal answer, not a failure: that version has no
+    /// extracted text (yet, or ever).
+    ///
+    /// --nodes scores up to 10 files against one --query in a single request.
+    /// It is WORKSPACE ONLY and its scores are comparable only within one
+    /// file, never across files.
+    Content {
+        /// Workspace ID (omit when targeting a share).
+        #[arg(long, required_unless_present = "share", conflicts_with = "share")]
+        workspace: Option<String>,
+        /// Share ID (alternative storage context to --workspace). Requires
+        /// DOWNLOAD permission on the share, not merely view.
+        #[arg(long)]
+        share: Option<String>,
+        /// Node ID of the single file or note to read. Omit when using --nodes.
+        #[arg(required_unless_present = "nodes", conflicts_with = "nodes")]
+        node_id: Option<String>,
+        /// Score 1-10 files against --query in one request (comma-separated or
+        /// repeated). WORKSPACE ONLY, and --query is required with it.
+        // `value_delimiter` only — deliberately NOT `num_args = 1..`, which
+        // would also accept space-separated values and let this flag swallow
+        // the NODE_ID positional that follows it.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            requires = "query",
+            conflicts_with_all = ["share", "page", "chunk_from", "chunk_to", "cursor"],
+        )]
+        nodes: Option<Vec<String>>,
+        /// Relevance mode: rank this file's own chunks against the query and
+        /// return the best ones with full text and a score (max 512 chars).
+        #[arg(long, conflicts_with_all = ["page", "chunk_from", "chunk_to", "cursor"])]
+        query: Option<String>,
+        /// Return the chunks overlapping this 1-based page (only where the
+        /// response reports `page_addressable`).
+        #[arg(long, conflicts_with_all = ["chunk_from", "chunk_to"])]
+        page: Option<u32>,
+        /// Start of an inclusive `position` range (below 10000).
+        #[arg(long)]
+        chunk_from: Option<u32>,
+        /// End of that inclusive `position` range (requires --chunk-from).
+        #[arg(long, requires = "chunk_from")]
+        chunk_to: Option<u32>,
+        /// Continue a walk: the previous response's `next_cursor`, verbatim.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Chunks per response, 1-20 (per FILE with --nodes).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// UTF-8 byte budget over the returned text, 1024-262144 (per FILE
+        /// with --nodes). Not applied in relevance mode.
+        #[arg(long)]
+        max_bytes: Option<u32>,
     },
 }
 
@@ -8947,5 +9060,318 @@ mod auth_user_secret_debug_tests {
             dbg.contains("v@example.com"),
             "non-secret email must render: {dbg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod content_surface_tests {
+    use super::{Cli, Commands, OrgCommands, SearchCommands, WorkspaceCommands};
+    use clap::Parser;
+
+    /// Helper: parse argv into a [`Cli`], panicking on a parse error with the
+    /// clap message (so the cause is visible).
+    fn cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).unwrap_or_else(|e| panic!("parse failed: {e}"))
+    }
+
+    // ─── `files content` window rules ──────────────────────────────────────
+    //
+    // clap owns WHICH FLAGS may be combined; `ContentReadParams::validate` owns
+    // every VALUE BOUND and is shared with the MCP server. These lock the clap
+    // half, which is the half a bad combination would otherwise reach the wire
+    // through — the api-layer validator never sees a `--page` that clap allowed
+    // beside a `--query`, because the builder can hold only one of each.
+
+    /// The single-file form takes a positional `NODE_ID` and the whole window
+    /// vocabulary, and reaches the parsed variant with each value intact.
+    #[test]
+    fn files_content_parses_a_single_file_range_read() {
+        let parsed = cli(&[
+            "fastio",
+            "files",
+            "content",
+            "--workspace",
+            "123",
+            "node-1",
+            "--chunk-from",
+            "40",
+            "--chunk-to",
+            "42",
+            "--detail",
+            "standard",
+        ]);
+        // Chunk verbosity rides on the GLOBAL --detail flag (there is no
+        // per-command --output; on this CLI that name means an output file).
+        assert_eq!(parsed.detail.as_deref(), Some("standard"));
+        match parsed.command {
+            Commands::Files(super::FilesCommands::Content {
+                workspace,
+                node_id,
+                nodes,
+                chunk_from,
+                chunk_to,
+                ..
+            }) => {
+                assert_eq!(workspace.as_deref(), Some("123"));
+                assert_eq!(node_id.as_deref(), Some("node-1"));
+                assert!(nodes.is_none(), "single-file form must not set nodes");
+                assert_eq!(chunk_from, Some(40));
+                assert_eq!(chunk_to, Some(42));
+            }
+            other => panic!("expected files content, got {other:?}"),
+        }
+    }
+
+    /// `--nodes` accepts the comma-separated spelling AND the repeated one, and
+    /// both land as the same list — the two forms the flag advertises.
+    #[test]
+    fn files_content_nodes_accepts_csv_and_repetition() {
+        for argv in [
+            vec![
+                "fastio",
+                "files",
+                "content",
+                "--workspace",
+                "123",
+                "--nodes",
+                "a,b,c",
+                "--query",
+                "termination clause",
+            ],
+            vec![
+                "fastio",
+                "files",
+                "content",
+                "--workspace",
+                "123",
+                "--nodes",
+                "a",
+                "--nodes",
+                "b",
+                "--nodes",
+                "c",
+                "--query",
+                "termination clause",
+            ],
+        ] {
+            match cli(&argv).command {
+                Commands::Files(super::FilesCommands::Content { nodes, node_id, .. }) => {
+                    assert_eq!(
+                        nodes.as_deref(),
+                        Some(["a".to_owned(), "b".to_owned(), "c".to_owned()].as_slice()),
+                        "argv: {argv:?}"
+                    );
+                    assert!(node_id.is_none(), "argv: {argv:?}");
+                }
+                other => panic!("expected files content, got {other:?}"),
+            }
+        }
+    }
+
+    /// Every combination clap must refuse. Each is a request that would
+    /// otherwise be sent and answered `406` by the server, or — worse for
+    /// `--nodes --share` — sent to a route that does not exist.
+    #[test]
+    fn files_content_refuses_illegal_flag_combinations() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "--nodes without --query",
+                &["--workspace", "123", "--nodes", "a,b"],
+            ),
+            (
+                "--nodes with --share (multi-file is workspace-only)",
+                &["--share", "s1", "--nodes", "a,b", "--query", "x"],
+            ),
+            (
+                "--nodes with a positional NODE_ID",
+                &["--workspace", "123", "n1", "--nodes", "a", "--query", "x"],
+            ),
+            (
+                "--nodes with a single-file window",
+                &[
+                    "--workspace",
+                    "123",
+                    "--nodes",
+                    "a",
+                    "--query",
+                    "x",
+                    "--cursor",
+                    "c",
+                ],
+            ),
+            (
+                "two window selectors (query + page)",
+                &["--workspace", "123", "n1", "--page", "2", "--query", "x"],
+            ),
+            (
+                "two window selectors (query + chunk range)",
+                &[
+                    "--workspace",
+                    "123",
+                    "n1",
+                    "--chunk-from",
+                    "1",
+                    "--query",
+                    "x",
+                ],
+            ),
+            (
+                "two window selectors (page + chunk range)",
+                &[
+                    "--workspace",
+                    "123",
+                    "n1",
+                    "--page",
+                    "2",
+                    "--chunk-from",
+                    "1",
+                ],
+            ),
+            (
+                "cursor with query (relevance is not a walk)",
+                &["--workspace", "123", "n1", "--cursor", "c", "--query", "x"],
+            ),
+            (
+                "--chunk-to without --chunk-from",
+                &["--workspace", "123", "n1", "--chunk-to", "5"],
+            ),
+            ("neither NODE_ID nor --nodes", &["--workspace", "123"]),
+            ("neither --workspace nor --share", &["n1"]),
+            (
+                "both --workspace and --share",
+                &["--workspace", "123", "--share", "s1", "n1"],
+            ),
+            (
+                "a detail value the routes do not accept",
+                &["--workspace", "123", "n1", "--detail", "verbose"],
+            ),
+        ];
+        for (label, tail) in cases {
+            let mut argv = vec!["fastio", "files", "content"];
+            argv.extend_from_slice(tail);
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "clap must reject {label}: {argv:?}"
+            );
+        }
+    }
+
+    /// A NEGATIVE CONTROL for the table above: the shapes it rejects are
+    /// rejected for their combination, not because `files content` refuses
+    /// everything. Each of these is a legal window and must parse.
+    #[test]
+    fn files_content_accepts_each_window_on_its_own() {
+        for tail in [
+            vec!["--workspace", "123", "n1"],
+            vec!["--share", "s1", "n1"],
+            vec!["--workspace", "123", "n1", "--query", "x"],
+            vec!["--workspace", "123", "n1", "--page", "2"],
+            vec![
+                "--workspace",
+                "123",
+                "n1",
+                "--chunk-from",
+                "1",
+                "--chunk-to",
+                "3",
+            ],
+            vec!["--workspace", "123", "n1", "--cursor", "abc"],
+            vec![
+                "--workspace",
+                "123",
+                "n1",
+                "--limit",
+                "5",
+                "--max-bytes",
+                "2048",
+                "--detail",
+                "terse",
+            ],
+        ] {
+            let mut argv = vec!["fastio", "files", "content"];
+            argv.extend_from_slice(&tail);
+            assert!(
+                Cli::try_parse_from(&argv).is_ok(),
+                "clap must accept {argv:?}"
+            );
+        }
+    }
+
+    /// `--details` reaches BOTH unified-search variants. The share leg carries
+    /// it deliberately: the server accepts it there and simply returns no
+    /// facts, so refusing it client-side would be a second, divergent rule.
+    #[test]
+    fn unified_search_details_parses_on_both_targets() {
+        match cli(&["fastio", "search", "workspace", "ws1", "q", "--details"]).command {
+            Commands::Search(SearchCommands::Workspace { details, .. }) => {
+                assert!(details, "--details must reach the workspace variant");
+            }
+            other => panic!("expected search workspace, got {other:?}"),
+        }
+        match cli(&["fastio", "search", "share", "s1", "q", "--details"]).command {
+            Commands::Search(SearchCommands::Share { details, .. }) => {
+                assert!(details, "--details must reach the share variant");
+            }
+            other => panic!("expected search share, got {other:?}"),
+        }
+        // Absent means absent — the flag must not default to on.
+        match cli(&["fastio", "search", "workspace", "ws1", "q"]).command {
+            Commands::Search(SearchCommands::Workspace { details, .. }) => {
+                assert!(!details, "--details must default to off");
+            }
+            other => panic!("expected search workspace, got {other:?}"),
+        }
+    }
+
+    /// `--metadata-extraction` is a THREE-STATE flag on all three surfaces that
+    /// accept it: absent (take the server default of on), `true`, and `false`.
+    /// Absent must stay `None` — an unset opt-out that parsed as `Some(false)`
+    /// would silently turn extraction off for every caller who never asked.
+    #[test]
+    fn metadata_extraction_is_three_state_everywhere() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "workspace create",
+                &["workspace", "create", "n", "--org", "1"],
+            ),
+            ("workspace update", &["workspace", "update", "ws1"]),
+            (
+                "org create-workspace",
+                &["org", "create-workspace", "1", "n"],
+            ),
+        ];
+        for (label, base) in cases {
+            for (arg, expected) in [
+                (None, None),
+                (Some("true"), Some(true)),
+                (Some("false"), Some(false)),
+            ] {
+                let mut argv = vec!["fastio"];
+                argv.extend_from_slice(base);
+                if let Some(v) = arg {
+                    argv.push("--metadata-extraction");
+                    argv.push(v);
+                }
+                let parsed = cli(&argv);
+                let actual = match parsed.command {
+                    Commands::Workspace(
+                        WorkspaceCommands::Create {
+                            metadata_extraction,
+                            ..
+                        }
+                        | WorkspaceCommands::Update {
+                            metadata_extraction,
+                            ..
+                        },
+                    )
+                    | Commands::Org(OrgCommands::CreateWorkspace {
+                        metadata_extraction,
+                        ..
+                    }) => metadata_extraction,
+                    other => panic!("{label}: unexpected command {other:?}"),
+                };
+                assert_eq!(actual, expected, "{label} with {arg:?}");
+            }
+        }
     }
 }

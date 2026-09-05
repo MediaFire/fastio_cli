@@ -37,6 +37,8 @@ pub enum WorkspaceCommand {
         description: Option<String>,
         /// Enable AI intelligence.
         intelligence: Option<bool>,
+        /// Automatic metadata extraction for newly uploaded files (opt-out).
+        metadata_extraction: Option<bool>,
     },
     /// Get workspace details.
     Info {
@@ -55,6 +57,8 @@ pub enum WorkspaceCommand {
         folder_name: Option<String>,
         /// Toggle AI indexing (intelligence).
         intelligence: Option<bool>,
+        /// Toggle automatic metadata extraction (opt-out under intelligence).
+        metadata_extraction: Option<bool>,
         /// Who can self-join the workspace (permission phrase).
         perm_join: Option<String>,
         /// Who can manage members (permission phrase).
@@ -115,6 +119,7 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
             folder_name,
             description,
             intelligence,
+            metadata_extraction,
         } => {
             create(
                 ctx,
@@ -123,6 +128,7 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
                 folder_name.as_deref(),
                 description.as_deref(),
                 *intelligence,
+                *metadata_extraction,
             )
             .await
         }
@@ -133,6 +139,7 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
             description,
             folder_name,
             intelligence,
+            metadata_extraction,
             perm_join,
             perm_member_manage,
             accent_color,
@@ -148,6 +155,7 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
                     description: description.as_deref(),
                     folder_name: folder_name.as_deref(),
                     intelligence: *intelligence,
+                    metadata_extraction: *metadata_extraction,
                     perm_join: perm_join.as_deref(),
                     perm_member_manage: perm_member_manage.as_deref(),
                     accent_color: accent_color.as_deref(),
@@ -198,6 +206,7 @@ async fn create(
     folder_name: Option<&str>,
     description: Option<&str>,
     intelligence: Option<bool>,
+    metadata_extraction: Option<bool>,
 ) -> Result<()> {
     // Use folder_name if provided, otherwise derive from name
     let effective_folder =
@@ -212,6 +221,7 @@ async fn create(
             name,
             description,
             intelligence,
+            metadata_extraction,
         },
     )
     .await
@@ -241,6 +251,8 @@ struct WorkspaceUpdate<'a> {
     folder_name: Option<&'a str>,
     /// AI-indexing (intelligence) toggle.
     intelligence: Option<bool>,
+    /// Automatic metadata-extraction toggle (opt-out under intelligence).
+    metadata_extraction: Option<bool>,
     /// Who can self-join the workspace (permission phrase).
     perm_join: Option<&'a str>,
     /// Who can manage members (permission phrase).
@@ -262,6 +274,7 @@ impl WorkspaceUpdate<'_> {
             && self.description.is_none()
             && self.folder_name.is_none()
             && self.intelligence.is_none()
+            && self.metadata_extraction.is_none()
             && self.perm_join.is_none()
             && self.perm_member_manage.is_none()
             && self.accent_color.is_none()
@@ -290,6 +303,9 @@ fn build_workspace_update_fields(u: &WorkspaceUpdate<'_>) -> HashMap<String, Str
     }
     if let Some(v) = u.intelligence {
         fields.insert("intelligence".to_owned(), v.to_string());
+    }
+    if let Some(v) = u.metadata_extraction {
+        fields.insert("metadata_extraction".to_owned(), v.to_string());
     }
     if let Some(v) = u.perm_join {
         fields.insert("perm_join".to_owned(), v.to_owned());

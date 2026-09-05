@@ -123,7 +123,17 @@ fastio workspace create --org ORG_ID --name "Knowledge Base" --intelligence true
 
 # Toggle AI indexing on an existing workspace
 fastio workspace update WS_ID --intelligence true
+
+# Keep AI indexing but stop extracting metadata from new uploads
+fastio workspace update WS_ID --metadata-extraction false
 ```
+
+`--metadata-extraction` is a separate opt-OUT layered under `intelligence`: it
+can withhold automatic extraction from newly uploaded files, but it can never
+enable extraction where the intelligence setting or the plan does not allow it.
+It defaults to on, it deletes nothing, and explicit per-file extraction requests
+are unaffected. It is accepted on `workspace create`, `workspace update` and
+`org create-workspace`.
 
 
 ## Core Workflows
@@ -139,6 +149,10 @@ fastio files search --workspace WS_ID --limit 25 "query" --format json
 fastio files create-folder --workspace WS_ID --parent NODE_ID --name "My Folder"
 fastio files delete --workspace WS_ID NODE_ID        # → trash
 fastio files purge  --workspace WS_ID NODE_ID        # permanent
+
+# A file's EXTRACTED TEXT (what search and AI indexed), not its raw bytes
+fastio files content --workspace WS_ID NODE_ID --query "termination clause"
+fastio files content --workspace WS_ID NODE_ID --chunk-from 40 --chunk-to 42
 ```
 
 ### Upload / download
@@ -183,7 +197,48 @@ fastio search workspace WS_ID "query" --format json
 fastio search share SHARE_ID "query" --only files,comments
 ```
 
-`fastio files search` remains the targeted file-only search.
+`fastio files search` remains the targeted file-only search. Add `--details` to
+either form to attach extracted metadata facts to file and note hits in the
+files bucket (workspace only; a share accepts the flag and returns no facts).
+
+### Reading a document's text (locate and quote)
+
+`fastio files read` returns a file's raw bytes. `fastio files content` returns
+its **extracted text** as ordered chunks — the same text the platform indexed
+for search and AI — so it is what actually reads a PDF's words. Each chunk
+carries a `position`, which is its address.
+
+To find a passage and quote it accurately:
+
+```bash
+# 1. Locate it. The hit carries best_chunk.position and best_chunk.indexed_version_id.
+fastio files search --workspace WS_ID "termination clause" --detail standard --format json
+
+# 2. Read that passage in context (P-1 .. P+1 around best_chunk.position P).
+fastio files content --workspace WS_ID NODE_ID --chunk-from 39 --chunk-to 41 --format json
+
+# 3. Confirm the response's indexed_version_id MATCHES the search hit's before
+#    quoting. If it differs the file was re-indexed — re-run the search.
+#    A hit whose best_chunk.position is null has no address — use --query
+#    on that file instead of a chunk range.
+```
+
+When `best_chunk.same_as_snippet` is true its `text` is null at
+`--detail terse`/`standard`; read `content_snippet` on the hit instead.
+`--detail terse` on `files content` returns the chunk map with no text.
+
+```bash
+# Score up to 10 candidate files against one question in a single request
+# (workspace only; scores are comparable only within one file, never across files).
+fastio files content --workspace WS_ID --nodes NODE_A,NODE_B,NODE_C --query "renewal terms"
+
+# Walk a whole file: pass the previous response's next_cursor back verbatim,
+# and stop when it is null.
+fastio files content --workspace WS_ID NODE_ID --cursor "NEXT_CURSOR"
+```
+
+`indexed: false` is a normal answer, not a failure — that version has no
+extracted text yet, or carries none at all.
 
 ## E-signature (disabled by default)
 
@@ -335,7 +390,10 @@ fastio mcp
 
 It speaks MCP over stdio and exposes the CLI's operations as action-routed tools
 (`ripley`, `fileshare`, `files`, `org`, `workspace`, … plus `sign` only when
-E-Sign is enabled). Tool results are
+E-Sign is enabled). The `files` tool mirrors the three ways to reach a file's
+words: `read` for raw bytes, `content` for one file's extracted text as
+addressed chunks, and `content-many` to score up to 10 files against one
+question in a single call. Tool results are
 rendered as GitHub-flavored Markdown for compact, high-signal consumption. This
 same guide is available as the `skill://guide` MCP resource and via
 `fastio skill`.

@@ -1174,10 +1174,18 @@ pub async fn lock_release(
 ///
 /// `GET /workspace/{workspace_id}/storage/{node_id}/read/`
 ///
-/// Returns `{ "node_id": <id>, "content": <text> }`. There is no `/content/`
-/// storage route: file bytes come from `/read/` (this fn / [`read_raw`]) and a
-/// note's markdown from `/readnote/` ([`crate::api::workspace::read_note`], used
-/// by `fastio view`).
+/// Returns `{ "node_id": <id>, "content": <text> }`.
+///
+/// Three different routes return "the content" of a node and they are not
+/// interchangeable:
+///
+/// - `/read/` — the file's **raw bytes** as text (this fn / [`read_raw`]).
+/// - `/readnote/` — a Note node's **markdown source**
+///   ([`crate::api::workspace::read_note`], used by `fastio view`).
+/// - `/content/` — the platform's **extracted, chunked text**, the same text it
+///   indexed for search and AI ([`read_content_chunks`], and
+///   [`read_content_many`] across several files). This is the route that reads
+///   a PDF's words; `/read/` would hand back the PDF container.
 pub async fn read_content(
     client: &ApiClient,
     context_type: &str,
@@ -1218,12 +1226,611 @@ pub async fn read_raw(
     client.get_raw_text(&path, params.as_ref()).await
 }
 
+// ─── Extracted text (`/content/`) ────────────────────────────────────────────
+
+/// Maximum length of a `/content/` relevance query (`q`), in Unicode **code
+/// points** — counted with `chars().count()`, never `len()`. The contract
+/// states the bound as "1-512 characters".
+pub const CONTENT_QUERY_MAX_LEN: usize = 512;
+
+/// Exclusive ceiling on a `chunk_from` / `chunk_to` position.
+///
+/// A position at or beyond this cannot be addressed by a range window; a caller
+/// walking a large file continues with `cursor`, which has no such limit.
+pub const CONTENT_POSITION_LIMIT: u32 = 10_000;
+
+/// Smallest accepted `limit` (chunks per response) on the content routes.
+pub const CONTENT_LIMIT_MIN: u32 = 1;
+
+/// Largest accepted `limit` (chunks per response) on the content routes.
+pub const CONTENT_LIMIT_MAX: u32 = 20;
+
+/// Smallest accepted `max_bytes` (UTF-8 byte budget over the emitted text).
+pub const CONTENT_MAX_BYTES_MIN: u32 = 1024;
+
+/// Largest accepted `max_bytes` (UTF-8 byte budget over the emitted text).
+pub const CONTENT_MAX_BYTES_MAX: u32 = 262_144;
+
+/// Accepted `output` verbosity tokens on the content routes.
+///
+/// The published contract also allows composing a `markdown` modifier onto an
+/// `output` value on every storage endpoint (`output=standard,markdown`). That
+/// composition is deliberately NOT expressible here: the CLI and the MCP server
+/// render markdown locally through `crate::output::markdown`, so a server-side
+/// markdown body would bypass the formatters entirely.
+pub const CONTENT_OUTPUT_VALUES: [&str; 3] = ["terse", "standard", "full"];
+
+/// Maximum number of node ids in one multi-file content read (`nodes`).
+pub const CONTENT_MANY_MAX_NODES: usize = 10;
+
+/// Validate a content-route `q` value (1-[`CONTENT_QUERY_MAX_LEN`] characters).
+///
+/// `label` names the parameter in the error message so the single-file route
+/// (where `q` is optional) and the multi-file route (where it is required) can
+/// share one implementation.
+fn validate_content_query(query: &str, label: &str) -> Result<(), CliError> {
+    if query.trim().is_empty() {
+        return Err(CliError::Parse(format!("{label} must not be empty")));
+    }
+    let len = query.chars().count();
+    if len > CONTENT_QUERY_MAX_LEN {
+        return Err(CliError::Parse(format!(
+            "{label} must be at most {CONTENT_QUERY_MAX_LEN} characters (got {len})"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the shared `limit` / `max_bytes` / `output` bounds carried by both
+/// content routes. Extracted so the two parameter structs cannot drift.
+fn validate_content_bounds(
+    limit: Option<u32>,
+    max_bytes: Option<u32>,
+    output: Option<&str>,
+) -> Result<(), CliError> {
+    if let Some(v) = limit
+        && !(CONTENT_LIMIT_MIN..=CONTENT_LIMIT_MAX).contains(&v)
+    {
+        return Err(CliError::Parse(format!(
+            "limit must be between {CONTENT_LIMIT_MIN} and {CONTENT_LIMIT_MAX} (got {v})"
+        )));
+    }
+    if let Some(v) = max_bytes
+        && !(CONTENT_MAX_BYTES_MIN..=CONTENT_MAX_BYTES_MAX).contains(&v)
+    {
+        return Err(CliError::Parse(format!(
+            "max_bytes must be between {CONTENT_MAX_BYTES_MIN} and {CONTENT_MAX_BYTES_MAX} \
+             (got {v})"
+        )));
+    }
+    if let Some(v) = output
+        && !CONTENT_OUTPUT_VALUES.contains(&v)
+    {
+        return Err(CliError::Parse(format!(
+            "output must be one of {} (got `{v}`)",
+            CONTENT_OUTPUT_VALUES.join(", "),
+        )));
+    }
+    Ok(())
+}
+
+/// Parameters for the single-file extracted-text read
+/// (`GET .../storage/{node_id}/content/`).
+///
+/// Every field is optional. At most **one** window selector may be set — `q`,
+/// `page`, or the `chunk_from`/`chunk_to` range — and with none the response
+/// starts at the beginning of the file. [`Self::validate`] enforces that and
+/// every documented bound client-side, so a mistake surfaces as a readable
+/// message instead of a `406`/`1605` from the server.
+///
+/// The unit is a **chunk, not a page**: text is chunked for retrieval and a
+/// chunk can span two pages or split one, so `page` returns the whole chunks
+/// that OVERLAP that page. A chunk's address is its `position`, which is what
+/// `chunk_from`/`chunk_to` select on; `chunk_index` is the legacy spelling of
+/// that idea and is nullable, and `sequence` is a correlation coordinate, not an
+/// address. Read `page_addressable` before sending a `page` — formats with no
+/// pages (spreadsheets, plain text, code, notes) answer an empty `chunks` list.
+///
+/// `cursor` is opaque: pass back the `next_cursor` from the MOST RECENT
+/// response verbatim, never a value built by the caller and never one stored
+/// from an earlier walk. It carries the file version it was issued against, so
+/// a walk can never straddle two versions — if the file is replaced mid-walk
+/// the next call returns an empty `chunks` list with `next_cursor: null`.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct ContentReadParams<'a> {
+    /// `q` — relevance mode. Rank this file's own chunks by keyword match and
+    /// return the best ones, each with full text and a numeric `score`.
+    /// 1-[`CONTENT_QUERY_MAX_LEN`] characters. Cannot be combined with `page`,
+    /// `chunk_from`/`chunk_to`, or `cursor`, and defaults `limit` to 3.
+    pub query: Option<&'a str>,
+    /// `page` — return the chunks whose `[start_page, end_page]` range overlaps
+    /// this 1-based page.
+    pub page: Option<u32>,
+    /// `chunk_from` — start of an inclusive `position` range. Must be below
+    /// [`CONTENT_POSITION_LIMIT`].
+    pub chunk_from: Option<u32>,
+    /// `chunk_to` — end of that inclusive `position` range. Requires
+    /// `chunk_from`, must be greater than or equal to it, and is subject to the
+    /// same ceiling.
+    pub chunk_to: Option<u32>,
+    /// `cursor` — opaque continuation token from the previous response's
+    /// `next_cursor`. Not valid with `q`.
+    pub cursor: Option<&'a str>,
+    /// `limit` — chunks per response
+    /// ([`CONTENT_LIMIT_MIN`]-[`CONTENT_LIMIT_MAX`]; server default 5, or 3 in
+    /// relevance mode).
+    pub limit: Option<u32>,
+    /// `max_bytes` — UTF-8 byte budget over the text in one response, applied in
+    /// the ordered modes only
+    /// ([`CONTENT_MAX_BYTES_MIN`]-[`CONTENT_MAX_BYTES_MAX`]; server default
+    /// 32768). Deliberately not applied in relevance mode, so a hit is never
+    /// silently dropped.
+    pub max_bytes: Option<u32>,
+    /// `output` — one of [`CONTENT_OUTPUT_VALUES`]. `terse` returns the chunk
+    /// map with no `text`.
+    pub output: Option<&'a str>,
+}
+
+impl<'a> ContentReadParams<'a> {
+    /// An empty parameter set (no window selector, server defaults for
+    /// everything). Equivalent to [`Default::default`]; provided so callers in
+    /// other crates can build the `#[non_exhaustive]` struct without
+    /// struct-literal syntax.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set `q` (relevance mode).
+    #[must_use]
+    pub fn query(mut self, v: Option<&'a str>) -> Self {
+        self.query = v;
+        self
+    }
+
+    /// Set `page` (1-based).
+    #[must_use]
+    pub fn page(mut self, v: Option<u32>) -> Self {
+        self.page = v;
+        self
+    }
+
+    /// Set the inclusive `chunk_from`/`chunk_to` `position` range.
+    #[must_use]
+    pub fn chunks(mut self, from: Option<u32>, to: Option<u32>) -> Self {
+        self.chunk_from = from;
+        self.chunk_to = to;
+        self
+    }
+
+    /// Set `cursor` (an opaque `next_cursor` from the most recent response).
+    #[must_use]
+    pub fn cursor(mut self, v: Option<&'a str>) -> Self {
+        self.cursor = v;
+        self
+    }
+
+    /// Set `limit` (chunks per response).
+    #[must_use]
+    pub fn limit(mut self, v: Option<u32>) -> Self {
+        self.limit = v;
+        self
+    }
+
+    /// Set `max_bytes` (UTF-8 byte budget over the emitted text).
+    #[must_use]
+    pub fn max_bytes(mut self, v: Option<u32>) -> Self {
+        self.max_bytes = v;
+        self
+    }
+
+    /// Set `output` (chunk verbosity).
+    #[must_use]
+    pub fn output(mut self, v: Option<&'a str>) -> Self {
+        self.output = v;
+        self
+    }
+
+    /// Reject, client-side, every window combination the server answers with
+    /// `1605 (Invalid Input)` / `406`.
+    ///
+    /// Both the CLI and the MCP server call this before sending, so the message
+    /// text is user-facing and names the offending wire parameters (`q`,
+    /// `page`, `chunk_from`, `chunk_to`, `cursor`, `limit`, `max_bytes`,
+    /// `output`) rather than any one front end's flag spelling.
+    ///
+    /// # Errors
+    /// [`CliError::Parse`] when more than one window selector is set, when `q`
+    /// is combined with `cursor`, when `chunk_to` is given without
+    /// `chunk_from`, when `chunk_from` exceeds `chunk_to`, when either range
+    /// endpoint is at or beyond [`CONTENT_POSITION_LIMIT`], when `page` is `0`,
+    /// or when `q`, `limit`, `max_bytes` or `output` is outside its documented
+    /// bounds.
+    pub fn validate(&self) -> Result<(), CliError> {
+        let mut selectors: Vec<&str> = Vec::new();
+        if self.query.is_some() {
+            selectors.push("q");
+        }
+        if self.page.is_some() {
+            selectors.push("page");
+        }
+        if self.chunk_from.is_some() || self.chunk_to.is_some() {
+            selectors.push("chunk_from/chunk_to");
+        }
+        if selectors.len() > 1 {
+            return Err(CliError::Parse(format!(
+                "at most one content window may be selected, but {} were given — \
+                 choose q (relevance), page, or chunk_from/chunk_to (positions)",
+                selectors.join(" and "),
+            )));
+        }
+        if self.query.is_some() && self.cursor.is_some() {
+            return Err(CliError::Parse(
+                "q cannot be combined with cursor — relevance mode returns one ranked \
+                 page, not a walk"
+                    .to_owned(),
+            ));
+        }
+        if self.chunk_to.is_some() && self.chunk_from.is_none() {
+            return Err(CliError::Parse(
+                "chunk_to requires chunk_from — a range needs both endpoints".to_owned(),
+            ));
+        }
+        if let (Some(from), Some(to)) = (self.chunk_from, self.chunk_to)
+            && from > to
+        {
+            return Err(CliError::Parse(format!(
+                "chunk_from ({from}) must not be greater than chunk_to ({to})"
+            )));
+        }
+        for (name, position) in [("chunk_from", self.chunk_from), ("chunk_to", self.chunk_to)] {
+            if let Some(p) = position
+                && p >= CONTENT_POSITION_LIMIT
+            {
+                return Err(CliError::Parse(format!(
+                    "{name} must be below {CONTENT_POSITION_LIMIT} (got {p}) — continue \
+                     further into a large file with cursor instead"
+                )));
+            }
+        }
+        if let Some(0) = self.page {
+            return Err(CliError::Parse(
+                "page is 1-based and must be at least 1".to_owned(),
+            ));
+        }
+        if let Some(q) = self.query {
+            validate_content_query(q, "q")?;
+        }
+        validate_content_bounds(self.limit, self.max_bytes, self.output)
+    }
+
+    /// Build the query-parameter map. Only the parameters the caller actually
+    /// set are emitted, so the server applies its own documented defaults to
+    /// the rest.
+    fn to_query(&self) -> HashMap<String, String> {
+        let mut params = HashMap::new();
+        if let Some(v) = self.query {
+            params.insert("q".to_owned(), v.to_owned());
+        }
+        if let Some(v) = self.page {
+            params.insert("page".to_owned(), v.to_string());
+        }
+        if let Some(v) = self.chunk_from {
+            params.insert("chunk_from".to_owned(), v.to_string());
+        }
+        if let Some(v) = self.chunk_to {
+            params.insert("chunk_to".to_owned(), v.to_string());
+        }
+        if let Some(v) = self.cursor {
+            params.insert("cursor".to_owned(), v.to_owned());
+        }
+        if let Some(v) = self.limit {
+            params.insert("limit".to_owned(), v.to_string());
+        }
+        if let Some(v) = self.max_bytes {
+            params.insert("max_bytes".to_owned(), v.to_string());
+        }
+        if let Some(v) = self.output {
+            params.insert("output".to_owned(), v.to_owned());
+        }
+        params
+    }
+}
+
+/// Read a file's or note's **extracted text** as ordered chunks.
+///
+/// `GET /workspace/{workspace_id}/storage/{node_id}/content/`
+/// `GET /share/{share_id}/storage/{node_id}/content/`
+///
+/// This is the same text the platform already extracted and indexed for search
+/// and AI, which makes it the route that lets a caller actually read a PDF's
+/// words — [`read_raw`] hands back the raw bytes and search returns only a
+/// snippet. `context_type` is `"workspace"` or `"share"`, matching
+/// [`read_content`] and [`list_files`].
+///
+/// Returns the response object verbatim after the envelope unwrap: `node_id`,
+/// `name`, `mimetype`, `indexed`, `complete`, `indexed_version_id`,
+/// `page_addressable`, `num_pages`, `total_chunks`, `chunks[]` (`position`,
+/// `sequence`, `chunk_index`, `start_page`, `end_page`, `chars`, `score`,
+/// `text`), `next_cursor` and `truncated`.
+///
+/// **`indexed: false` is a normal `200`, not an error** — the version has no
+/// text in the index (never processed, still queued, or a format carrying no
+/// extractable text). It is always a statement about the file and never about
+/// the platform, because a failure to read the index is a `500`.
+///
+/// **Auth.** View permission on the workspace. The share path requires
+/// **download**, not view — extracted text is the interior of the file, so a
+/// guest who may not fetch the bytes may not read the text either.
+///
+/// Error codes (see the published API docs at
+/// `https://api.fast.io/current/llms/full/`):
+///
+/// | class | HTTP | condition |
+/// |-------|------|-----------|
+/// | `1609 (Not Found)` | 404 | node not found, or it is in the trash |
+/// | `1605 (Invalid Input)` | 406 | node is a folder or a link — only files and notes carry text |
+/// | `1605 (Invalid Input)` | 406 | window parameters conflict or are out of range (pre-empted by [`ContentReadParams::validate`], except for a stale or out-of-range `cursor`, which only the server can judge) |
+/// | `1680 (Access Denied)` | 401 | share caller has no download permission, or the file is virus-flagged |
+/// | `1652 (Resource Not Found)` | 404 | the file's content is no longer available |
+/// | `1654 (Internal Error)` | 500 | content temporarily unavailable — **retry**; never treat this as "the file has no text" |
+///
+/// Those classes are HTTP-status classes, not `error.code` values (the same
+/// distinction called out on [`search_files_share`]).
+pub async fn read_content_chunks(
+    client: &ApiClient,
+    context_type: &str,
+    profile_id: &str,
+    node_id: &str,
+    params: &ContentReadParams<'_>,
+) -> Result<Value, CliError> {
+    params.validate()?;
+    let query = params.to_query();
+    let path = format!(
+        "/{}/{}/storage/{}/content/",
+        urlencoding::encode(context_type),
+        urlencoding::encode(profile_id),
+        urlencoding::encode(node_id),
+    );
+    client.get_with_params(&path, &query).await
+}
+
+/// Parameters for the multi-file content read
+/// (`GET /workspace/{workspace_id}/storage/content/`).
+///
+/// `nodes` and `query` are both **required** by the route; `limit`, `max_bytes`
+/// and `output` fall back to the server's documented defaults when unset.
+/// Blank `nodes` segments are dropped before the request is built (the server
+/// ignores them too) and duplicates are de-duplicated server-side.
+///
+/// There is no `page`, `chunk_from`/`chunk_to` or `cursor` here: those address a
+/// walk through ONE file, which [`read_content_chunks`] already serves. Follow a
+/// passage found here by calling that route with the `position` this one
+/// returned.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ContentManyParams {
+    /// `nodes` — 1-[`CONTENT_MANY_MAX_NODES`] node ids, sent comma-joined. Both
+    /// spellings are accepted, with or without hyphens.
+    pub nodes: Vec<String>,
+    /// `q` — the query every file is scored against.
+    /// 1-[`CONTENT_QUERY_MAX_LEN`] characters. Required: this route publishes no
+    /// other way to select text.
+    pub query: String,
+    /// `limit` — chunks returned **per file**
+    /// ([`CONTENT_LIMIT_MIN`]-[`CONTENT_LIMIT_MAX`]; server default 3).
+    pub limit: Option<u32>,
+    /// `max_bytes` — UTF-8 byte budget spent **per file**, not shared across the
+    /// request ([`CONTENT_MAX_BYTES_MIN`]-[`CONTENT_MAX_BYTES_MAX`]; server
+    /// default 32768). Ten files at the maximum is a deliberate opt-in to
+    /// roughly 2.5 MiB of text.
+    pub max_bytes: Option<u32>,
+    /// `output` — one of [`CONTENT_OUTPUT_VALUES`].
+    pub output: Option<String>,
+}
+
+impl ContentManyParams {
+    /// A parameter set naming the files to score and the query to score them
+    /// against. Blank ids are dropped when the request is built.
+    #[must_use]
+    pub fn new(nodes: Vec<String>, query: impl Into<String>) -> Self {
+        Self {
+            nodes,
+            query: query.into(),
+            limit: None,
+            max_bytes: None,
+            output: None,
+        }
+    }
+
+    /// Set `limit` (chunks per file).
+    #[must_use]
+    pub fn limit(mut self, v: Option<u32>) -> Self {
+        self.limit = v;
+        self
+    }
+
+    /// Set `max_bytes` (per-file UTF-8 byte budget).
+    #[must_use]
+    pub fn max_bytes(mut self, v: Option<u32>) -> Self {
+        self.max_bytes = v;
+        self
+    }
+
+    /// Set `output` (chunk verbosity).
+    #[must_use]
+    pub fn output(mut self, v: Option<&str>) -> Self {
+        self.output = v.map(str::to_owned);
+        self
+    }
+
+    /// The node ids actually sent: trimmed, with blank segments dropped.
+    ///
+    /// One function so [`Self::validate`] counts exactly what
+    /// [`Self::to_query`] emits — a count taken from the raw `Vec` would accept
+    /// eleven ids when one of them is blank, or refuse a list of one real id
+    /// beside a stray comma.
+    fn effective_nodes(&self) -> Vec<&str> {
+        self.nodes
+            .iter()
+            .map(|n| n.trim())
+            .filter(|n| !n.is_empty())
+            .collect()
+    }
+
+    /// Reject, client-side, the inputs the server answers with
+    /// `1605 (Invalid Input)` / `406`.
+    ///
+    /// # Errors
+    /// [`CliError::Parse`] when `nodes` names no ids after blanks are dropped or
+    /// more than [`CONTENT_MANY_MAX_NODES`] of them, or when `q`, `limit`,
+    /// `max_bytes` or `output` is outside its documented bounds. A malformed
+    /// (but non-blank) id is left to the server, which owns the id grammar.
+    pub fn validate(&self) -> Result<(), CliError> {
+        let nodes = self.effective_nodes();
+        if nodes.is_empty() {
+            return Err(CliError::Parse(
+                "nodes must name at least one file id".to_owned(),
+            ));
+        }
+        if nodes.len() > CONTENT_MANY_MAX_NODES {
+            return Err(CliError::Parse(format!(
+                "nodes must name at most {CONTENT_MANY_MAX_NODES} file ids (got {})",
+                nodes.len(),
+            )));
+        }
+        validate_content_query(&self.query, "q")?;
+        validate_content_bounds(self.limit, self.max_bytes, self.output.as_deref())
+    }
+
+    /// Build the query-parameter map, joining `nodes` into the single
+    /// comma-separated value the route expects.
+    fn to_query(&self) -> HashMap<String, String> {
+        let mut params = HashMap::new();
+        params.insert("nodes".to_owned(), self.effective_nodes().join(","));
+        params.insert("q".to_owned(), self.query.clone());
+        if let Some(v) = self.limit {
+            params.insert("limit".to_owned(), v.to_string());
+        }
+        if let Some(v) = self.max_bytes {
+            params.insert("max_bytes".to_owned(), v.to_string());
+        }
+        if let Some(v) = &self.output {
+            params.insert("output".to_owned(), v.clone());
+        }
+        params
+    }
+}
+
+/// Score several named files against one query and return the passages that
+/// answered it.
+///
+/// `GET /workspace/{workspace_id}/storage/content/?nodes=<csv>&q=…`
+///
+/// The relevance mode of [`read_content_chunks`] asked of up to
+/// [`CONTENT_MANY_MAX_NODES`] files at once, so a caller assembling context for
+/// a prompt makes one request instead of ten. The chunk objects are identical to
+/// that route's, field for field, and a `position` returned here can be sent
+/// straight back to it as `chunk_from`.
+///
+/// **Workspace only — there is no share form of this route.** The file ids
+/// travel in the `nodes` query parameter rather than the path, so this endpoint
+/// sits beside `search/` rather than under a `{node_id}`.
+///
+/// **Each file is scored against itself.** Scores are comparable only WITHIN one
+/// file's chunk list; do not merge the per-file lists and re-sort them by
+/// `score`.
+///
+/// Returns the response object verbatim: `q`, `limit`, `nodes` (an **object**
+/// keyed by hyphenated node id, in the order the ids were named — it is never
+/// normalized into an array here, so a caller can key straight into it) and
+/// `missing[]` (`{id, reason}` with `reason` one of `not_found`, `trashed`,
+/// `not_text`). `complete` and `next_cursor` are deliberately not published on
+/// this route; ask [`read_content_chunks`] when you need them.
+///
+/// Error codes (see the published API docs at
+/// `https://api.fast.io/current/llms/full/`):
+///
+/// | class | HTTP | condition |
+/// |-------|------|-----------|
+/// | `1605 (Invalid Input)` | 406 | `nodes` names no ids, more than [`CONTENT_MANY_MAX_NODES`], or a malformed id; `q` missing, empty or too long; `limit` or `max_bytes` out of bounds |
+/// | `1654 (Internal Error)` | 500 | content temporarily unavailable — **retry**; never treat this as "these files have no matching text" |
+/// | `1654 (Internal Error)` | 500 | a named node could not be retrieved — the WHOLE request fails; such a node is never reported in `missing` |
+///
+/// An empty `chunks` list therefore always means those files hold nothing
+/// matching the query, and never that the platform could not look.
+pub async fn read_content_many(
+    client: &ApiClient,
+    workspace_id: &str,
+    params: &ContentManyParams,
+) -> Result<Value, CliError> {
+    params.validate()?;
+    let query = params.to_query();
+    let path = format!(
+        "/workspace/{}/storage/content/",
+        urlencoding::encode(workspace_id),
+    );
+    client.get_with_params(&path, &query).await
+}
+
+/// Flatten a multi-file read response into one row per returned chunk.
+///
+/// The [`read_content_many`] envelope is `{q, limit, nodes: {<id>: {...}},
+/// missing: [...]}`. The single-payload renderers (`--format table|csv`) pick
+/// ONE array out of a response, and with that key set they land on `missing`
+/// — showing the ids that could not be read while silently dropping every
+/// chunk that was. Callers rendering a table therefore pass these rows
+/// instead of the envelope (JSON and markdown keep the envelope untouched).
+///
+/// Each row carries the file it came from (`node_id`, `name`,
+/// `indexed_version_id`) beside the chunk's own fields, in the order the
+/// files were named and the chunks were returned (`score` descending within
+/// a file). Scores are only comparable WITHIN one file, so the rows are
+/// deliberately not re-sorted across files. Files that matched nothing
+/// contribute no rows; the `missing` list is not folded in — report it
+/// separately.
+#[must_use]
+pub fn content_many_chunk_rows(value: &Value) -> Vec<Value> {
+    let Some(nodes) = value.get("nodes").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for (node_id, file) in nodes {
+        let Some(chunks) = file.get("chunks").and_then(Value::as_array) else {
+            continue;
+        };
+        for chunk in chunks {
+            let mut row = serde_json::Map::new();
+            row.insert("node_id".to_owned(), Value::String(node_id.clone()));
+            for key in ["name", "indexed_version_id"] {
+                row.insert(
+                    key.to_owned(),
+                    file.get(key).cloned().unwrap_or(Value::Null),
+                );
+            }
+            if let Some(fields) = chunk.as_object() {
+                for (k, v) in fields {
+                    row.insert(k.clone(), v.clone());
+                }
+            }
+            rows.push(Value::Object(row));
+        }
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         BULK_DETAILS_MAX_IDS, BulkDetailsResponse, SearchFilesParams, add_file_form,
         create_folder_form, lock_acquire_form, metadata_filter_block, normalize_search_response,
         parse_bulk_details_response, recent_query, sanitize_terminal_string, update_node_form,
+    };
+    use super::{
+        CONTENT_LIMIT_MAX, CONTENT_LIMIT_MIN, CONTENT_MANY_MAX_NODES, CONTENT_MAX_BYTES_MAX,
+        CONTENT_MAX_BYTES_MIN, CONTENT_OUTPUT_VALUES, CONTENT_POSITION_LIMIT,
+        CONTENT_QUERY_MAX_LEN, ContentManyParams, ContentReadParams, content_many_chunk_rows,
     };
     use crate::error::CliError;
     use crate::output::flatten_response;
@@ -1753,5 +2360,409 @@ mod tests {
     #[test]
     fn bulk_details_max_ids_matches_server_cap() {
         assert_eq!(BULK_DETAILS_MAX_IDS, 25);
+    }
+
+    // ─── content routes: client-side window validation ──────────────────────
+
+    /// The empty parameter set is the "read from the beginning" call and must
+    /// stay valid — every field is optional on this route.
+    #[test]
+    fn content_read_accepts_no_selector() {
+        assert!(ContentReadParams::new().validate().is_ok());
+        assert!(ContentReadParams::new().to_query().is_empty());
+    }
+
+    #[test]
+    fn content_read_accepts_each_single_selector() {
+        assert!(
+            ContentReadParams::new()
+                .query(Some("retention"))
+                .validate()
+                .is_ok()
+        );
+        assert!(ContentReadParams::new().page(Some(2)).validate().is_ok());
+        assert!(
+            ContentReadParams::new()
+                .chunks(Some(0), None)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            ContentReadParams::new()
+                .chunks(Some(4), Some(9))
+                .validate()
+                .is_ok()
+        );
+        // A range and an equal endpoint pair are both single windows.
+        assert!(
+            ContentReadParams::new()
+                .chunks(Some(7), Some(7))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    /// `cursor` is a continuation, not a selector: it composes with the ordered
+    /// windows and only conflicts with `q`.
+    #[test]
+    fn content_read_cursor_composes_with_ordered_windows() {
+        assert!(
+            ContentReadParams::new()
+                .cursor(Some("tok"))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            ContentReadParams::new()
+                .chunks(Some(0), Some(20))
+                .cursor(Some("tok"))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            ContentReadParams::new()
+                .page(Some(3))
+                .cursor(Some("tok"))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn content_read_rejects_two_selectors_and_names_them() {
+        let err = ContentReadParams::new()
+            .query(Some("clause"))
+            .page(Some(2))
+            .validate()
+            .expect_err("q and page are two windows");
+        let msg = err.to_string();
+        assert!(msg.contains('q') && msg.contains("page"), "{msg}");
+
+        assert!(
+            ContentReadParams::new()
+                .query(Some("clause"))
+                .chunks(Some(1), Some(2))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            ContentReadParams::new()
+                .page(Some(1))
+                .chunks(Some(1), None)
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn content_read_rejects_query_with_cursor() {
+        let err = ContentReadParams::new()
+            .query(Some("clause"))
+            .cursor(Some("tok"))
+            .validate()
+            .expect_err("relevance mode is not a walk");
+        let msg = err.to_string();
+        assert!(msg.contains('q') && msg.contains("cursor"), "{msg}");
+    }
+
+    #[test]
+    fn content_read_rejects_chunk_to_without_chunk_from() {
+        let err = ContentReadParams::new()
+            .chunks(None, Some(5))
+            .validate()
+            .expect_err("a range needs both endpoints");
+        assert!(err.to_string().contains("chunk_from"), "{err}");
+    }
+
+    #[test]
+    fn content_read_rejects_inverted_range() {
+        let err = ContentReadParams::new()
+            .chunks(Some(9), Some(4))
+            .validate()
+            .expect_err("chunk_from must not exceed chunk_to");
+        let msg = err.to_string();
+        assert!(msg.contains('9') && msg.contains('4'), "{msg}");
+    }
+
+    /// The ceiling is EXCLUSIVE — position 9999 is addressable, 10000 is not.
+    #[test]
+    fn content_read_rejects_positions_at_or_beyond_the_ceiling() {
+        assert_eq!(CONTENT_POSITION_LIMIT, 10_000);
+        assert!(
+            ContentReadParams::new()
+                .chunks(Some(CONTENT_POSITION_LIMIT - 1), None)
+                .validate()
+                .is_ok()
+        );
+        for params in [
+            ContentReadParams::new().chunks(Some(CONTENT_POSITION_LIMIT), None),
+            ContentReadParams::new().chunks(Some(0), Some(CONTENT_POSITION_LIMIT)),
+            ContentReadParams::new().chunks(Some(50_000), None),
+        ] {
+            let err = params.validate().expect_err("position at/over the ceiling");
+            assert!(err.to_string().contains("cursor"), "{err}");
+        }
+    }
+
+    #[test]
+    fn content_read_rejects_page_zero() {
+        assert!(ContentReadParams::new().page(Some(0)).validate().is_err());
+        assert!(ContentReadParams::new().page(Some(1)).validate().is_ok());
+    }
+
+    #[test]
+    fn content_read_enforces_query_length_bounds() {
+        assert!(ContentReadParams::new().query(Some("")).validate().is_err());
+        assert!(
+            ContentReadParams::new()
+                .query(Some("   "))
+                .validate()
+                .is_err()
+        );
+        let max = "x".repeat(CONTENT_QUERY_MAX_LEN);
+        assert!(
+            ContentReadParams::new()
+                .query(Some(&max))
+                .validate()
+                .is_ok()
+        );
+        let over = "x".repeat(CONTENT_QUERY_MAX_LEN + 1);
+        assert!(
+            ContentReadParams::new()
+                .query(Some(&over))
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn content_read_enforces_limit_and_max_bytes_bounds() {
+        assert!(ContentReadParams::new().limit(Some(0)).validate().is_err());
+        assert!(ContentReadParams::new().limit(Some(21)).validate().is_err());
+        assert!(
+            ContentReadParams::new()
+                .limit(Some(CONTENT_LIMIT_MIN))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            ContentReadParams::new()
+                .limit(Some(CONTENT_LIMIT_MAX))
+                .validate()
+                .is_ok()
+        );
+
+        assert!(
+            ContentReadParams::new()
+                .max_bytes(Some(CONTENT_MAX_BYTES_MIN - 1))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            ContentReadParams::new()
+                .max_bytes(Some(CONTENT_MAX_BYTES_MAX + 1))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            ContentReadParams::new()
+                .max_bytes(Some(CONTENT_MAX_BYTES_MIN))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            ContentReadParams::new()
+                .max_bytes(Some(CONTENT_MAX_BYTES_MAX))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn content_read_enforces_output_vocabulary() {
+        for ok in CONTENT_OUTPUT_VALUES {
+            assert!(
+                ContentReadParams::new().output(Some(ok)).validate().is_ok(),
+                "{ok} must be accepted"
+            );
+        }
+        for bad in ["verbose", "Full", "standard,markdown", ""] {
+            assert!(
+                ContentReadParams::new()
+                    .output(Some(bad))
+                    .validate()
+                    .is_err(),
+                "`{bad}` must be rejected"
+            );
+        }
+    }
+
+    /// Only the parameters the caller set may reach the wire — the server owns
+    /// the defaults, and sending our own would freeze them into the client.
+    #[test]
+    fn content_read_query_emits_only_what_was_set() {
+        let q = ContentReadParams::new()
+            .chunks(Some(4), Some(9))
+            .limit(Some(20))
+            .output(Some("terse"))
+            .to_query();
+        assert_eq!(q.get("chunk_from").map(String::as_str), Some("4"));
+        assert_eq!(q.get("chunk_to").map(String::as_str), Some("9"));
+        assert_eq!(q.get("limit").map(String::as_str), Some("20"));
+        assert_eq!(q.get("output").map(String::as_str), Some("terse"));
+        for absent in ["q", "page", "cursor", "max_bytes"] {
+            assert!(!q.contains_key(absent), "{absent} must be absent: {q:?}");
+        }
+
+        // The relevance query travels as `q`, never as `search` or `query`.
+        let q = ContentReadParams::new().query(Some("retention")).to_query();
+        assert_eq!(q.get("q").map(String::as_str), Some("retention"));
+        assert_eq!(q.len(), 1, "{q:?}");
+    }
+
+    // ─── content routes: multi-file parameters ──────────────────────────────
+
+    fn many(ids: &[&str]) -> ContentManyParams {
+        ContentManyParams::new(ids.iter().map(|s| (*s).to_owned()).collect(), "retention")
+    }
+
+    #[test]
+    fn content_many_rejects_no_ids() {
+        assert!(many(&[]).validate().is_err());
+        // Only blanks is the same thing as none. (A literal `,` INSIDE an id
+        // is not split here — `nodes` is a `Vec` of ids, so the caller names
+        // one id per element and the server owns the id grammar.)
+        let err = many(&["", "  ", "\t"])
+            .validate()
+            .expect_err("blank-only nodes name nothing");
+        assert!(err.to_string().contains("nodes"), "{err}");
+    }
+
+    #[test]
+    fn content_many_enforces_the_node_cap() {
+        assert_eq!(CONTENT_MANY_MAX_NODES, 10);
+        let ten: Vec<String> = (0..CONTENT_MANY_MAX_NODES)
+            .map(|i| format!("id{i}"))
+            .collect();
+        assert!(ContentManyParams::new(ten.clone(), "q").validate().is_ok());
+
+        let mut eleven = ten;
+        eleven.push("one-too-many".to_owned());
+        let err = ContentManyParams::new(eleven, "q")
+            .validate()
+            .expect_err("eleven ids exceed the cap");
+        assert!(err.to_string().contains("10"), "{err}");
+    }
+
+    /// Blanks are dropped BEFORE the cap is counted, so a stray comma neither
+    /// pushes a legal list over the limit nor rescues an over-long one.
+    #[test]
+    fn content_many_drops_blank_segments_before_counting() {
+        let p = many(&["a", "", "  ", "b"]);
+        assert!(p.validate().is_ok());
+        assert_eq!(p.to_query().get("nodes").map(String::as_str), Some("a,b"));
+
+        let mut with_blanks: Vec<String> = (0..CONTENT_MANY_MAX_NODES)
+            .map(|i| format!("id{i}"))
+            .collect();
+        with_blanks.push(String::new());
+        assert!(
+            ContentManyParams::new(with_blanks, "q").validate().is_ok(),
+            "a blank must not count toward the cap"
+        );
+    }
+
+    #[test]
+    fn content_many_enforces_query_bounds() {
+        assert!(
+            ContentManyParams::new(vec!["a".to_owned()], "")
+                .validate()
+                .is_err()
+        );
+        assert!(
+            ContentManyParams::new(vec!["a".to_owned()], "   ")
+                .validate()
+                .is_err()
+        );
+        let over = "x".repeat(CONTENT_QUERY_MAX_LEN + 1);
+        assert!(
+            ContentManyParams::new(vec!["a".to_owned()], over)
+                .validate()
+                .is_err()
+        );
+        let max = "x".repeat(CONTENT_QUERY_MAX_LEN);
+        assert!(
+            ContentManyParams::new(vec!["a".to_owned()], max)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn content_many_shares_the_single_file_bounds() {
+        assert!(many(&["a"]).limit(Some(21)).validate().is_err());
+        assert!(many(&["a"]).max_bytes(Some(512)).validate().is_err());
+        assert!(many(&["a"]).output(Some("brief")).validate().is_err());
+        assert!(
+            many(&["a"])
+                .limit(Some(3))
+                .max_bytes(Some(CONTENT_MAX_BYTES_MAX))
+                .output(Some("full"))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn content_many_query_joins_nodes_and_carries_q() {
+        let q = many(&["abc", "def-ghi"]).limit(Some(3)).to_query();
+        assert_eq!(q.get("nodes").map(String::as_str), Some("abc,def-ghi"));
+        assert_eq!(q.get("q").map(String::as_str), Some("retention"));
+        assert_eq!(q.get("limit").map(String::as_str), Some("3"));
+        assert!(!q.contains_key("max_bytes"));
+        assert!(!q.contains_key("output"));
+    }
+
+    #[test]
+    fn content_many_chunk_rows_keeps_every_file_and_skips_missing() {
+        let value = json!({
+            "q": "retention",
+            "limit": 3,
+            "nodes": {
+                "aaaaa-bbbbb": {
+                    "name": "MSA.pdf",
+                    "indexed_version_id": "v1",
+                    "chunks": [
+                        {"position": 4, "score": 7.25, "text": "record retention"},
+                        {"position": 9, "score": 1.5, "text": "later"}
+                    ],
+                    "truncated": false
+                },
+                "ccccc-ddddd": {
+                    "name": "empty.txt",
+                    "indexed_version_id": null,
+                    "chunks": [],
+                    "truncated": false
+                }
+            },
+            "missing": [{"id": "eeeee-fffff", "reason": "trashed"}]
+        });
+        let rows = content_many_chunk_rows(&value);
+        assert_eq!(rows.len(), 2, "one row per chunk, none for the empty file");
+        assert_eq!(rows[0]["node_id"], "aaaaa-bbbbb");
+        assert_eq!(rows[0]["name"], "MSA.pdf");
+        assert_eq!(rows[0]["indexed_version_id"], "v1");
+        assert_eq!(rows[0]["position"], 4);
+        assert_eq!(rows[1]["position"], 9);
+        assert!(rows.iter().all(|r| r.get("missing").is_none()));
+
+        // The flattener would have chosen `missing` over `nodes`, which is
+        // exactly why the rows exist.
+        let flattened = flatten_response(&value);
+        assert!(flattened.as_array().is_some_and(|a| a.len() == 1));
+        assert_eq!(flattened[0]["reason"], "trashed");
+
+        assert!(content_many_chunk_rows(&json!({"nodes": {}})).is_empty());
+        assert!(content_many_chunk_rows(&json!([])).is_empty());
     }
 }

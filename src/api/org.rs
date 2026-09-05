@@ -917,6 +917,13 @@ pub struct CreateWorkspaceParams<'a> {
     ///
     /// `None` omits the field, which the server reads as `true`.
     pub intelligence: Option<bool>,
+    /// Automatic metadata extraction for newly uploaded files, sent as the
+    /// `BooleanString` `"true"`/`"false"`.
+    ///
+    /// `None` omits the field, which the server reads as `true` — an opt-OUT
+    /// layered under `intelligence` and the plan, exactly like its twin on
+    /// [`crate::api::workspace::CreateWorkspaceParams`].
+    pub metadata_extraction: Option<bool>,
     /// Optional workspace description.
     pub description: Option<&'a str>,
     /// Optional accent color.
@@ -943,6 +950,9 @@ fn build_create_workspace_form(params: &CreateWorkspaceParams<'_>) -> HashMap<St
     );
     if let Some(v) = params.intelligence {
         form.insert("intelligence".to_owned(), v.to_string());
+    }
+    if let Some(v) = params.metadata_extraction {
+        form.insert("metadata_extraction".to_owned(), v.to_string());
     }
     if let Some(d) = params.description {
         form.insert("description".to_owned(), d.to_owned());
@@ -995,6 +1005,7 @@ mod tests {
             perm_join: "Member or above",
             perm_member_manage: "Admin or above",
             intelligence,
+            metadata_extraction: None,
             description: None,
             accent_color: None,
             background_color1: None,
@@ -1032,6 +1043,36 @@ mod tests {
         assert_eq!(off.get("intelligence").map(String::as_str), Some("false"));
         let on = build_create_workspace_form(&create_params(Some(true)));
         assert_eq!(on.get("intelligence").map(String::as_str), Some("true"));
+    }
+
+    /// `metadata_extraction` follows the same opt-OUT contract as
+    /// `intelligence`: unset must be ABSENT (the server default is on), and an
+    /// explicit choice must travel in either direction.
+    #[test]
+    fn create_workspace_omits_metadata_extraction_when_unset() {
+        let form = build_create_workspace_form(&create_params(None));
+        assert!(
+            !form.contains_key("metadata_extraction"),
+            "unset `metadata_extraction` must be OMITTED so the server applies \
+             its own default of true, got: {form:?}"
+        );
+
+        let off = build_create_workspace_form(&CreateWorkspaceParams {
+            metadata_extraction: Some(false),
+            ..create_params(None)
+        });
+        assert_eq!(
+            off.get("metadata_extraction").map(String::as_str),
+            Some("false")
+        );
+        let on = build_create_workspace_form(&CreateWorkspaceParams {
+            metadata_extraction: Some(true),
+            ..create_params(None)
+        });
+        assert_eq!(
+            on.get("metadata_extraction").map(String::as_str),
+            Some("true")
+        );
     }
 
     // ─── org update form (wire-key coverage) ───────────────────────────────

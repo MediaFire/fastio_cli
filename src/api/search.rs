@@ -67,6 +67,23 @@ pub struct UnifiedSearchParams {
     /// These scope the **files bucket only** — the other entity buckets
     /// (`metadata`, `comments`) ignore them entirely.
     pub modes: SearchModeParams,
+    /// `details` — add `metadata_facts` to `file` and `note` items in the
+    /// `files` bucket, shaped by `output` exactly as the node object and
+    /// `/storage/search/` shape it.
+    ///
+    /// Sent as the literal string `"true"` and only when set: the server treats
+    /// any OTHER value as absent (no error), so emitting `details=false` would
+    /// be indistinguishable from omitting it while still changing the request.
+    ///
+    /// **Workspace only in effect.** The share twin accepts the parameter and
+    /// never returns `metadata_facts` for any share role, because extracted
+    /// metadata is a workspace-only surface. Folder and link items never carry
+    /// the key on either route, and it is omitted entirely (never emitted
+    /// empty) for a caller not entitled to extracted metadata.
+    ///
+    /// Cost is at most one batched facts read per `files`-bucket page, not one
+    /// per item.
+    pub details: Option<bool>,
 }
 
 impl UnifiedSearchParams {
@@ -109,6 +126,17 @@ impl UnifiedSearchParams {
         self
     }
 
+    /// Request `metadata_facts` on the `files` bucket (`details=true`).
+    ///
+    /// `false` leaves the parameter off the wire entirely rather than sending
+    /// `details=false`, so the request stays byte-identical to one that never
+    /// knew about the parameter.
+    #[must_use]
+    pub fn details(mut self, v: bool) -> Self {
+        self.details = v.then_some(true);
+        self
+    }
+
     /// Build the query-parameter map, inserting `search` plus any supplied
     /// per-bucket offsets/limits. `include_metadata` is `false` for share
     /// searches so the workspace-only `metadata_*` params are never sent.
@@ -129,6 +157,9 @@ impl UnifiedSearchParams {
             }
             put("comments_offset", self.comments_offset);
             put("comments_limit", self.comments_limit);
+        }
+        if let Some(true) = self.details {
+            params.insert("details".to_owned(), "true".to_owned());
         }
         self.modes.apply(&mut params);
         params
@@ -290,5 +321,37 @@ mod tests {
         assert!(validate_query(&long).is_err());
         let ok: String = "x".repeat(MAX_QUERY_LEN);
         assert!(validate_query(&ok).is_ok());
+    }
+
+    #[test]
+    fn details_is_emitted_only_when_set() {
+        // Unset: absent.
+        let q = UnifiedSearchParams::new().into_query("docs", true);
+        assert!(!q.contains_key("details"), "{q:?}");
+
+        // Explicitly off: still absent — the server reads any non-"true" value
+        // as absent, so sending `false` would change the request without
+        // changing the response.
+        let q = UnifiedSearchParams::new()
+            .details(false)
+            .into_query("docs", true);
+        assert!(!q.contains_key("details"), "{q:?}");
+
+        // On: the literal string "true".
+        let q = UnifiedSearchParams::new()
+            .details(true)
+            .into_query("docs", true);
+        assert_eq!(q.get("details").map(String::as_str), Some("true"));
+    }
+
+    /// The share twin still SENDS `details` — it is accepted there and simply
+    /// never yields `metadata_facts`. Suppressing it client-side would be a
+    /// second, divergent rule for a route the server already handles.
+    #[test]
+    fn details_is_sent_on_the_share_route_too() {
+        let q = UnifiedSearchParams::new()
+            .details(true)
+            .into_query("docs", false);
+        assert_eq!(q.get("details").map(String::as_str), Some("true"));
     }
 }

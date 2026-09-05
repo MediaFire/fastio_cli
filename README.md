@@ -182,7 +182,7 @@ Pipelines that need machine-parseable output can opt back in with
 | Group | Description |
 |-------|-------------|
 | `search` | Unified search — one query across a workspace or share, grouped into `files` / `metadata` / `comments` buckets. Start here for any "find X" |
-| `files` | List, create folders, move, copy, rename, delete, trash, versions, search (flat file list, `--workspace` or `--share`), lock |
+| `files` | List, create folders, move, copy, rename, delete, trash, versions, search (flat file list, `--workspace` or `--share`), `content` (a file's extracted text as addressable chunks — relevance `--query`, `--page`, `--chunk-from/--chunk-to`, or `--nodes` to score up to 10 files at once), lock |
 | `upload` | File upload (chunked with progress), text upload, URL import, session management |
 | `download` | File download (streaming with progress), folder ZIP, batch |
 | `lock` | Acquire, check status, heartbeat, release file locks |

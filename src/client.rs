@@ -4091,6 +4091,14 @@ mod tests {
         assert!(ApiClient::output_injectable("/org/123/details/"));
         assert!(ApiClient::output_injectable("/workspace/1/list/"));
         assert!(ApiClient::output_injectable("/shares/all/"));
+        // The extracted-text routes take `?output=` for chunk verbosity, and
+        // `files content` documents that the global `--detail` reaches them.
+        assert!(ApiClient::output_injectable(
+            "/workspace/1/storage/abc/content/"
+        ));
+        assert!(ApiClient::output_injectable(
+            "/workspace/1/storage/content/"
+        ));
     }
 
     #[test]

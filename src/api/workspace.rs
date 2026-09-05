@@ -61,6 +61,15 @@ pub struct CreateWorkspaceParams<'a> {
     pub description: Option<&'a str>,
     /// Enable AI-powered intelligence features.
     pub intelligence: Option<bool>,
+    /// Automatic metadata extraction for newly uploaded files.
+    ///
+    /// Like `intelligence` it **defaults to `true`** server-side, so `None`
+    /// omits the field rather than sending `false`. It is an opt-OUT layered
+    /// under `intelligence` and the plan: automatic extraction runs only while
+    /// `intelligence` is on, the plan includes the `metadata` feature, and this
+    /// is not `false`. It can withhold extraction; it can never enable it where
+    /// the intelligence setting or the plan does not allow it.
+    pub metadata_extraction: Option<bool>,
 }
 
 /// Default join permission when the `workspace create` command does not expose
@@ -103,6 +112,9 @@ fn build_create_workspace_form(params: &CreateWorkspaceParams<'_>) -> HashMap<St
     if let Some(v) = params.intelligence {
         form.insert("intelligence".to_owned(), v.to_string());
     }
+    if let Some(v) = params.metadata_extraction {
+        form.insert("metadata_extraction".to_owned(), v.to_string());
+    }
     if let Some(v) = params.description {
         form.insert("description".to_owned(), v.to_owned());
     }
@@ -136,6 +148,12 @@ pub async fn get_workspace(client: &ApiClient, workspace_id: &str) -> Result<Val
 /// Update workspace settings.
 ///
 /// `POST /workspace/{workspace_id}/update/`
+///
+/// Takes the form fields verbatim, so every documented update key travels
+/// through here — including `metadata_extraction` (`"true"`/`"false"`), the
+/// automatic-extraction toggle whose create-time twin is
+/// [`CreateWorkspaceParams::metadata_extraction`]. Unlike `intelligence` it
+/// deletes nothing, is not rate-limited, and carries no plan requirement.
 #[allow(clippy::implicit_hasher)]
 pub async fn update_workspace(
     client: &ApiClient,
@@ -648,6 +666,7 @@ mod tests {
             folder_name: "eng",
             name: "Engineering",
             intelligence: None,
+            metadata_extraction: None,
             description: None,
         };
         let form = build_create_workspace_form(&params);
@@ -662,10 +681,38 @@ mod tests {
 
         let explicit = build_create_workspace_form(&CreateWorkspaceParams {
             intelligence: Some(false),
+            metadata_extraction: None,
             ..params
         });
         assert_eq!(
             explicit.get("intelligence").map(String::as_str),
+            Some("false"),
+            "an EXPLICIT opt-out must still be transmitted"
+        );
+    }
+
+    /// `metadata_extraction` follows `intelligence`'s opt-OUT contract on this
+    /// path too: absent unless the caller stated a preference.
+    #[test]
+    fn minimal_create_omits_metadata_extraction_when_unset() {
+        let params = CreateWorkspaceParams {
+            org_id: "123",
+            folder_name: "eng",
+            name: "Engineering",
+            intelligence: None,
+            metadata_extraction: None,
+            description: None,
+        };
+        assert!(
+            !build_create_workspace_form(&params).contains_key("metadata_extraction"),
+            "unset `metadata_extraction` must be omitted"
+        );
+        let off = build_create_workspace_form(&CreateWorkspaceParams {
+            metadata_extraction: Some(false),
+            ..params
+        });
+        assert_eq!(
+            off.get("metadata_extraction").map(String::as_str),
             Some("false"),
             "an EXPLICIT opt-out must still be transmitted"
         );

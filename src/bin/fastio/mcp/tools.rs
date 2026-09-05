@@ -833,6 +833,11 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "AI indexing on the new workspace (create-workspace) — boolean (true/false). OMIT to take the platform default, which is ON; the field is optional here. (The `share` tool's identically-named argument is REQUIRED and has no default — different contract, same name.)",
                 false,
             ),
+            (
+                "metadata_extraction",
+                "Automatic metadata extraction for newly uploaded files (create-workspace) — boolean (true/false). An OPT-OUT layered under `intelligence`: OMIT to take the platform default, which is ON, and send false to withhold automatic extraction. It can never enable extraction where `intelligence` or the plan does not allow it, and it does not affect explicit per-file extraction requests (the `metadata` tool's extract actions).",
+                false,
+            ),
             ("accent_color", "Accent color (create-workspace)", false),
             (
                 "background_color1",
@@ -887,6 +892,11 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("folder_name", "Folder name / slug (create)", false),
             ("description", "Description", false),
             ("intelligence", "Enable AI (true/false)", false),
+            (
+                "metadata_extraction",
+                "Automatic metadata extraction for newly uploaded files (create, update) — boolean (true/false). An OPT-OUT layered under `intelligence`: OMIT to take the platform default, which is ON, and send false to withhold automatic extraction. It can never enable extraction where `intelligence` or the plan does not allow it, and it does not affect explicit per-file extraction requests (the `metadata` tool's extract actions). Unlike `intelligence` it deletes nothing and is not rate-limited.",
+                false,
+            ),
             (
                 "perm_join",
                 "Who can self-join — permission phrase (update)",
@@ -994,7 +1004,15 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "files",
-        description: "File operations: list, details, create folders, move, copy, rename, update (metadata/content), add-file, delete, restore, purge, trash, versions, search, recent, lock, transfer, read content. search splits by target via search_in (filename | content | both): filename gives literal find-style matching with glob/prefix/contains/exact patterns over the whole name, while content searches the AI's summary and semantic index rather than raw file text. \
+        description: "File operations: list, details, create folders, move, copy, rename, update (metadata/content), add-file, delete, restore, purge, trash, versions, search, recent, lock, transfer, read content. \
+                      THREE WAYS TO GET AT A FILE'S WORDS, and they are not interchangeable: 'read' \
+                      returns the file's RAW BYTES (a PDF's container, not its text); 'content' returns \
+                      ONE file's EXTRACTED TEXT as ordered chunks, each with a `position` address, which \
+                      is the same text the platform indexed for search and AI; 'content-many' scores UP TO \
+                      10 files against one question in a single call. To quote a passage: search with \
+                      output=standard, take the hit's best_chunk.position P, then call content with \
+                      chunk_from=P-1 and chunk_to=P+1. \
+                      search splits by target via search_in (filename | content | both): filename gives literal find-style matching with glob/prefix/contains/exact patterns over the whole name, while content searches the AI's summary and semantic index rather than raw file text. Each hit may carry best_chunk (position + indexed_version_id) naming the passage that matched — feed those to the 'content' action; when best_chunk.same_as_snippet is true its text is null at output=terse/standard, so read content_snippet instead. \
                       'transfer': do NOT re-issue it after a 5xx. A lost acknowledgement is \
                       indistinguishable from a failure here, so a repeat is a SECOND transfer, not \
                       a retry — and (reported by the platform 2026-08-26, not measured here) the \
@@ -1025,6 +1043,8 @@ const TOOL_DEFS: &[ToolDef] = &[
             "lock-status",
             "lock-release",
             "read",
+            "content",
+            "content-many",
             // Universal: every tool self-describes. Declared so a STRICT
             // client will actually send it — the router has always accepted
             // it, but a schema that omits it makes the call look invalid.
@@ -1036,7 +1056,11 @@ const TOOL_DEFS: &[ToolDef] = &[
                 "Workspace ID (omit when targeting a share)",
                 false,
             ),
-            ("node_id", "File/folder node ID", false),
+            (
+                "node_id",
+                "File/folder node ID. On `content` it names the ONE file or note whose extracted text to read; the multi-file form is `content-many`, which takes `nodes` instead. Two things to read off a `content` response before trusting it: `indexed: false` is a normal 200 and a statement about the FILE — that version has no extracted text (never processed, still queued, or a format that carries none) — never a platform failure; and `indexed_version_id` must MATCH the one on the search hit you came from (best_chunk.indexed_version_id) before you quote the passage, because a mismatch means the file was re-indexed and the search should be re-run.",
+                false,
+            ),
             (
                 "folder",
                 "Parent folder ID (list, create-folder, add-file); defaults to root",
@@ -1089,9 +1113,42 @@ const TOOL_DEFS: &[ToolDef] = &[
                  verified here)",
                 false,
             ),
-            ("query", "Search query (search)", false),
-            ("limit", "Max results (search)", false),
+            (
+                "query",
+                "The query text. On `search` it is the search query. On `content` it selects RELEVANCE MODE: this one file's own chunks are ranked against it and the best are returned with FULL text and a numeric score, ignoring max_bytes so a hit is never truncated away (1-512 characters; it cannot be combined with page, chunk_from/chunk_to or cursor, and it defaults limit to 3). On `content-many` it is REQUIRED — it is the only way that route selects text.",
+                false,
+            ),
+            (
+                "limit",
+                "Max results (search). On `content` it is CHUNKS PER RESPONSE, 1-20 (server default 5, or 3 in relevance mode); on `content-many` it is chunks per FILE, 1-20 (server default 3).",
+                false,
+            ),
             ("offset", "Result offset (search)", false),
+            (
+                "nodes",
+                "content-many ONLY: 1-10 file node IDs, comma-separated, scored against `query` in ONE request — the way to assemble prompt context from several candidate files without ten round trips. WORKSPACE ONLY (send workspace_id, never share_id). Scores are computed per file and are NOT comparable across files, so never merge the per-file chunk lists and re-sort them by score. The response is {q, limit, nodes: {<node id>: {…chunks…}}, missing: [{id, reason}]} with reason one of not_found | trashed | not_text; a file that answered with an empty chunks list simply holds nothing matching the query. A `position` returned here can be sent straight back to `content` as chunk_from.",
+                false,
+            ),
+            (
+                "page",
+                "content ONLY: return the chunks whose [start_page, end_page] range OVERLAPS this 1-based page. The unit is a chunk, not a page — a chunk can span two pages or split one — so this returns whole chunks, not a page's exact text. Read `page_addressable` in the response first: formats with no pages (spreadsheets, plain text, code, notes) answer an empty chunks list. One window selector at a time: not with query, chunk_from/chunk_to or cursor.",
+                false,
+            ),
+            (
+                "chunk_from",
+                "content ONLY: start of an inclusive `position` range, below 10000. POSITION IS THE ADDRESS — it is the field to page and re-read by; `chunk_index` is a nullable legacy spelling of the same idea and `sequence` is a correlation coordinate, not an address. Given a search hit's best_chunk.position P, read the passage in context with chunk_from=P-1 and chunk_to=P+1; when that position is null the passage has no address — use query on the file instead. To go further into a large file than 10000, walk with cursor instead. One window selector at a time: not with query, page or cursor.",
+                false,
+            ),
+            (
+                "chunk_to",
+                "content ONLY: end of that inclusive `position` range. Requires chunk_from, must be greater than or equal to it, and is subject to the same 10000 ceiling.",
+                false,
+            ),
+            (
+                "max_bytes",
+                "content / content-many: UTF-8 byte budget over the text in one response, 1024-262144 (server default 32768; PER FILE on content-many, so ten files at the maximum is a deliberate opt-in to roughly 2.5 MiB). Applied in the ordered modes only — deliberately NOT in relevance mode, where a hit is never silently dropped.",
+                false,
+            ),
             (
                 "files_scope",
                 "Comma-separated nodeId:versionId pairs to narrow search (search)",
@@ -1122,7 +1179,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             (
                 "output",
-                "content_snippet verbosity: terse/standard/full (search)",
+                "Verbosity: terse | standard | full. On `search` it shapes content_snippet — and note that at terse and standard a hit's best_chunk.text is null when best_chunk.same_as_snippet is true, so read content_snippet for that passage rather than concluding the chunk is empty. On `content` / `content-many` it shapes the returned chunks: `terse` returns the CHUNK MAP with no text at all, which is the cheap way to find out how a file is laid out before spending a read on it.",
                 false,
             ),
             (
@@ -1143,7 +1200,11 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("sort_by", "Sort field (list)", false),
             ("sort_dir", "Sort direction: asc/desc", false),
             ("page_size", "Page size (list, trash)", false),
-            ("cursor", "Pagination cursor (list, trash)", false),
+            (
+                "cursor",
+                "Pagination cursor (list, trash). On `content` it WALKS one file: pass back the `next_cursor` from the MOST RECENT response VERBATIM — never a value you built, never one saved from an earlier walk — and stop when next_cursor is null. It carries the file version it was issued against, so a walk can never straddle two versions: if the file is replaced mid-walk the next call answers an empty chunks list with next_cursor null. Not valid with query, and not available on content-many.",
+                false,
+            ),
             (
                 "type",
                 "Filter by node type: file/folder/link/note (recent)",
@@ -1155,7 +1216,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             // ship. Both consumers are covered in this one string.
             (
                 "share_id",
-                "Share ID. On `add-link`, the share to link into. On EVERY OTHER action it targets SHARE storage instead of a workspace — supply this OR workspace_id, never both, and never an empty string. Share storage follows identical patterns to workspace storage for the common operations (list, info, create-folder, move, copy, delete, restore, purge, trash, versions, version-restore, recent, read, update, add-file, lock-acquire/status/release) and each of those routes is documented for shares. Two search caveats: workspace-backed (folder) shares do not support search at all, and `filters` is workspace-only — a share ignores it and still answers 200, so the response is checked and a warning attached when the predicate did not run.",
+                "Share ID. On `add-link`, the share to link into. On EVERY OTHER action it targets SHARE storage instead of a workspace — supply this OR workspace_id, never both, and never an empty string. Share storage follows identical patterns to workspace storage for the common operations (list, info, create-folder, move, copy, delete, restore, purge, trash, versions, version-restore, recent, read, update, add-file, lock-acquire/status/release) and each of those routes is documented for shares. `content` also works on a share, but it requires DOWNLOAD permission rather than mere view — extracted text is the interior of the file — while `content-many` is WORKSPACE ONLY and rejects a share_id. Two search caveats: workspace-backed (folder) shares do not support search at all, and `filters` is workspace-only — a share ignores it and still answers 200, so the response is checked and a warning attached when the predicate did not run.",
                 false,
             ),
             ("to_workspace", "Target workspace ID (transfer)", false),
@@ -1224,6 +1285,11 @@ const TOOL_DEFS: &[ToolDef] = &[
             (
                 "comments_limit",
                 "Page size for the comments bucket (default 25)",
+                false,
+            ),
+            (
+                "details",
+                "true adds `metadata_facts` — the file's EXTRACTED metadata field values — to file and note items in the FILES bucket. WORKSPACE ONLY: the share route accepts the parameter and never returns facts, and folder and link items never carry the key on either route. Costs at most one batched facts read per files-bucket page, not one per item.",
                 false,
             ),
             (
@@ -4897,6 +4963,12 @@ async fn handle_org_create_workspace(
         perm_join,
         perm_member_manage,
         intelligence,
+        // Same opt-OUT contract as `intelligence`: ABSENT stays None so the
+        // field is OMITTED and the server applies its own default of `true`.
+        metadata_extraction: match optional_bool_strict(args, "metadata_extraction") {
+            Ok(v) => v,
+            Err(e) => return Ok(e),
+        },
         description: optional_str(args, "description"),
         accent_color: optional_str(args, "accent_color"),
         background_color1: optional_str(args, "background_color1"),
@@ -4929,6 +5001,9 @@ fn build_workspace_update_fields(
     }
     if let Some(v) = optional_bool(args, "intelligence") {
         fields.insert("intelligence".to_owned(), v.to_string());
+    }
+    if let Some(v) = optional_bool(args, "metadata_extraction") {
+        fields.insert("metadata_extraction".to_owned(), v.to_string());
     }
     if let Some(v) = optional_str(args, "perm_join") {
         fields.insert("perm_join".to_owned(), v.to_owned());
@@ -4999,6 +5074,7 @@ async fn handle_workspace(
                     name,
                     description: optional_str(args, "description"),
                     intelligence: optional_bool(args, "intelligence"),
+                    metadata_extraction: optional_bool(args, "metadata_extraction"),
                 },
             )
             .await
@@ -5486,6 +5562,8 @@ async fn handle_files(
         "lock-status" => handle_files_lock_status(state, args).await,
         "lock-release" => handle_files_lock_release(state, args).await,
         "read" => handle_files_read(state, args).await,
+        "content" => handle_files_content(state, args).await,
+        "content-many" => handle_files_content_many(state, args).await,
         _ => Ok(error_text(&format!("Unknown files action: {action}"))),
     }
 }
@@ -5997,6 +6075,17 @@ async fn handle_search(
             strict_u32!("comments_offset"),
             strict_u32!("comments_limit"),
         )
+        // Sent on BOTH actions. `details` is workspace-only in EFFECT, not in
+        // acceptance: the share route takes it and returns no facts, so
+        // suppressing it here would be a second, divergent client-side rule
+        // for something the server already handles.
+        .details(
+            match optional_bool_strict(args, "details") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            }
+            .unwrap_or(false),
+        )
         .modes(match build_search_modes_strict(args) {
             Ok(v) => v,
             Err(e) => return Ok(e),
@@ -6493,6 +6582,128 @@ async fn handle_files_read(
         Err(e) => return Ok(e),
     };
     match api::storage::read_content(&client, context_type, ws_id, node_id).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// `files action=content` — one file's extracted text as ordered chunks.
+///
+/// The window parameters are parsed STRICTLY. `optional_u32` reads a
+/// present-but-unparseable value as ABSENT, which here would answer a
+/// different read than the caller asked for — `chunk_from: "12a"` becoming
+/// "start of file" — with a 200 and no way to tell the two apart. Every bound
+/// beyond parseability belongs to `ContentReadParams::validate`, which both
+/// front ends share, so a bad value comes back as the same readable message
+/// on either surface rather than as a server `406`.
+async fn handle_files_content(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    let (context_type, profile_id) = match resolve_storage_context(args, "files") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let node_id = match required_str(args, "node_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    macro_rules! strict_u32 {
+        ($key:literal) => {
+            match optional_u32_strict(args, $key) {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            }
+        };
+    }
+    macro_rules! strict_str {
+        ($key:literal) => {
+            match optional_str_strict(args, $key) {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            }
+        };
+    }
+    let params = api::storage::ContentReadParams::new()
+        .query(strict_str!("query"))
+        .page(strict_u32!("page"))
+        .chunks(strict_u32!("chunk_from"), strict_u32!("chunk_to"))
+        .cursor(strict_str!("cursor"))
+        .limit(strict_u32!("limit"))
+        .max_bytes(strict_u32!("max_bytes"))
+        .output(strict_str!("output"));
+    // Validated here as well as inside the API fn: the message names the WIRE
+    // parameters this tool advertises, so surfacing it before the request is
+    // sent tells the agent exactly which argument to change.
+    if let Err(e) = params.validate() {
+        return Ok(cli_err_to_result(&e));
+    }
+    match api::storage::read_content_chunks(&client, context_type, profile_id, node_id, &params)
+        .await
+    {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// `files action=content-many` — up to ten files scored against one query.
+///
+/// WORKSPACE ONLY. A `share_id` is refused with an explanation rather than
+/// quietly ignored: `share_id` is also this tool's `add-link` parameter, so an
+/// agent reusing an argument map from an earlier step would otherwise have its
+/// share read silently answered from a workspace.
+async fn handle_files_content_many(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    let client = state.client().read().await;
+    if let Some(share_id) = match optional_str_strict(args, "share_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    } && !share_id.is_empty()
+    {
+        return Ok(error_text(
+            "content-many reads several files at once and is WORKSPACE ONLY — there is no \
+             share form of this route. Send workspace_id, or read the share's files one \
+             at a time with action=content and node_id.",
+        ));
+    }
+    let ws_id = match required_str(args, "workspace_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let nodes = match optional_str_strict(args, "nodes") {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return Ok(error_text(
+                "Missing required parameter: nodes (1-10 comma-separated file node IDs)",
+            ));
+        }
+        Err(e) => return Ok(e),
+    };
+    let query = match required_str(args, "query") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let nodes: Vec<String> = nodes.split(',').map(str::to_owned).collect();
+    let params = api::storage::ContentManyParams::new(nodes, query)
+        .limit(match optional_u32_strict(args, "limit") {
+            Ok(v) => v,
+            Err(e) => return Ok(e),
+        })
+        .max_bytes(match optional_u32_strict(args, "max_bytes") {
+            Ok(v) => v,
+            Err(e) => return Ok(e),
+        })
+        .output(match optional_str_strict(args, "output") {
+            Ok(v) => v,
+            Err(e) => return Ok(e),
+        });
+    if let Err(e) = params.validate() {
+        return Ok(cli_err_to_result(&e));
+    }
+    match api::storage::read_content_many(&client, ws_id, &params).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -13942,6 +14153,160 @@ mod ripley_tool_tests {
             .await
             .expect("call_tool should not error");
         result_to_string(&res)
+    }
+
+    /// The `files` tool advertises BOTH extracted-text actions and both really
+    /// dispatch.
+    ///
+    /// Same drift hazard `metadata_surface_actions_all_dispatch` documents:
+    /// `call_tool` never checks `action` against `TOOL_DEFS`, so an advertised
+    /// action with no handler arm answers "Unknown files action" at runtime
+    /// while looking perfectly healthy in the schema. The negative control at
+    /// the end keeps the assertion from passing vacuously.
+    #[tokio::test]
+    async fn files_content_actions_are_advertised_and_dispatch() {
+        let actions = super::TOOL_DEFS
+            .iter()
+            .find(|d| d.name == "files")
+            .expect("files tool registered")
+            .actions;
+        for action in ["content", "content-many"] {
+            assert!(
+                actions.contains(&action),
+                "`files` must advertise `{action}`, got: {actions:?}"
+            );
+        }
+
+        let router = authed_router().await;
+        for action in ["content", "content-many"] {
+            let text = dispatch_action(&router, "files", action).await;
+            assert!(
+                !text.contains("Unknown files action"),
+                "`files` advertises `{action}` but it does not dispatch: {text}"
+            );
+        }
+        let text = dispatch_action(&router, "files", "no-such-action").await;
+        assert!(
+            text.contains("Unknown files action"),
+            "reachability lock is vacuous — an unknown `files` action must reach \
+             the fallback arm, got: {text}"
+        );
+    }
+
+    /// `content-many` refuses a `share_id` with an EXPLANATION rather than
+    /// quietly answering from a workspace.
+    ///
+    /// `share_id` is also this tool's `add-link` parameter, so an agent reusing
+    /// an argument map from an earlier step is the realistic way this gets sent
+    /// — and there is no share form of the route to fall back on.
+    #[tokio::test]
+    async fn files_content_many_rejects_a_share_id() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("content-many".to_owned()),
+        );
+        args.insert("share_id".to_owned(), Value::String("s1".to_owned()));
+        args.insert("nodes".to_owned(), Value::String("a,b".to_owned()));
+        args.insert("query".to_owned(), Value::String("q".to_owned()));
+        let text = result_to_string(&router.call_tool("files", args).await.expect("call_tool ok"));
+        assert!(
+            text.contains("WORKSPACE ONLY"),
+            "a share_id on content-many must be refused by name, got: {text}"
+        );
+    }
+
+    /// A bad VALUE is rejected by the shared `ContentReadParams::validate`, not
+    /// by a second MCP-only rule, and the wire parameter is named in the
+    /// message so an agent knows which argument to change.
+    #[tokio::test]
+    async fn files_content_surfaces_the_shared_window_validator() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("content".to_owned()));
+        args.insert("workspace_id".to_owned(), Value::String("123".to_owned()));
+        args.insert("node_id".to_owned(), Value::String("n1".to_owned()));
+        args.insert("query".to_owned(), Value::String("q".to_owned()));
+        args.insert("page".to_owned(), Value::from(2));
+        let text = result_to_string(&router.call_tool("files", args).await.expect("call_tool ok"));
+        assert!(
+            text.contains("at most one content window"),
+            "two window selectors must be refused by the shared validator, got: {text}"
+        );
+    }
+
+    /// Every tool that gained a parameter here declares each NAME exactly once.
+    ///
+    /// `action_schema` inserts params into a map keyed by name, so a second
+    /// entry for an existing name silently OVERWRITES the first and the loser
+    /// never ships — a failure with no compiler error and no runtime symptom
+    /// beyond an agent reading the wrong description. Asserted over the whole
+    /// registry, not just the four tools touched, because the hazard is
+    /// structural rather than specific to this change.
+    #[test]
+    fn no_tool_declares_a_parameter_name_twice() {
+        use std::collections::BTreeSet;
+        for def in super::TOOL_DEFS {
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            for (name, _, _) in def.params {
+                assert!(
+                    seen.insert(name),
+                    "tool `{}` declares parameter `{name}` more than once — the \
+                     later entry silently overwrites the earlier one",
+                    def.name
+                );
+            }
+        }
+    }
+
+    /// The new parameters are actually advertised on the tools that accept
+    /// them — the half `no_tool_declares_a_parameter_name_twice` cannot see.
+    #[test]
+    fn new_content_parameters_are_advertised() {
+        let params_of = |tool: &str| -> Vec<&str> {
+            super::TOOL_DEFS
+                .iter()
+                .find(|d| d.name == tool)
+                .unwrap_or_else(|| panic!("{tool} tool registered"))
+                .params
+                .iter()
+                .map(|(name, _, _)| *name)
+                .collect()
+        };
+        let files = params_of("files");
+        for name in ["nodes", "page", "chunk_from", "chunk_to", "max_bytes"] {
+            assert!(files.contains(&name), "`files` must advertise `{name}`");
+        }
+        assert!(
+            params_of("search").contains(&"details"),
+            "the unified `search` tool must advertise `details`"
+        );
+        for tool in ["workspace", "org"] {
+            assert!(
+                params_of(tool).contains(&"metadata_extraction"),
+                "`{tool}` must advertise `metadata_extraction`"
+            );
+        }
+    }
+
+    /// The MCP workspace update forwards `metadata_extraction` as the string
+    /// `"true"`/`"false"`, and OMITS it when unset — the opt-out contract: an
+    /// absent field must leave the server's default of on in place, never send
+    /// `false` on the caller's behalf.
+    #[test]
+    fn mcp_workspace_update_forwards_metadata_extraction() {
+        let mut args = Map::new();
+        args.insert("metadata_extraction".to_owned(), Value::Bool(false));
+        let fields = super::build_workspace_update_fields(&args);
+        assert_eq!(
+            fields.get("metadata_extraction").map(String::as_str),
+            Some("false")
+        );
+        assert!(
+            !super::build_workspace_update_fields(&Map::new()).contains_key("metadata_extraction"),
+            "unset `metadata_extraction` must be omitted from the update form"
+        );
     }
 
     #[tokio::test]

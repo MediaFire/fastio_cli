@@ -272,6 +272,32 @@ pub enum FilesCommand {
         /// Node ID.
         node_id: String,
     },
+    /// Read a file's EXTRACTED TEXT as ordered chunks — one file (`node_id`)
+    /// or up to ten scored against one query (`nodes`, workspace only).
+    Content {
+        /// Workspace ID (`None` when `share` is set).
+        workspace: Option<String>,
+        /// Share ID — the alternative storage context (single file only).
+        share: Option<String>,
+        /// Node ID of the single file to read (`None` when `nodes` is set).
+        node_id: Option<String>,
+        /// Node IDs for the multi-file read (`None` for the single-file form).
+        nodes: Option<Vec<String>>,
+        /// `q` — relevance query. Required with `nodes`.
+        query: Option<String>,
+        /// `page` — 1-based page whose overlapping chunks to return.
+        page: Option<u32>,
+        /// `chunk_from` — start of an inclusive `position` range.
+        chunk_from: Option<u32>,
+        /// `chunk_to` — end of that inclusive `position` range.
+        chunk_to: Option<u32>,
+        /// `cursor` — the previous response's `next_cursor`, verbatim.
+        cursor: Option<String>,
+        /// `limit` — chunks per response (per file in the multi-file form).
+        limit: Option<u32>,
+        /// `max_bytes` — UTF-8 byte budget over the emitted text.
+        max_bytes: Option<u32>,
+    },
 }
 
 /// File lock subcommand variants.
@@ -608,6 +634,37 @@ pub async fn execute(command: &FilesCommand, ctx: &CommandContext<'_>) -> Result
             share,
             node_id,
         } => read_content(ctx, workspace.as_deref(), share.as_deref(), node_id).await,
+        FilesCommand::Content {
+            workspace,
+            share,
+            node_id,
+            nodes,
+            query,
+            page,
+            chunk_from,
+            chunk_to,
+            cursor,
+            limit,
+            max_bytes,
+        } => {
+            content(
+                ctx,
+                &ContentRequest {
+                    workspace: workspace.as_deref(),
+                    share: share.as_deref(),
+                    node_id: node_id.as_deref(),
+                    nodes: nodes.as_deref(),
+                    query: query.as_deref(),
+                    page: *page,
+                    chunk_from: *chunk_from,
+                    chunk_to: *chunk_to,
+                    cursor: cursor.as_deref(),
+                    limit: *limit,
+                    max_bytes: *max_bytes,
+                },
+            )
+            .await
+        }
     }
 }
 
@@ -1479,6 +1536,163 @@ async fn read_content(
         .await
         .context("failed to read file content")?;
     ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// The arguments of `fastio files content`, borrowed from the parsed command.
+///
+/// A struct rather than a dozen positional parameters: the two routes it feeds
+/// take overlapping-but-different subsets, and a positional list of that length
+/// is the shape in which a `chunk_from`/`chunk_to` pair gets silently swapped.
+struct ContentRequest<'a> {
+    /// Workspace ID (`None` when `share` is set).
+    workspace: Option<&'a str>,
+    /// Share ID — the alternative storage context (single file only).
+    share: Option<&'a str>,
+    /// Node ID of the single file to read (`None` when `nodes` is set).
+    node_id: Option<&'a str>,
+    /// Node IDs for the multi-file read (`None` for the single-file form).
+    nodes: Option<&'a [String]>,
+    /// `q` — relevance query. Required with `nodes`.
+    query: Option<&'a str>,
+    /// `page` — 1-based page whose overlapping chunks to return.
+    page: Option<u32>,
+    /// `chunk_from` — start of an inclusive `position` range.
+    chunk_from: Option<u32>,
+    /// `chunk_to` — end of that inclusive `position` range.
+    chunk_to: Option<u32>,
+    /// `cursor` — the previous response's `next_cursor`, verbatim.
+    cursor: Option<&'a str>,
+    /// `limit` — chunks per response (per file in the multi-file form).
+    limit: Option<u32>,
+    /// `max_bytes` — UTF-8 byte budget over the emitted text.
+    max_bytes: Option<u32>,
+}
+
+/// Read extracted text: one file, or several scored against one query.
+///
+/// clap already guarantees exactly one of `NODE_ID` / `--nodes`
+/// (`required_unless_present` + `conflicts_with`); the match below is written
+/// out in full so it FAILS CLOSED with a readable message if that guarantee
+/// ever regresses, rather than preferring one selector and reading files the
+/// caller did not name.
+async fn content(ctx: &CommandContext<'_>, req: &ContentRequest<'_>) -> Result<()> {
+    match (req.node_id, req.nodes) {
+        (Some(node_id), None) => content_single(ctx, req, node_id).await,
+        (None, Some(nodes)) => content_many(ctx, req, nodes).await,
+        (Some(_), Some(_)) => {
+            anyhow::bail!("provide either a NODE_ID or --nodes, not both")
+        }
+        (None, None) => anyhow::bail!("provide a NODE_ID, or --nodes for several files"),
+    }
+}
+
+/// Single-file extracted-text read (workspace or share).
+async fn content_single(
+    ctx: &CommandContext<'_>,
+    req: &ContentRequest<'_>,
+    node_id: &str,
+) -> Result<()> {
+    let (context_type, profile_id) = resolve_storage_ctx(req.workspace, req.share)?;
+    validate_node_id(node_id, "node ID")?;
+    let params = api::storage::ContentReadParams::new()
+        .query(req.query)
+        .page(req.page)
+        .chunks(req.chunk_from, req.chunk_to)
+        .cursor(req.cursor)
+        .limit(req.limit)
+        .max_bytes(req.max_bytes);
+    // Chunk verbosity is not set here: the global `--detail` flag reaches the
+    // route as `?output=<detail>` through the client's injection seam, like
+    // every other envelope GET.
+    // The API fn validates too. Doing it HERE as well keeps the bounds check
+    // ahead of client construction and, more importantly, means the shared
+    // validator — not a second client-side rule — owns every value bound; clap
+    // only covers which flags may be combined.
+    params.validate()?;
+    let client = ctx.build_client()?;
+    let value =
+        api::storage::read_content_chunks(&client, context_type, profile_id, node_id, &params)
+            .await
+            .context("failed to read extracted text")?;
+    ctx.output.render(&value)?;
+    Ok(())
+}
+
+/// Multi-file extracted-text read — WORKSPACE ONLY, `--query` required.
+async fn content_many(
+    ctx: &CommandContext<'_>,
+    req: &ContentRequest<'_>,
+    nodes: &[String],
+) -> Result<()> {
+    let (context_type, workspace) = resolve_storage_ctx(req.workspace, req.share)?;
+    anyhow::ensure!(
+        context_type == "workspace",
+        "--nodes reads several files at once and is workspace-only; \
+         read a share's files one at a time with a NODE_ID"
+    );
+    // Blank segments (`a,,b`) are ignored by the route and by the shared
+    // validator, so drop them before the per-id check rather than refusing
+    // what every other layer accepts; `validate()` still owns the 1-10 count.
+    let nodes: Vec<String> = nodes
+        .iter()
+        .map(|n| n.trim())
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+        .collect();
+    for node_id in &nodes {
+        validate_node_id(node_id, "node ID")?;
+    }
+    let query = req
+        .query
+        .ok_or_else(|| anyhow::anyhow!("--query is required with --nodes"))?;
+    let params = api::storage::ContentManyParams::new(nodes, query)
+        .limit(req.limit)
+        .max_bytes(req.max_bytes);
+    params.validate()?;
+    let client = ctx.build_client()?;
+    let value = api::storage::read_content_many(&client, workspace, &params)
+        .await
+        .context("failed to read extracted text")?;
+    render_content_many(ctx, &value)
+}
+
+/// Render a multi-file read.
+///
+/// JSON and markdown carry the whole envelope. Table and CSV can show only
+/// one payload, and on this envelope the shared flattener would pick
+/// `missing` over `nodes` (the same key-order trap `render_bulk_info` guards
+/// against), so they get one row per chunk instead, with the unreadable ids
+/// reported on stderr.
+fn render_content_many(ctx: &CommandContext<'_>, value: &serde_json::Value) -> Result<()> {
+    use fastio_cli::output::OutputFormat;
+
+    if !matches!(ctx.output.format, OutputFormat::Table | OutputFormat::Csv) {
+        ctx.output.render(value)?;
+        return Ok(());
+    }
+
+    let rows = api::storage::content_many_chunk_rows(value);
+    ctx.output.render(&serde_json::Value::Array(rows))?;
+    if ctx.output.quiet {
+        return Ok(());
+    }
+    if let Some(missing) = value.get("missing").and_then(serde_json::Value::as_array)
+        && !missing.is_empty()
+    {
+        eprintln!("--- {} id(s) could not be read ---", missing.len());
+        for entry in missing {
+            let id = entry
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let reason = entry
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            eprintln!("{id}: {reason}");
+        }
+    }
     Ok(())
 }
 
