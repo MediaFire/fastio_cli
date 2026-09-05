@@ -2,7 +2,7 @@
 ///
 /// Provides a "get-started" prompt to guide new users.
 use rmcp::ErrorData as McpError;
-use rmcp::model::{GetPromptResult, ListPromptsResult, Prompt, PromptMessage, PromptMessageRole};
+use rmcp::model::{GetPromptResult, ListPromptsResult, Prompt, PromptMessage, Role};
 use serde_json::{Map, Value};
 
 /// List available MCP prompts.
@@ -15,6 +15,7 @@ pub fn list_prompts() -> ListPromptsResult {
         )],
         next_cursor: None,
         meta: None,
+        ..Default::default()
     }
 }
 
@@ -36,13 +37,13 @@ pub fn get_prompt(
 fn get_started_prompt() -> GetPromptResult {
     let messages = vec![
         PromptMessage::new_text(
-            PromptMessageRole::Assistant,
+            Role::Assistant,
             "I'll help you get started with Fast.io through the CLI's MCP server.",
         ),
-        PromptMessage::new_text(PromptMessageRole::User, GET_STARTED_TEXT),
+        PromptMessage::new_text(Role::User, GET_STARTED_TEXT),
     ];
 
-    // Constructor + `with_description`: rmcp 1.x marks this `#[non_exhaustive]`.
+    // Constructor + `with_description`: this type is `#[non_exhaustive]`.
     GetPromptResult::new(messages)
         .with_description("Guide for getting started with the Fast.io MCP server")
 }

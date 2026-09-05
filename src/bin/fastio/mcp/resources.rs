@@ -2,9 +2,7 @@
 ///
 /// Exposes session status and the agent skill guide as readable MCP resources.
 use rmcp::ErrorData as McpError;
-use rmcp::model::{
-    AnnotateAble, ListResourcesResult, RawResource, ReadResourceResult, ResourceContents,
-};
+use rmcp::model::{ListResourcesResult, ReadResourceResult, Resource, ResourceContents};
 
 use super::McpState;
 
@@ -28,18 +26,17 @@ pub async fn list_resources(state: &McpState) -> ListResourcesResult {
     } else {
         "Current session status (not authenticated)"
     };
-    let session = RawResource::new("session://status", session_description).no_annotation();
+    let session = Resource::new("session://status", session_description);
 
-    let mut guide = RawResource::new(SKILL_GUIDE_URI, "Fast.io agent skill guide");
-    guide.description =
-        Some("Agent guide for the Fast.io CLI (same content as `fastio skill`).".to_owned());
-    guide.mime_type = Some("text/markdown".to_owned());
-    let guide = guide.no_annotation();
+    let guide = Resource::new(SKILL_GUIDE_URI, "Fast.io agent skill guide")
+        .with_description("Agent guide for the Fast.io CLI (same content as `fastio skill`).")
+        .with_mime_type("text/markdown");
 
     ListResourcesResult {
         resources: vec![session, guide],
         next_cursor: None,
         meta: None,
+        ..Default::default()
     }
 }
 
@@ -61,8 +58,8 @@ pub async fn read_resource(state: &McpState, uri: &str) -> Result<ReadResourceRe
                     "hint": "Not authenticated. Run `fastio auth login` in a terminal, or use the auth tool with action=signin."
                 })
             };
-            // Constructor, not a struct literal: rmcp 1.x types are
-            // `#[non_exhaustive]`. Same contents as before.
+            // Constructor, not a struct literal: these types are
+            // `#[non_exhaustive]`.
             Ok(ReadResourceResult::new(vec![ResourceContents::text(
                 fastio_cli::output::markdown::to_markdown(&status),
                 uri.to_owned(),

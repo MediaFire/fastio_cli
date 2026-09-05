@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use rmcp::ErrorData as McpError;
-use rmcp::model::{CallToolResult, Content, ListToolsResult, Tool};
+use rmcp::model::{CallToolResult, ContentBlock, ListToolsResult, Tool};
 use serde_json::{Map, Value, json};
 
 use secrecy::SecretString;
@@ -35,12 +35,12 @@ use super::McpState;
 /// use it by default.
 fn success_json(value: &Value) -> CallToolResult {
     let text = fastio_cli::output::markdown::to_markdown(value);
-    CallToolResult::success(vec![Content::text(text)])
+    CallToolResult::success(vec![ContentBlock::text(text)])
 }
 
 /// Build an error MCP tool result (`is_error` = true).
 fn error_text(msg: &str) -> CallToolResult {
-    CallToolResult::error(vec![Content::text(msg.to_owned())])
+    CallToolResult::error(vec![ContentBlock::text(msg.to_owned())])
 }
 
 /// Resolve a tool name (possibly a hidden dispatch alias) to its canonical
@@ -66,7 +66,7 @@ pub fn canonical_tool_name(name: &str) -> &str {
 /// Extract a required string parameter.
 fn required_str<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str, CallToolResult> {
     args.get(key).and_then(Value::as_str).ok_or_else(|| {
-        CallToolResult::error(vec![Content::text(format!(
+        CallToolResult::error(vec![ContentBlock::text(format!(
             "Missing required parameter: {key}"
         ))])
     })
@@ -99,7 +99,7 @@ fn optional_str_strict<'a>(
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.as_str())),
-        Some(_) => Err(CallToolResult::error(vec![Content::text(format!(
+        Some(_) => Err(CallToolResult::error(vec![ContentBlock::text(format!(
             "Parameter {key} must be a string (omit it, or send null, to leave it unset)"
         ))])),
     }
@@ -126,7 +126,7 @@ fn optional_id(args: &Map<String, Value>, key: &str) -> Result<Option<String>, C
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.clone())),
         Some(Value::Number(n)) => Ok(Some(n.to_string())),
-        Some(_) => Err(CallToolResult::error(vec![Content::text(format!(
+        Some(_) => Err(CallToolResult::error(vec![ContentBlock::text(format!(
             "Parameter {key} must be an ID string (a JSON number is accepted; \
              omit it, or send null, to leave it unset)"
         ))])),
@@ -231,7 +231,7 @@ async fn require_auth(state: &McpState) -> Result<(), CallToolResult> {
     if state.is_authenticated().await {
         Ok(())
     } else {
-        Err(CallToolResult::error(vec![Content::text(
+        Err(CallToolResult::error(vec![ContentBlock::text(
             "Not authenticated. Run `fastio auth login` in a terminal first, \
              or use the auth tool with action=\"signin\" to sign in with email/password.",
         )]))
@@ -2959,6 +2959,7 @@ impl ToolRouter {
             tools,
             next_cursor: None,
             meta: None,
+            ..Default::default()
         }
     }
 
@@ -3044,6 +3045,7 @@ impl ToolRouter {
             tools,
             next_cursor: None,
             meta: None,
+            ..Default::default()
         }
     }
 
@@ -3179,7 +3181,7 @@ fn generic_describe(def: &ToolDef) -> CallToolResult {
         "\n# note\nRegistry-generated reference. `action` is always required; each param's \
          action-scoping is stated in its description.\n",
     );
-    CallToolResult::success(vec![Content::text(text)])
+    CallToolResult::success(vec![ContentBlock::text(text)])
 }
 /// Auth tool handler.
 async fn handle_auth(
@@ -5415,9 +5417,11 @@ async fn handle_workspace(
                                 .filter(|p| !p.is_empty())
                                 .collect(),
                             Err(e) => {
-                                return Ok(CallToolResult::error(vec![Content::text(format!(
-                                    "node_ids must be a JSON array of strings or a comma-separated list: {e}"
-                                ))]));
+                                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                                    format!(
+                                        "node_ids must be a JSON array of strings or a comma-separated list: {e}"
+                                    ),
+                                )]));
                             }
                         }
                     } else {
@@ -5429,13 +5433,13 @@ async fn handle_workspace(
                 }
                 (None, Some(s)) => vec![s.to_owned()],
                 (None, None) => {
-                    return Ok(CallToolResult::error(vec![Content::text(
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(
                         "Missing required parameter: node_id (or node_ids)",
                     )]));
                 }
             };
             if parsed.is_empty() {
-                return Ok(CallToolResult::error(vec![Content::text(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
                     "node_ids must contain at least one non-empty id",
                 )]));
             }

@@ -1,7 +1,8 @@
 [package]
 name = "fastio-cli"
-version = "0.2.82"
+version = "0.2.83"
 edition = "2024"
+rust-version = "1.88"
 description = "Command-line interface for the Fast.io cloud storage platform"
 license = "Apache-2.0"
 authors = ["Fast.io <support@fast.io>"]
@@ -17,7 +18,7 @@ path = "src/bin/fastio/main.rs"
 
 [dependencies]
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -31,18 +32,32 @@ indicatif = "0.18"
 getrandom_crate = { package = "getrandom", version = "0.2" }
 open = "5"
 openssl = { version = "0.10", features = ["vendored"], optional = true }
-reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+# reqwest 0.13 switched its `default-tls` to rustls; this crate stays on the
+# native-tls backend (platform TLS; OpenSSL on Linux), so defaults are off
+# and 0.12's default set is re-enabled explicitly (`native-tls-no-alpn` matches
+# 0.12's ALPN-less `default-tls`). `query` and `form` became opt-in features in 0.13.
+reqwest = { version = "0.13", default-features = false, features = [
+    "native-tls-no-alpn",
+    "charset",
+    "http2",
+    "system-proxy",
+    "json",
+    "form",
+    "query",
+    "stream",
+    "multipart",
+] }
 secrecy = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-termimad = "0.34"
+termimad = "0.35"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
-rmcp = { version = "1.4", features = ["server", "transport-io"] }
+rmcp = { version = "3.1", features = ["server", "transport-io"] }
 schemars = "1.2"
 urlencoding = "2"
 

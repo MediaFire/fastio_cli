@@ -10,13 +10,14 @@ pub mod resources;
 /// MCP tool definitions and dispatch router.
 pub mod tools;
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, GetPromptRequestParams, GetPromptResult, Implementation,
-    InitializeResult, ListPromptsResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResult,
+    CallToolRequestParams, CallToolResponse, GetPromptRequestParams, GetPromptResponse,
+    Implementation, InitializeResult, ListPromptsResult, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
     ServerCapabilities,
 };
 use rmcp::service::RequestContext;
@@ -212,12 +213,10 @@ impl FastioMcpServer {
 
 impl ServerHandler for FastioMcpServer {
     fn get_info(&self) -> InitializeResult {
-        // Constructor + `with_*` chain rather than a struct literal: rmcp 1.x
-        // marks these `#[non_exhaustive]`, so struct-expression syntax is
-        // rejected outside the defining crate — and `..Default::default()` does
-        // NOT rescue it (the `Implementation` literal here had that and still
-        // failed). Every field set below was set before; this is a syntax
-        // migration for the 0.16 → 1.x bump, not a behaviour change.
+        // Constructor + `with_*` chain rather than a struct literal: these
+        // types are `#[non_exhaustive]`, so struct-expression syntax is
+        // rejected outside the defining crate, and `..Default::default()` does
+        // not rescue it.
         InitializeResult::new(
             ServerCapabilities::builder()
                 .enable_prompts()
@@ -238,12 +237,24 @@ impl ServerHandler for FastioMcpServer {
         Ok(resources::list_resources(&self.state).await)
     }
 
+    /// Restrict protocol negotiation to the one revision this server implements.
+    ///
+    /// The default advertises every revision the MCP SDK knows about, which
+    /// would let a newer client negotiate a version whose result fields this
+    /// server does not populate. `get_info` announces the 2024-11-05 surface,
+    /// so negotiation is bounded to the same single version.
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(&[ProtocolVersion::V_2024_11_05])
+    }
+
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
-        resources::read_resource(&self.state, &request.uri).await
+    ) -> Result<ReadResourceResponse, McpError> {
+        resources::read_resource(&self.state, &request.uri)
+            .await
+            .map(Into::into)
     }
 
     async fn list_prompts(
@@ -258,8 +269,8 @@ impl ServerHandler for FastioMcpServer {
         &self,
         request: GetPromptRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, McpError> {
-        prompts::get_prompt(&request.name, request.arguments)
+    ) -> Result<GetPromptResponse, McpError> {
+        prompts::get_prompt(&request.name, request.arguments).map(Into::into)
     }
 
     async fn list_tools(
@@ -274,10 +285,11 @@ impl ServerHandler for FastioMcpServer {
         &self,
         request: CallToolRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         self.tool_router
             .call_tool(&request.name, request.arguments.unwrap_or_default())
             .await
+            .map(Into::into)
     }
 }
 

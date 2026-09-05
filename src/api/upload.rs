@@ -168,7 +168,10 @@ pub async fn single_call_upload(
                 }
 
                 let body: Value = resp.json().await.map_err(|e| {
-                    CliError::Parse(format!("failed to parse single-call upload response: {e}"))
+                    CliError::Parse(format!(
+                        "failed to parse single-call upload response: {}",
+                        crate::error::without_request_url(e)
+                    ))
                 })?;
 
                 let result_ok = match body.get("result") {
@@ -348,7 +351,7 @@ pub async fn create_fileshare_writeback_session(
 /// before returning a 500 (or before the client timed out / the in-flight
 /// `inner.call(req)` errored), so a replay could create a duplicate version or,
 /// with `if_version_id`, turn a silent success into a later CAS conflict. In
-/// reqwest 0.12 a request error wraps `inner.call(req).await`, which can fire
+/// reqwest 0.13 a request error wraps `inner.call(req).await`, which can fire
 /// while the body is mid-send — so it is excluded here even though
 /// [`stream_upload`] (where the same hazard exists but the precedent is broader)
 /// still retries it. The re-sendable chunked path
@@ -462,7 +465,10 @@ pub async fn single_shot_fileshare_writeback(
                 }
 
                 let body: Value = resp.json().await.map_err(|e| {
-                    CliError::Parse(format!("failed to parse write-back response: {e}"))
+                    CliError::Parse(format!(
+                        "failed to parse write-back response: {}",
+                        crate::error::without_request_url(e)
+                    ))
                 })?;
 
                 let result_ok = match body.get("result") {
@@ -499,7 +505,7 @@ pub async fn single_shot_fileshare_writeback(
                 // Retry ONLY a defensibly-pre-send failure: `is_connect` (the
                 // TCP connection itself failed) occurs before any bytes reach the
                 // wire, so a replay cannot duplicate a version. `is_request` is
-                // DELIBERATELY excluded — in reqwest 0.12 a request error wraps
+                // DELIBERATELY excluded — in reqwest 0.13 a request error wraps
                 // failures from `inner.call(req).await`, which can fire WHILE the
                 // body is being sent or the response awaited; for a non-idempotent
                 // single-shot write-back that may have already created a version,
@@ -507,7 +513,7 @@ pub async fn single_shot_fileshare_writeback(
                 // `if_version_id`, converting a silent success into a later CAS
                 // conflict. A timeout is likewise excluded — the full body may
                 // have been sent and a new version assembled before the client
-                // timed out. The classifiers OVERLAP in reqwest 0.12 (a timed-out
+                // timed out. The classifiers OVERLAP in reqwest 0.13 (a timed-out
                 // connect can ALSO report `is_connect`), so the leading
                 // `!is_timeout()` guard keeps a post-send timeout out even on the
                 // narrowed `is_connect()` predicate.
@@ -543,10 +549,10 @@ pub async fn single_shot_fileshare_writeback(
 /// `is_request` / `is_timeout`). Takes the relevant classifier flags directly.
 ///
 /// Only `is_connect` (the TCP connection itself failed — no bytes on the wire)
-/// is retryable, and only when NOT also a timeout (the reqwest 0.12 classifiers
+/// is retryable, and only when NOT also a timeout (the reqwest 0.13 classifiers
 /// overlap, so a timed-out connect can report `is_connect` too). `is_request` is
 /// intentionally NOT a parameter: it is never retryable on this non-idempotent
-/// single-shot path, because in reqwest 0.12 a request error wraps
+/// single-shot path, because in reqwest 0.13 a request error wraps
 /// `inner.call(req).await` and can fire mid-send after the server may already
 /// have assembled a new version.
 #[must_use]
@@ -754,7 +760,8 @@ async fn handle_chunk_response(
         Ok(b) => b,
         Err(e) => {
             return ChunkResult::Error(CliError::Parse(format!(
-                "failed to parse chunk upload response: {e}"
+                "failed to parse chunk upload response: {}",
+                crate::error::without_request_url(e)
             )));
         }
     };
@@ -1269,7 +1276,8 @@ async fn handle_stream_response(resp: reqwest::Response, attempt: &mut u32) -> S
         Ok(b) => b,
         Err(e) => {
             return StreamResult::Error(CliError::Parse(format!(
-                "failed to parse stream upload response: {e}"
+                "failed to parse stream upload response: {}",
+                crate::error::without_request_url(e)
             )));
         }
     };
@@ -1526,7 +1534,10 @@ pub async fn upload_batch(
                 }
 
                 let body: Value = resp.json().await.map_err(|e| {
-                    CliError::Parse(format!("failed to parse batch upload response: {e}"))
+                    CliError::Parse(format!(
+                        "failed to parse batch upload response: {}",
+                        crate::error::without_request_url(e)
+                    ))
                 })?;
 
                 return parse_batch_response(&body, status.as_u16());
