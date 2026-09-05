@@ -1,0 +1,54 @@
+# Dependabot version updates.
+# Security updates and alerts are enabled separately in the repository
+# settings; this file only governs the scheduled version-update PRs.
+version: 2
+
+updates:
+  # Rust crates (Cargo.toml + Cargo.lock at the repo root)
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Chicago
+    open-pull-requests-limit: 5
+    # Wait for a release to settle before proposing it; a longer wait on
+    # majors, which usually need code changes and a review.
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 7
+      semver-patch-days: 3
+    # One PR per week for all minor/patch bumps; majors get their own PR.
+    groups:
+      cargo-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: deps
+
+  # GitHub Actions used by ci.yml and release.yml
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Chicago
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: ci
+
+  # npm/package.json has no dependencies (it only downloads the prebuilt
+  # binary), so there is nothing for an npm entry to update. Add one here
+  # if that package ever gains dependencies.
