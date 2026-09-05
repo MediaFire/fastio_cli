@@ -431,6 +431,21 @@ pub(crate) fn json_u64(v: &serde_json::Value) -> Option<u64> {
         .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
 }
 
+/// Strip the request URL from a `reqwest` error.
+///
+/// `reqwest` attaches the request URL to errors raised by BUFFERED body reads
+/// (`bytes()`, `text()`, `json()`). Request URLs in this crate can carry
+/// short-lived capability tokens in their query string — upload, download and
+/// lock tokens — so an error rendered into stderr, into a `tracing` field, or
+/// into an MCP error payload would publish a live credential.
+///
+/// [`reqwest::Error::without_url`] removes only the URL: the error kind and the
+/// whole source chain are preserved, so the real cause is still reported.
+#[must_use]
+pub(crate) fn without_request_url(e: reqwest::Error) -> reqwest::Error {
+    e.without_url()
+}
+
 /// Code `1680` — the platform's **generic** access-denied code (`APP_DENIED`).
 ///
 /// **The wording here is deliberately resource-agnostic.** `1680` is

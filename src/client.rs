@@ -2542,6 +2542,10 @@ impl ApiClient {
                     });
                 }
                 Err(e) => {
+                    // Strip the request URL before it can reach either the log
+                    // line below or the stored error: it may carry a
+                    // short-lived capability token in its query string.
+                    let e = crate::error::without_request_url(e);
                     if Self::should_retry_body_read(replay, &sent.method, sent.attempt) {
                         tracing::warn!(
                             error = %e,
@@ -2568,7 +2572,7 @@ impl ApiClient {
     /// ([`Self::is_retryable_error`]); this adds the replay question on top of
     /// it, and only ever makes the answer more conservative.
     ///
-    /// **The connect/ambiguous split, from `reqwest` 0.12 semantics (verified
+    /// **The connect/ambiguous split, from `reqwest` 0.13 semantics (verified
     /// in its `error.rs`, not assumed):**
     ///
     /// - `is_connect()` walks the source chain for a `hyper_util` connect
@@ -2979,7 +2983,10 @@ impl ApiClient {
         resp: reqwest::Response,
     ) -> Result<T, CliError> {
         let status = resp.status();
-        let body = resp.bytes().await;
+        let body = resp
+            .bytes()
+            .await
+            .map_err(crate::error::without_request_url);
         Self::handle_envelope_body(status, body)
     }
 
@@ -3156,10 +3163,12 @@ impl ApiClient {
     async fn handle_response_text(resp: reqwest::Response) -> Result<String, CliError> {
         let status = resp.status();
         let http_status = status.as_u16();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| CliError::Parse(format!("failed to read response body: {e}")))?;
+        let body = resp.text().await.map_err(|e| {
+            CliError::Parse(format!(
+                "failed to read response body: {}",
+                crate::error::without_request_url(e)
+            ))
+        })?;
 
         if !status.is_success() {
             let message = if body.trim().is_empty() {
@@ -6305,6 +6314,76 @@ mod tests {
         assert!(
             ApiClient::should_retry_transport_error(ReplayPolicy::IfMethodIsSafe, &err),
             "ordinary requests must keep retrying timeouts exactly as before"
+        );
+    }
+
+    /// Serve ONE response whose declared `Content-Length` is LARGER than the
+    /// bytes actually written, then close the connection. The client therefore
+    /// fails while READING the body (not while sending), which is the class of
+    /// error that carries the request URL.
+    async fn spawn_truncated_body_server() -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Content-Length: 4096\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                // Far fewer bytes than declared, then EOF.
+                let _ = sock.write_all(b"{\"resu").await;
+                let _ = sock.flush().await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn body_read_error_does_not_leak_url_token() {
+        // Request URLs on the capability-bearing paths (upload / download /
+        // lock) carry a short-lived token in the query string. A buffered body
+        // read that fails must never render that URL into the error, because
+        // the error reaches stderr, `tracing`, and MCP error payloads.
+        let addr = spawn_truncated_body_server().await;
+        let url = format!("http://{addr}/current/file/read?token=SUPERSECRETVALUE");
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .expect("the stub answers with headers");
+
+        let client = ApiClient::new(&format!("http://{addr}"), Some("tok".to_owned()))
+            .expect("client builds");
+        let err = client
+            .handle_response::<Value>(resp)
+            .await
+            .expect_err("a truncated body must fail");
+
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        assert!(
+            !display.contains("SUPERSECRETVALUE"),
+            "the query-string token leaked into Display: {display}"
+        );
+        assert!(
+            !debug.contains("SUPERSECRETVALUE"),
+            "the query-string token leaked into Debug: {debug}"
+        );
+        assert!(
+            !display.contains(&addr),
+            "the request host:port leaked into Display: {display}"
+        );
+        assert!(
+            !debug.contains(&addr),
+            "the request host:port leaked into Debug: {debug}"
         );
     }
 }

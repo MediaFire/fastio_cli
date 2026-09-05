@@ -171,7 +171,10 @@ pub async fn upload_entity_asset(
         .await?;
 
     let status = resp.status();
-    let body: Value = resp.json().await.map_err(CliError::Http)?;
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| CliError::Http(crate::error::without_request_url(e)))?;
 
     if !status.is_success() {
         let msg = body
@@ -416,7 +419,10 @@ pub async fn read_user_asset(
         }));
     }
 
-    let bytes = resp.bytes().await.map_err(CliError::Http)?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| CliError::Http(crate::error::without_request_url(e)))?;
     tokio::fs::write(output_path, &bytes)
         .await
         .map_err(|e| CliError::Config(format!("failed to write file: {e}")))?;
