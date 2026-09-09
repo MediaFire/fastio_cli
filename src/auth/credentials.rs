@@ -80,6 +80,15 @@ pub struct StoredCredentials {
     /// Authentication method used (`basic`, `pkce`, `api_key`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
+    /// The credential's granted entity scopes, stored as the verbatim
+    /// JSON-encoded string the server returned — e.g.
+    /// `"[\"org:123:rwa\",\"userdetails:*:rw\"]"`.
+    ///
+    /// NOT a secret: it describes what the credential may do, never how to
+    /// authenticate, so it is shown unredacted in `Debug`. Absent for a
+    /// credential the server reported no entity scopes for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
 }
 
 impl fmt::Debug for StoredCredentials {
@@ -95,6 +104,8 @@ impl fmt::Debug for StoredCredentials {
             .field("user_id", &self.user_id)
             .field("email", &self.email)
             .field("auth_method", &self.auth_method)
+            // Not a secret — it describes authority, not how to authenticate.
+            .field("scopes", &self.scopes)
             .finish()
     }
 }
@@ -175,5 +186,83 @@ impl CredentialsFile {
     pub fn remove(&mut self, profile: &str, dir: &Path) -> Result<(), CliError> {
         self.profiles.remove(profile);
         self.save(dir)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StoredCredentials;
+    use secrecy::SecretString;
+
+    /// A credentials file written before `scopes` existed must still load.
+    #[test]
+    fn legacy_record_without_scopes_deserialises() {
+        let json = r#"{"token":"t","expires_at":123,"auth_method":"pkce"}"#;
+        let creds: StoredCredentials = serde_json::from_str(json).expect("legacy record loads");
+        assert_eq!(creds.scopes, None);
+        assert_eq!(creds.expose_token(), Some("t"));
+    }
+
+    /// An explicit null is the same as absent, not a parse failure.
+    #[test]
+    fn explicit_null_scopes_deserialises() {
+        let json = r#"{"token":"t","scopes":null}"#;
+        let creds: StoredCredentials = serde_json::from_str(json).expect("null scopes loads");
+        assert_eq!(creds.scopes, None);
+    }
+
+    /// The value is the server's own JSON string and must survive a
+    /// load/save/load cycle byte-for-byte.
+    #[test]
+    fn scopes_round_trip_byte_for_byte() {
+        let raw = "[\"org:123:rwa\",\"userdetails:*:rw\"]";
+        let json = format!(
+            "{{\"token\":\"t\",\"scopes\":{}}}",
+            serde_json::Value::String(raw.to_owned())
+        );
+        let creds: StoredCredentials = serde_json::from_str(&json).expect("scopes loads");
+        assert_eq!(creds.scopes.as_deref(), Some(raw));
+
+        let out = serde_json::to_string(&creds).expect("serialises");
+        let back: StoredCredentials = serde_json::from_str(&out).expect("reloads");
+        assert_eq!(back.scopes.as_deref(), Some(raw));
+    }
+
+    /// `None` must not write a `"scopes": null` key into the file.
+    #[test]
+    fn absent_scopes_is_omitted_on_serialise() {
+        let creds = StoredCredentials {
+            token: Some(SecretString::from("t")),
+            ..Default::default()
+        };
+        let out = serde_json::to_string(&creds).expect("serialises");
+        assert!(
+            !out.contains("scopes"),
+            "an absent grant must be omitted, got: {out}"
+        );
+    }
+
+    /// `scopes` describes authority, not a secret, so `Debug` shows it — while
+    /// every token field stays redacted.
+    #[test]
+    fn debug_shows_scopes_and_still_redacts_tokens() {
+        let creds = StoredCredentials {
+            token: Some(SecretString::from("secret-token")),
+            refresh_token: Some(SecretString::from("secret-refresh")),
+            api_key: Some(SecretString::from("secret-key")),
+            scopes: Some("[\"org:123:rwa\"]".to_owned()),
+            ..Default::default()
+        };
+        let rendered = format!("{creds:?}");
+        assert!(
+            rendered.contains("org:123:rwa"),
+            "scopes must be visible, got: {rendered}"
+        );
+        for secret in ["secret-token", "secret-refresh", "secret-key"] {
+            assert!(
+                !rendered.contains(secret),
+                "{secret} must stay redacted, got: {rendered}"
+            );
+        }
     }
 }

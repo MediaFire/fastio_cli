@@ -97,7 +97,9 @@ Both modes share a common API layer, ensuring zero code duplication.
 ### `auth/`
 
 #### `credentials.rs`
-- `StoredCredentials` with token, refresh_token, api_key, expires_at, user_id, email, auth_method
+- `StoredCredentials` with token, refresh_token, api_key, expires_at, user_id, email, auth_method,
+  scopes (the granted entity-scope list echoed by token exchange/refresh, stored verbatim as the
+  server's JSON-encoded string; absent on profiles written before it existed)
 - `CredentialsFile` managing `~/.fastio/credentials.json`
 - Per-profile credential storage with load/save/remove
 
@@ -123,7 +125,7 @@ Each module contains typed functions mapping to Fast.io REST endpoints:
 
 | Module | Endpoints | Description |
 |--------|-----------|-------------|
-| `auth.rs` | 21 functions | Login, signup, 2FA, API keys, OAuth sessions, PKCE |
+| `auth.rs` | 22 functions | Login, signup, 2FA, API keys, OAuth sessions (incl. scope narrowing), PKCE |
 | `user.rs` | 16 functions | Profile, search, assets, invitations |
 | `org.rs` | 42 functions | CRUD, billing, members, transfer, discovery, assets |
 | `workspace.rs` | 35 functions | CRUD, metadata, notes, archiving |
@@ -151,7 +153,7 @@ Each module handles one command group, orchestrating API calls and output render
 
 | Module | Commands | Description |
 |--------|----------|-------------|
-| `auth.rs` | 21 | Login, 2FA, API keys, OAuth sessions |
+| `auth.rs` | 22 | Login, 2FA, API keys, OAuth sessions, scopes |
 | `user.rs` | 16 | Profile, search, assets, invitations |
 | `org.rs` | 42 | Full org management with nested billing/members/invitations/transfer/assets |
 | `workspace.rs` | 24 | CRUD, metadata, notes |
@@ -198,7 +200,10 @@ Each module handles one command group, orchestrating API calls and output render
   the CLI side instead of the MCP path
 
 #### `resources.rs`
-- `session://status` — current auth state (authenticated, email, token expiry, scopes)
+- `session://status` — whether this process holds a credential (`authenticated`, `api_base`,
+  and a `hint`). A purely LOCAL read: it never calls the API, and it makes no claim about
+  what the credential is allowed to do — the hint points at the `auth` tool's `scopes`
+  action for the live view
 
 #### `prompts.rs`
 - `get-started` — first-time setup guidance
@@ -284,18 +289,26 @@ The `ApiClient::handle_response()` method:
 1. Generate code_verifier (32 random bytes via `getrandom`, base64url)
 2. Derive code_challenge (SHA-256, base64url)
 3. Generate random state parameter
-4. GET `/oauth/authorize/` with challenge, state, client_id
+4. GET `/oauth/authorize/` with challenge, state, client_id — plus `access_mode`
+   (`r`/`rwa`, from `--read-only`/`--admin`) and `account_settings=1` when requested;
+   both are a CEILING the consent page may narrow
 5. Open browser to `https://go.fast.io/connect?auth_request_id=...`
 6. Start local TCP server on `127.0.0.1:19836`
 7. User authenticates in browser, callback received
 8. Verify state matches (CSRF protection)
 9. POST `/oauth/token/` to exchange code + verifier for tokens
-10. Store access_token and refresh_token
+10. Store access_token, refresh_token, and the granted `scopes` echoed by the exchange
 
 ### API Key
 1. Create via `fastio auth api-key create --name "..."`
-2. Store as `FASTIO_API_KEY` env var or in profile credentials
-3. Used as Bearer token directly — no expiration client-side
+2. Scope it with the structured selectors — `--org` / `--workspace` / `--share` (repeatable) and
+   `--all` pick the entities, `--admin` / `--read-only` pick the access mode, `--account-settings`
+   appends `userdetails:*:rw`. A shared resolver (`api::auth::resolve_key_scopes`, also used by
+   `api-key update` and `oauth narrow`) turns them into the `scopes` JSON array the API expects.
+   It is fail-closed: it returns nothing only when no structured flag was given, and errors on
+   partial intent rather than widening. Raw `--scopes <json>` bypasses it and conflicts with it
+3. Store as `FASTIO_API_KEY` env var or in profile credentials
+4. Used as Bearer token directly — no expiration client-side
 
 ## Error Strategy
 

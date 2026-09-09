@@ -3,16 +3,22 @@
 /// Handles login (basic + PKCE), logout, status, signup, email
 /// verification, 2FA management, and API key management.
 use anyhow::{Context, Result};
+use colored::Colorize;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 
 use fastio_cli::api;
+use fastio_cli::api::auth::{
+    ApiKeyScopeSpec, HINT_KEY_SCOPES_CHANGED, HINT_SESSION_SCOPES_CHANGED,
+    map_scope_update_conflict,
+};
 use fastio_cli::auth::credentials::{CredentialsFile, StoredCredentials};
 use fastio_cli::auth::pkce;
 use fastio_cli::auth::token;
 use fastio_cli::client::ApiClient;
 use fastio_cli::config::Config;
 use fastio_cli::error::CliError;
+use fastio_cli::output::OutputFormat;
 
 use super::CommandContext;
 
@@ -27,6 +33,7 @@ pub async fn execute(
             email,
             password,
             agent_name,
+            access,
         } => {
             if let (Some(email), Some(password)) = (email.as_deref(), password.as_deref()) {
                 // Refuse rather than ignore: basic auth does not carry an agent
@@ -40,6 +47,19 @@ pub async fn execute(
                          `fastio auth api-key create --agent-name`."
                     )
                 }
+                // Same class of refusal: the access-mode ceiling and the
+                // account-settings request are asked for at the consent page,
+                // which basic auth never reaches. Accepting them here would
+                // hand back a credential the operator believes is scoped and
+                // is not.
+                if let Some(flag) = access.first_unsupported_by_basic_auth() {
+                    anyhow::bail!(
+                        "{flag} applies to browser (PKCE) login only; basic auth cannot \
+                         reach the consent page that grants it. Omit --email/--password \
+                         to use browser login, or scope an API key with \
+                         `fastio auth api-key create`."
+                    )
+                }
                 login_basic(config, ctx, email, password).await
             } else if password.is_some() {
                 anyhow::bail!(
@@ -47,7 +67,14 @@ pub async fn execute(
                      or omit both for browser login."
                 )
             } else {
-                login_pkce(config, ctx, email.as_deref(), agent_name.as_deref()).await
+                login_pkce(
+                    config,
+                    ctx,
+                    email.as_deref(),
+                    agent_name.as_deref(),
+                    *access,
+                )
+                .await
             }
         }
         AuthCommand::Logout => logout(ctx),
@@ -90,6 +117,55 @@ pub async fn execute(
     }
 }
 
+/// Access-mode ceiling requested at login, as asked for by `--admin`,
+/// `--read-only` and `--account-settings`.
+///
+/// A ceiling, not a grant: the consent page may narrow what is actually
+/// issued, which is why the PKCE path re-reads the granted set afterwards.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LoginAccess {
+    /// Ask for an admin (`rwa`) access mode.
+    pub admin: bool,
+    /// Ask for a read-only (`r`) access mode.
+    pub read_only: bool,
+    /// Also ask for account settings changes (`userdetails:*:rw`).
+    pub account_settings: bool,
+}
+
+impl LoginAccess {
+    /// The first flag set here that basic auth cannot honour, spelled as the
+    /// user typed it — `None` when nothing was requested.
+    #[must_use]
+    pub fn first_unsupported_by_basic_auth(self) -> Option<&'static str> {
+        if self.admin {
+            Some("--admin")
+        } else if self.read_only {
+            Some("--read-only")
+        } else if self.account_settings {
+            Some("--account-settings")
+        } else {
+            None
+        }
+    }
+
+    /// The wire form for the PKCE initiate call. `--admin` and `--read-only`
+    /// are mutually exclusive at the clap layer, so at most one can be set.
+    #[must_use]
+    fn to_authorize_access(self) -> api::auth::AuthorizeAccess<'static> {
+        let access_mode = if self.admin {
+            Some("rwa")
+        } else if self.read_only {
+            Some("r")
+        } else {
+            None
+        };
+        api::auth::AuthorizeAccess {
+            access_mode,
+            account_settings: self.account_settings,
+        }
+    }
+}
+
 /// Auth subcommand variants.
 #[derive(Clone)]
 #[non_exhaustive]
@@ -102,6 +178,8 @@ pub enum AuthCommand {
         password: Option<String>,
         /// Agent instance label for the resulting credential (PKCE only).
         agent_name: Option<String>,
+        /// Access-mode ceiling requested at the consent page (PKCE only).
+        access: LoginAccess,
     },
     /// Clear stored credentials (local only).
     Logout,
@@ -216,6 +294,8 @@ pub enum ApiKeyCommand {
         agent_name: Option<String>,
         /// Expiration datetime (strtotime-compatible).
         expires: Option<String>,
+        /// Structured scope selectors (mutually exclusive with `scopes`).
+        scope_spec: ApiKeyScopeSpec,
     },
     /// List all API keys.
     List,
@@ -241,6 +321,8 @@ pub enum ApiKeyCommand {
         agent_name: Option<String>,
         /// New expiration datetime (empty string clears).
         expires: Option<String>,
+        /// Structured scope selectors (mutually exclusive with `scopes`).
+        scope_spec: ApiKeyScopeSpec,
     },
 }
 
@@ -263,6 +345,15 @@ pub enum OauthCommand {
         device_name: Option<String>,
         /// New agent name (empty string clears).
         agent_name: Option<String>,
+    },
+    /// Narrow a session's granted scopes (narrower-or-equal only).
+    Narrow {
+        /// Session ID.
+        session_id: String,
+        /// Replacement scopes (JSON array string).
+        scopes: Option<String>,
+        /// Structured scope selectors (mutually exclusive with `scopes`).
+        scope_spec: ApiKeyScopeSpec,
     },
     /// Revoke a single session.
     Revoke {
@@ -299,6 +390,9 @@ async fn login_basic(
         user_id: None,
         email: Some(email.to_owned()),
         auth_method: Some("basic".to_owned()),
+        // Basic auth never reaches the consent page, so there is no granted
+        // entity list to record.
+        scopes: None,
     };
 
     let mut creds_file =
@@ -365,6 +459,7 @@ async fn login_pkce(
     ctx: &CommandContext<'_>,
     email_hint: Option<&str>,
     agent_name: Option<&str>,
+    access: LoginAccess,
 ) -> Result<()> {
     let client = ApiClient::new(ctx.api_base, None).context("failed to create API client")?;
 
@@ -380,6 +475,7 @@ async fn login_pkce(
         &challenge.state,
         pkce::PKCE_REDIRECT_URI,
         agent_name.as_deref(),
+        access.to_authorize_access(),
     )
     .await
     .context("failed to initiate PKCE authorization")?;
@@ -422,6 +518,11 @@ async fn login_pkce(
         user_id: None,
         email: email_hint.map(String::from),
         auth_method: Some("pkce".to_owned()),
+        // The granted entity array, normalized to the server's string form by
+        // `deserialize_optional_scopes`: a string arrives as received, an array
+        // is re-encoded to the same rendering, and a blank one reads as absent
+        // rather than erasing a real grant.
+        scopes: token_resp.scopes.clone(),
     };
 
     let mut creds_file =
@@ -429,6 +530,26 @@ async fn login_pkce(
     creds_file
         .set(ctx.profile_name, creds, ctx.config_dir)
         .context("failed to save credentials")?;
+
+    // `--admin` asks for a CEILING; the consent page decides. A login that
+    // silently came back without admin would surface much later as a 403 on
+    // the first admin operation, so confirm it once, here, while the user is
+    // still looking. Never fatal — the login itself succeeded.
+    // `--quiet` suppresses the WARNING, never the check. Quiet is an OUTPUT
+    // flag: it must change what the command prints and nothing else, so the
+    // introspection runs identically in both modes and only the printing is
+    // conditional. It leaves no record either way — under `--quiet` the
+    // refusal simply is not reported.
+    if access.admin
+        // Nothing in this block may fail the command: the credential is
+        // already stored and works, so a client that will not build here is
+        // one more reason to stay silent, never to exit non-zero.
+        && let Ok(confirm_client) =
+            ApiClient::new(ctx.api_base, Some(token_resp.access_token.clone()))
+        && let Some(warning) = admin_grant_notice(&confirm_client, ctx.output.quiet).await
+    {
+        eprintln!("{} {warning}", "warning:".yellow().bold());
+    }
 
     let value = json!({
         "status": "authenticated",
@@ -439,6 +560,51 @@ async fn login_pkce(
 
     ctx.output.render(&value)?;
     Ok(())
+}
+
+/// The post-login admin confirmation, with `--quiet` applied to the OUTPUT
+/// only.
+///
+/// The introspection call runs either way so that the login's side effects are
+/// the SAME in both modes: `--quiet` then changes only what is printed, never
+/// what the command does. Branching on it would make the quiet path a
+/// different command that happens to share a name, and the one visible
+/// difference — the warning — is suppressed here rather than upstream.
+async fn admin_grant_notice(client: &ApiClient, quiet: bool) -> Option<String> {
+    let warning = admin_grant_warning(client).await;
+    if quiet { None } else { warning }
+}
+
+/// Read back what the consent page actually granted, returning the warning
+/// text when `--admin` was asked for and not given.
+///
+/// Returns `None` when admin is confirmed. Never returns an error: the
+/// credential is already stored and works, so a failed introspection is worth
+/// a softer word, not a non-zero exit.
+async fn admin_grant_warning(client: &ApiClient) -> Option<String> {
+    match api::auth::scopes(client).await {
+        // Only an explicit `admin: true` confirms the ceiling. A missing or
+        // wrong-typed field is UNCONFIRMED, not confirmed: reading it as "fine"
+        // would report success for a login that never got admin.
+        Ok(body) => match body.get("admin").and_then(Value::as_bool) {
+            Some(true) => None,
+            Some(false) => Some(
+                "admin access was requested but the consent page did not grant it. \
+                 Run `fastio auth scopes` to see what this login actually holds."
+                    .to_owned(),
+            ),
+            None => Some(
+                "admin access was requested but could not be confirmed (the scope \
+                 introspection did not report it). \
+                 Run `fastio auth scopes` to see what this login actually holds."
+                    .to_owned(),
+            ),
+        },
+        Err(e) => Some(format!(
+            "admin access was requested but could not be confirmed ({e}). \
+             Run `fastio auth scopes` to see what this login actually holds."
+        )),
+    }
 }
 
 /// Prompt the user to manually paste an authorization code (sync wrapper).
@@ -483,27 +649,69 @@ fn logout(ctx: &CommandContext<'_>) -> Result<()> {
 /// Sign out server-side (invalidate the user's revocable sessions), then
 /// clear local credentials for the active profile.
 ///
-/// Best-effort when the stored credential is already dead: a 401 for a
-/// profile-store bearer on the profile's own API base — or a stored token
-/// that is already expired client-side — still clears local credentials, so
-/// a dead profile never wedges in a signed-in state. The rendered
-/// `server_signout_completed` field reports which path was taken. A 401 for a
-/// `--token`/env bearer, or under an `--api-base` override that differs from
-/// the profile's own base, stays fatal: the stored credentials were never
-/// what that server rejected.
+/// Best-effort when the credential cannot revoke its own session: a dead-bearer
+/// 401 or a read-only 403 — or a stored token already expired client-side —
+/// still clears local credentials, so a profile never wedges in a signed-in
+/// state. The rendered `server_signout_completed` field reports which path was
+/// taken.
+///
+/// All three of those clears are gated on the ACTIVE PROFILE ITSELF owning the
+/// credential at fault — the expiry arm on the profile holding the expired
+/// access token, the two server arms on the profile holding the exact bearer
+/// the server rejected — and the server arms additionally on the request having
+/// gone to that profile's own API base. A `--token`/env bearer stays fatal (the
+/// stored credentials were never what the server rejected), and so does
+/// resolution's fallback from a credential-less named profile to `default`:
+/// clearing there would destroy the innocent profile and leave the credential
+/// actually at fault on disk.
 async fn signout(config: &Config, ctx: &CommandContext<'_>) -> Result<()> {
+    let env_token = std::env::var("FASTIO_TOKEN").ok();
+    let env_key = std::env::var("FASTIO_API_KEY").ok();
+    signout_with_env(config, ctx, env_token.as_deref(), env_key.as_deref()).await
+}
+
+/// [`signout`] with the two environment credentials passed in rather than read
+/// from the process environment.
+///
+/// Mirrors [`token::resolve_token_with_env`], for the same reason: those two
+/// variables decide both which credential is sent AND whether the best-effort
+/// local clear may fire, so a test that lets them come from the ambient process
+/// environment is really testing whatever the runner inherited. The public
+/// wrapper reads the environment once; this takes the values.
+async fn signout_with_env(
+    config: &Config,
+    ctx: &CommandContext<'_>,
+    env_token: Option<&str>,
+    env_key: Option<&str>,
+) -> Result<()> {
     // A stored token that is already expired client-side can never reach the
     // server (resolution refuses to send it) — the sign-out intent is still
     // satisfiable locally, so clear the profile instead of wedging it. The
     // `Auth` variant only ever originates from stored-profile expiry (flag
     // and env bearers return earlier in the precedence chain).
-    let resolved = match token::resolve_token(ctx.flag_token, ctx.profile_name, ctx.config_dir) {
+    let resolved = match token::resolve_token_with_env(
+        ctx.flag_token,
+        env_token,
+        env_key,
+        ctx.profile_name,
+        ctx.config_dir,
+    ) {
         Ok(r) => r,
-        Err(CliError::Auth(_)) => {
+        Err(CliError::Auth(msg)) => {
             let creds_file =
                 CredentialsFile::load(ctx.config_dir).context("failed to load credentials")?;
-            if creds_file.get(ctx.profile_name).is_none() {
-                anyhow::bail!("authentication required. Run: fastio auth login");
+            // The same ownership invariant the server-refusal arms below carry,
+            // and for a stronger reason: this path also REVOKES the profile's
+            // refresh token, which nothing can undo. Mere presence of the named
+            // profile is not ownership — a metadata-only entry is fallen
+            // THROUGH by resolution, so the expired token the error names can
+            // belong to `default` instead. Only an access token of this
+            // profile's own can have produced this error, so only that clears.
+            let profile_holds_the_expired_token = creds_file
+                .get(ctx.profile_name)
+                .is_some_and(|s| s.expose_token().is_some());
+            if !profile_holds_the_expired_token {
+                return Err(CliError::Auth(msg)).context("failed to resolve token");
             }
             // The ACCESS token lapsed, which is precisely when the refresh token
             // matters most: it is the long-lived half and it is still live.
@@ -511,12 +719,33 @@ async fn signout(config: &Config, ctx: &CommandContext<'_>) -> Result<()> {
             // it — this path must revoke too, or the expiry case silently keeps
             // a decade-valid credential alive.
             let refresh_revoked = revoke_stored_refresh_token(ctx).await;
-            return clear_and_render(ctx, false, refresh_revoked);
+            return clear_and_render(ctx, false, refresh_revoked, None);
         }
         Err(e) => return Err(e).context("failed to resolve token"),
     };
     let t = resolved
         .ok_or_else(|| anyhow::anyhow!("authentication required. Run: fastio auth login"))?;
+
+    // Provenance for the best-effort local clear below, which removes THIS
+    // profile's stored credentials and must therefore only fire when THIS
+    // profile is what supplied the bearer the server rejected.
+    //
+    // `bearer_from_store` rules out a `--token` / env bearer but not
+    // resolution's fallback from a credential-less named profile to `default`:
+    // under `--profile x` the bearer sent can be `default`'s, so a refusal
+    // would wipe the innocent profile `x` and leave the rejected credential in
+    // place. The conjunct `auth status` already uses settles it — the profile
+    // must itself hold the token or key that went out.
+    let profile_supplied_bearer = {
+        let creds_file =
+            CredentialsFile::load(ctx.config_dir).context("failed to load credentials")?;
+        stored_scopes_describe_bearer(
+            bearer_from_store(ctx.flag_token, env_token, env_key),
+            Some(t.as_str()),
+            creds_file.get(ctx.profile_name),
+        )
+    };
+
     let client = ApiClient::new(ctx.api_base, Some(t)).context("failed to create API client")?;
 
     // A dead-bearer 401 still clears local credentials — but ONLY when the
@@ -542,23 +771,59 @@ async fn signout(config: &Config, ctx: &CommandContext<'_>) -> Result<()> {
     // API docs: clear local storage regardless of the response).
     let refresh_revoked = revoke_stored_refresh_token(ctx).await;
 
+    // A read-only credential is REFUSED (403) rather than found dead, and the
+    // recovery differs enough to be worth its own sentence — so the warning
+    // text travels with the outcome instead of being re-derived downstream.
+    let mut local_only_warning: Option<String> = None;
     let server_signout_completed = match api::auth::sign_out(&client).await {
         Ok(_) => true,
         Err(ref err)
-            if dead_session_401(err)
-                && bearer_from_store(
-                    ctx.flag_token,
-                    std::env::var("FASTIO_TOKEN").ok().as_deref(),
-                    std::env::var("FASTIO_API_KEY").ok().as_deref(),
-                )
+            if (dead_session_401(err) || read_only_signout_refusal(err))
+                && profile_supplied_bearer
                 && config.api_base(None, Some(ctx.profile_name)) == ctx.api_base =>
         {
+            if read_only_signout_refusal(err) {
+                local_only_warning = Some(read_only_signout_warning(err));
+            }
             false
         }
         Err(e) => return Err(e).context("sign-out failed"),
     };
 
-    clear_and_render(ctx, server_signout_completed, refresh_revoked)
+    clear_and_render(
+        ctx,
+        server_signout_completed,
+        refresh_revoked,
+        local_only_warning.as_deref(),
+    )
+}
+
+/// The stderr line for a sign-out that was refused because the credential is
+/// read-only.
+///
+/// It REPLACES the default "already invalid" wording, which names the wrong
+/// cause: the credential works, it simply may not write. It also carries the
+/// refusal's own `hint:` line — the refusal never reaches the render layer (the
+/// command exits `0`), so this is the only place that advice can be seen at
+/// all, and without it a read-only sign-out looks like an unexplained partial
+/// success.
+fn read_only_signout_warning(err: &CliError) -> String {
+    let mut warning = "warning: this credential is read-only, so it cannot revoke its own \
+         server-side session; local credentials were cleared anyway"
+        .to_owned();
+    if let Some(hint) = err.suggestion() {
+        // Every `scope_write_required` hint ends by pointing at `fastio auth
+        // scopes`, which reads the CURRENT credential — and by the time this
+        // line prints, `clear_and_render` has already deleted it. Forwarded
+        // whole, the hint contradicts the sentence above it and sends the
+        // reader to a command that can no longer authenticate.
+        let applicable = hint
+            .split_once("Run `fastio auth scopes`")
+            .map_or(hint, |(head, _)| head.trim_end());
+        warning.push_str("\nhint: ");
+        warning.push_str(applicable);
+    }
+    warning
 }
 
 /// Revoke this profile's stored OAuth refresh token, best-effort.
@@ -593,6 +858,7 @@ fn clear_and_render(
     ctx: &CommandContext<'_>,
     server_signout_completed: bool,
     refresh_revoked: Option<bool>,
+    local_only_warning: Option<&str>,
 ) -> Result<()> {
     let mut creds_file =
         CredentialsFile::load(ctx.config_dir).context("failed to load credentials")?;
@@ -601,10 +867,18 @@ fn clear_and_render(
         .context("failed to clear credentials")?;
 
     if !server_signout_completed {
-        eprintln!(
-            "warning: this profile's credentials were already invalid (revoked, lapsed, or \
-             expired); local credentials were cleared without a server-side sign-out"
-        );
+        // A caller-supplied line REPLACES the default: the default names the
+        // wrong cause for a live-but-read-only credential, and telling someone
+        // their working credential was "already invalid" sends them off to
+        // re-issue a key that is perfectly fine.
+        if let Some(warning) = local_only_warning {
+            eprintln!("{warning}");
+        } else {
+            eprintln!(
+                "warning: this profile's credentials were already invalid (revoked, lapsed, or \
+                 expired); local credentials were cleared without a server-side sign-out"
+            );
+        }
     }
 
     if refresh_revoked == Some(false) {
@@ -710,6 +984,34 @@ fn dead_session_401(err: &CliError) -> bool {
     )
 }
 
+/// `ERROR_SCOPE_WRITE_REQUIRED` — a read-only credential refused a
+/// user-anchored mutation. Keyed alongside the `reason` because a refusal that
+/// arrives WITHOUT the `params` object still carries its code.
+const SCOPE_WRITE_REQUIRED_CODE: u32 = 10_770;
+
+/// True when sign-out was refused because the credential itself is read-only.
+///
+/// This is NOT a dead credential — it is a live one that may not revoke its own
+/// session, and no retry with it can ever succeed. Treating it as fatal would
+/// wedge a read-only profile in a permanently signed-in state: the user asks to
+/// sign out, is told 403, and the local credential stays on disk forever. So it
+/// joins [`dead_session_401`] on the best-effort path — local credentials are
+/// cleared, `server_signout_completed` reports `false`, and the refusal's own
+/// recovery hint is printed so the read-only grant is not a silent surprise.
+///
+/// The GATES on that clear are unchanged and still apply: the bearer must have
+/// come from the profile store, and the request must have gone to the profile's
+/// own API base.
+fn read_only_signout_refusal(err: &CliError) -> bool {
+    matches!(
+        err,
+        CliError::Api(e)
+            if e.http_status == 403
+                && (e.code == SCOPE_WRITE_REQUIRED_CODE
+                    || e.field_reason() == Some("scope_write_required"))
+    )
+}
+
 /// True when the active bearer was resolved from the profile store — i.e. NOT
 /// supplied via `--token` or the `FASTIO_TOKEN` / `FASTIO_API_KEY` env vars.
 /// Mirrors `token::resolve_token` precedence exactly (empty strings are
@@ -722,6 +1024,39 @@ fn bearer_from_store(
 ) -> bool {
     let present = |v: Option<&str>| v.is_some_and(|s| !s.is_empty());
     !present(flag_token) && !present(env_token) && !present(env_key)
+}
+
+/// Does the profile's stored grant describe the credential `auth status`
+/// actually reported on?
+///
+/// [`bearer_from_store`] rules out a `--token` / env bearer, but two cases
+/// survive it and both would attribute one credential's authority to another:
+///
+/// - **Profile fallback.** `--profile x` where `x` holds metadata but no usable
+///   token falls back to the DEFAULT profile's token
+///   ([`token::resolve_token`]), while `status` reads profile `x`. Reporting
+///   `x`'s scopes next to the default profile's bearer describes a credential
+///   that was never used.
+/// - **No bearer at all.** With nothing to resolve, the payload is
+///   `authenticated: false`; a `scopes` key there claims a grant for a
+///   credential the command could not even find.
+///
+/// So the grant is reported only when the profile itself supplied the bearer —
+/// and that is decided by IDENTITY, not by presence. "The profile holds some
+/// credential" is a weaker claim than "the profile holds THIS one": between
+/// resolution and this check another invocation can write a credential into a
+/// profile that was empty when the bearer was chosen, and a presence test would
+/// then attribute the fallback bearer to it. Comparing the resolved bearer
+/// against the record's own values closes that window.
+fn stored_scopes_describe_bearer(
+    from_store: bool,
+    resolved: Option<&str>,
+    stored: Option<&StoredCredentials>,
+) -> bool {
+    let (Some(bearer), Some(stored)) = (resolved, stored) else {
+        return false;
+    };
+    from_store && (stored.expose_api_key() == Some(bearer) || stored.expose_token() == Some(bearer))
 }
 
 /// Invalidate every login session for the user (sign out everywhere), then
@@ -803,8 +1138,42 @@ async fn status(ctx: &CommandContext<'_>) -> Result<()> {
         })
     };
 
+    let mut value = value;
+    apply_stored_scopes(
+        &mut value,
+        stored_scopes_describe_bearer(
+            bearer_from_store(
+                ctx.flag_token,
+                std::env::var("FASTIO_TOKEN").ok().as_deref(),
+                std::env::var("FASTIO_API_KEY").ok().as_deref(),
+            ),
+            resolved.as_deref(),
+            stored,
+        ),
+        stored,
+    );
+
     ctx.output.render(&value)?;
     Ok(())
+}
+
+/// Attach the stored profile's granted scopes to an `auth status` payload —
+/// but ONLY when the bearer actually came from that profile.
+///
+/// A `--token` / `FASTIO_TOKEN` / `FASTIO_API_KEY` bearer is a different
+/// credential from whatever the profile happens to hold, so reporting the
+/// profile's scopes alongside it would attribute one credential's authority to
+/// another. Those calls omit the key entirely. When the profile IS the bearer
+/// and it has no recorded grant (a basic-auth or pre-upgrade profile), the key
+/// is present as `null` — absent means "not this credential's", `null` means
+/// "this credential, nothing recorded".
+fn apply_stored_scopes(value: &mut Value, from_store: bool, stored: Option<&StoredCredentials>) {
+    let Some(stored) = stored.filter(|_| from_store) else {
+        return;
+    };
+    if let Some(map) = value.as_object_mut() {
+        map.insert("scopes".to_owned(), json!(stored.scopes));
+    }
 }
 
 /// Create a new user account.
@@ -845,6 +1214,9 @@ async fn signup(
             user_id: None,
             email: Some(email.to_owned()),
             auth_method: Some("basic".to_owned()),
+            // Auto-login after signup is basic auth: no consent page, no
+            // granted entity list.
+            scopes: None,
         };
 
         let mut creds_file =
@@ -1000,22 +1372,24 @@ async fn api_key(cmd: &ApiKeyCommand, ctx: &CommandContext<'_>) -> Result<()> {
             scopes,
             agent_name,
             expires,
+            scope_spec,
         } => {
+            // Raw `--scopes` and the structured selectors are mutually
+            // exclusive at the clap layer, so at most one of these is `Some`.
+            let resolved = api::auth::resolve_key_scopes(scope_spec)
+                .context("could not build the requested scopes")?;
+            let scopes = scopes.as_deref().or(resolved.as_deref());
             let result = api::auth::api_key_create(
                 &client,
                 name.as_deref(),
-                scopes.as_deref(),
+                scopes,
                 agent_name.as_deref(),
                 expires.as_deref(),
             )
             .await
             .context("API key creation failed")?;
 
-            let value = json!({
-                "status": "created",
-                "api_key": result.api_key,
-            });
-            ctx.output.render(&value)?;
+            ctx.output.render(&api_key_create_value(&result))?;
         }
         ApiKeyCommand::List => {
             let result = api::auth::api_key_list(&client)
@@ -1053,28 +1427,73 @@ async fn api_key(cmd: &ApiKeyCommand, ctx: &CommandContext<'_>) -> Result<()> {
             scopes,
             agent_name,
             expires,
+            scope_spec,
         } => {
-            if name.is_none() && scopes.is_none() && agent_name.is_none() && expires.is_none() {
+            // An update REPLACES the scope set wholesale, so a half-specified
+            // request must not reach the server — and the recovery is always
+            // the same: look at what the key holds now, then send the whole
+            // intended set.
+            let resolved = api::auth::resolve_key_scopes(scope_spec).with_context(|| {
+                format!(
+                    "could not build the requested scopes. An update replaces the key's \
+                     scopes wholesale — run `fastio auth api-key get {key_id}` to see the \
+                     current set before replacing it"
+                )
+            })?;
+            // `resolved.is_none()` is exactly "no structured selector was
+            // given", so it doubles as the emptiness check for the guard.
+            if name.is_none()
+                && scopes.is_none()
+                && agent_name.is_none()
+                && expires.is_none()
+                && resolved.is_none()
+            {
                 anyhow::bail!(
                     "at least one update field is required \
-                     (--name, --scopes, --agent-name, --expires)"
+                     (--name, --scopes, --agent-name, --expires, or \
+                     --org/--workspace/--share/--all/--account-settings)"
                 );
             }
             let result = api::auth::api_key_update(
                 &client,
                 key_id,
                 name.as_deref(),
-                scopes.as_deref(),
+                scopes.as_deref().or(resolved.as_deref()),
                 agent_name.as_deref(),
                 expires.as_deref(),
             )
             .await
+            // The scope write is compare-and-swap server-side: a lost race is a
+            // 409 whose generic "wait and retry" hint would talk the caller into
+            // re-applying a set built from a stale read — and the update
+            // REPLACES the whole set, so that retry would delete whatever won.
+            .map_err(|e| map_scope_update_conflict(e, HINT_KEY_SCOPES_CHANGED))
             .context("API key update failed")?;
             ctx.output.render(&result)?;
         }
     }
 
     Ok(())
+}
+
+/// Render the whole key object the server returned on creation.
+///
+/// `POST /user/auth/key/` has no `response` sub-object, so the envelope's own
+/// `result` flag arrives alongside the key fields — it is bookkeeping, not part
+/// of the key, and is dropped here. The raw `api_key` is shown ONCE: this is
+/// the only time the server ever returns it in full.
+fn api_key_create_value(result: &api::types::ApiKeyCreateResponse) -> Value {
+    let mut obj = serde_json::Map::new();
+    for (key, val) in &result.extra {
+        if key == "result" {
+            continue;
+        }
+        obj.insert(key.clone(), val.clone());
+    }
+    // Last so the CLI's own fields always win over a same-named server field.
+    obj.insert("status".to_owned(), json!("created"));
+    obj.insert("api_key".to_owned(), json!(result.api_key));
+    Value::Object(obj)
 }
 
 /// Verify the current token is valid.
@@ -1195,6 +1614,33 @@ async fn oauth(cmd: &OauthCommand, ctx: &CommandContext<'_>) -> Result<()> {
             .context("failed to rename OAuth session")?;
             ctx.output.render(&value)?;
         }
+        OauthCommand::Narrow {
+            session_id,
+            scopes,
+            scope_spec,
+        } => {
+            let resolved = api::auth::resolve_key_scopes(scope_spec)
+                .context("could not build the requested scopes")?;
+            // A blank `--scopes ""` is not a narrowing request: forwarding it
+            // would send `scopes=` and ask the server to interpret an empty
+            // grant. Treat it as absent so the bail below explains what to
+            // supply.
+            let raw = scopes.as_deref().filter(|s| !s.trim().is_empty());
+            let Some(scopes_json) = raw.or(resolved.as_deref()) else {
+                anyhow::bail!(
+                    "nothing to narrow to: supply --scopes <json>, or the structured \
+                     selectors (--org/--workspace/--share/--all/--account-settings)"
+                );
+            };
+            let value = api::auth::oauth_narrow(&client, session_id, scopes_json)
+                .await
+                // Same compare-and-swap surface as `api-key update`: a 409 here
+                // means the session's stored scopes moved, and narrowing is
+                // measured against what it holds NOW.
+                .map_err(|e| map_scope_update_conflict(e, HINT_SESSION_SCOPES_CHANGED))
+                .context("failed to narrow OAuth session scopes")?;
+            ctx.output.render(&value)?;
+        }
         OauthCommand::Revoke { session_id } => {
             api::auth::oauth_revoke(&client, session_id)
                 .await
@@ -1225,8 +1671,122 @@ async fn scopes(ctx: &CommandContext<'_>) -> Result<()> {
     let value = api::auth::scopes(&client)
         .await
         .context("token scope introspection failed")?;
+    // Row-shaping is a RENDERING concern for the two tabular formats only.
+    // `json` and `markdown` stay byte-identical to the server's own payload.
+    let value = match ctx.output.format {
+        OutputFormat::Table | OutputFormat::Csv => scopes_rows_for_table(&value),
+        // Any format added later renders the server payload untouched, which
+        // is the safe default: only the tabular renderers need rows.
+        _ => value,
+    };
     ctx.output.render(&value)?;
     Ok(())
+}
+
+/// Reshape an `/auth/scopes/` payload into one row per scope for table/CSV.
+///
+/// The tabular renderers flatten an envelope to its first non-empty array, so
+/// an introspection response renders as a bare list of scope strings with none
+/// of the surrounding context — and, for a credential whose only array is
+/// empty, as nothing at all. Rows come from `scopes_detail` when it carries
+/// OBJECT entries (it is the hydrated form, with entity names), plus a
+/// `{"scope": …}` row for every plain `scopes` string those objects do not
+/// account for — so a mixed or partial `scopes_detail` cannot make a granted
+/// scope vanish from the output. Each row then carries every credential-level
+/// scalar so a single row is self-describing.
+///
+/// A payload with no scopes at all is returned unchanged — an unscoped
+/// credential has no rows to show, and the top-level object is the answer.
+/// The `entity_type:entity_id:access_mode` string one hydrated `scopes_detail`
+/// entry stands for, so it can be matched against the plain `scopes` list.
+///
+/// Prefers an explicit `scope` field when the entry carries one; otherwise
+/// rebuilds it from the three hydrated fields. `None` means the entry names no
+/// recognizable scope, so it can account for nothing.
+fn detail_scope_string(entry: &Value) -> Option<String> {
+    if let Some(scope) = entry.get("scope").and_then(Value::as_str) {
+        return Some(scope.to_owned());
+    }
+    let entity_type = entry.get("entity_type").and_then(Value::as_str)?;
+    let entity_id = entry.get("entity_id").and_then(Value::as_str)?;
+    let access_mode = entry.get("access_mode").and_then(Value::as_str)?;
+    Some(format!("{entity_type}:{entity_id}:{access_mode}"))
+}
+
+fn scopes_rows_for_table(body: &Value) -> Value {
+    let Some(map) = body.as_object() else {
+        return body.clone();
+    };
+
+    // `scopes_detail` is a richer view only where it carries OBJECTS. A
+    // non-empty array of plain strings (or the string half of a mixed one)
+    // yields nothing a row can be built from, so the object entries are
+    // selected first and the plain-`scopes` path covers the rest.
+    let detail: Vec<Value> = map
+        .get("scopes_detail")
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().filter(|e| e.is_object()).cloned().collect())
+        .unwrap_or_default();
+
+    let scope_strings: Vec<&str> = map
+        .get("scopes")
+        .and_then(Value::as_array)
+        .map(|scopes| scopes.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    // A string in `scopes` that no detail object accounts for still gets a row:
+    // filtering to objects must never make a scope disappear from the very
+    // command the docs tell agents to run to confirm what they got. A detail
+    // entry accounts for a string either by naming it in its own `scope` field
+    // or by rebuilding it from `entity_type:entity_id:access_mode`, the shape
+    // the hydrated form uses. When no entry yields either — an unrecognized
+    // detail shape — the entries are taken to account for the first
+    // `detail.len()` strings by position.
+    let named: Vec<String> = detail.iter().filter_map(detail_scope_string).collect();
+    let uncovered: Vec<&str> = if named.is_empty() {
+        scope_strings.iter().skip(detail.len()).copied().collect()
+    } else {
+        scope_strings
+            .iter()
+            .filter(|s| !named.iter().any(|n| n == *s))
+            .copied()
+            .collect()
+    };
+
+    let mut rows: Vec<Value> = detail;
+    rows.extend(uncovered.into_iter().map(|s| json!({ "scope": s })));
+
+    if rows.is_empty() {
+        return body.clone();
+    }
+
+    for row in &mut rows {
+        let Some(obj) = row.as_object_mut() else {
+            continue;
+        };
+        // EVERY top-level scalar is a credential-level fact, carried onto the
+        // row generically: a fixed list silently drops whatever the server adds
+        // next (`expires`, `is_agent`, `agent_name` were all lost that way).
+        // Arrays and objects are the rows' own source, and `result` is envelope
+        // bookkeeping.
+        for (key, val) in map {
+            if key == "result" || val.is_array() || val.is_object() {
+                continue;
+            }
+            if obj.contains_key(key.as_str()) {
+                // A per-row key describes THAT scope; the credential-level
+                // field of the same name is a different fact. Both are kept,
+                // under distinct keys, so neither is shadowed. The rule is
+                // generic for the same reason the copy above is: naming the
+                // colliding keys would silently drop whatever the server adds
+                // next.
+                obj.insert(format!("credential_{key}"), val.clone());
+            } else {
+                obj.insert(key.clone(), val.clone());
+            }
+        }
+    }
+    Value::Array(rows)
 }
 
 /// Check password reset code validity.
@@ -1331,5 +1891,1610 @@ mod tests {
         assert!(!bearer_from_store(None, Some("t"), None));
         assert!(!bearer_from_store(None, None, Some("k")));
         assert!(!bearer_from_store(Some(""), Some("t"), None));
+    }
+}
+
+#[cfg(test)]
+mod admin_scope_tests {
+    use super::{
+        ApiKeyCommand, ApiKeyScopeSpec, AuthCommand, CommandContext, HINT_KEY_SCOPES_CHANGED,
+        HINT_SESSION_SCOPES_CHANGED, LoginAccess, OauthCommand, admin_grant_warning,
+        api_key_create_value, apply_stored_scopes, execute, read_only_signout_warning,
+        scopes_rows_for_table, signout_with_env,
+    };
+    use fastio_cli::api::types::ApiKeyCreateResponse;
+    use fastio_cli::auth::credentials::{CredentialsFile, StoredCredentials};
+    use fastio_cli::client::ApiClient;
+    use fastio_cli::config::Config;
+    use fastio_cli::error::CliError;
+    use fastio_cli::output::OutputConfig;
+    use fastio_cli::output::format::filter_fields;
+    use secrecy::SecretString;
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A loopback address with nothing listening on it: bound to claim a free
+    /// port, then released.
+    fn closed_loopback_addr() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        drop(listener);
+        addr
+    }
+
+    /// Serve exactly one canned JSON response on a loopback port.
+    async fn spawn_json_server(status_line: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let header = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        addr
+    }
+
+    fn client_for(addr: &str) -> ApiClient {
+        ApiClient::new(&format!("http://{addr}"), Some("token".to_owned())).expect("client builds")
+    }
+
+    // ─── the basic-auth refusal ────────────────────────────────────────────
+
+    /// The access-mode ceiling and the account-settings request are granted at
+    /// the consent page, which basic auth never reaches. Accepting them there
+    /// would hand back a credential the operator believes is scoped and is not
+    /// — the same failure the `--agent-name` refusal exists to prevent.
+    #[tokio::test]
+    async fn basic_auth_refuses_each_consent_page_flag() {
+        let dir = std::env::temp_dir().join(format!("fastio-admin-basic-{}", std::process::id()));
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let base = format!("http://{}", closed_loopback_addr());
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "default",
+            api_base: &base,
+            flag_token: None,
+            config_dir: &dir,
+        };
+        let config = Config::default();
+
+        for (flag, access) in [
+            (
+                "--admin",
+                LoginAccess {
+                    admin: true,
+                    ..LoginAccess::default()
+                },
+            ),
+            (
+                "--read-only",
+                LoginAccess {
+                    read_only: true,
+                    ..LoginAccess::default()
+                },
+            ),
+            (
+                "--account-settings",
+                LoginAccess {
+                    account_settings: true,
+                    ..LoginAccess::default()
+                },
+            ),
+        ] {
+            let cmd = AuthCommand::Login {
+                email: Some("someone@example.com".to_owned()),
+                password: Some("pw".to_owned()),
+                agent_name: None,
+                access,
+            };
+            let err = execute(&cmd, &config, &ctx)
+                .await
+                .expect_err("basic auth must refuse a consent-page flag");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(flag), "the refusal must name the flag: {msg}");
+            assert!(
+                msg.contains("browser (PKCE) login only"),
+                "the refusal must point at browser login: {msg}"
+            );
+        }
+    }
+
+    /// POSITIVE CONTROL for the refusal above: `--email` WITHOUT `--password`
+    /// is still browser login, so the same flags must sail through to the
+    /// initiate call. Reaching the network at all is the proof — the refusal
+    /// short-circuits before any client is built.
+    #[tokio::test]
+    async fn email_only_login_accepts_the_consent_page_flags() {
+        let dir = std::env::temp_dir().join(format!("fastio-admin-pkce-{}", std::process::id()));
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let addr = spawn_json_server(
+            "HTTP/1.1 500 Internal Server Error",
+            r#"{"result":false,"error":{"code":1,"text":"nope"}}"#,
+        )
+        .await;
+        let base = format!("http://{addr}");
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "default",
+            api_base: &base,
+            flag_token: None,
+            config_dir: &dir,
+        };
+        let cmd = AuthCommand::Login {
+            email: Some("someone@example.com".to_owned()),
+            password: None,
+            agent_name: None,
+            access: LoginAccess {
+                admin: true,
+                account_settings: true,
+                ..LoginAccess::default()
+            },
+        };
+        let err = execute(&cmd, &Config::default(), &ctx)
+            .await
+            .expect_err("the canned 500 fails the initiate call");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("applies to browser (PKCE) login only"),
+            "browser login must not refuse its own flags: {msg}"
+        );
+        assert!(
+            msg.contains("failed to initiate PKCE authorization"),
+            "the flags must have been carried into the initiate call: {msg}"
+        );
+    }
+
+    /// The ceiling is a request for an access MODE, and the two mode flags map
+    /// to the two non-default modes. `--account-settings` is orthogonal: it
+    /// never sets a mode of its own.
+    #[test]
+    fn login_access_maps_to_the_wire_access_mode() {
+        let none = LoginAccess::default().to_authorize_access();
+        assert_eq!(none.access_mode, None);
+        assert!(!none.account_settings);
+
+        let admin = LoginAccess {
+            admin: true,
+            ..LoginAccess::default()
+        }
+        .to_authorize_access();
+        assert_eq!(admin.access_mode, Some("rwa"));
+
+        let read_only = LoginAccess {
+            read_only: true,
+            ..LoginAccess::default()
+        }
+        .to_authorize_access();
+        assert_eq!(read_only.access_mode, Some("r"));
+
+        let settings = LoginAccess {
+            account_settings: true,
+            ..LoginAccess::default()
+        }
+        .to_authorize_access();
+        assert_eq!(settings.access_mode, None);
+        assert!(settings.account_settings);
+    }
+
+    /// Nothing requested means nothing to refuse — otherwise every basic-auth
+    /// login would start failing.
+    #[test]
+    fn nothing_requested_is_never_refused() {
+        assert_eq!(
+            LoginAccess::default().first_unsupported_by_basic_auth(),
+            None
+        );
+        for (expected, access) in [
+            (
+                "--admin",
+                LoginAccess {
+                    admin: true,
+                    ..LoginAccess::default()
+                },
+            ),
+            (
+                "--read-only",
+                LoginAccess {
+                    read_only: true,
+                    ..LoginAccess::default()
+                },
+            ),
+            (
+                "--account-settings",
+                LoginAccess {
+                    account_settings: true,
+                    ..LoginAccess::default()
+                },
+            ),
+        ] {
+            assert_eq!(
+                access.first_unsupported_by_basic_auth(),
+                Some(expected),
+                "{expected} must be named back to the user"
+            );
+        }
+    }
+
+    // ─── the post-login admin confirmation ─────────────────────────────────
+
+    /// `--admin` asks for a ceiling the consent page may decline. A login that
+    /// silently came back without admin surfaces much later as a 403 on the
+    /// first admin operation, so the mismatch is reported while the user is
+    /// still looking.
+    #[tokio::test]
+    async fn admin_grant_warning_fires_when_admin_was_not_granted() {
+        let addr = spawn_json_server(
+            "HTTP/1.1 200 OK",
+            r#"{"result":true,"auth_type":"jwt_v2","admin":false,"full_access":false,
+                "scopes":["org:1:rw"]}"#,
+        )
+        .await;
+        let warning = admin_grant_warning(&client_for(&addr))
+            .await
+            .expect("a declined admin request must warn");
+        assert!(warning.contains("did not grant"), "{warning}");
+        assert!(
+            warning.contains("fastio auth scopes"),
+            "the warning must name the inspection command: {warning}"
+        );
+    }
+
+    /// POSITIVE CONTROL: a granted request is silent. Warning on every
+    /// `--admin` login would train the user to ignore the line.
+    #[tokio::test]
+    async fn admin_grant_warning_is_silent_when_admin_was_granted() {
+        let addr = spawn_json_server(
+            "HTTP/1.1 200 OK",
+            r#"{"result":true,"auth_type":"jwt_v2","admin":true,"full_access":false,
+                "scopes":["org:1:rwa"]}"#,
+        )
+        .await;
+        assert!(
+            admin_grant_warning(&client_for(&addr)).await.is_none(),
+            "a granted admin request must stay quiet"
+        );
+    }
+
+    /// A failed introspection is not a failed login: the credential is already
+    /// stored and works. The softer wording says admin could not be CONFIRMED,
+    /// never that it was refused — and the function cannot return an error at
+    /// all, so the login's exit code stays 0 by construction.
+    #[tokio::test]
+    async fn admin_grant_warning_softens_when_introspection_fails() {
+        let addr = spawn_json_server(
+            "HTTP/1.1 500 Internal Server Error",
+            r#"{"result":false,"error":{"code":1,"text":"boom"}}"#,
+        )
+        .await;
+        let warning = admin_grant_warning(&client_for(&addr))
+            .await
+            .expect("an unreadable grant is still worth a word");
+        assert!(warning.contains("could not be confirmed"), "{warning}");
+        assert!(!warning.contains("did not grant"), "{warning}");
+        assert!(warning.contains("fastio auth scopes"), "{warning}");
+    }
+
+    /// `--quiet` suppresses the WARNING, never the check.
+    ///
+    /// The introspection is the one call that makes the requested ceiling
+    /// verifiable; skipping it under `--quiet` would leave a scripted
+    /// `--admin` login with no record that admin was refused. So the request
+    /// must still reach the server, and only the printed line disappears.
+    #[tokio::test]
+    async fn admin_grant_notice_still_introspects_under_quiet() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                if sock.read(&mut buf).await.is_ok() {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                let body = br#"{"result":true,"auth_type":"jwt_v2","admin":false,"scopes":[]}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let quiet = super::admin_grant_notice(&client_for(&addr), true).await;
+        assert!(quiet.is_none(), "quiet mode prints nothing: {quiet:?}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the scope introspection must still run under --quiet"
+        );
+    }
+
+    /// The negative control: without `--quiet` the same refusal is reported.
+    #[tokio::test]
+    async fn admin_grant_notice_reports_the_refusal_when_not_quiet() {
+        let addr = spawn_json_server(
+            "HTTP/1.1 200 OK",
+            r#"{"result":true,"auth_type":"jwt_v2","admin":false,"scopes":[]}"#,
+        )
+        .await;
+        let warning = super::admin_grant_notice(&client_for(&addr), false)
+            .await
+            .expect("a declined admin request must warn");
+        assert!(warning.contains("did not grant"), "{warning}");
+    }
+
+    /// Only an explicit `admin: true` confirms the ceiling. A response with no
+    /// top-level `admin` field has not confirmed anything, and reading that
+    /// silence as confirmation is how a login that never got admin reports
+    /// success.
+    #[tokio::test]
+    async fn admin_grant_warning_fires_when_the_grant_is_not_reported() {
+        let addr = spawn_json_server(
+            "HTTP/1.1 200 OK",
+            r#"{"result":true,"auth_type":"jwt_v2","full_access":false,
+                "scopes":["org:1:rw"]}"#,
+        )
+        .await;
+        let warning = admin_grant_warning(&client_for(&addr))
+            .await
+            .expect("an unreported grant must warn");
+        assert!(warning.contains("could not be confirmed"), "{warning}");
+        assert!(
+            !warning.contains("did not grant"),
+            "silence is not a refusal: {warning}"
+        );
+    }
+
+    // ─── `auth oauth narrow` input guards ──────────────────────────────────
+
+    /// `--scopes ""` is not a narrowing request. Forwarding it would send
+    /// `scopes=` and leave the server to interpret an empty grant, so it must
+    /// fall into the same bail as supplying nothing at all.
+    #[tokio::test]
+    async fn oauth_narrow_treats_blank_scopes_as_nothing_to_narrow_to() {
+        use fastio_cli::auth::credentials::CredentialsFile;
+        use secrecy::SecretString;
+
+        let dir = std::env::temp_dir().join(format!(
+            "fastio-cli-narrow-blank-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        let mut file = CredentialsFile::load(&dir).expect("load credentials");
+        file.set(
+            "default",
+            StoredCredentials {
+                token: Some(SecretString::from("stored-token")),
+                ..StoredCredentials::default()
+            },
+            &dir,
+        )
+        .expect("write default profile");
+
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let base = format!("http://{}", closed_loopback_addr());
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "default",
+            api_base: &base,
+            flag_token: None,
+            config_dir: &dir,
+        };
+        let cmd = AuthCommand::Oauth(super::OauthCommand::Narrow {
+            session_id: "s1".to_owned(),
+            scopes: Some("   ".to_owned()),
+            scope_spec: fastio_cli::api::auth::ApiKeyScopeSpec::default(),
+        });
+        let err = execute(&cmd, &Config::default(), &ctx)
+            .await
+            .expect_err("a blank --scopes must not reach the server");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nothing to narrow to"),
+            "a blank value must bail like an absent one, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── `auth status` scope attribution ───────────────────────────────────
+
+    /// The profile's grant describes the PROFILE'S credential. Reporting it
+    /// next to a `--token` / env bearer would attribute one credential's
+    /// authority to another, so those calls omit the key entirely — while a
+    /// profile bearer with nothing recorded reports `null`, which is a
+    /// different statement from silence.
+    #[test]
+    fn status_scopes_are_attributed_to_the_bearer() {
+        let granted = StoredCredentials {
+            scopes: Some(r#"["org:1:rwa"]"#.to_owned()),
+            ..StoredCredentials::default()
+        };
+        let ungranted = StoredCredentials::default();
+
+        let mut value = json!({"authenticated": true});
+        apply_stored_scopes(&mut value, true, Some(&granted));
+        assert_eq!(value["scopes"], json!(r#"["org:1:rwa"]"#));
+
+        // Present-as-null: this credential, nothing recorded.
+        let mut value = json!({"authenticated": true});
+        apply_stored_scopes(&mut value, true, Some(&ungranted));
+        assert_eq!(
+            value.get("scopes"),
+            Some(&Value::Null),
+            "a stored profile with no grant reports null, not silence"
+        );
+
+        // A flag/env bearer omits the key, even though the profile has one.
+        let mut value = json!({"authenticated": true});
+        apply_stored_scopes(&mut value, false, Some(&granted));
+        assert!(
+            value.get("scopes").is_none(),
+            "a flag/env bearer must never borrow the profile's grant: {value}"
+        );
+
+        // No stored profile at all: nothing to attribute.
+        let mut value = json!({"authenticated": false});
+        apply_stored_scopes(&mut value, true, None);
+        assert!(value.get("scopes").is_none(), "{value}");
+    }
+
+    /// A credentials directory holding the two profiles the fallback test
+    /// needs: a metadata-only `x` (a recorded grant, no usable credential) and
+    /// a `default` that actually holds the token.
+    fn fallback_profile_dir(tag: &str) -> std::path::PathBuf {
+        use fastio_cli::auth::credentials::CredentialsFile;
+        use secrecy::SecretString;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "fastio-cli-status-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        let mut file = CredentialsFile::load(&dir).expect("load credentials");
+        file.set(
+            "x",
+            StoredCredentials {
+                scopes: Some(r#"["org:1:rwa"]"#.to_owned()),
+                ..StoredCredentials::default()
+            },
+            &dir,
+        )
+        .expect("write profile x");
+        file.set(
+            "default",
+            StoredCredentials {
+                token: Some(SecretString::from("default-token")),
+                ..StoredCredentials::default()
+            },
+            &dir,
+        )
+        .expect("write default profile");
+        dir
+    }
+
+    /// `--profile x` where `x` holds a recorded grant but NO usable credential
+    /// falls back to the default profile's token, so the bearer belongs to
+    /// `default` while `status` reads `x`. Reporting `x`'s scopes there would
+    /// describe a credential the command never used — a full-access default
+    /// bearer would appear narrowly scoped.
+    #[test]
+    fn status_omits_scopes_when_the_bearer_came_from_the_fallback_profile() {
+        use fastio_cli::auth::credentials::CredentialsFile;
+        use fastio_cli::auth::token;
+
+        let dir = fallback_profile_dir("fallback");
+        // Resolution takes its environment INJECTED, never from the ambient
+        // process environment: a `FASTIO_API_KEY` in the developer's shell
+        // would otherwise win precedence 3 and the fallback under test would
+        // never run, while the assertions below still passed.
+        let resolved = token::resolve_token_with_env(None, None, None, "x", &dir)
+            .expect("resolution succeeds");
+        // POSITIVE CONTROL: the fallback must actually have fired. Without
+        // this, a `resolve_token` returning `None` for any reason would satisfy
+        // every assertion below for the wrong reason.
+        assert_eq!(
+            resolved.as_deref(),
+            Some("default-token"),
+            "profile x has no usable credential, so the default profile's token must be the bearer"
+        );
+        let creds_file = CredentialsFile::load(&dir).expect("load credentials");
+        let stored = creds_file.get("x");
+        assert!(
+            stored.is_some_and(|s| s.scopes.is_some()),
+            "fixture: profile x must carry a recorded grant"
+        );
+
+        // The bearer-origin inputs are injected for the same reason.
+        // `bearer_from_store` has its own test for the env arms.
+        let describes = super::stored_scopes_describe_bearer(
+            super::bearer_from_store(None, None, None),
+            resolved.as_deref(),
+            stored,
+        );
+        assert!(
+            !describes,
+            "profile x supplied no bearer, so its grant must not be reported"
+        );
+
+        let mut value = json!({"authenticated": true});
+        apply_stored_scopes(&mut value, describes, stored);
+        assert!(
+            value.get("scopes").is_none(),
+            "a fallback bearer must not borrow the requested profile's grant: {value}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no bearer at all the payload is `authenticated: false`. A `scopes`
+    /// key there claims a grant for a credential the command could not even
+    /// find.
+    #[test]
+    fn status_omits_scopes_when_there_is_no_bearer() {
+        let stored = StoredCredentials {
+            scopes: Some(r#"["org:1:rwa"]"#.to_owned()),
+            ..StoredCredentials::default()
+        };
+        let describes = super::stored_scopes_describe_bearer(true, None, Some(&stored));
+        assert!(
+            !describes,
+            "no bearer means nothing to attribute a grant to"
+        );
+
+        let mut value = json!({"authenticated": false, "reason": "no_credentials"});
+        apply_stored_scopes(&mut value, describes, Some(&stored));
+        assert!(
+            value.get("scopes").is_none(),
+            "an unauthenticated payload must carry no grant: {value}"
+        );
+    }
+
+    /// POSITIVE CONTROL: a profile that DID supply the bearer still reports its
+    /// grant. Without this, a guard that dropped `scopes` unconditionally would
+    /// pass both tests above.
+    #[test]
+    fn status_reports_scopes_when_the_profile_supplied_the_bearer() {
+        use secrecy::SecretString;
+
+        let stored = StoredCredentials {
+            token: Some(SecretString::from("profile-token")),
+            scopes: Some(r#"["org:1:rwa"]"#.to_owned()),
+            ..StoredCredentials::default()
+        };
+        assert!(super::stored_scopes_describe_bearer(
+            true,
+            Some("profile-token"),
+            Some(&stored)
+        ));
+
+        let mut value = json!({"authenticated": true});
+        apply_stored_scopes(&mut value, true, Some(&stored));
+        assert_eq!(value["scopes"], json!(r#"["org:1:rwa"]"#));
+    }
+
+    // ─── `api-key create` rendering ────────────────────────────────────────
+
+    /// The create endpoint has no `response` sub-object, so the envelope's own
+    /// `result` flag arrives alongside the key fields. It is bookkeeping, not
+    /// part of the key. Everything else the server sent is shown, because this
+    /// is the only time the raw key is ever returned and the user needs the id
+    /// and scopes beside it.
+    #[test]
+    fn api_key_create_renders_the_whole_key_without_the_envelope_flag() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("result".to_owned(), json!(true));
+        extra.insert("id".to_owned(), json!("key-1"));
+        extra.insert("memo".to_owned(), json!("ci"));
+        extra.insert("scopes".to_owned(), json!(["org:1:rwa"]));
+        extra.insert("admin".to_owned(), json!(true));
+        extra.insert("legacy".to_owned(), json!(false));
+        let response = ApiKeyCreateResponse {
+            api_key: "SECRET-KEY-VALUE".to_owned(),
+            extra,
+        };
+
+        let rendered = api_key_create_value(&response);
+        assert_eq!(rendered["status"], json!("created"));
+        assert_eq!(rendered["id"], json!("key-1"));
+        assert_eq!(rendered["memo"], json!("ci"));
+        assert_eq!(rendered["scopes"], json!(["org:1:rwa"]));
+        assert_eq!(rendered["admin"], json!(true));
+        assert_eq!(rendered["legacy"], json!(false));
+        assert!(
+            rendered.get("result").is_none(),
+            "the envelope flag is not part of the key: {rendered}"
+        );
+
+        let text = rendered.to_string();
+        assert_eq!(
+            text.matches("SECRET-KEY-VALUE").count(),
+            1,
+            "the raw key is shown exactly once: {text}"
+        );
+    }
+
+    /// A server field named like one of the CLI's own must not displace it —
+    /// `status` and `api_key` are written last for exactly that reason.
+    #[test]
+    fn api_key_create_keeps_its_own_fields_authoritative() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("status".to_owned(), json!("something-else"));
+        let response = ApiKeyCreateResponse {
+            api_key: "K".to_owned(),
+            extra,
+        };
+        let rendered = api_key_create_value(&response);
+        assert_eq!(rendered["status"], json!("created"));
+        assert_eq!(rendered["api_key"], json!("K"));
+    }
+
+    // ─── `auth scopes` row shaping ─────────────────────────────────────────
+
+    fn detail_body() -> Value {
+        json!({
+            "result": true,
+            "auth_type": "jwt_v2",
+            "full_access": false,
+            "admin": true,
+            "legacy": false,
+            "scopes": ["org:12345:rwa", "userdetails:*:rw"],
+            "scopes_detail": [
+                {"entity_type": "org", "entity_id": "12345", "access_mode": "rwa",
+                 "name": "Example Org"},
+                {"entity_type": "userdetails", "entity_id": "*", "access_mode": "rw"},
+            ],
+        })
+    }
+
+    /// The hydrated entries are the better rows — they carry entity names — and
+    /// each is stamped with the credential-level facts so a single row answers
+    /// "what is this credential, and what can it reach?" on its own.
+    #[test]
+    fn scopes_rows_use_the_hydrated_detail_when_present() {
+        let rows = scopes_rows_for_table(&detail_body());
+        let rows = rows.as_array().expect("an array of rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["entity_type"], json!("org"));
+        assert_eq!(rows[0]["name"], json!("Example Org"));
+        for row in rows {
+            assert_eq!(row["auth_type"], json!("jwt_v2"));
+            assert_eq!(row["full_access"], json!(false));
+            assert_eq!(row["admin"], json!(true));
+            assert_eq!(row["legacy"], json!(false));
+        }
+    }
+
+    /// With no hydrated detail — a legacy credential, or one the server did not
+    /// expand — the plain scope strings still become rows rather than a bare
+    /// list of strings with no context.
+    #[test]
+    fn scopes_rows_fall_back_to_the_plain_strings() {
+        let body = json!({
+            "result": true,
+            "auth_type": "api_key_scoped",
+            "full_access": false,
+            "admin": false,
+            "legacy": true,
+            "scopes": ["org:1:rw", "workspace:2:r"],
+            "scopes_detail": [],
+        });
+        let rows = scopes_rows_for_table(&body);
+        let rows = rows.as_array().expect("an array of rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["scope"], json!("org:1:rw"));
+        assert_eq!(rows[1]["scope"], json!("workspace:2:r"));
+        for row in rows {
+            assert_eq!(row["auth_type"], json!("api_key_scoped"));
+            assert_eq!(row["full_access"], json!(false));
+            assert_eq!(row["admin"], json!(false));
+            assert_eq!(row["legacy"], json!(true));
+        }
+    }
+
+    /// An unscoped credential has no rows to show, so the top-level object IS
+    /// the answer and is returned untouched.
+    #[test]
+    fn scopes_rows_leave_a_scopeless_payload_alone() {
+        let body = json!({
+            "result": true,
+            "auth_type": "jwt_v1",
+            "full_access": true,
+            "scopes": [],
+            "scopes_detail": [],
+        });
+        assert_eq!(scopes_rows_for_table(&body), body);
+        // And a non-object payload is never reshaped either.
+        let scalar = json!("nope");
+        assert_eq!(scopes_rows_for_table(&scalar), scalar);
+    }
+
+    /// The reshape is a TABLE/CSV rendering concern. `json` and `markdown`
+    /// render the server's payload, so the reshape must be a pure function the
+    /// caller can decline to apply — never a mutation of the response.
+    #[test]
+    fn scopes_reshape_never_touches_the_source_payload() {
+        let body = detail_body();
+        let before = body.clone();
+        let _ = scopes_rows_for_table(&body);
+        assert_eq!(body, before, "the json path must see the original bytes");
+    }
+
+    /// The credential-level facts are carried GENERICALLY, so a field the
+    /// server adds later reaches the table instead of being dropped by a fixed
+    /// list. `expires`, `is_agent` and `agent_name` are exactly the fields an
+    /// enumerated list had already lost.
+    #[test]
+    fn scopes_rows_carry_every_credential_level_scalar() {
+        let body = json!({
+            "result": true,
+            "auth_type": "api_key_scoped",
+            "full_access": false,
+            "admin": false,
+            "legacy": false,
+            "is_agent": true,
+            "agent_name": "ci-runner",
+            "expires": "2026-12-31 23:59:59",
+            "scopes": ["org:12345:rw"],
+            "scopes_detail": [
+                {"entity_type": "org", "entity_id": "12345", "access_mode": "rw"},
+            ],
+        });
+        let rows = scopes_rows_for_table(&body);
+        let rows = rows.as_array().expect("an array of rows");
+        assert_eq!(rows.len(), 1);
+        for row in rows {
+            for key in [
+                "auth_type",
+                "full_access",
+                "admin",
+                "legacy",
+                "is_agent",
+                "agent_name",
+                "expires",
+            ] {
+                assert!(row.get(key).is_some(), "{key} must reach the row: {row}");
+            }
+            assert_eq!(row["is_agent"], json!(true));
+            assert_eq!(row["agent_name"], json!("ci-runner"));
+            assert_eq!(row["expires"], json!("2026-12-31 23:59:59"));
+            // The envelope flag is bookkeeping, not a credential fact.
+            assert!(row.get("result").is_none(), "{row}");
+            // The arrays are the rows' own source, never a cell.
+            assert!(row.get("scopes").is_none(), "{row}");
+            assert!(row.get("scopes_detail").is_none(), "{row}");
+        }
+    }
+
+    /// A non-empty `scopes_detail` carrying no objects is not a hydrated view —
+    /// there is nothing to build a row from, so the plain strings must still
+    /// produce rows rather than a table of unusable entries.
+    #[test]
+    fn scopes_rows_fall_back_when_detail_holds_no_objects() {
+        let body = json!({
+            "result": true,
+            "auth_type": "api_key_scoped",
+            "scopes": ["org:1:rw", "workspace:2:r"],
+            "scopes_detail": ["org:1:rw", "workspace:2:r"],
+        });
+        let rows = scopes_rows_for_table(&body);
+        let rows = rows.as_array().expect("an array of rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["scope"], json!("org:1:rw"));
+        assert_eq!(rows[1]["scope"], json!("workspace:2:r"));
+        assert_eq!(rows[0]["auth_type"], json!("api_key_scoped"));
+    }
+
+    /// A MIXED array uses the hydrated object for the scope it describes, and
+    /// falls back to a plain `{scope}` row for the one it does not — dropping
+    /// the uncovered string would hide a granted scope on the very command the
+    /// docs tell agents to run to confirm what they got.
+    #[test]
+    fn scopes_rows_keep_only_the_object_entries_of_a_mixed_detail() {
+        let body = json!({
+            "result": true,
+            "auth_type": "jwt_v2",
+            "scopes": ["org:1:rw", "workspace:2:r"],
+            "scopes_detail": [
+                "org:1:rw",
+                {"entity_type": "workspace", "entity_id": "2", "access_mode": "r"},
+            ],
+        });
+        let rows = scopes_rows_for_table(&body);
+        let rows = rows.as_array().expect("an array of rows");
+        assert_eq!(rows.len(), 2, "no granted scope may be dropped: {rows:?}");
+        assert_eq!(rows[0]["entity_type"], json!("workspace"));
+        assert!(
+            rows[0].get("scope").is_none(),
+            "the hydrated entry is used as-is: {}",
+            rows[0]
+        );
+        assert_eq!(
+            rows[1]["scope"],
+            json!("org:1:rw"),
+            "the uncovered string still gets a row: {}",
+            rows[1]
+        );
+        for row in rows {
+            assert_eq!(row["auth_type"], json!("jwt_v2"));
+        }
+    }
+
+    /// A detail entry that names its scope with a `scope` field covers by that
+    /// field rather than by position — a positional rule would credit the
+    /// wrong string whenever a mixed array reorders or omits entries.
+    #[test]
+    fn a_detail_entry_covers_the_scope_string_it_names() {
+        let body = json!({
+            "result": true,
+            "auth_type": "jwt_v2",
+            "scopes": ["org:1:rw", "workspace:2:r", "share:3:r"],
+            "scopes_detail": [
+                {"scope": "share:3:r", "name": "Public share"},
+            ],
+        });
+        let rows = scopes_rows_for_table(&body);
+        let rows = rows.as_array().expect("an array of rows");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["name"], json!("Public share"));
+        assert_eq!(rows[1]["scope"], json!("org:1:rw"));
+        assert_eq!(rows[2]["scope"], json!("workspace:2:r"));
+    }
+
+    /// An unrecognizable detail shape names no scope at all, so it can only be
+    /// taken to account for the entries it sits in front of. The remainder
+    /// still reaches the table.
+    #[test]
+    fn an_unrecognizable_detail_entry_covers_by_position() {
+        let body = json!({
+            "result": true,
+            "auth_type": "jwt_v2",
+            "scopes": ["org:1:rw", "workspace:2:r"],
+            "scopes_detail": [{"label": "something new"}],
+        });
+        let rows = scopes_rows_for_table(&body);
+        let rows = rows.as_array().expect("an array of rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["label"], json!("something new"));
+        assert_eq!(rows[1]["scope"], json!("workspace:2:r"));
+    }
+
+    /// A per-row key and the credential-level field of the same name are
+    /// DIFFERENT facts. Letting the row value suppress the credential one hid
+    /// whether the key itself is an admin credential, so both are carried —
+    /// always, so the column set does not depend on the values. The rule is
+    /// GENERIC: `expires` here collides on a name nobody enumerated, and must
+    /// survive exactly as `admin` and `legacy` do.
+    #[test]
+    fn scopes_rows_keep_both_the_row_and_credential_admin() {
+        let body = json!({
+            "result": true,
+            "auth_type": "jwt_v2",
+            "admin": true,
+            "legacy": false,
+            "expires": "2026-12-31 23:59:59",
+            "scopes": ["org:12345:rwa"],
+            "scopes_detail": [
+                {"entity_type": "org", "entity_id": "12345", "access_mode": "rwa",
+                 "admin": false, "legacy": true, "expires": "2026-06-30 00:00:00"},
+            ],
+        });
+        let rows = scopes_rows_for_table(&body);
+        let rows = rows.as_array().expect("an array of rows");
+        assert_eq!(rows[0]["admin"], json!(false), "the row's own value stands");
+        assert_eq!(rows[0]["credential_admin"], json!(true));
+        assert_eq!(rows[0]["legacy"], json!(true));
+        assert_eq!(rows[0]["credential_legacy"], json!(false));
+        assert_eq!(rows[0]["expires"], json!("2026-06-30 00:00:00"));
+        assert_eq!(
+            rows[0]["credential_expires"],
+            json!("2026-12-31 23:59:59"),
+            "an unenumerated collision must be kept too: {}",
+            rows[0]
+        );
+    }
+
+    /// `--fields` projects over whatever rows the renderer is given, so the
+    /// reshaped rows must be projectable the same way any listing is.
+    #[test]
+    fn field_projection_works_over_the_reshaped_rows() {
+        let rows = scopes_rows_for_table(&detail_body());
+        let fields = ["entity_id".to_owned(), "access_mode".to_owned()];
+        let projected = filter_fields(&rows, Some(&fields));
+        let projected = projected.as_array().expect("an array of rows");
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected[0]["entity_id"], json!("12345"));
+        assert_eq!(projected[0]["access_mode"], json!("rwa"));
+        assert!(
+            projected[0].get("auth_type").is_none(),
+            "the projection must drop what was not asked for: {:?}",
+            projected[0]
+        );
+    }
+
+    // ─── the read-only sign-out refusal and the scope CAS conflicts ─────────
+
+    /// Serve one canned response per connection, FOREVER, counting connections.
+    ///
+    /// The single-shot [`spawn_json_server`] cannot distinguish "the client sent
+    /// one request" from "the client retried and the retry was refused by a
+    /// closed listener" — and whether a conflict is silently retried is exactly
+    /// what the 409 tests assert. Staying open makes a retry succeed at the
+    /// socket level, so a retry that happens is COUNTED rather than hidden.
+    async fn spawn_counting_server(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                if sock.read(&mut buf).await.is_err() {
+                    continue;
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                let header = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (addr, hits)
+    }
+
+    /// The refusal a read-only credential gets on a user-anchored mutation.
+    const SCOPE_WRITE_REQUIRED_BODY: &str = r#"{"result":"no","error":{"code":10770,
+        "text":"read-only credential","params":{"reason":"scope_write_required",
+        "required_access_mode":"rw","current_access_mode":"r",
+        "credential_type":"api_key"}}}"#;
+
+    /// A private config dir seeded with one live stored credential for the
+    /// `default` profile, plus a `Config` whose profile points at `base`.
+    ///
+    /// The api-base match is not incidental: `signout`'s best-effort clear is
+    /// gated on the request having gone to the PROFILE'S OWN base, so a config
+    /// left at the production default would take the fatal path for the wrong
+    /// reason and the test would pass while proving nothing.
+    fn seeded_profile(slug: &str, base: &str) -> (std::path::PathBuf, Config) {
+        let dir = std::env::temp_dir().join(format!(
+            "fastio-signout-{slug}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        let mut creds = CredentialsFile::load(&dir).expect("load credentials");
+        creds
+            .set(
+                "default",
+                StoredCredentials {
+                    token: Some(SecretString::from("live-token")),
+                    // Far future: an expired token short-circuits before the
+                    // request is ever sent, which is a different code path.
+                    expires_at: Some(4_102_444_800),
+                    auth_method: Some("api_key".to_owned()),
+                    ..StoredCredentials::default()
+                },
+                &dir,
+            )
+            .expect("seed credentials");
+        let mut config = Config::default();
+        if let Some(profile) = config.profiles.get_mut("default") {
+            profile.api_base = base.to_owned();
+        }
+        (dir, config)
+    }
+
+    /// A read-only credential cannot revoke its own session, so sign-out must
+    /// still clear the local credential and exit 0.
+    ///
+    /// Driven through the injected-env seam: `FASTIO_TOKEN` / `FASTIO_API_KEY`
+    /// in the runner's shell would otherwise win precedence 2-3, the
+    /// best-effort clear would be gated shut, and this would fail for a reason
+    /// unrelated to the code.
+    ///
+    /// Left fatal, the profile WEDGES: the user asks to sign out, is told 403,
+    /// and the credential stays on disk with no command able to remove it — the
+    /// same failure the dead-bearer 401 path exists to prevent, arriving on a
+    /// different status.
+    #[tokio::test]
+    async fn signout_clears_locally_when_the_credential_is_read_only() {
+        let addr = spawn_counting_server("HTTP/1.1 403 Forbidden", SCOPE_WRITE_REQUIRED_BODY)
+            .await
+            .0;
+        let base = format!("http://{addr}");
+        let (dir, config) = seeded_profile("readonly", &base);
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "default",
+            api_base: &base,
+            flag_token: None,
+            config_dir: &dir,
+        };
+
+        signout_with_env(&config, &ctx, None, None)
+            .await
+            .expect("a read-only refusal must not fail the sign-out");
+
+        let after = CredentialsFile::load(&dir).expect("reload credentials");
+        assert!(
+            after.get("default").is_none(),
+            "the local credential must be gone — otherwise the profile is wedged \
+             in a signed-in state no command can clear"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate is unchanged: a `--token` bearer's refusal must NOT wipe the
+    /// stored credential it never came from. Same 403, opposite outcome.
+    #[tokio::test]
+    async fn signout_read_only_refusal_never_wipes_a_flag_token_profile() {
+        let addr = spawn_counting_server("HTTP/1.1 403 Forbidden", SCOPE_WRITE_REQUIRED_BODY)
+            .await
+            .0;
+        let base = format!("http://{addr}");
+        let (dir, config) = seeded_profile("readonly-flag", &base);
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "default",
+            api_base: &base,
+            flag_token: Some("someone-elses-token"),
+            config_dir: &dir,
+        };
+
+        let err = signout_with_env(&config, &ctx, None, None)
+            .await
+            .expect_err("a flag bearer's refusal stays fatal");
+        assert!(
+            format!("{err:#}").contains("sign-out failed"),
+            "the refusal must surface, not be swallowed: {err:#}"
+        );
+        let after = CredentialsFile::load(&dir).expect("reload credentials");
+        assert!(
+            after.get("default").is_some(),
+            "a --token refusal must never destroy stored credentials it did not \
+             come from"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refusal earned by ANOTHER profile's bearer must never clear this one.
+    ///
+    /// `token::resolve_token` falls through a named profile that holds no
+    /// usable credential to `default`, so `--profile shadow auth signout` sends
+    /// `default`'s bearer. No flag and no env bearer means `bearer_from_store`
+    /// is true, and the api base matches, so without a provenance conjunct the
+    /// 403 would clear profile `shadow` — destroying an innocent profile, and
+    /// leaving the credential the server actually rejected on disk under
+    /// `default`, with exit 0.
+    #[tokio::test]
+    async fn signout_never_clears_a_profile_that_did_not_supply_the_bearer() {
+        let (addr, hits) =
+            spawn_counting_server("HTTP/1.1 403 Forbidden", SCOPE_WRITE_REQUIRED_BODY).await;
+        let base = format!("http://{addr}");
+        let (dir, mut config) = seeded_profile("readonly-shadow", &base);
+        // Exists, but holds neither a token nor a key: resolution falls through
+        // it to `default`.
+        let mut creds = CredentialsFile::load(&dir).expect("load credentials");
+        creds
+            .set(
+                "shadow",
+                StoredCredentials {
+                    email: Some("shadow@example.invalid".to_owned()),
+                    auth_method: Some("api_key".to_owned()),
+                    ..StoredCredentials::default()
+                },
+                &dir,
+            )
+            .expect("seed the credential-less profile");
+        // The api-base conjunct must NOT be what fails, or the provenance gate
+        // under test is never reached and this passes while proving nothing.
+        let profile = config
+            .profiles
+            .get("default")
+            .expect("default profile")
+            .clone();
+        config.profiles.insert("shadow".to_owned(), profile);
+
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "shadow",
+            api_base: &base,
+            flag_token: None,
+            config_dir: &dir,
+        };
+
+        let err = signout_with_env(&config, &ctx, None, None)
+            .await
+            .expect_err("a refusal earned by another profile's bearer stays fatal");
+        assert!(
+            format!("{err:#}").contains("sign-out failed"),
+            "the refusal must surface, not be swallowed: {err:#}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the fallback bearer must really have been sent — otherwise the \
+             refusal never happened and the gate was never exercised"
+        );
+        let after = CredentialsFile::load(&dir).expect("reload credentials");
+        assert!(
+            after.get("shadow").is_some(),
+            "the profile that supplied nothing must survive a refusal it did \
+             not earn"
+        );
+        assert!(
+            after.get("default").is_some(),
+            "the profile whose bearer WAS rejected must not be silently left \
+             behind either — nothing was cleared on this path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Positive control for the same gate: a named profile that DID supply the
+    /// bearer is cleared, and only it.
+    ///
+    /// Exit 0 on a 403 is reachable only through the best-effort arm, which is
+    /// what renders `server_signout_completed: false`.
+    #[tokio::test]
+    async fn signout_clears_a_named_profile_that_did_supply_the_bearer() {
+        let (addr, hits) =
+            spawn_counting_server("HTTP/1.1 403 Forbidden", SCOPE_WRITE_REQUIRED_BODY).await;
+        let base = format!("http://{addr}");
+        let (dir, mut config) = seeded_profile("readonly-owner", &base);
+        let mut creds = CredentialsFile::load(&dir).expect("load credentials");
+        creds
+            .set(
+                "owner",
+                StoredCredentials {
+                    token: Some(SecretString::from("owner-token")),
+                    expires_at: Some(4_102_444_800),
+                    auth_method: Some("api_key".to_owned()),
+                    ..StoredCredentials::default()
+                },
+                &dir,
+            )
+            .expect("seed the bearer-holding profile");
+        let profile = config
+            .profiles
+            .get("default")
+            .expect("default profile")
+            .clone();
+        config.profiles.insert("owner".to_owned(), profile);
+
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "owner",
+            api_base: &base,
+            flag_token: None,
+            config_dir: &dir,
+        };
+
+        signout_with_env(&config, &ctx, None, None)
+            .await
+            .expect("the profile's own read-only refusal must not fail sign-out");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the profile's own bearer must have been sent exactly once"
+        );
+        let after = CredentialsFile::load(&dir).expect("reload credentials");
+        assert!(
+            after.get("owner").is_none(),
+            "the profile that supplied the refused bearer must be cleared, or \
+             it wedges in a signed-in state"
+        );
+        assert!(
+            after.get("default").is_some(),
+            "no other profile may be touched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A client-side expiry clears local credentials too — but only for the
+    /// profile whose OWN access token lapsed.
+    ///
+    /// `--profile shadow` where `shadow` holds metadata but no access token is
+    /// fallen through by resolution, so the expiry error names `default`.
+    /// Ungated, this arm would clear `shadow` and REVOKE its refresh token
+    /// server-side — an irreversible side effect the 403 path does not even
+    /// have — while leaving the expired credential on disk under `default`,
+    /// with exit 0.
+    #[tokio::test]
+    async fn signout_expiry_never_clears_a_profile_that_did_not_hold_the_expired_token() {
+        let (addr, hits) = spawn_counting_server("HTTP/1.1 200 OK", r#"{"result":"yes"}"#).await;
+        let base = format!("http://{addr}");
+        let (dir, config) = seeded_profile("expiry-shadow", &base);
+        let mut creds = CredentialsFile::load(&dir).expect("load credentials");
+        // The credential the error will actually name: expired, and on a
+        // profile the command was not asked about.
+        creds
+            .set(
+                "default",
+                StoredCredentials {
+                    token: Some(SecretString::from("stale-token")),
+                    expires_at: Some(1_000_000_000),
+                    auth_method: Some("api_key".to_owned()),
+                    ..StoredCredentials::default()
+                },
+                &dir,
+            )
+            .expect("seed the expired default");
+        // The refresh token is the MUTATION CONTROL: ungated, this profile's
+        // revocation goes out and the counter reads 1 instead of 0.
+        creds
+            .set(
+                "shadow",
+                StoredCredentials {
+                    email: Some("shadow@example.invalid".to_owned()),
+                    refresh_token: Some(SecretString::from("shadow-refresh")),
+                    ..StoredCredentials::default()
+                },
+                &dir,
+            )
+            .expect("seed the credential-less profile");
+
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "shadow",
+            api_base: &base,
+            flag_token: None,
+            config_dir: &dir,
+        };
+
+        let err = signout_with_env(&config, &ctx, None, None)
+            .await
+            .expect_err("another profile's expiry must not be swallowed as success");
+        assert!(
+            format!("{err:#}").contains("expired"),
+            "the expiry must surface rather than be silently absorbed: {err:#}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "nothing may leave — least of all a revocation of a refresh token \
+             belonging to a profile whose credential did not expire"
+        );
+        let after = CredentialsFile::load(&dir).expect("reload credentials");
+        assert!(
+            after.get("shadow").is_some(),
+            "the profile that held no expired token must survive"
+        );
+        assert!(
+            after.get("default").is_some(),
+            "and the profile that DID must not be silently left behind either — \
+             nothing was cleared on this path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// POSITIVE CONTROL for the same arm: the profile whose own access token
+    /// expired is still cleared, and its refresh token still revoked.
+    ///
+    /// Without this, an arm that simply never cleared on expiry would satisfy
+    /// the test above — and would re-open the wedge the arm exists to prevent,
+    /// since an expired token can never reach the server to be signed out.
+    #[tokio::test]
+    async fn signout_expiry_clears_the_profile_whose_own_token_expired() {
+        let (addr, hits) = spawn_counting_server("HTTP/1.1 200 OK", r#"{"result":"yes"}"#).await;
+        let base = format!("http://{addr}");
+        let (dir, config) = seeded_profile("expiry-owner", &base);
+        let mut creds = CredentialsFile::load(&dir).expect("load credentials");
+        creds
+            .set(
+                "owner",
+                StoredCredentials {
+                    token: Some(SecretString::from("owner-stale-token")),
+                    refresh_token: Some(SecretString::from("owner-refresh")),
+                    expires_at: Some(1_000_000_000),
+                    auth_method: Some("api_key".to_owned()),
+                    ..StoredCredentials::default()
+                },
+                &dir,
+            )
+            .expect("seed the expired owner");
+
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "owner",
+            api_base: &base,
+            flag_token: None,
+            config_dir: &dir,
+        };
+
+        signout_with_env(&config, &ctx, None, None)
+            .await
+            .expect("an expired credential must still sign out locally");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the expired access token is exactly when the long-lived refresh \
+             token matters most, so its revocation must still go out"
+        );
+        let after = CredentialsFile::load(&dir).expect("reload credentials");
+        assert!(
+            after.get("owner").is_none(),
+            "the profile whose own token expired must be cleared, or it wedges"
+        );
+        assert!(
+            after.get("default").is_some(),
+            "no other profile may be touched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Provenance is an IDENTITY check, not a presence check.
+    ///
+    /// The bearer is resolved once and the profile record is loaded again for
+    /// the gate; between the two, a concurrent `auth login --profile x` can put
+    /// a credential into a profile that was empty when the fallback bearer was
+    /// chosen. A presence test would then read that new credential as proof
+    /// that `x` supplied the rejected bearer, and clear it. Only an exact match
+    /// against the record's own values rules that out — and the race has no
+    /// seam to stage end to end, so it is pinned here, at the predicate both
+    /// `signout` and `status` call.
+    #[test]
+    fn stored_scopes_never_describe_a_bearer_the_profile_does_not_hold() {
+        let token_profile = StoredCredentials {
+            token: Some(SecretString::from("x-own-token")),
+            scopes: Some(r#"["org:1:rwa"]"#.to_owned()),
+            ..StoredCredentials::default()
+        };
+        assert!(
+            !super::stored_scopes_describe_bearer(
+                true,
+                Some("default-token"),
+                Some(&token_profile)
+            ),
+            "holding SOME credential is not having supplied THIS one"
+        );
+        assert!(
+            super::stored_scopes_describe_bearer(true, Some("x-own-token"), Some(&token_profile)),
+            "positive control: the profile's own token must still count"
+        );
+
+        let key_profile = StoredCredentials {
+            api_key: Some(SecretString::from("x-own-key")),
+            ..StoredCredentials::default()
+        };
+        assert!(
+            !super::stored_scopes_describe_bearer(true, Some("x-own-token"), Some(&key_profile)),
+            "an api-key profile must not claim another profile's token"
+        );
+        assert!(
+            super::stored_scopes_describe_bearer(true, Some("x-own-key"), Some(&key_profile)),
+            "positive control: the profile's own api key must still count"
+        );
+    }
+
+    /// The dispatch arm and the environment-reading wrapper are exercised at
+    /// least once.
+    ///
+    /// Every other sign-out test drives `signout_with_env` directly, so without
+    /// this nothing proves `AuthCommand::Signout` reaches `signout` at all, nor
+    /// that the wrapper passes `FASTIO_TOKEN` and `FASTIO_API_KEY` in the order
+    /// resolution expects. The request counter is the assertion that holds
+    /// whatever the runner's own environment contains; the local clear is
+    /// checked only when that environment supplies no bearer of its own, since
+    /// one would legitimately gate the clear shut.
+    #[tokio::test]
+    async fn signout_is_reachable_through_the_auth_command_dispatch() {
+        let (addr, hits) =
+            spawn_counting_server("HTTP/1.1 403 Forbidden", SCOPE_WRITE_REQUIRED_BODY).await;
+        let base = format!("http://{addr}");
+        let (dir, config) = seeded_profile("dispatch", &base);
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "default",
+            api_base: &base,
+            flag_token: None,
+            config_dir: &dir,
+        };
+
+        let result = execute(&AuthCommand::Signout, &config, &ctx).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the dispatch arm must reach `signout` and send exactly one sign-out"
+        );
+        if std::env::var_os("FASTIO_TOKEN").is_none()
+            && std::env::var_os("FASTIO_API_KEY").is_none()
+        {
+            result.expect("a read-only refusal must not fail the sign-out");
+            let after = CredentialsFile::load(&dir).expect("reload credentials");
+            assert!(
+                after.get("default").is_none(),
+                "the wrapper must forward two absent env credentials, leaving the \
+                 stored bearer as the resolved one and the clear ungated"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stderr line for that path must name the REAL cause and carry the
+    /// refusal's own recovery advice.
+    ///
+    /// The default wording says the credentials were "already invalid", which
+    /// for a live read-only credential is false and sends the reader off to
+    /// re-issue a key that works. And because the command exits 0, the refusal
+    /// never reaches the render layer — this line is the only place its hint
+    /// can be seen at all.
+    #[test]
+    fn the_read_only_signout_warning_explains_itself() {
+        let err = CliError::Api(fastio_cli::error::ApiError::new(
+            10_770,
+            None,
+            "read-only credential".to_owned(),
+            403,
+        ));
+        let warning = read_only_signout_warning(&err);
+        assert!(
+            warning.contains("read-only"),
+            "the cause must be named: {warning}"
+        );
+        assert!(
+            !warning.contains("already invalid"),
+            "a live read-only credential is not an invalid one: {warning}"
+        );
+        assert!(
+            warning.contains("local credentials were cleared"),
+            "the reader must be told what DID happen: {warning}"
+        );
+        assert!(
+            warning.contains("hint: "),
+            "the refusal's own recovery advice must ride along: {warning}"
+        );
+        assert!(
+            warning.contains("--read-only"),
+            "the advice must name the flag to drop: {warning}"
+        );
+        // The credential is already gone by the time this prints, so the hints'
+        // shared "see what the CURRENT credential holds" tail is advice the
+        // reader cannot act on — and it contradicts the line above it.
+        assert!(
+            !warning.contains("auth scopes"),
+            "the warning must not send the reader to a command that needs the \
+             credential it just deleted: {warning}"
+        );
+    }
+
+    /// A lost compare-and-swap race on `api-key update` must be re-hinted, and
+    /// must NOT be retried.
+    ///
+    /// The generic 409 advice is "wait and retry"; here the retry would resend a
+    /// scope set built from a stale read, and the update REPLACES the whole set
+    /// — so the retry deletes whatever won the race.
+    #[tokio::test]
+    async fn api_key_update_conflict_is_re_hinted_and_not_retried() {
+        let (addr, hits) = spawn_counting_server(
+            "HTTP/1.1 409 Conflict",
+            r#"{"result":"no","error":{"code":181408,"text":"scopes changed"}}"#,
+        )
+        .await;
+        let base = format!("http://{addr}");
+        let dir = std::env::temp_dir().join(format!("fastio-cas-key-{}", std::process::id()));
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "default",
+            api_base: &base,
+            flag_token: Some("tok"),
+            config_dir: &dir,
+        };
+        let cmd = AuthCommand::ApiKey(ApiKeyCommand::Update {
+            key_id: "key-1".to_owned(),
+            name: Some("renamed".to_owned()),
+            scopes: None,
+            agent_name: None,
+            expires: None,
+            scope_spec: ApiKeyScopeSpec::default(),
+        });
+        let err = execute(&cmd, &Config::default(), &ctx)
+            .await
+            .expect_err("a 409 is still a failure");
+        let cli = err
+            .downcast_ref::<CliError>()
+            .expect("the conflict must survive as a CliError");
+        assert_eq!(
+            cli.suggestion(),
+            Some(HINT_KEY_SCOPES_CHANGED),
+            "the conflict must carry the key surface's re-read advice"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a scope conflict must NOT be retried — the caller has to re-read first"
+        );
+    }
+
+    /// The same, on the session surface: `oauth narrow` writes scopes through
+    /// the same compare-and-swap, and its re-read command is the session one.
+    #[tokio::test]
+    async fn oauth_narrow_conflict_is_re_hinted_and_not_retried() {
+        let (addr, hits) = spawn_counting_server(
+            "HTTP/1.1 409 Conflict",
+            r#"{"result":"no","error":{"code":172160,"text":"scopes changed"}}"#,
+        )
+        .await;
+        let base = format!("http://{addr}");
+        let dir = std::env::temp_dir().join(format!("fastio-cas-sess-{}", std::process::id()));
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "default",
+            api_base: &base,
+            flag_token: Some("tok"),
+            config_dir: &dir,
+        };
+        let cmd = AuthCommand::Oauth(OauthCommand::Narrow {
+            session_id: "sess-1".to_owned(),
+            scopes: Some(r#"["org:1:r"]"#.to_owned()),
+            scope_spec: ApiKeyScopeSpec::default(),
+        });
+        let err = execute(&cmd, &Config::default(), &ctx)
+            .await
+            .expect_err("a 409 is still a failure");
+        let cli = err
+            .downcast_ref::<CliError>()
+            .expect("the conflict must survive as a CliError");
+        assert_eq!(
+            cli.suggestion(),
+            Some(HINT_SESSION_SCOPES_CHANGED),
+            "the conflict must carry the SESSION surface's re-read advice"
+        );
+        assert_ne!(
+            cli.suggestion(),
+            Some(HINT_KEY_SCOPES_CHANGED),
+            "the two surfaces must not share one re-read command"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a scope conflict must NOT be retried"
+        );
     }
 }

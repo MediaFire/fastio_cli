@@ -126,8 +126,73 @@ pub struct PkceTokenResponse {
     /// Refresh token for obtaining new access tokens.
     pub refresh_token: Option<String>,
     /// Granted scope.
+    ///
+    /// The legacy OAuth scope WORD (`user`, `org`, …), not the entity grant.
+    /// Never read it as the grant — that is [`PkceTokenResponse::scopes`].
     #[allow(dead_code)]
     pub scope: Option<String>,
+    /// The granted entity scopes, as the JSON-ENCODED STRING the token
+    /// endpoint returns — e.g. `"[\"org:123:rwa\",\"userdetails:*:rw\"]"`.
+    ///
+    /// Always this string form, whichever shape the server sent: a string is
+    /// stored as received, and an array is re-encoded to the same rendering by
+    /// [`deserialize_optional_scopes`].
+    ///
+    /// Absent for a token that carries no explicit entity scopes (the legacy
+    /// full-access shape), which is why it is `Option` rather than defaulting
+    /// to an empty array: "no entry" and "an empty grant" are different states.
+    #[serde(default, deserialize_with = "deserialize_optional_scopes")]
+    pub scopes: Option<String>,
+}
+
+/// Accept the `scopes` grant as a JSON **string** or a JSON **array of
+/// strings**, and always produce the string form the credential store keeps.
+///
+/// The token endpoint has sent both shapes; a mismatch used to fail the whole
+/// response and so break login and refresh outright, which is a far worse
+/// outcome than normalizing the one field. An array is re-encoded with
+/// `serde_json::to_string` so the stored value stays byte-identical to the
+/// server's own string rendering.
+///
+/// A blank-after-trim string becomes `None` rather than `Some("")`: the refresh
+/// path replaces the stored grant whenever the response states one, and `""`
+/// states nothing — treating it as a value would erase a real grant.
+/// `null` and an absent field are likewise `None`. Anything else (a number, an
+/// object, an array holding a non-string) is a hard error, exactly as before.
+fn deserialize_optional_scopes<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(deserializer)?;
+    match v {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => {
+            if s.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(s))
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let mut entries: Vec<String> = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    serde_json::Value::String(s) => entries.push(s),
+                    other => {
+                        return Err(serde::de::Error::custom(format!(
+                            "expected a string in the scopes array, got {other}"
+                        )));
+                    }
+                }
+            }
+            serde_json::to_string(&entries)
+                .map(Some)
+                .map_err(serde::de::Error::custom)
+        }
+        other => Err(serde::de::Error::custom(format!(
+            "expected string or array of strings for scopes, got {other}"
+        ))),
+    }
 }
 
 impl fmt::Debug for PkceTokenResponse {
@@ -141,21 +206,33 @@ impl fmt::Debug for PkceTokenResponse {
                 &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("scope", &self.scope)
+            .field("scopes", &self.scopes)
             .finish()
     }
 }
 
 /// API key creation response.
+///
+/// The typed `api_key` is the one field the caller must have; everything else
+/// the server returns alongside it (`id`, `memo`, `scopes`, `agent_name`,
+/// `created`, `expires`, …, plus the envelope's own `result`) is kept verbatim
+/// in `extra` so a newly-added server field is surfaced rather than dropped.
+/// This endpoint has no `response` sub-object, so the whole envelope minus
+/// `current_api_version` lands here.
 #[derive(Deserialize)]
 pub struct ApiKeyCreateResponse {
-    /// The newly created API key.
+    /// The newly created API key. Returned in full ONLY at creation time.
     pub api_key: String,
+    /// Every other field of the response, preserved as sent.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl fmt::Debug for ApiKeyCreateResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ApiKeyCreateResponse")
             .field("api_key", &"[REDACTED]")
+            .field("extra", &self.extra)
             .finish()
     }
 }
@@ -442,5 +519,160 @@ mod search_mode_tests {
         for mode in NAME_MATCH_PRECISE {
             assert!(SearchModeParams::new().name_match(Some(mode)).is_precise());
         }
+    }
+}
+
+#[cfg(test)]
+mod auth_response_tests {
+    use super::{ApiKeyCreateResponse, PkceTokenResponse};
+
+    /// The grant arrives as a JSON-ENCODED STRING and is kept verbatim — it is
+    /// stored and re-sent as-is, so re-encoding it would change the bytes.
+    #[test]
+    fn token_response_reads_scopes_when_present() {
+        let json = r#"{"access_token":"a","token_type":"Bearer","expires_in":3600,
+                       "scopes":"[\"org:123:rwa\",\"userdetails:*:rw\"]"}"#;
+        let resp: PkceTokenResponse = serde_json::from_str(json).expect("token response parses");
+        assert_eq!(
+            resp.scopes.as_deref(),
+            Some("[\"org:123:rwa\",\"userdetails:*:rw\"]")
+        );
+    }
+
+    #[test]
+    fn token_response_reads_null_scopes_as_absent() {
+        let json = r#"{"access_token":"a","token_type":"Bearer","expires_in":3600,"scopes":null}"#;
+        let resp: PkceTokenResponse = serde_json::from_str(json).expect("token response parses");
+        assert_eq!(resp.scopes, None);
+    }
+
+    /// A token endpoint that never learned about `scopes` must still parse.
+    #[test]
+    fn token_response_tolerates_absent_scopes() {
+        let json = r#"{"access_token":"a","token_type":"Bearer","expires_in":3600}"#;
+        let resp: PkceTokenResponse = serde_json::from_str(json).expect("token response parses");
+        assert_eq!(resp.scopes, None);
+    }
+
+    /// The endpoint has also sent the grant as a real JSON array. Rejecting it
+    /// failed the WHOLE response and broke login and refresh, so it is
+    /// re-encoded into the string form the credential store keeps.
+    #[test]
+    fn token_response_accepts_an_array_of_scope_strings() {
+        let json = r#"{"access_token":"a","token_type":"Bearer","expires_in":3600,
+                       "scopes":["org:123:rwa","userdetails:*:rw"]}"#;
+        let resp: PkceTokenResponse = serde_json::from_str(json).expect("token response parses");
+        assert_eq!(
+            resp.scopes.as_deref(),
+            Some("[\"org:123:rwa\",\"userdetails:*:rw\"]"),
+            "the array must be re-encoded into the server's string shape"
+        );
+    }
+
+    /// A blank grant states nothing. Keeping `Some("")` would let a refresh
+    /// overwrite a real stored grant with an empty one.
+    #[test]
+    fn token_response_reads_a_blank_scopes_string_as_absent() {
+        for blank in ["\"\"", "\"   \""] {
+            let json = format!(
+                r#"{{"access_token":"a","token_type":"Bearer","expires_in":3600,"scopes":{blank}}}"#
+            );
+            let resp: PkceTokenResponse =
+                serde_json::from_str(&json).expect("token response parses");
+            assert_eq!(resp.scopes, None, "scopes={blank} must read as absent");
+        }
+    }
+
+    /// Normalizing string-or-array is deliberate and bounded: a number is not
+    /// a grant, and guessing at one would store a value nothing can honour.
+    #[test]
+    fn token_response_rejects_a_non_string_non_array_scopes() {
+        let json = r#"{"access_token":"a","token_type":"Bearer","expires_in":3600,"scopes":7}"#;
+        let err = serde_json::from_str::<PkceTokenResponse>(json)
+            .expect_err("an integer grant must be rejected");
+        assert!(
+            err.to_string().contains("scopes"),
+            "the error must name the field, got: {err}"
+        );
+    }
+
+    /// An array holding a non-string is the same case one level down.
+    ///
+    /// Asserting only `is_err()` would pass with the array branch fully
+    /// reverted — a plain `Option<String>` field rejects an array too — so the
+    /// assertion names the deserializer's OWN phrase, which only this code path
+    /// can produce.
+    #[test]
+    fn token_response_rejects_a_non_string_inside_the_scopes_array() {
+        let json = r#"{"access_token":"a","token_type":"Bearer","expires_in":3600,"scopes":["org:1:r",7]}"#;
+        let err = serde_json::from_str::<PkceTokenResponse>(json)
+            .expect_err("a non-string array entry must be rejected");
+        assert!(
+            err.to_string()
+                .contains("expected a string in the scopes array"),
+            "the refusal must come from the array branch, got: {err}"
+        );
+    }
+
+    /// The legacy `scope` WORD is a different field with a different meaning.
+    /// Reading it as the grant would persist `"user"` where an entity array
+    /// belongs.
+    #[test]
+    fn legacy_scope_word_is_not_the_grant() {
+        let json = r#"{"access_token":"a","token_type":"Bearer","expires_in":3600,"scope":"user"}"#;
+        let resp: PkceTokenResponse = serde_json::from_str(json).expect("token response parses");
+        assert_eq!(resp.scope.as_deref(), Some("user"));
+        assert_eq!(
+            resp.scopes, None,
+            "the legacy word must not become the grant"
+        );
+    }
+
+    /// Everything the server sends alongside the key is kept, so a field added
+    /// server-side is surfaced rather than silently dropped.
+    #[test]
+    fn api_key_create_keeps_every_field_the_server_sent() {
+        let json = r#"{"result":true,"api_key":"raw-secret-key","id":"key_1","memo":"CI",
+                       "scopes":"[\"org:1:rwa\"]","agent_name":"a","created":"2026-01-01 00:00:00 UTC",
+                       "expires":null,"admin":true,"legacy":false}"#;
+        let resp: ApiKeyCreateResponse =
+            serde_json::from_str(json).expect("create response parses");
+        assert_eq!(resp.api_key, "raw-secret-key");
+        for key in [
+            "result",
+            "id",
+            "memo",
+            "scopes",
+            "agent_name",
+            "created",
+            "expires",
+            "admin",
+            "legacy",
+        ] {
+            assert!(resp.extra.contains_key(key), "{key} must be preserved");
+        }
+        assert_eq!(
+            resp.extra.get("scopes").and_then(serde_json::Value::as_str),
+            Some("[\"org:1:rwa\"]")
+        );
+    }
+
+    /// The raw key is shown exactly once, at creation. `Debug` must never be
+    /// the second place it appears — including via the preserved extras.
+    #[test]
+    fn api_key_create_debug_still_redacts_the_key() {
+        let json = r#"{"result":true,"api_key":"raw-secret-key","memo":"CI"}"#;
+        let resp: ApiKeyCreateResponse =
+            serde_json::from_str(json).expect("create response parses");
+        let rendered = format!("{resp:?}");
+        assert!(
+            !rendered.contains("raw-secret-key"),
+            "the raw key must stay redacted, got: {rendered}"
+        );
+        assert!(rendered.contains("[REDACTED]"), "got: {rendered}");
+        assert!(
+            rendered.contains("CI"),
+            "preserved extras must still render, got: {rendered}"
+        );
     }
 }

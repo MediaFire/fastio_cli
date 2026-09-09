@@ -582,6 +582,172 @@ pub const HINT_SCOPE_INCORRECT: &str = "Your credential is valid, but its scope 
      If you signed in to a 2FA-enabled account, the stored token stays limited until you finish verifying: run `fastio auth 2fa verify --code <CODE>`. \
      Otherwise use a credential whose scopes cover this operation (a restricted API key reaches only what it was issued for; a full account sign-in may have broader scopes).";
 
+/// Scope / access-mode refusal hints (HTTP 403).
+///
+/// The server enriches these refusals with an OBJECT-shaped `error.params`
+/// carrying a stable `reason` plus the `credential_type` that produced the
+/// refusal, so the recovery differs by BOTH. The reason picks the family; the
+/// credential type picks the member. The `reason` is AUTHORITATIVE: it is what
+/// selects a hint whenever it is present, and it outranks the numeric code —
+/// see [`ApiError::field_reason`] for why. Codes 10767/10768/10769 are keyed
+/// only as an ABSENCE fallback, reached when the refusal carries no `params` at
+/// all; each then yields the generic member of its family, since the credential
+/// type is unknowable without the reason object.
+///
+/// The wording deliberately never calls admin a "role" and never tells the
+/// reader to ask someone else to grant it: an access mode is a property of the
+/// CREDENTIAL, so the fix is always to re-issue or re-consent the credential.
+///
+/// `scope_admin_required`, `credential_type: api_key` — the key was issued
+/// without an `rwa` access mode for the target entity.
+/// **The update is a WHOLESALE REPLACEMENT.** `POST /user/auth/key/{id}/`
+/// replaces the key's entire scope set with the array it is sent, so a hint
+/// that names only the missing scope would talk the reader into deleting every
+/// other scope the key holds. The wording therefore sends them to read the key
+/// first and re-state everything it should keep.
+///
+/// **`--admin` is applied to EVERY scope the invocation names**, so re-stating a
+/// mixed-mode key with the selector flags silently escalates its read-only
+/// scopes to admin. The hint therefore names the raw `--scopes` form as the
+/// escape hatch for a key whose scopes do not all share one access mode.
+pub const HINT_SCOPE_ADMIN_REQUIRED_API_KEY: &str = "This API key has no admin (rwa) access mode for that resource. \
+     Re-issue it with admin — but an update REPLACES the key's whole scope set, so run `fastio auth api-key get <key-id>` first, then run `fastio auth api-key update <key-id>` and re-specify every scope it should keep — `--org <id>`, `--workspace <id>`, `--share <id>` or `--all` — alongside `--admin`, from a credential that already holds that access. \
+     If the key's scopes do not all use the same access mode, re-state them verbatim with `--scopes` instead: `--admin` applies admin to every scope the invocation names, which would escalate a read-only one. \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
+/// `scope_admin_required`, `credential_type: oauth` — the consent page was not
+/// asked for, or did not grant, admin.
+pub const HINT_SCOPE_ADMIN_REQUIRED_OAUTH: &str = "This login has no admin (rwa) access mode for that resource. \
+     Run `fastio auth login --admin` and approve admin access on the consent page, then retry. \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
+/// `scope_admin_required`, `credential_type: session` — a web session whose
+/// grant does not include admin.
+pub const HINT_SCOPE_ADMIN_REQUIRED_SESSION: &str = "This session has no admin (rwa) access mode for that resource. \
+     Run `fastio auth login --admin` and approve admin access on the consent page, then retry. \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
+/// `scope_admin_required`, credential type absent or unrecognised — names both
+/// recovery paths because the response did not say which credential this is.
+pub const HINT_SCOPE_ADMIN_REQUIRED_GENERIC: &str = "The credential has no admin (rwa) access mode for that resource. \
+     Run `fastio auth login --admin` and approve admin access, or issue a key with admin — `fastio auth api-key create` with `--org <id>`, `--workspace <id>`, `--share <id>` or `--all`, alongside `--admin` — then retry. \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
+/// `scope_exceeds_issuer` / `access_mode_exceeds_initiate`,
+/// `credential_type: api_key` — the requested grant is wider than the issuing
+/// key. Both reasons share this family: they are the same refusal seen at two
+/// points in the flow, and the recovery is identical.
+pub const HINT_SCOPE_EXCEEDS_ISSUER_API_KEY: &str = "The requested scopes are broader than this API key. \
+     Narrow the request, or issue it from a credential that already holds the access you asked for — a web session, or a fresh login with the ceiling you need (`fastio auth login --admin` for admin access, `fastio auth login --account-settings` for account settings). \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
+/// `scope_exceeds_issuer` / `access_mode_exceeds_initiate`,
+/// `credential_type: oauth`.
+pub const HINT_SCOPE_EXCEEDS_ISSUER_OAUTH: &str = "The requested scopes are broader than this login's grant. \
+     Narrow the request, or issue it from a credential that already holds the access you asked for — a web session, or a fresh login with the ceiling you need (`fastio auth login --admin` for admin access, `fastio auth login --account-settings` for account settings). \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
+/// `scope_exceeds_issuer` / `access_mode_exceeds_initiate`,
+/// `credential_type: session`.
+pub const HINT_SCOPE_EXCEEDS_ISSUER_SESSION: &str = "The requested scopes are broader than this session's grant. \
+     Narrow the request, or issue it from a credential that already holds the access you asked for — a web session, or a fresh login with the ceiling you need (`fastio auth login --admin` for admin access, `fastio auth login --account-settings` for account settings). \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
+/// `scope_exceeds_issuer` / `access_mode_exceeds_initiate`, credential type
+/// absent or unrecognised.
+pub const HINT_SCOPE_EXCEEDS_ISSUER_GENERIC: &str = "The requested scopes are broader than the credential issuing them. \
+     Narrow the request, or issue it from a credential that already holds the access you asked for — a web session, or a fresh login with the ceiling you need (`fastio auth login --admin` for admin access, `fastio auth login --account-settings` for account settings). \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
+/// `userdetails_scope_required`, `credential_type: api_key` — the key lacks
+/// `userdetails:*:rw`. Never mentions admin: account settings are a separate
+/// scope, not a wider access mode.
+pub const HINT_USERDETAILS_SCOPE_REQUIRED_API_KEY: &str = "This API key cannot change account settings. \
+     Add the account-settings scope — but an update REPLACES the key's whole scope set, so run `fastio auth api-key get <key-id>` first, then run `fastio auth api-key update <key-id>` and re-specify every scope it should keep — `--org <id>`, `--workspace <id>`, `--share <id>` or `--all` — alongside `--account-settings`, from a credential that already holds that access. \
+     Then retry.";
+
+/// `userdetails_scope_required`, `credential_type: oauth`.
+pub const HINT_USERDETAILS_SCOPE_REQUIRED_OAUTH: &str = "This login cannot change account settings. \
+     Run `fastio auth login --account-settings` and approve account settings on the consent page, then retry.";
+
+/// `userdetails_scope_required`, `credential_type: session`.
+pub const HINT_USERDETAILS_SCOPE_REQUIRED_SESSION: &str = "This session cannot change account settings. \
+     Run `fastio auth login --account-settings` and approve account settings on the consent page, then retry.";
+
+/// `userdetails_scope_required`, credential type absent or unrecognised —
+/// names the scope itself plus both recovery paths.
+pub const HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC: &str = "Account settings changes need the `userdetails:*:rw` scope. \
+     Run `fastio auth login --account-settings`, or add it to a key — a key update REPLACES the whole scope set, so run `fastio auth api-key get <key-id>` first, then run `fastio auth api-key update <key-id>` and re-specify every scope it should keep — `--org <id>`, `--workspace <id>`, `--share <id>` or `--all` — alongside `--account-settings`. \
+     Then retry.";
+
+/// `scope_write_required`, `credential_type: api_key` — every scope mode on the
+/// key is `r`, so it may read the account but not mutate it. Write is NOT
+/// admin: the fix is a read-write access mode, never `--admin`, which asks for
+/// a strictly higher ceiling the operation does not need.
+///
+/// Like the other API-key hints, the update is a WHOLESALE REPLACEMENT, so the
+/// wording sends the reader to read the key back before re-stating it.
+pub const HINT_SCOPE_WRITE_REQUIRED_API_KEY: &str = "This API key is read-only (access mode r) for account operations. \
+     Re-issue it read-write — but an update REPLACES the key's whole scope set, so run `fastio auth api-key get <key-id>` first, then run `fastio auth api-key update <key-id>` and re-specify every scope it should keep — `--org <id>`, `--workspace <id>`, `--share <id>` or `--all` — WITHOUT `--read-only`, from a credential that already has that access. \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
+/// `scope_write_required`, `credential_type: oauth` — the login was consented
+/// read-only.
+pub const HINT_SCOPE_WRITE_REQUIRED_OAUTH: &str = "This login is read-only (access mode r) for account operations. \
+     Sign in again without `--read-only` — run `fastio auth login` and approve the request, then retry. \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
+/// `scope_write_required`, `credential_type: session` — a web session whose
+/// grant is read-only.
+pub const HINT_SCOPE_WRITE_REQUIRED_SESSION: &str = "This session is read-only (access mode r) for account operations. \
+     Sign in again without `--read-only` — run `fastio auth login` and approve the request, then retry. \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
+/// `scope_write_required`, credential type absent or unrecognised — names both
+/// recovery paths because the response did not say which credential this is.
+pub const HINT_SCOPE_WRITE_REQUIRED_GENERIC: &str = "The credential is read-only (access mode r) for account operations. \
+     Sign in again without `--read-only` (`fastio auth login`), or issue a read-write key — a key update REPLACES the whole scope set, so run `fastio auth api-key get <key-id>` first, then run `fastio auth api-key update <key-id>` and re-specify every scope it should keep — `--org <id>`, `--workspace <id>`, `--share <id>` or `--all` — without `--read-only`. \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
+/// Map a scope/access-mode refusal `reason` plus the refusing `credential_type`
+/// to its recovery hint.
+///
+/// Separate from [`reason_hint`] because these four reasons need a SECOND
+/// discriminator: the same refusal has a different recovery for an API key
+/// (re-issue it), an OAuth grant (re-consent), and a web session. Unknown
+/// reasons return `None` so the caller falls through to the reason/code/status
+/// table unchanged.
+#[must_use]
+fn scope_refusal_hint(reason: &str, credential_type: Option<&str>) -> Option<&'static str> {
+    match reason {
+        "scope_admin_required" => Some(match credential_type {
+            Some("api_key") => HINT_SCOPE_ADMIN_REQUIRED_API_KEY,
+            Some("oauth") => HINT_SCOPE_ADMIN_REQUIRED_OAUTH,
+            Some("session") => HINT_SCOPE_ADMIN_REQUIRED_SESSION,
+            _ => HINT_SCOPE_ADMIN_REQUIRED_GENERIC,
+        }),
+        "scope_exceeds_issuer" | "access_mode_exceeds_initiate" => Some(match credential_type {
+            Some("api_key") => HINT_SCOPE_EXCEEDS_ISSUER_API_KEY,
+            Some("oauth") => HINT_SCOPE_EXCEEDS_ISSUER_OAUTH,
+            Some("session") => HINT_SCOPE_EXCEEDS_ISSUER_SESSION,
+            _ => HINT_SCOPE_EXCEEDS_ISSUER_GENERIC,
+        }),
+        "userdetails_scope_required" => Some(match credential_type {
+            Some("api_key") => HINT_USERDETAILS_SCOPE_REQUIRED_API_KEY,
+            Some("oauth") => HINT_USERDETAILS_SCOPE_REQUIRED_OAUTH,
+            Some("session") => HINT_USERDETAILS_SCOPE_REQUIRED_SESSION,
+            _ => HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC,
+        }),
+        "scope_write_required" => Some(match credential_type {
+            Some("api_key") => HINT_SCOPE_WRITE_REQUIRED_API_KEY,
+            Some("oauth") => HINT_SCOPE_WRITE_REQUIRED_OAUTH,
+            Some("session") => HINT_SCOPE_WRITE_REQUIRED_SESSION,
+            _ => HINT_SCOPE_WRITE_REQUIRED_GENERIC,
+        }),
+        _ => None,
+    }
+}
+
 /// Wrong email or password at sign-in (code `10008`).
 ///
 /// **Found live 2026-08-23**, while end-to-end testing
@@ -915,6 +1081,23 @@ impl ApiError {
         }
     }
 
+    /// Read a STRING value out of the OBJECT-shaped `error.params` by key.
+    ///
+    /// Object shape ONLY, exactly like [`Self::param_u64`] and for the same
+    /// reason: the ARRAY form is the per-field validation-diagnostics list, a
+    /// different payload that never carries endpoint-level enrichment such as
+    /// `credential_type`. Reading only the shape that actually carries the key
+    /// is fail-closed by construction — an array-shaped refusal still resolves
+    /// its `reason`, but yields no credential type, so the caller falls back to
+    /// the credential-agnostic wording rather than guessing.
+    #[must_use]
+    fn param_str(&self, key: &str) -> Option<&str> {
+        match self.details.as_deref()?.get("params")? {
+            serde_json::Value::Object(map) => map.get(key).and_then(serde_json::Value::as_str),
+            _ => None,
+        }
+    }
+
     /// Whether this error says the account is CURRENTLY locked out.
     ///
     /// **One predicate, used by both [`Self::lockout_note`] and
@@ -1051,6 +1234,16 @@ impl ApiError {
     pub fn suggestion(&self) -> Option<&'static str> {
         // Structured `reason` first: it is the server's documented stable
         // discriminator, so it outranks both the numeric code and the status.
+        //
+        // Scope / access-mode refusals are keyed on the reason AND the
+        // `credential_type` that produced it — the same refusal has a different
+        // recovery per credential — so that two-key table resolves first.
+        if let Some(hint) = self
+            .field_reason()
+            .and_then(|reason| scope_refusal_hint(reason, self.param_str("credential_type")))
+        {
+            return Some(hint);
+        }
         if let Some(hint) = self.field_reason().and_then(reason_hint) {
             return Some(hint);
         }
@@ -1164,6 +1357,18 @@ impl ApiError {
                 });
             }
             10560 => return Some(HINT_TOKEN_SCOPE),
+            // Code-keyed FALLBACK for the scope/access-mode refusals, reached
+            // only when the refusal arrives without the `params` object the
+            // reason-keyed table above reads. Without these arms such a
+            // response lands on the generic 403 line, whose "your account lacks
+            // the required role" wording is the exact advice this whole family
+            // exists to displace. The credential type is unknowable here, so
+            // each code maps to the GENERIC member of its family — the only
+            // member that is correct without one.
+            10767 => return Some(HINT_SCOPE_ADMIN_REQUIRED_GENERIC),
+            10768 => return Some(HINT_SCOPE_EXCEEDS_ISSUER_GENERIC),
+            10769 => return Some(HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC),
+            10770 => return Some(HINT_SCOPE_WRITE_REQUIRED_GENERIC),
             // `10175` rides HTTP 401 today and HTTP 403 after the platform's
             // RFC-6750 correction. Keyed here on the CODE so it outranks BOTH
             // status fallbacks — see [`HINT_SCOPE_INCORRECT`] for why each of
@@ -2950,5 +3155,463 @@ mod tests {
             rendered.contains("Try again in about 30 minutes."),
             "interpreted sentence appended: {rendered}"
         );
+    }
+
+    /// Every hint the scope/access-mode refusal table can emit.
+    const ALL_SCOPE_REFUSAL_HINTS: [&str; 16] = [
+        HINT_SCOPE_ADMIN_REQUIRED_API_KEY,
+        HINT_SCOPE_ADMIN_REQUIRED_OAUTH,
+        HINT_SCOPE_ADMIN_REQUIRED_SESSION,
+        HINT_SCOPE_ADMIN_REQUIRED_GENERIC,
+        HINT_SCOPE_EXCEEDS_ISSUER_API_KEY,
+        HINT_SCOPE_EXCEEDS_ISSUER_OAUTH,
+        HINT_SCOPE_EXCEEDS_ISSUER_SESSION,
+        HINT_SCOPE_EXCEEDS_ISSUER_GENERIC,
+        HINT_USERDETAILS_SCOPE_REQUIRED_API_KEY,
+        HINT_USERDETAILS_SCOPE_REQUIRED_OAUTH,
+        HINT_USERDETAILS_SCOPE_REQUIRED_SESSION,
+        HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC,
+        HINT_SCOPE_WRITE_REQUIRED_API_KEY,
+        HINT_SCOPE_WRITE_REQUIRED_OAUTH,
+        HINT_SCOPE_WRITE_REQUIRED_SESSION,
+        HINT_SCOPE_WRITE_REQUIRED_GENERIC,
+    ];
+
+    /// The credential-type column of the refusal matrix: the three the server
+    /// emits, plus the two ways it can fail to name one (absent, unrecognised),
+    /// both of which must land on the GENERIC member.
+    const CREDENTIAL_TYPE_CASES: [Option<&str>; 5] = [
+        Some("api_key"),
+        Some("oauth"),
+        Some("session"),
+        None,
+        Some("robot"),
+    ];
+
+    /// A 403 refusal with the OBJECT-shaped `params` the server actually sends.
+    fn scope_err(code: u32, reason: &str, credential_type: Option<&str>) -> ApiError {
+        let mut params = serde_json::Map::new();
+        params.insert("reason".to_owned(), json!(reason));
+        params.insert("entity_type".to_owned(), json!("org"));
+        params.insert("entity_id".to_owned(), json!("1234567890123456789"));
+        if let Some(ct) = credential_type {
+            params.insert("credential_type".to_owned(), json!(ct));
+        }
+        api_err(code, 403).with_details(json!({ "params": params }))
+    }
+
+    /// The full 5-reason × 5-credential-type matrix.
+    ///
+    /// Every cell must render its own const — never `None`, and never the
+    /// generic 403 fallback, whose "your account lacks the required role"
+    /// wording is the exact advice these hints exist to displace.
+    #[test]
+    fn scope_refusal_matrix_renders_the_credential_specific_hint() {
+        let generic_403 = api_err(0, 403).suggestion();
+        assert!(
+            generic_403.is_some(),
+            "fixture: the 403 fallback must exist"
+        );
+
+        let cases: [(u32, &str, [&str; 4]); 5] = [
+            (
+                10767,
+                "scope_admin_required",
+                [
+                    HINT_SCOPE_ADMIN_REQUIRED_API_KEY,
+                    HINT_SCOPE_ADMIN_REQUIRED_OAUTH,
+                    HINT_SCOPE_ADMIN_REQUIRED_SESSION,
+                    HINT_SCOPE_ADMIN_REQUIRED_GENERIC,
+                ],
+            ),
+            (
+                10768,
+                "scope_exceeds_issuer",
+                [
+                    HINT_SCOPE_EXCEEDS_ISSUER_API_KEY,
+                    HINT_SCOPE_EXCEEDS_ISSUER_OAUTH,
+                    HINT_SCOPE_EXCEEDS_ISSUER_SESSION,
+                    HINT_SCOPE_EXCEEDS_ISSUER_GENERIC,
+                ],
+            ),
+            (
+                10768,
+                "access_mode_exceeds_initiate",
+                [
+                    HINT_SCOPE_EXCEEDS_ISSUER_API_KEY,
+                    HINT_SCOPE_EXCEEDS_ISSUER_OAUTH,
+                    HINT_SCOPE_EXCEEDS_ISSUER_SESSION,
+                    HINT_SCOPE_EXCEEDS_ISSUER_GENERIC,
+                ],
+            ),
+            (
+                10769,
+                "userdetails_scope_required",
+                [
+                    HINT_USERDETAILS_SCOPE_REQUIRED_API_KEY,
+                    HINT_USERDETAILS_SCOPE_REQUIRED_OAUTH,
+                    HINT_USERDETAILS_SCOPE_REQUIRED_SESSION,
+                    HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC,
+                ],
+            ),
+            (
+                10770,
+                "scope_write_required",
+                [
+                    HINT_SCOPE_WRITE_REQUIRED_API_KEY,
+                    HINT_SCOPE_WRITE_REQUIRED_OAUTH,
+                    HINT_SCOPE_WRITE_REQUIRED_SESSION,
+                    HINT_SCOPE_WRITE_REQUIRED_GENERIC,
+                ],
+            ),
+        ];
+
+        for (code, reason, [api_key, oauth, session, generic]) in cases {
+            let expected = [
+                (Some("api_key"), api_key),
+                (Some("oauth"), oauth),
+                (Some("session"), session),
+                (None, generic),
+                // Unrecognised credential types must degrade to GENERIC, never
+                // to no hint at all.
+                (Some("robot"), generic),
+            ];
+            for (credential_type, want) in expected {
+                let got = scope_err(code, reason, credential_type).suggestion();
+                assert_eq!(
+                    got,
+                    Some(want),
+                    "{reason} / {credential_type:?} rendered the wrong hint"
+                );
+                assert!(
+                    got.is_some(),
+                    "{reason} / {credential_type:?} must never fall through to no hint"
+                );
+                assert_ne!(
+                    got, generic_403,
+                    "{reason} / {credential_type:?} must not fall back to the generic 403"
+                );
+            }
+        }
+    }
+
+    /// `access_mode_exceeds_initiate` is the same refusal as
+    /// `scope_exceeds_issuer` seen earlier in the flow — settled deliberately as
+    /// one hint family, so the two must be indistinguishable to a user.
+    #[test]
+    fn access_mode_exceeds_initiate_matches_scope_exceeds_issuer() {
+        for credential_type in CREDENTIAL_TYPE_CASES {
+            let initiate = scope_err(10768, "access_mode_exceeds_initiate", credential_type);
+            let exceeds = scope_err(10768, "scope_exceeds_issuer", credential_type);
+            assert_eq!(
+                initiate.suggestion(),
+                exceeds.suggestion(),
+                "the two reasons share one family ({credential_type:?})"
+            );
+            assert!(initiate.suggestion().is_some());
+        }
+    }
+
+    /// Wording guards.
+    ///
+    /// An access mode is a property of the CREDENTIAL, so calling it a "role" or
+    /// sending the reader to an admin is the failure mode these hints replace —
+    /// no admin action widens a credential's own grant. The bare word `admin` is
+    /// required and stays.
+    ///
+    /// Account settings are a separate SCOPE, not a wider access mode, so the
+    /// `userdetails` hints must never recommend `--admin`.
+    #[test]
+    fn scope_refusal_hints_avoid_the_role_and_ask_an_admin_wording() {
+        for hint in ALL_SCOPE_REFUSAL_HINTS {
+            let lower = hint.to_lowercase();
+            for needle in ["role", "ask an admin", "admin of the org"] {
+                assert!(
+                    !lower.contains(needle),
+                    "an access mode is not a role — `{needle}` must not appear in: {hint}"
+                );
+            }
+            // The line continuations must render single spaces, not the source
+            // indentation, and never a newline.
+            assert!(
+                !hint.contains("  "),
+                "double space in rendered hint: {hint}"
+            );
+            assert!(!hint.contains('\n'), "newline in rendered hint: {hint}");
+        }
+        for hint in [
+            HINT_USERDETAILS_SCOPE_REQUIRED_API_KEY,
+            HINT_USERDETAILS_SCOPE_REQUIRED_OAUTH,
+            HINT_USERDETAILS_SCOPE_REQUIRED_SESSION,
+            HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC,
+        ] {
+            assert!(
+                !hint.contains("--admin"),
+                "account settings are a scope, not an access mode: {hint}"
+            );
+        }
+        // Write is not admin. A read-only credential needs a read-write access
+        // mode; recommending `--admin` would ask for a strictly higher ceiling
+        // the operation never required, and a credential that cannot obtain it
+        // would be told to give up on a request it could actually satisfy.
+        for hint in [
+            HINT_SCOPE_WRITE_REQUIRED_API_KEY,
+            HINT_SCOPE_WRITE_REQUIRED_OAUTH,
+            HINT_SCOPE_WRITE_REQUIRED_SESSION,
+            HINT_SCOPE_WRITE_REQUIRED_GENERIC,
+        ] {
+            assert!(
+                !hint.contains("--admin"),
+                "write is not admin — an rwa ceiling is not the remedy: {hint}"
+            );
+            assert!(
+                hint.contains("read-only"),
+                "the refusal is about a read-only access mode; the hint must \
+                 name it: {hint}"
+            );
+            assert!(
+                hint.contains("--read-only"),
+                "the flag that produced the read-only credential must be named \
+                 so the reader knows what to drop: {hint}"
+            );
+        }
+    }
+
+    /// A key update REPLACES the whole scope set, so any hint that tells the
+    /// reader to run `api-key update` must first tell them to read the key back
+    /// and re-state what it should keep. Without that sentence the hint's own
+    /// advice silently deletes every scope it did not name.
+    #[test]
+    fn api_key_update_hints_say_the_update_replaces_the_whole_scope_set() {
+        for hint in [
+            HINT_SCOPE_ADMIN_REQUIRED_API_KEY,
+            HINT_USERDETAILS_SCOPE_REQUIRED_API_KEY,
+            HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC,
+            HINT_SCOPE_WRITE_REQUIRED_API_KEY,
+            HINT_SCOPE_WRITE_REQUIRED_GENERIC,
+        ] {
+            assert!(
+                hint.contains("REPLACES"),
+                "the wholesale replacement must be stated: {hint}"
+            );
+            assert!(
+                hint.contains("api-key get"),
+                "the reader must be told to read the key back first: {hint}"
+            );
+            assert!(
+                hint.contains("re-specify every scope it should keep"),
+                "the reader must be told to re-state the scopes to keep: {hint}"
+            );
+            assert!(
+                hint.contains("api-key update"),
+                "the command that applies the re-stated scopes must be named: {hint}"
+            );
+        }
+
+        // `--admin` is applied to every scope the invocation names, so a key
+        // holding a read-only scope alongside an admin one cannot be re-stated
+        // with the selector flags without escalating it. Only the admin hint
+        // recommends `--admin`, so only it needs the escape hatch.
+        assert!(
+            HINT_SCOPE_ADMIN_REQUIRED_API_KEY.contains("--scopes"),
+            "the mixed-access-mode escape hatch must name `--scopes`: \
+             {HINT_SCOPE_ADMIN_REQUIRED_API_KEY}"
+        );
+        assert!(
+            HINT_SCOPE_ADMIN_REQUIRED_API_KEY.contains("read-only"),
+            "the reason for `--scopes` — not escalating a read-only scope — must \
+             be stated: {HINT_SCOPE_ADMIN_REQUIRED_API_KEY}"
+        );
+    }
+
+    /// The example invocations in those same hints must be COPY-PASTEABLE.
+    ///
+    /// `--org/--workspace/--share <id>` reads as a menu to a human and is not a
+    /// flag any of these commands accepts: a reader who pastes it gets
+    /// `unexpected argument`. The example therefore names the selectors
+    /// separately, and names more than one so it cannot be re-collapsed into a
+    /// single hard-coded `--org`.
+    ///
+    /// The GENERIC members show an api-key invocation too, so they carry the
+    /// same obligation: an org-only example reads as though a key can only ever
+    /// be scoped to an org.
+    #[test]
+    fn api_key_update_hint_examples_are_valid_selector_neutral_syntax() {
+        for hint in [
+            HINT_SCOPE_ADMIN_REQUIRED_API_KEY,
+            HINT_SCOPE_ADMIN_REQUIRED_GENERIC,
+            HINT_USERDETAILS_SCOPE_REQUIRED_API_KEY,
+            HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC,
+            HINT_SCOPE_WRITE_REQUIRED_API_KEY,
+            HINT_SCOPE_WRITE_REQUIRED_GENERIC,
+        ] {
+            assert!(
+                !hint.contains("--org/--workspace"),
+                "`--org/--workspace/--share <id>` is not valid CLI syntax: {hint}"
+            );
+            assert!(
+                hint.contains("--workspace <id>"),
+                "the example must name more than one selector, not just \
+                 `--org`: {hint}"
+            );
+            assert!(
+                hint.contains("--org <id>") && hint.contains("--share <id>"),
+                "every entity selector must be spelled out separately: {hint}"
+            );
+            assert!(
+                hint.contains("--all"),
+                "the all-entities selector must be offered alongside the \
+                 per-entity ones: {hint}"
+            );
+            assert!(
+                !hint.contains("<org-id>"),
+                "an org-only placeholder re-introduces the single-selector \
+                 example: {hint}"
+            );
+        }
+    }
+
+    /// `--admin` raises the ACCESS MODE; it does not grant `userdetails:*:rw`.
+    /// A hint for an over-broad request that named only `--admin` would send a
+    /// caller who needs account settings to a login that still cannot do it, so
+    /// the issuer family must name both ceilings or neither.
+    #[test]
+    fn exceeds_issuer_hints_do_not_prescribe_admin_alone() {
+        for hint in [
+            HINT_SCOPE_EXCEEDS_ISSUER_API_KEY,
+            HINT_SCOPE_EXCEEDS_ISSUER_OAUTH,
+            HINT_SCOPE_EXCEEDS_ISSUER_SESSION,
+            HINT_SCOPE_EXCEEDS_ISSUER_GENERIC,
+        ] {
+            assert!(
+                hint.contains("--account-settings"),
+                "a hint naming `--admin` must also name the account-settings \
+                 ceiling, which admin does not confer: {hint}"
+            );
+            assert!(
+                hint.contains("already holds the access you asked for"),
+                "the remedy is a more privileged ISSUER, not a flag: {hint}"
+            );
+        }
+    }
+
+    /// The `reason` outranks the numeric `code`, exactly as it does for the
+    /// import reasons: a refusal carrying an unrelated code that has its own
+    /// arm must still render the scope hint.
+    #[test]
+    fn scope_reason_outranks_an_unrelated_numeric_code() {
+        // `10175` has a code-keyed arm of its own further down `suggestion()`.
+        let e = scope_err(10175, "scope_admin_required", Some("oauth"));
+        assert_eq!(e.suggestion(), Some(HINT_SCOPE_ADMIN_REQUIRED_OAUTH));
+        assert_ne!(e.suggestion(), Some(HINT_SCOPE_INCORRECT));
+
+        // And a code from an unrelated family behaves the same way.
+        assert_eq!(
+            scope_err(1680, "userdetails_scope_required", Some("api_key")).suggestion(),
+            Some(HINT_USERDETAILS_SCOPE_REQUIRED_API_KEY)
+        );
+    }
+
+    /// The ARRAY shape is the per-field validation payload: `field_reason()`
+    /// reads it, but `param_str` deliberately does not, so a credential type
+    /// riding in an array row is NOT read and the hint degrades to GENERIC
+    /// rather than trusting a value from the wrong payload.
+    #[test]
+    fn array_shaped_params_resolve_the_reason_but_not_the_credential_type() {
+        let e = api_err(10767, 403).with_details(json!({
+            "params": [{
+                "name": "scopes",
+                "kind": "invalid",
+                "reason": "scope_admin_required",
+                "credential_type": "oauth"
+            }]
+        }));
+        assert_eq!(e.field_reason(), Some("scope_admin_required"));
+        assert_eq!(e.param_str("credential_type"), None);
+        assert_eq!(e.suggestion(), Some(HINT_SCOPE_ADMIN_REQUIRED_GENERIC));
+        assert_ne!(e.suggestion(), Some(HINT_SCOPE_ADMIN_REQUIRED_OAUTH));
+    }
+
+    /// A scope refusal that arrives with NO `params` still carries its numeric
+    /// code, and the reason-keyed table cannot see it. Without a code-keyed
+    /// fallback those refusals landed on the generic 403 line — whose "your
+    /// account lacks the required role" wording is precisely what this family
+    /// exists to displace — so each code must resolve to the GENERIC member of
+    /// its family, the only member correct when the credential type is unknown.
+    #[test]
+    fn scope_codes_without_params_use_the_generic_hint() {
+        let generic_403 = api_err(0, 403).suggestion();
+        assert!(
+            generic_403.is_some(),
+            "fixture: the 403 fallback must exist"
+        );
+
+        for (code, want) in [
+            (10767, HINT_SCOPE_ADMIN_REQUIRED_GENERIC),
+            (10768, HINT_SCOPE_EXCEEDS_ISSUER_GENERIC),
+            (10769, HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC),
+            (10770, HINT_SCOPE_WRITE_REQUIRED_GENERIC),
+        ] {
+            let got = api_err(code, 403).suggestion();
+            assert_eq!(got, Some(want), "code {code} with no params");
+            assert_ne!(
+                got, generic_403,
+                "code {code} must not fall back to the generic 403"
+            );
+            let rendered = got.unwrap_or_default().to_lowercase();
+            assert!(
+                !rendered.contains("role"),
+                "code {code} must not call an access mode a role: {rendered}"
+            );
+        }
+    }
+
+    /// Regression guard on the insertion point: the new branch sits ahead of the
+    /// reason-only table, so every reason it does not claim must still reach the
+    /// old hint unchanged.
+    #[test]
+    fn non_scope_reasons_are_unaffected_by_the_scope_branch() {
+        let array_shaped = api_err(146_652, 400).with_details(json!({
+            "params": [{ "name": "drive_id", "kind": "invalid", "reason": "drive_required" }]
+        }));
+        assert_eq!(array_shaped.suggestion(), Some(HINT_DRIVE_REQUIRED));
+
+        let object_shaped = api_err(146_652, 400).with_details(json!({
+            "params": { "reason": "destination_nested", "credential_type": "oauth" }
+        }));
+        assert_eq!(object_shaped.suggestion(), Some(HINT_DESTINATION_NESTED));
+
+        // An unknown reason still falls through to the code/status table.
+        let unknown = scope_err(1688, "some_future_reason", Some("oauth"));
+        assert_eq!(unknown.suggestion(), Some(HINT_SUBSCRIPTION_REQUIRED));
+    }
+
+    /// A hint earns its place only by naming the flag that resolves the refusal
+    /// — and the two families recommend DIFFERENT flags.
+    #[test]
+    fn scope_refusal_hints_name_the_flag_they_recommend() {
+        for hint in [
+            HINT_SCOPE_ADMIN_REQUIRED_API_KEY,
+            HINT_SCOPE_ADMIN_REQUIRED_OAUTH,
+            HINT_SCOPE_ADMIN_REQUIRED_SESSION,
+            HINT_SCOPE_ADMIN_REQUIRED_GENERIC,
+            HINT_SCOPE_EXCEEDS_ISSUER_API_KEY,
+            HINT_SCOPE_EXCEEDS_ISSUER_OAUTH,
+            HINT_SCOPE_EXCEEDS_ISSUER_SESSION,
+            HINT_SCOPE_EXCEEDS_ISSUER_GENERIC,
+        ] {
+            assert!(hint.contains("--admin"), "must name the flag: {hint}");
+        }
+        for hint in [
+            HINT_USERDETAILS_SCOPE_REQUIRED_API_KEY,
+            HINT_USERDETAILS_SCOPE_REQUIRED_OAUTH,
+            HINT_USERDETAILS_SCOPE_REQUIRED_SESSION,
+            HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC,
+        ] {
+            assert!(
+                hint.contains("--account-settings"),
+                "must name the flag: {hint}"
+            );
+        }
     }
 }

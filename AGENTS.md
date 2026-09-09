@@ -60,6 +60,154 @@ export FASTIO_TOKEN=your_api_key
 fastio org list
 ```
 
+### Scopes and access modes
+
+Every credential carries a list of **entity scopes**, each written
+`entity_type:entity_id:access_mode` — for example `org:1234567890123456789:rw`,
+`workspace:9876543210987654321:r`, or `user:*:rwa` for the whole account. The
+access mode is one of:
+
+- `r` — read only
+- `rw` — read and write (the default mode once an entity is selected)
+- `rwa` — read, write, and **administrative** operations on that entity
+
+`rwa` is an access mode, not a role. Holding it does not change who the human
+is, and it never grants more than the account already has — the user's own
+permissions still apply on top of it.
+
+### Requesting admin as a ceiling
+
+`--admin` asks for the `rwa` access mode. It is a **ceiling, not a grant** — it
+is the most the resulting credential may be given. What happens to a request
+that reaches for more than it may have depends on where it is issued, and the
+two rules are different:
+
+- **`fastio auth login` — consent may narrow it.** The ceiling is what the
+  browser session asks for; the consent page may approve less, and the
+  credential ends up with whatever was approved. So the result can be smaller
+  than the request.
+- **`api-key create` / `api-key update` / `oauth narrow` — the issuer contains
+  it.** The request is sent exactly as written, and the server **rejects** it
+  when it is wider than the credential doing the issuing. It is never quietly
+  trimmed: the call either fails, or returns precisely the scopes you asked for.
+
+Either way, confirm what you actually got:
+
+```bash
+fastio auth login --admin    # request an admin ceiling, approve it in the browser
+fastio auth scopes           # live view of what the credential may now do
+```
+
+`--read-only` is the same idea in the other direction: it asks for `r`. The two
+are mutually exclusive, and both apply to `auth login` (browser/PKCE login
+only), `auth api-key create`, `auth api-key update`, and `auth oauth narrow`.
+
+**Selectors choose *what* the scopes cover; the access mode chooses *how much*.**
+`--org`, `--workspace` and `--share` each take an entity id and may be repeated;
+`--all` selects the whole account (`user:*`). Once at least one selector is
+given, the access mode defaults to `rw` unless `--admin` or `--read-only` says
+otherwise, and it applies to every entity in that request. **Give no selector at
+all** — no `--org` / `--workspace` / `--share` / `--all`, no `--account-settings`
+and no raw `--scopes` — and no scope list is sent: the credential is
+**unscoped**, covering the whole account with read and write but **not**
+administrative access. `rw` is the default *mode*, not what an unscoped
+credential is written as.
+
+### Account settings are a separate scope
+
+Changing the account itself — password, email address, enrolling a second
+factor (`auth 2fa setup` / `auth 2fa verify-setup`), and invalidating every
+session — needs the `userdetails:*:rw` scope, requested with
+`--account-settings`. **`rwa` does not grant it.** Administrative access to
+organizations and account-settings access are orthogonal; ask for each one
+explicitly. Signing in with 2FA (`auth 2fa send` / `auth 2fa verify`) is not
+gated by it.
+
+### Issuing and narrowing credentials
+
+```bash
+# A key that administers one org (structured flags share one access mode)
+fastio auth api-key create --name "release bot" \
+  --org 1234567890123456789 --admin
+
+# Mixed access modes need the raw form: admin on one org, read on one workspace
+fastio auth api-key create --name "release bot" \
+  --scopes '["org:1234567890123456789:rwa","workspace:9876543210987654321:r"]'
+
+# Give up authority on an existing login session
+fastio auth oauth narrow SESSION_ID --org 1234567890123456789 --read-only
+```
+
+Points that bite agents:
+
+- **An `api-key update` REPLACES the key's entire scope set.** There is no
+  "add one scope" call. Run `fastio auth api-key get <key-id>` first, then
+  re-state every scope the key should keep alongside the new one.
+- **Key changes apply immediately; OAuth narrowing applies at the session's
+  next token refresh.** An access token already issued keeps its original
+  scopes until then.
+- **`auth oauth narrow` can only give up authority**, never add it — the server
+  refuses anything wider than the session already holds. To widen, sign in
+  again with the ceiling you need.
+- **Raw `--scopes '<json array>'` still works** for anything the structured
+  flags do not express, and is mutually exclusive with them.
+- **Keys issued before scopes existed** (no scope list at all) behave as
+  `user:*:rw`: full read and write, **not** administrative, and **not** able to
+  change account settings. Re-issue them with the access they need.
+- **`full_access` does not imply admin.** It means the credential covers the
+  whole account with write access rather than being narrowed to particular
+  entities. The access mode is reported separately — read it there.
+
+### Seeing what a credential may do
+
+- `fastio auth scopes` asks the server. Authoritative and current — use this.
+- `fastio auth status` shows the scopes cached locally when the profile signed
+  in, so it can be stale if the grant has been narrowed since.
+
+### When a call is refused for scope
+
+Scope refusals are HTTP `403` carrying a machine-readable reason, and the CLI
+prints a specific remedy for each. Repeating the *same* request with the same
+credential never helps — something has to change: either the credential is
+re-issued or re-consented with the access it lacks, or the request itself is
+narrowed to something that credential can already satisfy.
+
+- **`scope_admin_required`** — the credential covers the entity but without
+  `rwa`. For an API key, read it with `api-key get`, then run `api-key update`
+  re-stating its scopes plus `--admin`, from a credential that already holds
+  that access. If those scopes do not all share one access mode, re-state them
+  with the raw `--scopes '[...]'` form instead: `--admin` applies to every
+  entity in the request, so a blanket flag would escalate a read-only scope
+  along with the one you meant to raise. For a login or a web session, run
+  `fastio auth login --admin` and approve admin access on the consent page.
+- **`scope_exceeds_issuer`** / **`access_mode_exceeds_initiate`** — you asked
+  to mint something broader than the credential doing the minting. Narrow the
+  request, or issue it from a credential that already holds the access you
+  asked for: a web session, or a fresh login with the ceiling you need.
+- **`userdetails_scope_required`** — an account-settings operation from a
+  credential without `userdetails:*:rw`. Run
+  `fastio auth login --account-settings`, or add `--account-settings` when
+  re-issuing the key (remembering that a key update replaces the whole scope
+  set). `--admin` is not the fix here.
+- **`scope_write_required`** — every access mode on the credential is `r`, so
+  it is read-only and cannot perform account operations (creating an org,
+  updating the user, revoking sessions, signing out). Sign in again *without*
+  `--read-only`, or re-issue the key read-write (again: an update replaces the
+  whole scope set, so read it back with `api-key get` first). Write is not
+  admin — `--admin` asks for a higher ceiling than this needs and is not the
+  fix. Sign-out is the one special case: a read-only credential cannot revoke
+  its own session, so `fastio auth signout` discards the credential locally,
+  reports `server_signout_completed: false`, and exits `0`.
+
+Changing a credential's scopes is a compare-and-swap: `auth api-key update` and
+`auth oauth narrow` write against the set they read, so a concurrent change
+returns HTTP `409`. Do not retry the same request — re-read the credential
+(`auth api-key get <key-id>` or `auth oauth details <session-id>`) and resend
+the full intended set, because an update replaces the whole set and a narrow is
+measured against what the session holds now.
+
+Full endpoint reference: <https://api.fast.io/current/llms/full/>.
+
 ## Output Format and verbosity
 
 Two orthogonal knobs control output:
@@ -100,7 +248,7 @@ always an array of records, so `--format json|table|csv|markdown` and `--fields`
 all apply.
 
 ```bash
-fastio id info 2yxh5-ojakx-r3mwz-ty6tv-k66cj-nqsw NODE_ID2    # → StorageNode (hyphens OK)
+fastio id info 2abcd-efghj-kmnpq-rstuv-wxyz3-4567 NODE_ID2    # → StorageNode (hyphens OK)
 ```
 
 Over MCP this is the `id` tool (`action: "info"`, params `id` or `ids`). A
@@ -346,9 +494,9 @@ A `402` / billing error surfaces an actionable hint pointing at
 ## ID Formats
 
 - **Organization / Workspace / Share IDs**: 19-digit numeric strings
-  (e.g. `3867689418901071163`)
+  (e.g. `1234567890123456789`)
 - **Node IDs** (files/folders): opaque alphanumeric with hyphens
-  (e.g. `2yxh5-ojakx-r3mwz-ty6tv-k66cj-nqsw`)
+  (e.g. `2abcd-efghj-kmnpq-rstuv-wxyz3-4567`)
 - **Root folder**: the literal string `root`
 - **Trash**: the literal string `trash`
 

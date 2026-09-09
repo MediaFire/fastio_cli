@@ -14,7 +14,7 @@ use cli::{AuthCommands, Cli, Commands};
 use commands::ai::AiCommand;
 use commands::apps::AppsCommand;
 use commands::asset::AssetCommand;
-use commands::auth::{ApiKeyCommand, AuthCommand, OauthCommand, TwoFaCommand};
+use commands::auth::{ApiKeyCommand, AuthCommand, LoginAccess, OauthCommand, TwoFaCommand};
 use commands::comment::CommentCommand;
 use commands::download::DownloadCommand;
 use commands::event::EventCommand;
@@ -519,10 +519,18 @@ fn map_auth_command(cmd: AuthCommands) -> AuthCommand {
             email,
             password,
             agent_name,
+            admin,
+            read_only,
+            account_settings,
         } => AuthCommand::Login {
             email,
             password,
             agent_name,
+            access: LoginAccess {
+                admin,
+                read_only,
+                account_settings,
+            },
         },
         AuthCommands::Logout => AuthCommand::Logout,
         AuthCommands::Signout => AuthCommand::Signout,
@@ -550,35 +558,7 @@ fn map_auth_command(cmd: AuthCommands) -> AuthCommand {
             cli::TwoFaCommands::Send { channel } => TwoFaCommand::Send { channel },
             cli::TwoFaCommands::VerifySetup { token } => TwoFaCommand::VerifySetup { token },
         }),
-        AuthCommands::ApiKey(ak) => AuthCommand::ApiKey(match ak {
-            cli::ApiKeyCommands::Create {
-                name,
-                scopes,
-                agent_name,
-                expires,
-            } => ApiKeyCommand::Create {
-                name,
-                scopes,
-                agent_name,
-                expires,
-            },
-            cli::ApiKeyCommands::List => ApiKeyCommand::List,
-            cli::ApiKeyCommands::Delete { key_id } => ApiKeyCommand::Delete { key_id },
-            cli::ApiKeyCommands::Get { key_id } => ApiKeyCommand::Get { key_id },
-            cli::ApiKeyCommands::Update {
-                key_id,
-                name,
-                scopes,
-                agent_name,
-                expires,
-            } => ApiKeyCommand::Update {
-                key_id,
-                name,
-                scopes,
-                agent_name,
-                expires,
-            },
-        }),
+        AuthCommands::ApiKey(ak) => AuthCommand::ApiKey(map_api_key_command(ak)),
         AuthCommands::Check => AuthCommand::Check,
         AuthCommands::Session => AuthCommand::Session,
         AuthCommands::EmailCheck { email } => AuthCommand::EmailCheck { email },
@@ -592,25 +572,76 @@ fn map_auth_command(cmd: AuthCommands) -> AuthCommand {
             password1,
             password2,
         },
-        AuthCommands::Oauth(o) => AuthCommand::Oauth(match o {
-            cli::OauthCommands::List => OauthCommand::List,
-            cli::OauthCommands::Details { session_id } => OauthCommand::Details { session_id },
-            cli::OauthCommands::Rename {
-                session_id,
-                device_name,
-                agent_name,
-            } => OauthCommand::Rename {
-                session_id,
-                device_name,
-                agent_name,
-            },
-            cli::OauthCommands::Revoke { session_id } => OauthCommand::Revoke { session_id },
-            cli::OauthCommands::RevokeAll { exclude_current } => {
-                OauthCommand::RevokeAll { exclude_current }
-            }
-        }),
+        AuthCommands::Oauth(o) => AuthCommand::Oauth(map_oauth_command(o)),
         AuthCommands::Scopes => AuthCommand::Scopes,
         AuthCommands::PasswordResetCheck { code } => AuthCommand::PasswordResetCheck { code },
+    }
+}
+
+/// Convert clap-parsed API key commands to the internal enum.
+fn map_api_key_command(cmd: cli::ApiKeyCommands) -> ApiKeyCommand {
+    match cmd {
+        cli::ApiKeyCommands::Create {
+            name,
+            scopes,
+            agent_name,
+            expires,
+            scope_selectors,
+        } => ApiKeyCommand::Create {
+            name,
+            scopes,
+            agent_name,
+            expires,
+            scope_spec: scope_selectors.to_spec(),
+        },
+        cli::ApiKeyCommands::List => ApiKeyCommand::List,
+        cli::ApiKeyCommands::Delete { key_id } => ApiKeyCommand::Delete { key_id },
+        cli::ApiKeyCommands::Get { key_id } => ApiKeyCommand::Get { key_id },
+        cli::ApiKeyCommands::Update {
+            key_id,
+            name,
+            scopes,
+            agent_name,
+            expires,
+            scope_selectors,
+        } => ApiKeyCommand::Update {
+            key_id,
+            name,
+            scopes,
+            agent_name,
+            expires,
+            scope_spec: scope_selectors.to_spec(),
+        },
+    }
+}
+
+/// Convert clap-parsed OAuth session commands to the internal enum.
+fn map_oauth_command(cmd: cli::OauthCommands) -> OauthCommand {
+    match cmd {
+        cli::OauthCommands::List => OauthCommand::List,
+        cli::OauthCommands::Details { session_id } => OauthCommand::Details { session_id },
+        cli::OauthCommands::Rename {
+            session_id,
+            device_name,
+            agent_name,
+        } => OauthCommand::Rename {
+            session_id,
+            device_name,
+            agent_name,
+        },
+        cli::OauthCommands::Narrow {
+            session_id,
+            scopes,
+            scope_selectors,
+        } => OauthCommand::Narrow {
+            session_id,
+            scopes,
+            scope_spec: scope_selectors.to_spec(),
+        },
+        cli::OauthCommands::Revoke { session_id } => OauthCommand::Revoke { session_id },
+        cli::OauthCommands::RevokeAll { exclude_current } => {
+            OauthCommand::RevokeAll { exclude_current }
+        }
     }
 }
 

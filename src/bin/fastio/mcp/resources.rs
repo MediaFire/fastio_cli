@@ -49,7 +49,7 @@ pub async fn read_resource(state: &McpState, uri: &str) -> Result<ReadResourceRe
                 serde_json::json!({
                     "authenticated": true,
                     "api_base": state.api_base(),
-                    "hint": "Session is active. You can call any tool."
+                    "hint": "Session is active. You can call any tool. This resource does not check what the credential is allowed to do — call the auth tool with action=\"scopes\" for the live view of that."
                 })
             } else {
                 serde_json::json!({
@@ -112,6 +112,73 @@ mod tests {
         assert!(
             text.contains("Fast.io CLI"),
             "guide text should be the AGENTS.md guide"
+        );
+        // The guide is the only scope documentation an MCP agent ever sees, so
+        // pin the vocabulary it must teach: entity scopes carry an ACCESS MODE,
+        // and `--admin` asks for a ceiling rather than granting a role.
+        assert!(
+            text.contains("access mode"),
+            "guide text must explain entity-scope access modes"
+        );
+        assert!(
+            text.contains("ceiling, not a grant"),
+            "guide text must describe --admin as a ceiling, not a role"
+        );
+        // A read-only credential is refused on account operations, and the only
+        // remedy is a read-write one. An agent that never learns the word
+        // cannot tell that refusal apart from the admin one, and would try
+        // `--admin` — a higher ceiling that does not fix it.
+        // Keyed on the refusal's own `reason` string, which appears nowhere in
+        // the guide before this paragraph — `read-only` alone would pass on the
+        // unrelated `--read-only` flag prose and measure nothing.
+        assert!(
+            text.contains("scope_write_required"),
+            "guide text must teach the read-only refusal by name"
+        );
+    }
+
+    /// `session://status` reports what this process holds in memory. It must
+    /// stay a LOCAL read and point at the `auth` tool's `scopes` action for the
+    /// live view of what the credential is actually allowed to do — "I have a
+    /// token" and "that token can do X" are different questions, and answering
+    /// the second here would need a network round trip on every status read.
+    ///
+    /// The state points at a black-hole listener that accepts but never
+    /// answers, so a network call would hang rather than fail fast; the bounded
+    /// timeout is therefore what proves no call was made.
+    #[tokio::test]
+    async fn read_resource_session_status_is_local_and_names_the_scopes_action() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        tokio::spawn(async move {
+            // Accept and hold open: a request here never gets a response.
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let state = McpState::new_unauthenticated_for_test(&format!("http://{addr}"));
+        state.set_token("test-token".to_owned()).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            read_resource(&state, "session://status"),
+        )
+        .await
+        .expect("session://status must not make a network call")
+        .expect("session://status must be readable");
+
+        let text = match result.contents.first() {
+            Some(ResourceContents::TextResourceContents { text, .. }) => text.clone(),
+            _ => panic!("session://status must return text contents"),
+        };
+        assert!(
+            text.contains("action=\"scopes\""),
+            "the hint must name the auth tool's scopes action as the live view \
+             of the credential's abilities, got: {text}"
         );
     }
 
