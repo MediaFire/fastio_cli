@@ -693,6 +693,53 @@ pub async fn oauth_narrow(
     client.patch_form(&path, &form).await
 }
 
+/// Recovery hint for a lost compare-and-swap race on an API key's scope set
+/// ([`api_key_update`]).
+///
+/// The server updates a key's scopes with a conditional write against the set
+/// it read, so a concurrent update by another credential loses the race and
+/// comes back HTTP `409`. The generic conflict wording ("wait a moment and
+/// retry") is wrong here twice over: retrying the SAME request would re-apply a
+/// set built from a now-stale read, and an update REPLACES the whole scope set,
+/// so the loser would silently delete whatever the winner just added. The
+/// recovery is therefore to re-read the key and re-state the full intended set.
+pub const HINT_KEY_SCOPES_CHANGED: &str = "The credential's scope set changed underneath this request (someone else updated it). \
+     Re-read it with `fastio auth api-key get <key-id>` and retry with the full intended set — an update REPLACES the whole set, so a retry built on the stale read would drop the change that won the race.";
+
+/// Recovery hint for a lost compare-and-swap race on an OAuth session's scope
+/// set ([`oauth_narrow`]).
+///
+/// Same mechanism as [`HINT_KEY_SCOPES_CHANGED`], read back through the session
+/// endpoint. Narrowing is give-up-authority only, so a retry built on a stale
+/// read can also be REFUSED as a widening request rather than merely losing
+/// data — re-reading first is the only way to know what is still narrowable.
+pub const HINT_SESSION_SCOPES_CHANGED: &str = "The credential's scope set changed underneath this request (someone else updated it). \
+     Re-read it with `fastio auth oauth details <session-id>` and retry with the full intended set — narrowing is measured against what the session holds now, so a retry built on the stale read can be refused as a widening request.";
+
+/// Re-hint an HTTP `409` from one of the two scope compare-and-swap surfaces.
+///
+/// [`api_key_update`] and [`oauth_narrow`] both write scopes conditionally
+/// against the stored set, so both can lose a race. Keyed on the STATUS, never
+/// on the per-call-site numeric codes: those are per-route fuses that change
+/// independently of the contract, and a code list assembled from the two known
+/// today would silently stop matching the moment a third site is added or a
+/// fuse is renumbered.
+///
+/// Every other error — including a 409 that is not one of these calls, because
+/// this is only ever applied at those two call sites — passes through
+/// untouched. Nothing is retried: the caller must re-read before deciding what
+/// to send, so an automatic retry would re-apply the stale set.
+#[must_use]
+pub fn map_scope_update_conflict(err: CliError, surface_hint: &'static str) -> CliError {
+    match err {
+        CliError::Api(api) if api.http_status == 409 => CliError::MappedApi {
+            api,
+            hint: Some(surface_hint),
+        },
+        other => other,
+    }
+}
+
 /// Revoke a single OAuth session.
 ///
 /// `DELETE /oauth/sessions/{session_id}/`
@@ -753,10 +800,11 @@ pub async fn password_reset_check(client: &ApiClient, code: &str) -> Result<Valu
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiKeyScopeSpec, AuthorizeAccess, oauth_narrow, pkce_authorize, resolve_key_scopes,
+        ApiKeyScopeSpec, AuthorizeAccess, HINT_KEY_SCOPES_CHANGED, HINT_SESSION_SCOPES_CHANGED,
+        map_scope_update_conflict, oauth_narrow, pkce_authorize, resolve_key_scopes,
     };
     use crate::client::ApiClient;
-    use crate::error::CliError;
+    use crate::error::{ApiError, CliError};
     use std::sync::{Arc, Mutex};
 
     /// Serve one canned authorize envelope and capture the raw request.
@@ -1383,6 +1431,82 @@ mod tests {
             .unwrap_or_else(|| panic!("the body must be the single scopes field, got: {body}"));
         let decoded = urlencoding::decode(value).expect("form value decodes");
         assert_eq!(decoded, "[\"org:1:r\"]");
+    }
+
+    // ─── the scope compare-and-swap conflict mapper ────────────────────────
+
+    /// A `409` from either scope-writing surface must be re-hinted with THAT
+    /// surface's re-read command.
+    ///
+    /// The generic conflict advice is "wait a moment and retry", which is the
+    /// one thing a caller must not do here: the request they would retry was
+    /// built from a read that is now stale, and a key update REPLACES the whole
+    /// scope set — so the blind retry deletes exactly the change that won the
+    /// race.
+    #[test]
+    fn a_409_is_re_hinted_per_surface() {
+        for (hint, needle) in [
+            (HINT_KEY_SCOPES_CHANGED, "api-key get <key-id>"),
+            (HINT_SESSION_SCOPES_CHANGED, "oauth details <session-id>"),
+        ] {
+            let err = CliError::Api(ApiError::new(181_408, None, "conflict".to_owned(), 409));
+            let mapped = map_scope_update_conflict(err, hint);
+            assert!(
+                matches!(mapped, CliError::MappedApi { .. }),
+                "a 409 on a scope write must be re-hinted"
+            );
+            assert_eq!(mapped.suggestion(), Some(hint));
+            let rendered = mapped.suggestion().unwrap_or_default();
+            assert!(
+                rendered.contains(needle),
+                "the hint must name the re-read command for its own surface: {rendered}"
+            );
+            assert!(
+                rendered.contains("changed underneath this request"),
+                "the hint must say WHY the write was refused: {rendered}"
+            );
+        }
+    }
+
+    /// Keyed on the STATUS, not the per-call-site code.
+    ///
+    /// The backend numbers these fuses per route (a different one for the key
+    /// update than for the session PATCH), and a client-side code list
+    /// assembled from the two known today stops matching the moment a third
+    /// surface appears or a fuse is renumbered — silently, with the caller sent
+    /// back to "wait and retry".
+    #[test]
+    fn any_409_code_maps_including_an_unknown_one() {
+        for code in [181_408_u32, 172_160, 0, 999_999] {
+            let err = CliError::Api(ApiError::new(code, None, "conflict".to_owned(), 409));
+            let mapped = map_scope_update_conflict(err, HINT_KEY_SCOPES_CHANGED);
+            assert_eq!(
+                mapped.suggestion(),
+                Some(HINT_KEY_SCOPES_CHANGED),
+                "code {code} rides HTTP 409 and must be re-hinted"
+            );
+        }
+    }
+
+    /// The negative control. Everything that is NOT a 409 passes through
+    /// untouched — including the scope refusals, whose own reason-keyed hints
+    /// would be destroyed by an over-broad wrap.
+    #[test]
+    fn non_conflict_errors_pass_through_unchanged() {
+        let forbidden = CliError::Api(ApiError::new(10_770, None, "forbidden".to_owned(), 403));
+        let before = forbidden.suggestion();
+        let after = map_scope_update_conflict(forbidden, HINT_KEY_SCOPES_CHANGED);
+        assert!(
+            matches!(after, CliError::Api(_)),
+            "a non-409 must not be re-hinted"
+        );
+        assert_eq!(after.suggestion(), before, "its own hint must survive");
+        assert_ne!(after.suggestion(), Some(HINT_KEY_SCOPES_CHANGED));
+
+        // And a non-API error (transport, parse) is not an API conflict at all.
+        let parse = CliError::Parse("html".to_owned());
+        let mapped = map_scope_update_conflict(parse, HINT_KEY_SCOPES_CHANGED);
+        assert!(matches!(mapped, CliError::Parse(_)));
     }
 
     /// A session id is a path segment: anything needing encoding is encoded,

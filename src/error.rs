@@ -680,6 +680,35 @@ pub const HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC: &str = "Account settings chan
      Run `fastio auth login --account-settings`, or add it to a key — a key update REPLACES the whole scope set, so run `fastio auth api-key get <key-id>` first, then run `fastio auth api-key update <key-id>` and re-specify every scope it should keep — `--org <id>`, `--workspace <id>`, `--share <id>` or `--all` — alongside `--account-settings`. \
      Then retry.";
 
+/// `scope_write_required`, `credential_type: api_key` — every scope mode on the
+/// key is `r`, so it may read the account but not mutate it. Write is NOT
+/// admin: the fix is a read-write access mode, never `--admin`, which asks for
+/// a strictly higher ceiling the operation does not need.
+///
+/// Like the other API-key hints, the update is a WHOLESALE REPLACEMENT, so the
+/// wording sends the reader to read the key back before re-stating it.
+pub const HINT_SCOPE_WRITE_REQUIRED_API_KEY: &str = "This API key is read-only (access mode r) for account operations. \
+     Re-issue it read-write — but an update REPLACES the key's whole scope set, so run `fastio auth api-key get <key-id>` first, then run `fastio auth api-key update <key-id>` and re-specify every scope it should keep — `--org <id>`, `--workspace <id>`, `--share <id>` or `--all` — WITHOUT `--read-only`, from a credential that already has that access. \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
+/// `scope_write_required`, `credential_type: oauth` — the login was consented
+/// read-only.
+pub const HINT_SCOPE_WRITE_REQUIRED_OAUTH: &str = "This login is read-only (access mode r) for account operations. \
+     Sign in again without `--read-only` — run `fastio auth login` and approve the request, then retry. \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
+/// `scope_write_required`, `credential_type: session` — a web session whose
+/// grant is read-only.
+pub const HINT_SCOPE_WRITE_REQUIRED_SESSION: &str = "This session is read-only (access mode r) for account operations. \
+     Sign in again without `--read-only` — run `fastio auth login` and approve the request, then retry. \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
+/// `scope_write_required`, credential type absent or unrecognised — names both
+/// recovery paths because the response did not say which credential this is.
+pub const HINT_SCOPE_WRITE_REQUIRED_GENERIC: &str = "The credential is read-only (access mode r) for account operations. \
+     Sign in again without `--read-only` (`fastio auth login`), or issue a read-write key — a key update REPLACES the whole scope set, so run `fastio auth api-key get <key-id>` first, then run `fastio auth api-key update <key-id>` and re-specify every scope it should keep — `--org <id>`, `--workspace <id>`, `--share <id>` or `--all` — without `--read-only`. \
+     Run `fastio auth scopes` to see what the current credential holds.";
+
 /// Map a scope/access-mode refusal `reason` plus the refusing `credential_type`
 /// to its recovery hint.
 ///
@@ -708,6 +737,12 @@ fn scope_refusal_hint(reason: &str, credential_type: Option<&str>) -> Option<&'s
             Some("oauth") => HINT_USERDETAILS_SCOPE_REQUIRED_OAUTH,
             Some("session") => HINT_USERDETAILS_SCOPE_REQUIRED_SESSION,
             _ => HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC,
+        }),
+        "scope_write_required" => Some(match credential_type {
+            Some("api_key") => HINT_SCOPE_WRITE_REQUIRED_API_KEY,
+            Some("oauth") => HINT_SCOPE_WRITE_REQUIRED_OAUTH,
+            Some("session") => HINT_SCOPE_WRITE_REQUIRED_SESSION,
+            _ => HINT_SCOPE_WRITE_REQUIRED_GENERIC,
         }),
         _ => None,
     }
@@ -1333,6 +1368,7 @@ impl ApiError {
             10767 => return Some(HINT_SCOPE_ADMIN_REQUIRED_GENERIC),
             10768 => return Some(HINT_SCOPE_EXCEEDS_ISSUER_GENERIC),
             10769 => return Some(HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC),
+            10770 => return Some(HINT_SCOPE_WRITE_REQUIRED_GENERIC),
             // `10175` rides HTTP 401 today and HTTP 403 after the platform's
             // RFC-6750 correction. Keyed here on the CODE so it outranks BOTH
             // status fallbacks — see [`HINT_SCOPE_INCORRECT`] for why each of
@@ -3122,7 +3158,7 @@ mod tests {
     }
 
     /// Every hint the scope/access-mode refusal table can emit.
-    const ALL_SCOPE_REFUSAL_HINTS: [&str; 12] = [
+    const ALL_SCOPE_REFUSAL_HINTS: [&str; 16] = [
         HINT_SCOPE_ADMIN_REQUIRED_API_KEY,
         HINT_SCOPE_ADMIN_REQUIRED_OAUTH,
         HINT_SCOPE_ADMIN_REQUIRED_SESSION,
@@ -3135,6 +3171,10 @@ mod tests {
         HINT_USERDETAILS_SCOPE_REQUIRED_OAUTH,
         HINT_USERDETAILS_SCOPE_REQUIRED_SESSION,
         HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC,
+        HINT_SCOPE_WRITE_REQUIRED_API_KEY,
+        HINT_SCOPE_WRITE_REQUIRED_OAUTH,
+        HINT_SCOPE_WRITE_REQUIRED_SESSION,
+        HINT_SCOPE_WRITE_REQUIRED_GENERIC,
     ];
 
     /// The credential-type column of the refusal matrix: the three the server
@@ -3160,7 +3200,7 @@ mod tests {
         api_err(code, 403).with_details(json!({ "params": params }))
     }
 
-    /// The full 4-reason × 5-credential-type matrix.
+    /// The full 5-reason × 5-credential-type matrix.
     ///
     /// Every cell must render its own const — never `None`, and never the
     /// generic 403 fallback, whose "your account lacks the required role"
@@ -3173,7 +3213,7 @@ mod tests {
             "fixture: the 403 fallback must exist"
         );
 
-        let cases: [(u32, &str, [&str; 4]); 4] = [
+        let cases: [(u32, &str, [&str; 4]); 5] = [
             (
                 10767,
                 "scope_admin_required",
@@ -3212,6 +3252,16 @@ mod tests {
                     HINT_USERDETAILS_SCOPE_REQUIRED_OAUTH,
                     HINT_USERDETAILS_SCOPE_REQUIRED_SESSION,
                     HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC,
+                ],
+            ),
+            (
+                10770,
+                "scope_write_required",
+                [
+                    HINT_SCOPE_WRITE_REQUIRED_API_KEY,
+                    HINT_SCOPE_WRITE_REQUIRED_OAUTH,
+                    HINT_SCOPE_WRITE_REQUIRED_SESSION,
+                    HINT_SCOPE_WRITE_REQUIRED_GENERIC,
                 ],
             ),
         ];
@@ -3300,6 +3350,31 @@ mod tests {
                 "account settings are a scope, not an access mode: {hint}"
             );
         }
+        // Write is not admin. A read-only credential needs a read-write access
+        // mode; recommending `--admin` would ask for a strictly higher ceiling
+        // the operation never required, and a credential that cannot obtain it
+        // would be told to give up on a request it could actually satisfy.
+        for hint in [
+            HINT_SCOPE_WRITE_REQUIRED_API_KEY,
+            HINT_SCOPE_WRITE_REQUIRED_OAUTH,
+            HINT_SCOPE_WRITE_REQUIRED_SESSION,
+            HINT_SCOPE_WRITE_REQUIRED_GENERIC,
+        ] {
+            assert!(
+                !hint.contains("--admin"),
+                "write is not admin — an rwa ceiling is not the remedy: {hint}"
+            );
+            assert!(
+                hint.contains("read-only"),
+                "the refusal is about a read-only access mode; the hint must \
+                 name it: {hint}"
+            );
+            assert!(
+                hint.contains("--read-only"),
+                "the flag that produced the read-only credential must be named \
+                 so the reader knows what to drop: {hint}"
+            );
+        }
     }
 
     /// A key update REPLACES the whole scope set, so any hint that tells the
@@ -3312,6 +3387,8 @@ mod tests {
             HINT_SCOPE_ADMIN_REQUIRED_API_KEY,
             HINT_USERDETAILS_SCOPE_REQUIRED_API_KEY,
             HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC,
+            HINT_SCOPE_WRITE_REQUIRED_API_KEY,
+            HINT_SCOPE_WRITE_REQUIRED_GENERIC,
         ] {
             assert!(
                 hint.contains("REPLACES"),
@@ -3365,6 +3442,8 @@ mod tests {
             HINT_SCOPE_ADMIN_REQUIRED_GENERIC,
             HINT_USERDETAILS_SCOPE_REQUIRED_API_KEY,
             HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC,
+            HINT_SCOPE_WRITE_REQUIRED_API_KEY,
+            HINT_SCOPE_WRITE_REQUIRED_GENERIC,
         ] {
             assert!(
                 !hint.contains("--org/--workspace"),
@@ -3471,6 +3550,7 @@ mod tests {
             (10767, HINT_SCOPE_ADMIN_REQUIRED_GENERIC),
             (10768, HINT_SCOPE_EXCEEDS_ISSUER_GENERIC),
             (10769, HINT_USERDETAILS_SCOPE_REQUIRED_GENERIC),
+            (10770, HINT_SCOPE_WRITE_REQUIRED_GENERIC),
         ] {
             let got = api_err(code, 403).suggestion();
             assert_eq!(got, Some(want), "code {code} with no params");

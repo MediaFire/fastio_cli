@@ -124,6 +124,17 @@ mod tests {
             text.contains("ceiling, not a grant"),
             "guide text must describe --admin as a ceiling, not a role"
         );
+        // A read-only credential is refused on account operations, and the only
+        // remedy is a read-write one. An agent that never learns the word
+        // cannot tell that refusal apart from the admin one, and would try
+        // `--admin` — a higher ceiling that does not fix it.
+        // Keyed on the refusal's own `reason` string, which appears nowhere in
+        // the guide before this paragraph — `read-only` alone would pass on the
+        // unrelated `--read-only` flag prose and measure nothing.
+        assert!(
+            text.contains("scope_write_required"),
+            "guide text must teach the read-only refusal by name"
+        );
     }
 
     /// `session://status` reports what this process holds in memory. It must

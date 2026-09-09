@@ -3865,7 +3865,12 @@ async fn handle_auth_api_key_update(
     .await
     {
         Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
+        // The same shared mapper the CLI uses, so the two surfaces cannot drift
+        // in what they tell a caller who lost the scope compare-and-swap race.
+        Err(e) => Ok(cli_err_to_result(&api::auth::map_scope_update_conflict(
+            e,
+            api::auth::HINT_KEY_SCOPES_CHANGED,
+        ))),
     }
 }
 
@@ -4115,7 +4120,10 @@ async fn handle_auth_oauth_narrow(
     let client = state.client().read().await;
     match api::auth::oauth_narrow(&client, session_id, &scopes).await {
         Ok(v) => Ok(success_json(&v)),
-        Err(e) => Ok(cli_err_to_result(&e)),
+        Err(e) => Ok(cli_err_to_result(&api::auth::map_scope_update_conflict(
+            e,
+            api::auth::HINT_SESSION_SCOPES_CHANGED,
+        ))),
     }
 }
 
@@ -19717,6 +19725,18 @@ mod ripley_tool_tests {
     async fn router_answering(
         body: &'static [u8],
     ) -> (ToolRouter, std::sync::Arc<std::sync::Mutex<String>>) {
+        router_answering_status("HTTP/1.1 200 OK", body).await
+    }
+
+    /// [`router_answering`] with a caller-chosen STATUS LINE, for the handlers
+    /// whose mapping of a FAILURE status is the thing under test.
+    ///
+    /// The 200-only variant cannot exercise an error mapper at all: every
+    /// assertion about a re-hinted 409 would be made against a success body.
+    async fn router_answering_status(
+        status_line: &'static str,
+        body: &'static [u8],
+    ) -> (ToolRouter, std::sync::Arc<std::sync::Mutex<String>>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -19749,7 +19769,7 @@ mod ripley_tool_tests {
                 }
                 *sink.lock().expect("capture lock") = String::from_utf8_lossy(&acc).into_owned();
                 let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                    "{status_line}\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
@@ -20896,6 +20916,71 @@ mod ripley_tool_tests {
         assert!(
             req.contains("workspace") && req.contains("%3Ar"),
             "the resolved read-only workspace scope must be what is sent:\n{req}"
+        );
+    }
+
+    /// A lost compare-and-swap race on the MCP `api-key-update` action must
+    /// carry the SAME re-read advice the CLI gives.
+    ///
+    /// Both surfaces call one shared mapper precisely so they cannot drift: an
+    /// agent told to "wait and retry" would resend a scope set built from a
+    /// stale read, and the update REPLACES the whole set — deleting whatever
+    /// won the race, with a success response to show for it.
+    #[tokio::test]
+    async fn auth_api_key_update_conflict_carries_the_key_re_read_hint() {
+        let (router, _captured) = router_answering_status(
+            "HTTP/1.1 409 Conflict",
+            br#"{"result":"no","error":{"code":181408,"text":"scopes changed"}}"#,
+        )
+        .await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("api-key-update".to_owned()),
+        );
+        args.insert("key_id".to_owned(), Value::String("key-1".to_owned()));
+        args.insert("name".to_owned(), Value::String("renamed".to_owned()));
+        let res = router.call_tool("auth", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("api-key get <key-id>"),
+            "the conflict must name the key surface's re-read command: {text}"
+        );
+        assert!(
+            text.contains("changed underneath this request"),
+            "the conflict must say why the write was refused: {text}"
+        );
+        assert!(
+            !text.contains("oauth details <session-id>"),
+            "the key surface must not hand out the session re-read command: {text}"
+        );
+    }
+
+    /// The same on `oauth-narrow`, whose re-read command is the session one.
+    #[tokio::test]
+    async fn auth_oauth_narrow_conflict_carries_the_session_re_read_hint() {
+        let (router, _captured) = router_answering_status(
+            "HTTP/1.1 409 Conflict",
+            br#"{"result":"no","error":{"code":172160,"text":"scopes changed"}}"#,
+        )
+        .await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("oauth-narrow".to_owned()),
+        );
+        args.insert("session_id".to_owned(), Value::String("sess-1".to_owned()));
+        args.insert("workspace".to_owned(), Value::String("456".to_owned()));
+        args.insert("read_only".to_owned(), Value::Bool(true));
+        let res = router.call_tool("auth", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("oauth details <session-id>"),
+            "the conflict must name the session surface's re-read command: {text}"
+        );
+        assert!(
+            !text.contains("api-key get <key-id>"),
+            "the session surface must not hand out the key re-read command: {text}"
         );
     }
 

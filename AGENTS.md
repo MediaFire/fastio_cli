@@ -189,6 +189,22 @@ narrowed to something that credential can already satisfy.
   `fastio auth login --account-settings`, or add `--account-settings` when
   re-issuing the key (remembering that a key update replaces the whole scope
   set). `--admin` is not the fix here.
+- **`scope_write_required`** — every access mode on the credential is `r`, so
+  it is read-only and cannot perform account operations (creating an org,
+  updating the user, revoking sessions, signing out). Sign in again *without*
+  `--read-only`, or re-issue the key read-write (again: an update replaces the
+  whole scope set, so read it back with `api-key get` first). Write is not
+  admin — `--admin` asks for a higher ceiling than this needs and is not the
+  fix. Sign-out is the one special case: a read-only credential cannot revoke
+  its own session, so `fastio auth signout` discards the credential locally,
+  reports `server_signout_completed: false`, and exits `0`.
+
+Changing a credential's scopes is a compare-and-swap: `auth api-key update` and
+`auth oauth narrow` write against the set they read, so a concurrent change
+returns HTTP `409`. Do not retry the same request — re-read the credential
+(`auth api-key get <key-id>` or `auth oauth details <session-id>`) and resend
+the full intended set, because an update replaces the whole set and a narrow is
+measured against what the session holds now.
 
 Full endpoint reference: <https://api.fast.io/current/llms/full/>.
 
