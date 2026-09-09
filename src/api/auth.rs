@@ -149,6 +149,26 @@ pub async fn password_reset_request(
     client.post_no_auth("/user/email/reset/", &form).await
 }
 
+/// The access ceiling requested at PKCE initiate.
+///
+/// Bundled into a single argument because [`pkce_authorize`] would otherwise
+/// carry more parameters than the lint budget allows. `Default` reproduces the
+/// pre-existing request byte-for-byte: neither parameter is sent.
+///
+/// Both are a CEILING, not a grant — the consent page may narrow what is
+/// actually approved.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AuthorizeAccess<'a> {
+    /// Requested access mode (`r`, `rw`, or `rwa`). Sent as the `access_mode`
+    /// query parameter only when `Some` and non-blank after trimming; omitted
+    /// otherwise so the server applies its own default.
+    pub access_mode: Option<&'a str>,
+    /// Whether to request the account-settings (`userdetails:*:rw`) scope.
+    /// Sends `account_settings=1` when `true`; the parameter is omitted when
+    /// `false` — a literal `0` is never sent.
+    pub account_settings: bool,
+}
+
 /// Initiate PKCE authorization.
 ///
 /// `GET /oauth/authorize/` with query parameters.
@@ -163,6 +183,8 @@ pub async fn password_reset_request(
 /// label, not an instance. It is optional and omitted when absent: the server
 /// echoes it back in the authorize response when supplied.
 ///
+/// `access` carries the requested access ceiling; see [`AuthorizeAccess`].
+///
 /// [`PKCE_CLIENT_ID`]: crate::auth::pkce::PKCE_CLIENT_ID
 pub async fn pkce_authorize(
     client: &ApiClient,
@@ -171,6 +193,7 @@ pub async fn pkce_authorize(
     state: &str,
     redirect_uri: &str,
     agent_name: Option<&str>,
+    access: AuthorizeAccess<'_>,
 ) -> Result<PkceAuthorizeResponse, CliError> {
     let mut params = HashMap::new();
     params.insert("client_id".to_owned(), client_id.to_owned());
@@ -182,6 +205,12 @@ pub async fn pkce_authorize(
     params.insert("response_format".to_owned(), "json".to_owned());
     if let Some(agent_name) = agent_name.map(str::trim).filter(|n| !n.is_empty()) {
         params.insert("agent_name".to_owned(), agent_name.to_owned());
+    }
+    if let Some(mode) = access.access_mode.map(str::trim).filter(|m| !m.is_empty()) {
+        params.insert("access_mode".to_owned(), mode.to_owned());
+    }
+    if access.account_settings {
+        params.insert("account_settings".to_owned(), "1".to_owned());
     }
 
     client
@@ -268,6 +297,176 @@ pub async fn two_factor_disable(
 ) -> Result<EmptyResponse, CliError> {
     let path = format!("/user/auth/2factor/{}/", urlencoding::encode(token));
     client.delete(&path).await
+}
+
+/// Structured scope selectors for an API key or an OAuth session, as supplied
+/// by CLI flags or MCP parameters.
+///
+/// The default value means "nothing was selected"; [`resolve_key_scopes`] maps
+/// it to `Ok(None)` so the caller omits the `scopes` field entirely.
+///
+/// The four flags mirror four independent user-facing switches one-for-one, so
+/// the lint's suggested state machine would add a translation layer between the
+/// flags and this type without removing a single state. The illegal
+/// combinations are rejected by [`resolve_key_scopes`] instead, which is the
+/// one place both the CLI and the MCP parameters go through.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Default, Clone)]
+pub struct ApiKeyScopeSpec {
+    /// Organization ids to scope to (`org:<id>:<mode>`).
+    pub org: Vec<String>,
+    /// Workspace ids to scope to (`workspace:<id>:<mode>`).
+    pub workspace: Vec<String>,
+    /// Share ids to scope to (`share:<id>:<mode>`).
+    pub share: Vec<String>,
+    /// Scope to the whole account (`user:*:<mode>`). Mutually exclusive with
+    /// the three id lists.
+    pub all: bool,
+    /// Request the admin access mode (`rwa`). Mutually exclusive with
+    /// [`ApiKeyScopeSpec::read_only`].
+    pub admin: bool,
+    /// Request the read-only access mode (`r`).
+    pub read_only: bool,
+    /// Append the account-settings scope, which is always `userdetails:*:rw`
+    /// regardless of the access mode chosen for the other entities.
+    pub account_settings: bool,
+}
+
+/// Append `entry` to `out` unless it is already present, preserving first-seen
+/// order.
+fn push_unique(out: &mut Vec<String>, entry: String) {
+    if !out.contains(&entry) {
+        out.push(entry);
+    }
+}
+
+/// Append one `entity_type:id:mode` string per id, rejecting blank ids and ids
+/// that are neither all-numeric nor the bare wildcard `*`.
+///
+/// `kind` is both the scope prefix and the flag name, so the error text names
+/// the flag the user actually typed.
+///
+/// Org, workspace and share ids are numeric id strings, and the scope grammar
+/// is `type:id:mode` — so an id carrying a separator (`1:rwa`, `1,2`) would be
+/// pasted straight into the scope string and produce a grant the caller did not
+/// ask for, silently and often a wider one. Validating the id against the
+/// grammar is the only place that can be caught, since the resulting string is
+/// well-formed by construction.
+///
+/// The bare wildcard `*` is accepted because it is a real grant the platform
+/// issues and reports — `org:*:rw` means every organization, and the scope
+/// detail contract gives `entity_id` as a numeric id or `*`. It is a distinct
+/// grant from `--all`, which emits `user:*:<mode>` for a different entity type.
+/// Anything containing a wildcard alongside other characters (`*1`, `**`) is
+/// still refused: only the exact single-character form is a grammar-legal id.
+fn push_entity(
+    out: &mut Vec<String>,
+    kind: &str,
+    ids: &[String],
+    mode: &str,
+) -> Result<(), CliError> {
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(CliError::Parse(format!("--{kind} id must not be blank")));
+        }
+        if id != "*" && !id.chars().all(|c| c.is_ascii_digit()) {
+            return Err(CliError::Parse(format!("--{kind} id must be numeric or *")));
+        }
+        push_unique(out, format!("{kind}:{id}:{mode}"));
+    }
+    Ok(())
+}
+
+/// Turn structured scope selectors into the JSON-encoded `scopes` string the
+/// API expects, or `None` when no scoping was requested at all.
+///
+/// Shared by the CLI flags and the MCP tool parameters so both produce byte-
+/// identical scope strings. `None` means "send no `scopes` field", which is the
+/// unscoped, full-access default; it is returned ONLY when the caller supplied
+/// no selector and no access-mode flag. Every other outcome is either a
+/// non-empty array or an error — an empty array grants no authority and is
+/// never produced.
+///
+/// Access mode: `--admin` gives `rwa`, `--read-only` gives `r`, neither gives
+/// `rw`. The account-settings entry is always `userdetails:*:rw`.
+///
+/// # Errors
+///
+/// Returns [`CliError::Parse`] — the crate's input-validation variant — when
+/// `admin` and `read_only` are both set, when `all` is combined with an id
+/// list, when an access-mode flag is supplied with nothing the mode can apply
+/// to, or when an id is blank, or is after trimming neither all-numeric nor the
+/// bare wildcard `*`.
+pub fn resolve_key_scopes(spec: &ApiKeyScopeSpec) -> Result<Option<String>, CliError> {
+    let has_entities = !spec.org.is_empty() || !spec.workspace.is_empty() || !spec.share.is_empty();
+    // The account-settings scope is ALWAYS `userdetails:*:rw`, so it is not a
+    // target an access mode can be applied to: only the entity selectors and
+    // `--all` carry the mode.
+    let has_mode_target = has_entities || spec.all;
+    let has_selector = has_mode_target || spec.account_settings;
+
+    // No structured input whatsoever — the caller omits `scopes` and the
+    // credential keeps today's full access.
+    if !has_selector && !spec.admin && !spec.read_only {
+        return Ok(None);
+    }
+
+    if spec.admin && spec.read_only {
+        return Err(CliError::Parse(
+            "--admin and --read-only are mutually exclusive; supply at most one".to_owned(),
+        ));
+    }
+    if spec.all && has_entities {
+        return Err(CliError::Parse(
+            "--all cannot be combined with --org, --workspace, or --share".to_owned(),
+        ));
+    }
+    if (spec.admin || spec.read_only) && !has_mode_target {
+        // An access mode with nothing to apply it to is a half-typed command,
+        // not a request for account-wide access — fail rather than guess.
+        // `--account-settings` does not count: pairing it with `--admin` would
+        // otherwise drop the requested ceiling silently and issue a credential
+        // narrower than the one asked for.
+        let flag = if spec.admin { "--admin" } else { "--read-only" };
+        return Err(CliError::Parse(format!(
+            "{flag} needs at least one of --org/--workspace/--share/--all \
+             (the account-settings scope is always rw)"
+        )));
+    }
+
+    let mode = if spec.admin {
+        "rwa"
+    } else if spec.read_only {
+        "r"
+    } else {
+        "rw"
+    };
+
+    let mut entries: Vec<String> = Vec::new();
+    if spec.all {
+        entries.push(format!("user:*:{mode}"));
+    }
+    push_entity(&mut entries, "org", &spec.org, mode)?;
+    push_entity(&mut entries, "workspace", &spec.workspace, mode)?;
+    push_entity(&mut entries, "share", &spec.share, mode)?;
+    if spec.account_settings {
+        // Always `rw`: `userdetails:*:rw` is the only valid userdetails scope.
+        push_unique(&mut entries, "userdetails:*:rw".to_owned());
+    }
+
+    if entries.is_empty() {
+        // Unreachable — every surviving path pushes at least one entry. Kept as
+        // a fail-closed guard so an empty array can never be sent.
+        return Err(CliError::Parse(
+            "no scopes to apply; supply --org/--workspace/--share/--all/--account-settings"
+                .to_owned(),
+        ));
+    }
+
+    Ok(Some(
+        Value::Array(entries.into_iter().map(Value::String).collect()).to_string(),
+    ))
 }
 
 /// Create an API key.
@@ -474,6 +673,26 @@ pub async fn oauth_rename(
     client.patch_form(&path, &form).await
 }
 
+/// Narrow an OAuth session's granted scopes.
+///
+/// `PATCH /oauth/sessions/{session_id}/` with a single form-encoded `scopes`
+/// field carrying the JSON-encoded array of `entity_type:entity_id:access_mode`
+/// strings (the shape [`resolve_key_scopes`] produces).
+///
+/// The new set must be narrower than or equal to what the session already
+/// holds; the server enforces that and refuses a widening request, so this is a
+/// give-up-authority operation only.
+pub async fn oauth_narrow(
+    client: &ApiClient,
+    session_id: &str,
+    scopes_json: &str,
+) -> Result<Value, CliError> {
+    let mut form = HashMap::new();
+    form.insert("scopes".to_owned(), scopes_json.to_owned());
+    let path = format!("/oauth/sessions/{}/", urlencoding::encode(session_id));
+    client.patch_form(&path, &form).await
+}
+
 /// Revoke a single OAuth session.
 ///
 /// `DELETE /oauth/sessions/{session_id}/`
@@ -533,8 +752,11 @@ pub async fn password_reset_check(client: &ApiClient, code: &str) -> Result<Valu
 
 #[cfg(test)]
 mod tests {
-    use super::pkce_authorize;
+    use super::{
+        ApiKeyScopeSpec, AuthorizeAccess, oauth_narrow, pkce_authorize, resolve_key_scopes,
+    };
     use crate::client::ApiClient;
+    use crate::error::CliError;
     use std::sync::{Arc, Mutex};
 
     /// Serve one canned authorize envelope and capture the raw request.
@@ -568,7 +790,77 @@ mod tests {
         (addr, seen)
     }
 
-    async fn authorize_request_line(agent_name: Option<&str>) -> String {
+    /// Index just past the `\r\n\r\n` that ends the request headers, or `None`
+    /// while the headers are still incomplete.
+    fn header_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+    }
+
+    /// The declared body length of a captured request, or `0` when the request
+    /// carries no `Content-Length` (a GET, or a header still in flight).
+    fn content_length(head: &[u8]) -> usize {
+        String::from_utf8_lossy(head)
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0)
+    }
+
+    /// Serve one canned session envelope and capture the WHOLE request —
+    /// request line, headers and body — so a form field can be asserted.
+    async fn spawn_body_capturing_server() -> (String, Arc<Mutex<String>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&seen);
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut acc: Vec<u8> = Vec::new();
+                let mut buf = vec![0u8; 4096];
+                // Headers and a small form body normally arrive in one segment,
+                // but that is not guaranteed. Stopping at the first byte AFTER
+                // the header terminator would capture a truncated body and turn
+                // a split TCP write into a flaky wire assertion, so read until
+                // `Content-Length` is satisfied.
+                for _ in 0..8 {
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    acc.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = header_end(&acc)
+                        && acc.len() >= pos + content_length(&acc[..pos])
+                    {
+                        break;
+                    }
+                }
+                *sink.lock().expect("capture lock") = String::from_utf8_lossy(&acc).into_owned();
+                let body = br#"{"result":"yes","response":{"session":{"session_id":"s1"}}}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (addr, seen)
+    }
+
+    async fn authorize_request_line(
+        agent_name: Option<&str>,
+        access: AuthorizeAccess<'_>,
+    ) -> String {
         let (addr, seen) = spawn_capturing_server().await;
         let client = ApiClient::new(&format!("http://{addr}"), None).expect("client builds");
         let _ = pkce_authorize(
@@ -578,19 +870,34 @@ mod tests {
             "state-1",
             "http://localhost:19836/callback",
             agent_name,
+            access,
         )
         .await;
         let req = seen.lock().expect("capture lock").clone();
         req.lines().next().unwrap_or_default().to_owned()
     }
 
+    /// Read one query-parameter value out of a captured request line.
+    ///
+    /// Substring matching is not good enough here: `access_mode=r` is a prefix
+    /// of `access_mode=rwa`, so a `contains` assertion for the read-only case
+    /// would pass on an admin request.
+    fn query_param(line: &str, key: &str) -> Option<String> {
+        let target = line.split_whitespace().nth(1)?;
+        let query = target.split_once('?')?.1;
+        query.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k == key).then(|| v.to_owned())
+        })
+    }
+
     /// A supplied `agent_name` must reach the authorize request. Verified live:
     /// the server echoes `agent_name` back only when it is sent.
     #[tokio::test]
     async fn pkce_authorize_sends_agent_name_when_supplied() {
-        let line = authorize_request_line(Some("claude-2")).await;
+        let line = authorize_request_line(Some("cli-agent-2"), AuthorizeAccess::default()).await;
         assert!(
-            line.contains("agent_name=claude-2"),
+            line.contains("agent_name=cli-agent-2"),
             "agent_name must reach the authorize request, got: {line}"
         );
     }
@@ -600,11 +907,498 @@ mod tests {
     #[tokio::test]
     async fn pkce_authorize_omits_absent_or_blank_agent_name() {
         for supplied in [None, Some(""), Some("   ")] {
-            let line = authorize_request_line(supplied).await;
+            let line = authorize_request_line(supplied, AuthorizeAccess::default()).await;
             assert!(
                 !line.contains("agent_name"),
                 "blank/absent agent_name must be omitted, got: {line} (supplied {supplied:?})"
             );
         }
+    }
+
+    // ─── Access ceiling on the initiate GET ──────────────────────────────────
+
+    /// The admin path asks for the `rwa` ceiling on the initiate itself.
+    #[tokio::test]
+    async fn pkce_authorize_sends_admin_access_mode() {
+        let access = AuthorizeAccess {
+            access_mode: Some("rwa"),
+            account_settings: false,
+        };
+        let line = authorize_request_line(None, access).await;
+        assert_eq!(
+            query_param(&line, "access_mode").as_deref(),
+            Some("rwa"),
+            "got: {line}"
+        );
+    }
+
+    /// Read-only asks for `r` — and must not be confusable with `rwa`.
+    #[tokio::test]
+    async fn pkce_authorize_sends_read_only_access_mode() {
+        let access = AuthorizeAccess {
+            access_mode: Some("r"),
+            account_settings: false,
+        };
+        let line = authorize_request_line(None, access).await;
+        assert_eq!(
+            query_param(&line, "access_mode").as_deref(),
+            Some("r"),
+            "got: {line}"
+        );
+    }
+
+    /// Neither flag sends NO `access_mode` at all — the absence is the
+    /// contract, not some client-side default value.
+    #[tokio::test]
+    async fn pkce_authorize_omits_access_mode_when_unset() {
+        let line = authorize_request_line(None, AuthorizeAccess::default()).await;
+        assert_eq!(query_param(&line, "access_mode"), None, "got: {line}");
+    }
+
+    /// A blank or whitespace-only ceiling is treated as absent rather than
+    /// sent as an empty value the server would have to interpret.
+    #[tokio::test]
+    async fn pkce_authorize_treats_blank_access_mode_as_absent() {
+        for supplied in [Some(""), Some("   ")] {
+            let access = AuthorizeAccess {
+                access_mode: supplied,
+                account_settings: false,
+            };
+            let line = authorize_request_line(None, access).await;
+            assert_eq!(
+                query_param(&line, "access_mode"),
+                None,
+                "blank ceiling must be omitted (supplied {supplied:?}), got: {line}"
+            );
+        }
+    }
+
+    /// `account_settings` is sent as the literal `1` when requested.
+    #[tokio::test]
+    async fn pkce_authorize_sends_account_settings_when_requested() {
+        let access = AuthorizeAccess {
+            access_mode: None,
+            account_settings: true,
+        };
+        let line = authorize_request_line(None, access).await;
+        assert_eq!(
+            query_param(&line, "account_settings").as_deref(),
+            Some("1"),
+            "got: {line}"
+        );
+    }
+
+    /// …and OMITTED when not — never sent as `0`, which would still be a
+    /// request the consent page has to answer.
+    #[tokio::test]
+    async fn pkce_authorize_omits_account_settings_when_not_requested() {
+        let line = authorize_request_line(None, AuthorizeAccess::default()).await;
+        assert_eq!(query_param(&line, "account_settings"), None, "got: {line}");
+        assert!(
+            !line.contains("account_settings"),
+            "a literal 0 must never be sent, got: {line}"
+        );
+    }
+
+    // ─── Scope resolution ────────────────────────────────────────────────────
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_owned()).collect()
+    }
+
+    fn resolved(spec: &ApiKeyScopeSpec) -> String {
+        resolve_key_scopes(spec)
+            .expect("spec resolves")
+            .expect("spec produces scopes")
+    }
+
+    fn error_message(spec: &ApiKeyScopeSpec) -> String {
+        match resolve_key_scopes(spec) {
+            Err(CliError::Parse(msg)) => msg,
+            Err(other) => panic!("expected CliError::Parse, got {other:?}"),
+            Ok(value) => panic!("expected a validation error, got {value:?}"),
+        }
+    }
+
+    fn entries(spec: &ApiKeyScopeSpec) -> Vec<String> {
+        serde_json::from_str(&resolved(spec)).expect("scopes is a JSON array of strings")
+    }
+
+    #[test]
+    fn org_with_admin_yields_rwa() {
+        let spec = ApiKeyScopeSpec {
+            org: ids(&["1"]),
+            admin: true,
+            ..Default::default()
+        };
+        assert_eq!(resolved(&spec), "[\"org:1:rwa\"]");
+    }
+
+    #[test]
+    fn all_with_read_only_yields_the_user_wildcard() {
+        let spec = ApiKeyScopeSpec {
+            all: true,
+            read_only: true,
+            ..Default::default()
+        };
+        assert_eq!(resolved(&spec), "[\"user:*:r\"]");
+    }
+
+    /// No structured input at all is the ONLY route to `None` — the caller then
+    /// omits `scopes` and the credential keeps full access.
+    #[test]
+    fn no_flags_resolves_to_none() {
+        assert_eq!(
+            resolve_key_scopes(&ApiKeyScopeSpec::default()).expect("empty spec resolves"),
+            None
+        );
+    }
+
+    /// The account-settings entry is `rw` regardless of the access mode chosen
+    /// for everything else, and appears exactly once.
+    #[test]
+    fn account_settings_is_always_rw_and_appears_once() {
+        let spec = ApiKeyScopeSpec {
+            org: ids(&["5"]),
+            read_only: true,
+            account_settings: true,
+            ..Default::default()
+        };
+        let out = entries(&spec);
+        let userdetails: Vec<&String> = out
+            .iter()
+            .filter(|e| e.starts_with("userdetails:"))
+            .collect();
+        assert_eq!(
+            userdetails.len(),
+            1,
+            "exactly one userdetails entry: {out:?}"
+        );
+        assert_eq!(userdetails[0], "userdetails:*:rw", "got: {out:?}");
+        assert!(
+            out.contains(&"org:5:r".to_owned()),
+            "the read-only mode still applies to the org: {out:?}"
+        );
+    }
+
+    /// `--account-settings` on its own is a complete request, not a partial one.
+    #[test]
+    fn account_settings_alone_is_valid() {
+        let spec = ApiKeyScopeSpec {
+            account_settings: true,
+            ..Default::default()
+        };
+        assert_eq!(resolved(&spec), "[\"userdetails:*:rw\"]");
+    }
+
+    /// An access mode with nothing to apply it to is a half-typed command.
+    #[test]
+    fn admin_alone_is_an_error() {
+        let spec = ApiKeyScopeSpec {
+            admin: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            error_message(&spec),
+            "--admin needs at least one of --org/--workspace/--share/--all \
+             (the account-settings scope is always rw)"
+        );
+    }
+
+    #[test]
+    fn read_only_alone_is_an_error() {
+        let spec = ApiKeyScopeSpec {
+            read_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            error_message(&spec),
+            "--read-only needs at least one of --org/--workspace/--share/--all \
+             (the account-settings scope is always rw)"
+        );
+    }
+
+    /// `--admin --account-settings` names a ceiling with nothing to apply it
+    /// to: the account-settings scope is always `userdetails:*:rw`, so
+    /// accepting the pair would issue a key WITHOUT the admin access the
+    /// caller asked for and report success.
+    #[test]
+    fn admin_with_only_account_settings_is_an_error() {
+        let spec = ApiKeyScopeSpec {
+            admin: true,
+            account_settings: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            error_message(&spec),
+            "--admin needs at least one of --org/--workspace/--share/--all \
+             (the account-settings scope is always rw)"
+        );
+
+        let read_only = ApiKeyScopeSpec {
+            read_only: true,
+            account_settings: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            error_message(&read_only),
+            "--read-only needs at least one of --org/--workspace/--share/--all \
+             (the account-settings scope is always rw)"
+        );
+    }
+
+    /// POSITIVE CONTROL for the rule above: a mode flag WITH a real target and
+    /// `--account-settings` alongside is still valid, and the mode still
+    /// reaches the entity.
+    #[test]
+    fn admin_with_a_target_and_account_settings_is_valid() {
+        let spec = ApiKeyScopeSpec {
+            org: ids(&["7"]),
+            admin: true,
+            account_settings: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolved(&spec),
+            "[\"org:7:rwa\",\"userdetails:*:rw\"]",
+            "the ceiling applies to the org; account settings stay rw"
+        );
+    }
+
+    /// A blank id would build the scope string `org::rw`, which names nothing.
+    #[test]
+    fn blank_id_is_an_error() {
+        let spec = ApiKeyScopeSpec {
+            org: ids(&[""]),
+            ..Default::default()
+        };
+        assert_eq!(error_message(&spec), "--org id must not be blank");
+    }
+
+    #[test]
+    fn whitespace_only_id_is_an_error() {
+        let spec = ApiKeyScopeSpec {
+            workspace: ids(&["   "]),
+            ..Default::default()
+        };
+        assert_eq!(error_message(&spec), "--workspace id must not be blank");
+    }
+
+    /// An id carrying a scope-grammar separator, a partial wildcard, or any
+    /// other non-digit would be pasted verbatim into `type:id:mode` and produce
+    /// a grant nobody asked for — `--org "1:rwa"` alone would smuggle an admin
+    /// entry past the `--admin`/`--read-only` checks.
+    #[test]
+    fn non_numeric_ids_are_an_error() {
+        for bad in ["1:rwa", "1,2", "abc", "1 2", "**", "*1", "1*"] {
+            let spec = ApiKeyScopeSpec {
+                org: ids(&[bad]),
+                ..Default::default()
+            };
+            assert_eq!(
+                error_message(&spec),
+                "--org id must be numeric or *",
+                "id {bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// `org:*:rw` is a real grant the platform issues and reports ("All
+    /// Organizations"), and `--all` is not a substitute — it emits
+    /// `user:*:<mode>`, a different entity type. The numeric rule exists for
+    /// separators, so the bare wildcard has to survive it.
+    #[test]
+    fn a_bare_wildcard_entity_id_resolves() {
+        for kind in ["org", "workspace", "share"] {
+            let mut spec = ApiKeyScopeSpec::default();
+            match kind {
+                "workspace" => spec.workspace = ids(&["*"]),
+                "share" => spec.share = ids(&["*"]),
+                _ => spec.org = ids(&["*"]),
+            }
+            assert_eq!(resolved(&spec), format!("[\"{kind}:*:rw\"]"));
+        }
+    }
+
+    /// The access mode applies to a wildcard entity exactly as it does to a
+    /// numeric one — this is the workflow the admin hints send readers to.
+    #[test]
+    fn a_wildcard_entity_id_takes_the_admin_ceiling() {
+        let spec = ApiKeyScopeSpec {
+            org: ids(&["*"]),
+            admin: true,
+            ..Default::default()
+        };
+        assert_eq!(resolved(&spec), "[\"org:*:rwa\"]");
+    }
+
+    /// The blank case keeps its own wording — the MCP surface matches on it.
+    #[test]
+    fn blank_id_keeps_the_blank_message_not_the_numeric_one() {
+        let spec = ApiKeyScopeSpec {
+            share: ids(&["  "]),
+            ..Default::default()
+        };
+        assert_eq!(error_message(&spec), "--share id must not be blank");
+    }
+
+    /// POSITIVE CONTROL: real ids are 19-digit numeric strings, so the check
+    /// must not be a length or `u32`-parse test in disguise.
+    #[test]
+    fn a_long_all_digit_id_resolves() {
+        let spec = ApiKeyScopeSpec {
+            workspace: ids(&["1234567890123456789"]),
+            ..Default::default()
+        };
+        assert_eq!(resolved(&spec), "[\"workspace:1234567890123456789:rw\"]");
+    }
+
+    #[test]
+    fn all_combined_with_an_entity_id_is_an_error() {
+        let spec = ApiKeyScopeSpec {
+            org: ids(&["1"]),
+            all: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            error_message(&spec),
+            "--all cannot be combined with --org, --workspace, or --share"
+        );
+    }
+
+    /// The flags contradict each other; the CLI blocks this but the MCP
+    /// parameters do not, so the resolver has to.
+    #[test]
+    fn admin_with_read_only_is_an_error() {
+        let spec = ApiKeyScopeSpec {
+            org: ids(&["1"]),
+            admin: true,
+            read_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            error_message(&spec),
+            "--admin and --read-only are mutually exclusive; supply at most one"
+        );
+    }
+
+    #[test]
+    fn duplicate_ids_are_deduplicated() {
+        let spec = ApiKeyScopeSpec {
+            org: ids(&["1", "1", "2", "1"]),
+            ..Default::default()
+        };
+        assert_eq!(resolved(&spec), "[\"org:1:rw\",\"org:2:rw\"]");
+    }
+
+    /// Trimming happens BEFORE the scope string is built, and before the
+    /// duplicate check — so a padded repeat is still a duplicate.
+    #[test]
+    fn ids_are_trimmed() {
+        let spec = ApiKeyScopeSpec {
+            org: ids(&["  7  ", "7"]),
+            ..Default::default()
+        };
+        assert_eq!(resolved(&spec), "[\"org:7:rw\"]");
+    }
+
+    /// Entity types compose in the documented order: `user`, then org,
+    /// workspace, share in that order, then the account-settings entry last.
+    #[test]
+    fn entity_types_compose_in_the_documented_order() {
+        let spec = ApiKeyScopeSpec {
+            org: ids(&["1"]),
+            workspace: ids(&["2"]),
+            share: ids(&["3"]),
+            account_settings: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            entries(&spec),
+            vec![
+                "org:1:rw".to_owned(),
+                "workspace:2:rw".to_owned(),
+                "share:3:rw".to_owned(),
+                "userdetails:*:rw".to_owned(),
+            ]
+        );
+    }
+
+    /// An empty array is NOT unconstrained — it grants no authority and the
+    /// credential is refused everywhere. The resolver must never produce one.
+    #[test]
+    fn a_successful_resolution_is_never_an_empty_array() {
+        let specs = [
+            ApiKeyScopeSpec {
+                all: true,
+                ..Default::default()
+            },
+            ApiKeyScopeSpec {
+                account_settings: true,
+                ..Default::default()
+            },
+            ApiKeyScopeSpec {
+                org: ids(&["1"]),
+                admin: true,
+                ..Default::default()
+            },
+            ApiKeyScopeSpec {
+                share: ids(&["9"]),
+                read_only: true,
+                account_settings: true,
+                ..Default::default()
+            },
+        ];
+        for spec in &specs {
+            let out = resolved(spec);
+            assert_ne!(out, "[]", "spec produced an empty grant: {spec:?}");
+            assert!(
+                !entries(spec).is_empty(),
+                "spec produced no entries: {spec:?}"
+            );
+        }
+    }
+
+    // ─── Session narrowing ───────────────────────────────────────────────────
+
+    /// The narrow call is a PATCH on the session path carrying one `scopes`
+    /// form field with the JSON array verbatim.
+    #[tokio::test]
+    async fn oauth_narrow_patches_the_session_with_a_scopes_form_field() {
+        let (addr, seen) = spawn_body_capturing_server().await;
+        let client = ApiClient::new(&format!("http://{addr}"), Some("tok".to_owned()))
+            .expect("client builds");
+        let _ = oauth_narrow(&client, "a1b2c3", "[\"org:1:r\"]").await;
+
+        let req = seen.lock().expect("capture lock").clone();
+        let line = req.lines().next().unwrap_or_default();
+        assert!(
+            line.starts_with("PATCH /oauth/sessions/a1b2c3/ "),
+            "got: {line}"
+        );
+
+        let body = req.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let value = body
+            .strip_prefix("scopes=")
+            .unwrap_or_else(|| panic!("the body must be the single scopes field, got: {body}"));
+        let decoded = urlencoding::decode(value).expect("form value decodes");
+        assert_eq!(decoded, "[\"org:1:r\"]");
+    }
+
+    /// A session id is a path segment: anything needing encoding is encoded,
+    /// so it can never open a second path segment.
+    #[tokio::test]
+    async fn oauth_narrow_percent_encodes_the_session_id() {
+        let (addr, seen) = spawn_body_capturing_server().await;
+        let client = ApiClient::new(&format!("http://{addr}"), Some("tok".to_owned()))
+            .expect("client builds");
+        let _ = oauth_narrow(&client, "a/b", "[]").await;
+
+        let req = seen.lock().expect("capture lock").clone();
+        let line = req.lines().next().unwrap_or_default();
+        assert!(
+            line.starts_with("PATCH /oauth/sessions/a%2Fb/ "),
+            "the session id must be percent-encoded, got: {line}"
+        );
     }
 }

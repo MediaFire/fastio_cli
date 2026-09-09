@@ -238,8 +238,18 @@ async fn require_auth(state: &McpState) -> Result<(), CallToolResult> {
     }
 }
 
-/// Convert a `CliError` into an MCP tool error result.
+/// Convert a `CliError` into an MCP tool error result, appending the error's
+/// recovery hint when it has one.
+///
+/// `CliError::suggestion()` is where a refusal says HOW to recover — for a
+/// scope / access-mode refusal it is the ONLY place that names the fix. The CLI
+/// prints it on its own `hint:` line; MCP has no second line, so it is appended
+/// in parentheses. Same shape as [`billing_err_to_result`], which needed this
+/// first and is left as-is.
 fn cli_err_to_result(err: &fastio_cli::error::CliError) -> CallToolResult {
+    if let Some(hint) = err.suggestion() {
+        return error_text(&format!("{err} ({hint})"));
+    }
     error_text(&err.to_string())
 }
 
@@ -525,6 +535,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             "oauth-list",
             "oauth-details",
             "oauth-rename",
+            "oauth-narrow",
             "oauth-revoke",
             "oauth-revoke-all",
             // Universal: every tool self-describes. Declared so a STRICT
@@ -547,7 +558,42 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             (
                 "scopes",
-                "Comma-separated scopes (api-key-create, api-key-update)",
+                "JSON array string of entity scopes, e.g. [\"org:123:rwa\",\"userdetails:*:rw\"] (api-key-create, api-key-update, oauth-narrow). Each entry is <type>:<id-or-*>:<access-mode>, where the access mode is r, rw or rwa. Supply it as that JSON array encoded as a string. Mutually exclusive with the structured selectors below (org, workspace, share, all, admin, read_only, account_settings) when any of them is set — supply one form or the other, never both. A boolean sent as false is an explicit no, not a selector, and is ignored. On api-key-update and oauth-narrow the resulting set REPLACES the credential's existing scopes wholesale, so read the current set first (api-key-get for a key, oauth-details for a session) and re-state every scope it should keep.",
+                false,
+            ),
+            (
+                "org",
+                "Organization ID(s) to scope the credential to, as one ID or several separated by commas (api-key-create, api-key-update, oauth-narrow). Each becomes org:<id>:<access-mode>.",
+                false,
+            ),
+            (
+                "workspace",
+                "Workspace ID(s) to scope the credential to, as one ID or several separated by commas (api-key-create, api-key-update, oauth-narrow). Each becomes workspace:<id>:<access-mode>.",
+                false,
+            ),
+            (
+                "share",
+                "Share ID(s) to scope the credential to, as one ID or several separated by commas (api-key-create, api-key-update, oauth-narrow). Each becomes share:<id>:<access-mode>.",
+                false,
+            ),
+            (
+                "all",
+                "\"true\" to scope to the whole account (user:*:<access-mode>) instead of named IDs (api-key-create, api-key-update, oauth-narrow). Cannot be combined with org, workspace or share.",
+                false,
+            ),
+            (
+                "admin",
+                "\"true\" to request the admin (rwa) access mode for the selected entities (api-key-create, api-key-update, oauth-narrow). This is an access-mode CEILING on those entities: it confers no membership and nothing the issuing credential does not already hold. These three actions send an EXACT request: the server REJECTS a scope set wider than the issuing credential (containment) instead of silently narrowing it. That is a different rule from `fastio auth login --admin`, which requests a ceiling the consent page MAY narrow. Mutually exclusive with read_only, and needs at least one of org/workspace/share/all. Default without it is rw.",
+                false,
+            ),
+            (
+                "read_only",
+                "\"true\" to request the read-only (r) access mode for the selected entities (api-key-create, api-key-update, oauth-narrow). Mutually exclusive with admin, and needs at least one of org/workspace/share/all.",
+                false,
+            ),
+            (
+                "account_settings",
+                "\"true\" to include the account-settings scope userdetails:*:rw, which is always rw regardless of the access mode chosen for the other entities (api-key-create, api-key-update, oauth-narrow).",
                 false,
             ),
             (
@@ -580,7 +626,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("token", "2FA token (2fa-verify-setup)", false),
             (
                 "session_id",
-                "OAuth session ID (oauth-details, oauth-rename, oauth-revoke)",
+                "OAuth session ID (oauth-details, oauth-rename, oauth-narrow, oauth-revoke)",
                 false,
             ),
             (
@@ -3210,6 +3256,7 @@ async fn handle_auth(
         "oauth-list" => handle_auth_oauth_list(state, args).await,
         "oauth-details" => handle_auth_oauth_details(state, args).await,
         "oauth-rename" => handle_auth_oauth_rename(state, args).await,
+        "oauth-narrow" => handle_auth_oauth_narrow(state, args).await,
         "oauth-revoke" => handle_auth_oauth_revoke(state, args).await,
         "oauth-revoke-all" => handle_auth_oauth_revoke_all(state, args).await,
         "scopes" => handle_auth_scopes(state, args).await,
@@ -3218,10 +3265,357 @@ async fn handle_auth(
     }
 }
 
+/// The structured scope selectors shared by `api-key-create`, `api-key-update`
+/// and `oauth-narrow`, in the order they are named in error messages.
+///
+/// One list so the conflict check, the "is this update empty" check and the
+/// user-facing messages can never drift apart.
+const STRUCTURED_SCOPE_PARAMS: &[&str] = &[
+    "org",
+    "workspace",
+    "share",
+    "all",
+    "admin",
+    "read_only",
+    "account_settings",
+];
+
+/// The scope and access-mode selectors `signin` refuses.
+///
+/// Basic auth issues the credential's default access; there is no consent step
+/// in which to narrow or raise it, so accepting these params would let a caller
+/// ask for something the request cannot express — and get a credential that
+/// silently differs from what it asked for. The narrowing selectors are
+/// refused for the same reason as the ceilings: a caller that asked for a
+/// scoped credential and got a full-access one has no way to notice.
+///
+/// Refused only when the value EXPRESSES that intent — see
+/// [`signin_access_intent`]. A supplied-but-empty `org`, or `admin: false`, is
+/// an explicit NO: refusing those blocks a legitimate sign-in over a parameter
+/// that asked for nothing.
+const SIGNIN_REJECTED_ACCESS_PARAMS: &[&str] = &[
+    "scopes",
+    "org",
+    "workspace",
+    "share",
+    "all",
+    "admin",
+    "read_only",
+    "account_settings",
+];
+
+/// Does this `signin` call actually ASK for the access parameter `key`?
+///
+/// Presence is not intent. `admin: false` and `org: ""` are how a client
+/// spells "no" — a caller that sent them asked for nothing, so refusing the
+/// sign-in over them blocks a legitimate call and teaches nothing. Only a
+/// value that would CHANGE the credential counts:
+///
+/// - the four booleans: only a parsed `true`;
+/// - `org` / `workspace` / `share`: only a non-empty parsed id list;
+/// - `scopes`: only a non-blank string or a non-empty array (a wrong-typed
+///   value is still an attempt to scope, so it is treated as intent and
+///   refused rather than read as absent).
+///
+/// A malformed value returns the extractor's own error, which is a refusal
+/// either way — never a silent "no intent".
+fn signin_access_intent(args: &Map<String, Value>, key: &str) -> Result<bool, CallToolResult> {
+    match key {
+        "admin" | "read_only" | "account_settings" | "all" => {
+            Ok(optional_bool_strict(args, key)? == Some(true))
+        }
+        "scopes" => Ok(match args.get(key) {
+            None | Some(Value::Null) => false,
+            Some(Value::String(s)) => !s.trim().is_empty(),
+            Some(Value::Array(items)) => !items.is_empty(),
+            Some(_) => true,
+        }),
+        _ => Ok(!string_list_arg(args, key)?.is_empty()),
+    }
+}
+
+/// Was a parameter actually SUPPLIED?
+///
+/// Present-and-`null` is how an MCP client spells an unset optional (the same
+/// convention [`optional_str_strict`] and [`optional_bool_strict`] honour), so a
+/// bare `contains_key` would read "I sent nothing" as "I sent something".
+fn arg_supplied(args: &Map<String, Value>, key: &str) -> bool {
+    args.get(key).is_some_and(|v| !v.is_null())
+}
+
+/// Every parameter key the `auth` tool's published input schema declares.
+///
+/// DERIVED from `TOOL_DEFS` — the same data [`action_schema`] turns into the
+/// advertised `properties` object — rather than hand-listed. A hand-written
+/// set goes stale the moment a parameter is added to the schema, and a stale
+/// accepted-set is exactly the failure the guard below exists to prevent: a
+/// newly declared parameter would be refused, or a removed one still accepted.
+/// `action` is included because [`action_schema`] inserts it for every tool.
+fn auth_declared_params() -> impl Iterator<Item = &'static str> {
+    const NONE: &[(&str, &str, bool)] = &[];
+    TOOL_DEFS
+        .iter()
+        .find(|def| def.name == "auth")
+        .map_or(NONE, |def| def.params)
+        .iter()
+        .map(|&(name, _, _)| name)
+        .chain(std::iter::once("action"))
+}
+
+/// Refuse any argument key the `auth` tool does not declare.
+///
+/// The scope extractors read the keys they know and IGNORE everything else, so
+/// a misspelling — `read-only` for `read_only`, `--org` for `org`, `scope` for
+/// `scopes` — is silently dropped. Dropping a narrowing selector is not a
+/// no-op: `api-key-create` then mints a credential with the DEFAULT access
+/// (unscoped, or `rw` where `r` was asked for) and reports success, so the
+/// caller receives something BROADER than it requested with nothing to notice
+/// it by. Fail closed instead, and name the accepted spellings so the caller
+/// can correct the key rather than guess at it.
+fn reject_undeclared_auth_args(args: &Map<String, Value>) -> Result<(), CallToolResult> {
+    for key in args.keys() {
+        if auth_declared_params().any(|declared| declared == key.as_str()) {
+            continue;
+        }
+        let mut accepted: Vec<&'static str> = auth_declared_params().collect();
+        accepted.sort_unstable();
+        return Err(error_text(&format!(
+            "unknown parameter `{key}` — it would be dropped silently and the credential \
+             issued WIDER than the one asked for, so it is refused instead. Accepted \
+             parameters: {}",
+            accepted.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Rewrite a shared-resolver message for the MCP surface.
+///
+/// [`api::auth::resolve_key_scopes`] phrases its refusals in CLI flag
+/// spellings (`--org`, `--read-only`, …) because the CLI is its other caller.
+/// MCP has no flags: telling an agent to pass `--org` names something it
+/// cannot send, and sends it hunting for a parameter that does not exist here.
+///
+/// A general substitution over the WHOLE message, not a match on one sentence:
+/// the library grows rules in this style (a blank-id check, a numeric-id
+/// check), and each new one has to arrive already mapped rather than waiting
+/// for this helper to be taught about it.
+fn mcp_scope_message(msg: &str) -> String {
+    let mut out = msg.to_owned();
+    // Longest first, so no replacement can eat the prefix of a longer flag.
+    for (flag, param) in [
+        ("--account-settings", "account_settings"),
+        ("--read-only", "read_only"),
+        ("--workspace", "workspace"),
+        ("--scopes", "scopes"),
+        ("--share", "share"),
+        ("--admin", "admin"),
+        ("--org", "org"),
+        ("--all", "all"),
+    ] {
+        out = out.replace(flag, param);
+    }
+    out
+}
+
+/// [`cli_err_to_result`] for a scope refusal: same rendering, MCP spelling.
+///
+/// The recovery hint is part of the text the caller reads, so it is mapped
+/// too — a hint that named a flag would leak one just as surely as the message.
+fn mcp_scope_error(err: &fastio_cli::error::CliError) -> CallToolResult {
+    let rendered = err
+        .suggestion()
+        .map_or_else(|| err.to_string(), |hint| format!("{err} ({hint})"));
+    error_text(&mcp_scope_message(&rendered))
+}
+
+/// The library's own blank-id refusal, in MCP spelling.
+///
+/// [`string_list_arg`] drops a blank id before the library ever sees it, so
+/// this surface has to raise the refusal itself — but re-typing the sentence
+/// would let the two wordings drift. Ask the resolver to resolve a spec whose
+/// only content is one blank id of this kind, and map back what it says.
+fn blank_entity_id_error(kind: &str) -> CallToolResult {
+    let mut spec = api::auth::ApiKeyScopeSpec::default();
+    let blank = vec![String::new()];
+    match kind {
+        "workspace" => spec.workspace = blank,
+        "share" => spec.share = blank,
+        _ => spec.org = blank,
+    }
+    match api::auth::resolve_key_scopes(&spec) {
+        Err(e) => mcp_scope_error(&e),
+        // Unreachable: a blank id is precisely what the resolver refuses. Kept
+        // as a fail-closed fallback so a library change can never turn a
+        // malformed selector into a silent full-access credential.
+        Ok(_) => error_text(&format!("{kind} id must not be blank")),
+    }
+}
+
+/// Build an [`api::auth::ApiKeyScopeSpec`] from the structured MCP scope params.
+///
+/// Extraction is STRICT throughout: [`string_list_arg`] for the three id lists,
+/// [`optional_bool_strict`] for the four booleans. A wrong-typed value is an
+/// error, never a silent omission — dropping `admin: "yes"` would mint a
+/// credential with a narrower access mode than the caller asked for and report
+/// success.
+fn key_scope_spec_from_args(
+    args: &Map<String, Value>,
+) -> Result<api::auth::ApiKeyScopeSpec, CallToolResult> {
+    Ok(api::auth::ApiKeyScopeSpec {
+        org: string_list_arg(args, "org")?,
+        workspace: string_list_arg(args, "workspace")?,
+        share: string_list_arg(args, "share")?,
+        all: optional_bool_strict(args, "all")?.unwrap_or(false),
+        admin: optional_bool_strict(args, "admin")?.unwrap_or(false),
+        read_only: optional_bool_strict(args, "read_only")?.unwrap_or(false),
+        account_settings: optional_bool_strict(args, "account_settings")?.unwrap_or(false),
+    })
+}
+
+/// Read the RAW `scopes` param strictly.
+///
+/// - absent or `null` → `Ok(None)`
+/// - a JSON string → passed through verbatim (already the encoded array)
+/// - a JSON array → serialized with `serde_json::to_string`, so the natural
+///   spelling reaches the wire in the form the server expects
+/// - anything else → an error. Reading a number or object as "not supplied"
+///   would issue a credential with the DEFAULT (full) scope while the caller
+///   believed it had restricted one.
+fn raw_scopes_arg(args: &Map<String, Value>) -> Result<Option<String>, CallToolResult> {
+    match args.get("scopes") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(v @ Value::Array(_)) => serde_json::to_string(v).map(Some).map_err(|e| {
+            error_text(&format!(
+                "scopes could not be encoded as a JSON array of strings: {e}"
+            ))
+        }),
+        Some(_) => Err(error_text(
+            "scopes must be a JSON array of entity scope strings, or that array encoded as a \
+             string (e.g. [\"org:123:rwa\",\"userdetails:*:rw\"])",
+        )),
+    }
+}
+
+/// Resolve the `scopes` form value for a key/session scope change.
+///
+/// Either the raw `scopes` array or the structured selectors, never both — the
+/// same conflict clap enforces on the CLI. With neither, returns `Ok(None)` and
+/// the caller omits the field.
+///
+/// Validation of the structured form (mutually exclusive modes, `all` versus
+/// named ids, blank ids, partial intent) belongs to
+/// [`api::auth::resolve_key_scopes`]; its errors are propagated through
+/// [`mcp_scope_error`], which keeps the resolver's own sentence and only maps
+/// the CLI flag spellings it names (`--org`, `--admin`, …) onto the matching
+/// MCP parameter names — so the two surfaces cannot drift into two wordings of
+/// one rule, and neither tells its caller to type the other's syntax.
+fn resolve_scopes_from_args(args: &Map<String, Value>) -> Result<Option<String>, CallToolResult> {
+    // Before anything is read: an unknown key here is a DROPPED selector, and a
+    // dropped selector issues a credential wider than the one asked for.
+    reject_undeclared_auth_args(args)?;
+    let raw = raw_scopes_arg(args)?;
+    let spec = key_scope_spec_from_args(args)?;
+    let entity_lists: [(&str, &[String]); 3] = [
+        ("org", spec.org.as_slice()),
+        ("workspace", spec.workspace.as_slice()),
+        ("share", spec.share.as_slice()),
+    ];
+
+    // "Structured input was supplied" is read from the PARSED spec for the
+    // booleans: `admin: false` is an explicit NO, not a selector, so pairing it
+    // with a raw `scopes` array is not a conflict. The three id lists are read
+    // from PRESENCE instead — a supplied-but-empty `org` is a structured
+    // request that happens to be malformed, and the blank-id check below is
+    // what refuses it.
+    let structured: Vec<&str> = STRUCTURED_SCOPE_PARAMS
+        .iter()
+        .copied()
+        .filter(|key| match *key {
+            "org" | "workspace" | "share" => arg_supplied(args, key),
+            "all" => spec.all,
+            "admin" => spec.admin,
+            "read_only" => spec.read_only,
+            "account_settings" => spec.account_settings,
+            _ => false,
+        })
+        .collect();
+    if raw.is_some() && !structured.is_empty() {
+        return Err(error_text(&format!(
+            "scopes cannot be combined with the structured scope parameters ({}); \
+             supply the raw scopes array OR the selectors, not both",
+            structured.join(", ")
+        )));
+    }
+
+    // A SUPPLIED entity selector that parsed to nothing (`""`, `" , "`, `[]`)
+    // is a blank id, not "no scoping requested". Letting it fall through would
+    // omit `scopes` entirely: `api-key-create` would mint a full-access key and
+    // report success, and `api-key-update` would leave the key's scopes
+    // untouched while the caller believed it had narrowed them.
+    for (key, ids) in entity_lists {
+        if ids.is_empty() && arg_supplied(args, key) {
+            return Err(blank_entity_id_error(key));
+        }
+    }
+
+    if raw.is_some() {
+        return Ok(raw);
+    }
+    // The resolver's sentence is kept; `mcp_scope_error` only rewrites the CLI
+    // flag spellings inside it as MCP parameter names, so a refusal never tells
+    // an MCP caller to pass a flag it has no way to send.
+    api::auth::resolve_key_scopes(&spec).map_err(|e| mcp_scope_error(&e))
+}
+
+/// Render an `api-key-create` response as the FULL key object.
+///
+/// `POST /user/auth/key/` returns no `response` sub-object, so the client's
+/// envelope unwrap hands the whole envelope through and the flattened `extra`
+/// carries the envelope's own `result` marker alongside the real fields
+/// (`id`, `memo`, `scopes`, `agent_name`, `created`, `expires`, `admin`,
+/// `legacy`). `result` is transport bookkeeping, not a property of the key, so
+/// it is filtered out rather than shown.
+fn api_key_create_payload(resp: &api::types::ApiKeyCreateResponse) -> Value {
+    let mut out = Map::new();
+    out.insert("api_key".to_owned(), Value::String(resp.api_key.clone()));
+    for (key, value) in &resp.extra {
+        if key == "result" {
+            continue;
+        }
+        out.insert(key.clone(), value.clone());
+    }
+    Value::Object(out)
+}
+
 async fn handle_auth_signin(
     state: &McpState,
     args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
+    // `signin` is the email/password path: the server issues the credential's
+    // default access and there is no consent step to raise or narrow it.
+    // Accepting these silently would hand back a credential whose access does
+    // not match what was asked for, with no error to notice. Only a value that
+    // EXPRESSES that intent is refused: `admin: false` and `org: ""` ask for
+    // nothing, and blocking a sign-in over them is a false refusal.
+    for key in SIGNIN_REJECTED_ACCESS_PARAMS {
+        match signin_access_intent(args, key) {
+            Ok(false) => continue,
+            Err(e) => return Ok(e),
+            Ok(true) => {}
+        }
+        return Ok(error_text(&format!(
+            "`{key}` is not accepted by action=signin — email/password sign-in issues the \
+             credential's default access and cannot request scopes or an access mode. \
+             Access-mode ceilings (admin rwa, read-only), the account-settings scope and a \
+             narrowed grant are chosen on the consent page of the browser (PKCE) login: run \
+             `fastio auth login` in a terminal. For a scoped credential instead, use \
+             action=api-key-create with scopes, or with org/workspace/share/all — admin and \
+             read_only are optional there, and the default without either is read-write — \
+             and/or account_settings."
+        )));
+    }
     let email = match required_str(args, "email") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -3353,17 +3747,28 @@ async fn handle_auth_api_key_create(
     if let Err(e) = require_auth(state).await {
         return Ok(e);
     }
+    let scopes = match resolve_scopes_from_args(args) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let client = state.client().read().await;
     match api::auth::api_key_create(
         &client,
         optional_str(args, "name"),
-        optional_str(args, "scopes"),
+        scopes.as_deref(),
         optional_str(args, "agent_name"),
         optional_str(args, "expires"),
     )
     .await
     {
-        Ok(resp) => Ok(success_json(&json!({ "api_key": resp.api_key }))),
+        // The whole key object, not just the secret: the caller needs the id to
+        // update or delete it later, and `scopes` to read back what was
+        // issued. `api-key-create` (like `api-key-update` and `oauth-narrow`)
+        // sends an EXACT request: the server REJECTS a scope set wider than the
+        // issuing credential — containment, never a silent narrowing. Only
+        // `fastio auth login --admin` asks for a CEILING that the consent page
+        // may narrow.
+        Ok(resp) => Ok(success_json(&api_key_create_payload(&resp))),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
 }
@@ -3433,16 +3838,32 @@ async fn handle_auth_api_key_update(
         Err(e) => return Ok(e),
     };
     let name = optional_str(args, "name");
-    let scopes = optional_str(args, "scopes");
+    // Resolved, not read raw: an update carrying only `org` + `admin` supplies a
+    // real `scopes` value, so the emptiness guard has to see the RESOLVED field
+    // or it would reject a perfectly complete update as empty.
+    let scopes = match resolve_scopes_from_args(args) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let agent_name = optional_str(args, "agent_name");
     let expires = optional_str(args, "expires");
     if name.is_none() && scopes.is_none() && agent_name.is_none() && expires.is_none() {
         return Ok(error_text(
-            "at least one update field is required (name, scopes, agent_name, expires)",
+            "at least one update field is required (name, scopes, agent_name, expires, \
+             or a scope selector: org, workspace, share, all, account_settings)",
         ));
     }
     let client = state.client().read().await;
-    match api::auth::api_key_update(&client, key_id, name, scopes, agent_name, expires).await {
+    match api::auth::api_key_update(
+        &client,
+        key_id,
+        name,
+        scopes.as_deref(),
+        agent_name,
+        expires,
+    )
+    .await
+    {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -3653,6 +4074,46 @@ async fn handle_auth_oauth_rename(
     }
     let client = state.client().read().await;
     match api::auth::oauth_rename(&client, session_id, device_name, agent_name).await {
+        Ok(v) => Ok(success_json(&v)),
+        Err(e) => Ok(cli_err_to_result(&e)),
+    }
+}
+
+/// Narrow an OAuth session's granted scopes.
+///
+/// The new grant must be narrower than or equal to what the session already
+/// holds; the server enforces that, so a widening attempt comes back as a
+/// scope refusal (whose recovery hint [`cli_err_to_result`] now forwards).
+/// The scopes are required here — unlike a key update there is no other field
+/// to change, so an omitted selector is a caller mistake, not a no-op request.
+async fn handle_auth_oauth_narrow(
+    state: &McpState,
+    args: &Map<String, Value>,
+) -> Result<CallToolResult, McpError> {
+    if let Err(e) = require_auth(state).await {
+        return Ok(e);
+    }
+    let session_id = match required_str(args, "session_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    // A BLANK raw `scopes` is the same request as none at all: a whitespace
+    // string forwarded verbatim would narrow the session to an empty grant (or
+    // be rejected by the server as malformed) instead of saying what is wrong.
+    // The CLI's `auth oauth narrow` folds the two cases together the same way.
+    let scopes = match resolve_scopes_from_args(args) {
+        Ok(Some(v)) if !v.trim().is_empty() => v,
+        Ok(_) => {
+            return Ok(error_text(
+                "oauth-narrow needs the scopes to narrow to: supply `scopes` (a JSON array of \
+                 entity scope strings), or org/workspace/share/all (optionally with admin or \
+                 read_only), and/or account_settings",
+            ));
+        }
+        Err(e) => return Ok(e),
+    };
+    let client = state.client().read().await;
+    match api::auth::oauth_narrow(&client, session_id, &scopes).await {
         Ok(v) => Ok(success_json(&v)),
         Err(e) => Ok(cli_err_to_result(&e)),
     }
@@ -4243,8 +4704,11 @@ async fn handle_org_delete(
 /// recovery hint (`CliError::suggestion()` — which covers 402 / 1688 / 1695 /
 /// 1696) so a subscription/credit error steers the agent to the billing-plan
 /// surface.
-/// The generic [`cli_err_to_result`] drops the suggestion; billing actions need
-/// it to surface, mirroring `sign_err_to_result`.
+/// [`cli_err_to_result`] now appends the same suggestion, so the two behave
+/// identically today. This one is kept as its own entry point because the
+/// billing hint is load-bearing for these actions: it names the surface that
+/// resolves the failure, and a later narrowing of the generic converter must
+/// not be able to take it away silently, mirroring `sign_err_to_result`.
 fn billing_err_to_result(err: &fastio_cli::error::CliError) -> CallToolResult {
     if let Some(hint) = err.suggestion() {
         return error_text(&format!("{err} ({hint})"));
@@ -13784,9 +14248,15 @@ mod ripley_tool_tests {
         args.insert("key_id".to_owned(), Value::String("key-123".to_owned()));
         let res = router.call_tool("auth", args).await.expect("call_tool ok");
         let text = result_to_string(&res);
+        // The WHOLE message: the parenthesised list is the actionable half,
+        // and a prefix assertion would not notice it drifting.
         assert!(
-            text.contains("at least one update field is required"),
-            "empty api-key-update must be rejected client-side, got: {text}"
+            text.contains(
+                "at least one update field is required (name, scopes, agent_name, expires, \
+                 or a scope selector: org, workspace, share, all, account_settings)"
+            ),
+            "empty api-key-update must be rejected client-side with the full \
+             field list, got: {text}"
         );
     }
 
@@ -19220,6 +19690,33 @@ mod ripley_tool_tests {
     /// silently-dropped scope id stays invisible: every layer looks fine in
     /// isolation and only the wire shows the field is gone.
     async fn capture_router() -> (ToolRouter, std::sync::Arc<std::sync::Mutex<String>>) {
+        router_answering(br#"{"result":"yes","response":{}}"#).await
+    }
+
+    /// Index just past the `\r\n\r\n` that ends the captured request's headers,
+    /// or `None` while the headers are still incomplete.
+    fn capture_header_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+    }
+
+    /// The declared body length of a captured request, or `0` when it carries
+    /// no `Content-Length` (a GET, or a header still in flight).
+    fn capture_content_length(head: &[u8]) -> usize {
+        String::from_utf8_lossy(head)
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0)
+    }
+
+    /// [`capture_router`] with a CALLER-CHOSEN response body, for the handlers
+    /// whose rendering of the response is the thing under test.
+    async fn router_answering(
+        body: &'static [u8],
+    ) -> (ToolRouter, std::sync::Arc<std::sync::Mutex<String>>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -19230,12 +19727,27 @@ mod ripley_tool_tests {
         let sink = std::sync::Arc::clone(&captured);
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
+                // Read until `Content-Length` is satisfied rather than taking
+                // whatever the first segment happened to contain: a split TCP
+                // write would otherwise truncate the captured body and make the
+                // wire assertions flaky.
+                let mut acc: Vec<u8> = Vec::new();
                 let mut buf = vec![0u8; 8192];
-                if let Ok(n) = sock.read(&mut buf).await {
-                    *sink.lock().expect("capture lock") =
-                        String::from_utf8_lossy(&buf[..n]).into_owned();
+                for _ in 0..8 {
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    acc.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = capture_header_end(&acc)
+                        && acc.len() >= pos + capture_content_length(&acc[..pos])
+                    {
+                        break;
+                    }
                 }
-                let body = br#"{"result":"yes","response":{}}"#;
+                *sink.lock().expect("capture lock") = String::from_utf8_lossy(&acc).into_owned();
                 let header = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n",
@@ -19691,6 +20203,946 @@ mod ripley_tool_tests {
             expected.as_slice(),
             "the container-scoped comment routes accept exactly the node-scoped \
              types except `fileshare`, which always targets a specific node"
+        );
+    }
+
+    // ─── Admin-scope parity: schema, strict extraction, handlers ────────────
+
+    /// A scope refusal is useless without its recovery hint: the bare message
+    /// says the credential was refused, the hint says how to fix it. The CLI
+    /// prints it on a `hint:` line; MCP has one text block, so it must be
+    /// appended there or the agent never sees it.
+    #[test]
+    fn cli_err_to_result_forwards_the_recovery_hint() {
+        use fastio_cli::error::{ApiError, CliError};
+
+        let err = CliError::Api(
+            ApiError::new(
+                10767,
+                Some("APP_FORBIDDEN".to_owned()),
+                "forbidden".to_owned(),
+                403,
+            )
+            .with_details(json!({
+                "params": {
+                    "reason": "scope_admin_required",
+                    "credential_type": "api_key",
+                }
+            })),
+        );
+
+        let hint = err
+            .suggestion()
+            .expect("a scope refusal carries a recovery hint");
+        let text = result_to_string(&super::cli_err_to_result(&err));
+        assert!(
+            text.contains("forbidden"),
+            "the error message itself must survive: {text}"
+        );
+        assert!(
+            text.contains(hint),
+            "the recovery hint must be forwarded to the caller: {text}"
+        );
+    }
+
+    /// The negative control: an error with no hint gains no parenthetical.
+    #[test]
+    fn cli_err_to_result_adds_nothing_when_there_is_no_hint() {
+        use fastio_cli::error::CliError;
+
+        let err = CliError::Parse("bad input".to_owned());
+        assert!(
+            err.suggestion().is_none(),
+            "this fixture must be a hint-free error for the assertion to mean anything"
+        );
+        let text = result_to_string(&super::cli_err_to_result(&err));
+        assert!(
+            text.contains("bad input") && !text.contains("bad input ("),
+            "a hint-free error must render unchanged: {text}"
+        );
+    }
+
+    /// The `auth` tool's published `properties` object.
+    fn auth_schema_properties() -> serde_json::Map<String, Value> {
+        let tools = ToolRouter::list_tools_with(true).tools;
+        let auth = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "auth")
+            .expect("auth tool present");
+        auth.input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .cloned()
+            .expect("auth schema has properties")
+    }
+
+    /// The `auth` tool's advertised action list.
+    fn auth_schema_actions() -> Vec<String> {
+        auth_schema_properties()
+            .get("action")
+            .and_then(|a| a.get("enum"))
+            .and_then(Value::as_array)
+            .map(|xs| {
+                xs.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .expect("auth action enum present")
+    }
+
+    /// The structured selectors and `oauth-narrow` must be ADVERTISED, not just
+    /// accepted: a client only sends what the schema declares.
+    ///
+    /// Positive control first — without it, an empty tool list, a renamed tool
+    /// or a schema that failed to resolve would satisfy every assertion below
+    /// by having nothing to disagree with.
+    #[test]
+    fn auth_tool_advertises_structured_scope_params_and_oauth_narrow() {
+        let props = auth_schema_properties();
+        let actions = auth_schema_actions();
+
+        assert!(
+            props.contains_key("key_id") && props.contains_key("scopes"),
+            "the auth schema did not resolve as expected, so the assertions \
+             below would pass vacuously: {props:?}"
+        );
+        assert!(
+            actions.iter().any(|a| a == "api-key-create"),
+            "the auth action list did not resolve as expected: {actions:?}"
+        );
+
+        for param in super::STRUCTURED_SCOPE_PARAMS {
+            assert!(
+                props.contains_key(*param),
+                "`{param}` must be advertised on the auth tool: {props:?}"
+            );
+        }
+        assert!(
+            actions.iter().any(|a| a == "oauth-narrow"),
+            "oauth-narrow must be advertised: {actions:?}"
+        );
+    }
+
+    /// The `scopes` description must document the JSON-array contract, not the
+    /// comma-separated one it never had.
+    #[test]
+    fn auth_scopes_description_documents_the_json_array_form() {
+        let props = auth_schema_properties();
+        let desc = props
+            .get("scopes")
+            .and_then(|p| p.get("description"))
+            .and_then(Value::as_str)
+            .expect("scopes description present")
+            .to_owned();
+
+        assert!(
+            !desc.to_lowercase().contains("comma-separated"),
+            "the scopes param is a JSON array of entity scopes, never a \
+             comma-separated list: {desc}"
+        );
+        assert!(
+            desc.contains(r#"["org:123:rwa","userdetails:*:rw"]"#),
+            "the scopes description must carry a concrete example: {desc}"
+        );
+    }
+
+    /// The mode-target list in the schema must match the resolver's rule.
+    ///
+    /// `resolve_key_scopes` refuses `admin`/`read_only` unless an ENTITY
+    /// selector or `all` is present: the account-settings scope is always
+    /// `userdetails:*:rw`, so it is not something an access mode can apply to.
+    /// A schema that listed it as a target would advertise a combination the
+    /// resolver rejects, and an agent that believed the schema would send it.
+    #[test]
+    fn access_mode_descriptions_do_not_list_account_settings_as_a_target() {
+        let props = auth_schema_properties();
+        for param in ["admin", "read_only"] {
+            let desc = props
+                .get(param)
+                .and_then(|p| p.get("description"))
+                .and_then(Value::as_str)
+                .expect("access-mode description present");
+            // Positive control: without it, a renamed param or an unresolved
+            // schema would satisfy the negative assertion by being empty.
+            assert!(
+                desc.contains("org"),
+                "`{param}` must still name the selectors it does apply to: {desc}"
+            );
+            assert!(
+                !desc.contains("account_settings"),
+                "`{param}` must not name account_settings among the targets a \
+                 mode applies to — the resolver rejects that pairing: {desc}"
+            );
+        }
+    }
+
+    /// `admin` is an ACCESS MODE ceiling. Calling it a role, or "admin of the
+    /// org", tells an agent it confers membership or authority it does not.
+    #[test]
+    fn admin_param_is_described_as_an_access_mode_not_a_role() {
+        let props = auth_schema_properties();
+        let desc = props
+            .get("admin")
+            .and_then(|p| p.get("description"))
+            .and_then(Value::as_str)
+            .expect("admin description present")
+            .to_owned();
+        let lowered = desc.to_lowercase();
+
+        assert!(
+            desc.contains("rwa"),
+            "the admin param must name the access mode it requests: {desc}"
+        );
+        assert!(
+            !lowered.contains("admin of the org"),
+            "`admin` is an access mode on selected entities, not organization \
+             administration: {desc}"
+        );
+        assert!(
+            !lowered.contains("role"),
+            "`admin` must not be described as a role: {desc}"
+        );
+    }
+
+    fn scope_args(pairs: Vec<(&str, Value)>) -> Map<String, Value> {
+        let mut args = Map::new();
+        for (key, value) in pairs {
+            args.insert(key.to_owned(), value);
+        }
+        args
+    }
+
+    /// A boolean selector may arrive as a native bool or as the string form an
+    /// LLM often emits; both mean the same thing.
+    #[test]
+    fn scope_booleans_accept_native_and_string_true() {
+        for value in [Value::Bool(true), Value::String("true".to_owned())] {
+            let args = scope_args(vec![
+                ("org", Value::String("123".to_owned())),
+                ("admin", value.clone()),
+            ]);
+            let spec = super::key_scope_spec_from_args(&args).expect("spec builds");
+            assert!(spec.admin, "`admin`={value:?} must parse as true");
+            assert_eq!(spec.org, vec!["123".to_owned()]);
+        }
+    }
+
+    /// A wrong-typed boolean is an ERROR. Reading it as absent would mint a
+    /// credential with a narrower access mode than was asked for and report
+    /// success.
+    #[test]
+    fn scope_booleans_reject_wrong_types() {
+        for value in [json!(1), json!({"admin": true}), json!(["true"])] {
+            let args = scope_args(vec![("admin", value.clone())]);
+            let err = super::key_scope_spec_from_args(&args)
+                .err()
+                .unwrap_or_else(|| panic!("`admin`={value:?} must be rejected"));
+            let text = result_to_string(&err);
+            assert!(
+                text.contains("admin must be a boolean"),
+                "the rejection must name the param: {text}"
+            );
+        }
+    }
+
+    /// The three id selectors accept a single id, a comma-separated string and
+    /// a JSON array, and reject anything else.
+    #[test]
+    fn scope_id_lists_accept_string_and_array_forms() {
+        let args = scope_args(vec![
+            ("org", Value::String("1, 2".to_owned())),
+            ("workspace", json!(["11", "22"])),
+            ("share", Value::String("33".to_owned())),
+        ]);
+        let spec = super::key_scope_spec_from_args(&args).expect("spec builds");
+        assert_eq!(spec.org, vec!["1".to_owned(), "2".to_owned()]);
+        assert_eq!(spec.workspace, vec!["11".to_owned(), "22".to_owned()]);
+        assert_eq!(spec.share, vec!["33".to_owned()]);
+
+        let bad = scope_args(vec![("org", json!(7))]);
+        let err =
+            super::key_scope_spec_from_args(&bad).expect_err("a numeric org must be rejected");
+        assert!(
+            result_to_string(&err).contains("org must be a JSON array of strings"),
+            "the rejection must name the param"
+        );
+    }
+
+    /// A raw `scopes` ARRAY is the natural spelling; serialize it rather than
+    /// refusing it. A number is a caller bug and must not read as "unset",
+    /// which would issue a credential with the DEFAULT full scope.
+    #[test]
+    fn raw_scopes_array_is_serialized_and_a_number_is_rejected() {
+        let args = scope_args(vec![("scopes", json!(["org:123:rwa", "userdetails:*:rw"]))]);
+        assert_eq!(
+            super::resolve_scopes_from_args(&args).expect("array form resolves"),
+            Some(r#"["org:123:rwa","userdetails:*:rw"]"#.to_owned())
+        );
+
+        let as_string = scope_args(vec![(
+            "scopes",
+            Value::String(r#"["org:123:rwa"]"#.to_owned()),
+        )]);
+        assert_eq!(
+            super::resolve_scopes_from_args(&as_string).expect("string form resolves"),
+            Some(r#"["org:123:rwa"]"#.to_owned()),
+            "a string passes through verbatim"
+        );
+
+        let numeric = scope_args(vec![("scopes", json!(5))]);
+        let err = super::resolve_scopes_from_args(&numeric)
+            .expect_err("a numeric scopes value must be rejected, not ignored");
+        assert!(
+            result_to_string(&err).contains("scopes must be a JSON array"),
+            "the rejection must explain the accepted shape"
+        );
+    }
+
+    /// Raw and structured are two spellings of one field; the CLI refuses both
+    /// at once and so must MCP.
+    #[test]
+    fn raw_scopes_with_a_structured_selector_is_rejected() {
+        let args = scope_args(vec![
+            ("scopes", json!(["org:123:rwa"])),
+            ("org", Value::String("123".to_owned())),
+        ]);
+        let err =
+            super::resolve_scopes_from_args(&args).expect_err("raw + structured must be rejected");
+        let text = result_to_string(&err);
+        assert!(
+            text.contains("cannot be combined with the structured scope parameters")
+                && text.contains("org"),
+            "the rejection must name the offending selector: {text}"
+        );
+    }
+
+    /// Partial intent is the shared resolver's rule, and its wording is the
+    /// resolver's too — MCP propagates rather than re-states it.
+    #[test]
+    fn partial_intent_is_rejected_by_the_shared_resolver() {
+        let args = scope_args(vec![("admin", Value::Bool(true))]);
+        let err = super::resolve_scopes_from_args(&args)
+            .expect_err("`admin` with no selector must be rejected");
+        let text = result_to_string(&err);
+        assert!(
+            text.contains("admin needs at least one of")
+                && text.contains("org/workspace/share/all"),
+            "the resolver's own rule must reach the caller: {text}"
+        );
+        // …in MCP spelling. `--admin` names a flag an MCP client cannot send,
+        // so a caller told to pass one has nowhere to go.
+        for flag in ["--admin", "--org", "--workspace", "--share", "--all"] {
+            assert!(
+                !text.contains(flag),
+                "the MCP surface must not name `{flag}`: {text}"
+            );
+        }
+    }
+
+    /// A SUPPLIED entity selector that parses to nothing is a blank id, not
+    /// "no scoping requested".
+    ///
+    /// `string_list_arg` drops blank CSV items and accepts `[]`, so every one
+    /// of these spellings used to resolve to `Ok(None)` — the `scopes` field
+    /// would then be omitted entirely and `api-key-create` would mint a
+    /// FULL-ACCESS key while reporting success for the scoped one that was
+    /// asked for.
+    #[test]
+    fn a_supplied_but_empty_entity_selector_is_a_blank_id() {
+        for (key, value) in [
+            ("org", Value::String(String::new())),
+            ("org", json!([])),
+            ("org", Value::String(" , ".to_owned())),
+            ("workspace", Value::String(String::new())),
+            ("share", json!([])),
+        ] {
+            let args = scope_args(vec![(key, value.clone())]);
+            let err = super::resolve_scopes_from_args(&args)
+                .expect_err("a supplied-but-empty selector must be rejected");
+            let text = result_to_string(&err);
+            assert!(
+                text.contains(&format!("{key} id must not be blank")),
+                "{key} = {value} must report a blank id, got: {text}"
+            );
+            assert!(
+                !text.contains(&format!("--{key}")),
+                "the MCP surface must not name a CLI flag: {text}"
+            );
+        }
+    }
+
+    /// The wire-level half of the rule above: the malformed create is refused
+    /// BEFORE any request is sent, so no key is minted at all.
+    #[tokio::test]
+    async fn auth_api_key_create_with_a_blank_selector_sends_nothing() {
+        for value in [
+            Value::String(String::new()),
+            json!([]),
+            Value::String(" , ".to_owned()),
+        ] {
+            let (router, captured) = capture_router().await;
+            let mut args = Map::new();
+            args.insert(
+                "action".to_owned(),
+                Value::String("api-key-create".to_owned()),
+            );
+            args.insert("name".to_owned(), Value::String("ci".to_owned()));
+            args.insert("org".to_owned(), value.clone());
+            let res = router.call_tool("auth", args).await.expect("call_tool ok");
+            let text = result_to_string(&res);
+            assert!(
+                text.contains("org id must not be blank") && !text.contains("--org"),
+                "org = {value} must be refused in MCP spelling, got: {text}"
+            );
+            assert!(
+                captured.lock().expect("capture lock").is_empty(),
+                "a refused create must not reach the server (org = {value})"
+            );
+        }
+    }
+
+    /// The update form of the same trap: with another field set, an omitted
+    /// `scopes` is a VALID update that silently leaves the key's scopes exactly
+    /// as they were, so the blank selector has to be an error rather than a
+    /// no-op.
+    #[tokio::test]
+    async fn auth_api_key_update_with_a_blank_selector_is_refused() {
+        let (router, captured) = capture_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("api-key-update".to_owned()),
+        );
+        args.insert("key_id".to_owned(), Value::String("key-123".to_owned()));
+        args.insert("name".to_owned(), Value::String("ci".to_owned()));
+        args.insert("org".to_owned(), json!([]));
+        let res = router.call_tool("auth", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("org id must not be blank") && !text.contains("--org"),
+            "a blank selector must not be silently dropped, got: {text}"
+        );
+        assert!(
+            captured.lock().expect("capture lock").is_empty(),
+            "a refused update must not reach the server"
+        );
+    }
+
+    /// `admin: false` is an explicit NO, not structured input, so it does not
+    /// conflict with a raw `scopes` array — reading key PRESENCE rather than
+    /// the parsed value would refuse a perfectly ordinary call.
+    #[test]
+    fn a_false_boolean_selector_does_not_conflict_with_raw_scopes() {
+        let args = scope_args(vec![
+            ("scopes", json!(["org:123:rwa"])),
+            ("admin", Value::Bool(false)),
+        ]);
+        assert_eq!(
+            super::resolve_scopes_from_args(&args).expect("admin:false is not a selector"),
+            Some(r#"["org:123:rwa"]"#.to_owned())
+        );
+
+        // …while a SUPPLIED entity selector still conflicts, blank or not: the
+        // conflict is reported ahead of the blank-id check so the caller sees
+        // the real mistake.
+        let blank = scope_args(vec![
+            ("scopes", json!(["org:123:rwa"])),
+            ("org", Value::String(String::new())),
+        ]);
+        let err = super::resolve_scopes_from_args(&blank)
+            .expect_err("raw + a supplied selector must be rejected");
+        let text = result_to_string(&err);
+        assert!(
+            text.contains("cannot be combined with the structured scope parameters"),
+            "the conflict outranks the blank id: {text}"
+        );
+    }
+
+    /// No scope input at all means no `scopes` field — today's behaviour, and
+    /// the difference between "leave it alone" and "restrict it to nothing".
+    #[test]
+    fn no_scope_input_yields_no_scopes_field() {
+        let args = scope_args(vec![("name", Value::String("ci".to_owned()))]);
+        assert_eq!(
+            super::resolve_scopes_from_args(&args).expect("resolves"),
+            None
+        );
+    }
+
+    /// The emptiness guard must see the RESOLVED scopes: an update carrying
+    /// only `org` + `admin` is a complete update, not an empty one.
+    #[tokio::test]
+    async fn auth_api_key_update_accepts_a_structured_scope_only_update() {
+        let (router, captured) = capture_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("api-key-update".to_owned()),
+        );
+        args.insert("key_id".to_owned(), Value::String("key-123".to_owned()));
+        args.insert("org".to_owned(), Value::String("123".to_owned()));
+        args.insert("admin".to_owned(), Value::Bool(true));
+        let res = router.call_tool("auth", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("at least one update field is required"),
+            "org + admin is a complete update, got: {text}"
+        );
+
+        let req = captured.lock().expect("capture lock").clone();
+        assert!(!req.is_empty(), "the capture server saw no request at all");
+        assert!(
+            req.contains("scopes=") && req.contains("rwa"),
+            "the resolved admin scope must reach the wire:\n{req}"
+        );
+    }
+
+    /// `signin` is basic auth: it cannot request an access mode, so refusing is
+    /// the only honest answer. Ignoring the param would hand back a credential
+    /// that differs from the one asked for, with nothing to notice.
+    /// A value of `param` that actually ASKS for the access it names.
+    ///
+    /// `true` is intent for a boolean but nonsense for an id list — and a
+    /// wrong-typed value would be refused by the extractor rather than by the
+    /// sign-in guard, which would make the assertions below pass for the wrong
+    /// reason.
+    fn signin_intent_value(param: &str) -> Value {
+        match param {
+            "admin" | "read_only" | "account_settings" | "all" => Value::Bool(true),
+            "scopes" => json!(["org:123:rwa"]),
+            _ => Value::String("123".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_signin_rejects_access_mode_params() {
+        for param in super::SIGNIN_REJECTED_ACCESS_PARAMS {
+            let router = authed_router().await;
+            let mut args = Map::new();
+            args.insert("action".to_owned(), Value::String("signin".to_owned()));
+            args.insert(
+                "email".to_owned(),
+                Value::String("someone@example.com".to_owned()),
+            );
+            args.insert("password".to_owned(), Value::String("pw".to_owned()));
+            args.insert((*param).to_owned(), signin_intent_value(param));
+            let res = router.call_tool("auth", args).await.expect("call_tool ok");
+            let text = result_to_string(&res);
+            assert!(
+                text.contains(&format!("`{param}` is not accepted by action=signin")),
+                "signin must refuse `{param}`, got: {text}"
+            );
+            assert!(
+                text.contains("fastio auth login"),
+                "the refusal must name the browser login path, got: {text}"
+            );
+            assert!(
+                text.contains("api-key-create"),
+                "the refusal must name the action that DOES issue a scoped \
+                 credential, got: {text}"
+            );
+            // The mode flags are OPTIONAL on api-key-create — the default
+            // without either is read-write. Advice that reads as "you must
+            // also pass admin or read_only" sends the reader to a second,
+            // avoidable error.
+            assert!(
+                text.contains("optional"),
+                "the recovery must say the access-mode flags are optional, \
+                 got: {text}"
+            );
+        }
+    }
+
+    /// The narrowing selectors are refused for the same reason as the
+    /// ceilings: basic auth issues the credential's default access, so a
+    /// caller that asked for a scoped credential and got a full-access one has
+    /// nothing to notice it by.
+    #[test]
+    fn signin_refuses_every_scope_and_access_parameter() {
+        for key in ["scopes", "org", "workspace", "share", "all"] {
+            assert!(
+                super::SIGNIN_REJECTED_ACCESS_PARAMS.contains(&key),
+                "`{key}` must be refused by signin"
+            );
+        }
+        for key in super::STRUCTURED_SCOPE_PARAMS {
+            assert!(
+                super::SIGNIN_REJECTED_ACCESS_PARAMS.contains(key),
+                "every structured selector must be refused by signin, `{key}` is not"
+            );
+        }
+    }
+
+    /// The negative control for the test above: a plain signin is untouched.
+    /// Without it, a guard that rejected EVERY signin would still pass.
+    #[tokio::test]
+    async fn auth_signin_without_access_params_is_not_refused() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("signin".to_owned()));
+        args.insert(
+            "email".to_owned(),
+            Value::String("someone@example.com".to_owned()),
+        );
+        args.insert("password".to_owned(), Value::String("pw".to_owned()));
+        let res = router.call_tool("auth", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("is not accepted by action=signin"),
+            "a plain signin must reach the network attempt, got: {text}"
+        );
+    }
+
+    /// `POST /user/auth/key/` answers with the whole envelope, so the flattened
+    /// `extra` carries the envelope's own `result` marker. It is transport
+    /// bookkeeping, not a field of the key, and must not be rendered.
+    #[test]
+    fn api_key_create_payload_keeps_the_key_fields_and_drops_result() {
+        let resp: super::api::types::ApiKeyCreateResponse = serde_json::from_value(json!({
+            "result": "yes",
+            "api_key": "secret-value",
+            "id": "key-abc123",
+            "memo": "ci-key",
+            "scopes": "[\"org:123:rwa\"]",
+            "agent_name": "ci",
+            "created": 1,
+            "expires": 2,
+            "admin": true,
+            "legacy": false,
+        }))
+        .expect("create response deserializes");
+
+        let payload = super::api_key_create_payload(&resp);
+        let obj = payload.as_object().expect("payload is an object");
+
+        assert!(
+            !obj.contains_key("result"),
+            "the envelope's own result marker must not be rendered: {obj:?}"
+        );
+        for field in [
+            "api_key",
+            "id",
+            "memo",
+            "scopes",
+            "agent_name",
+            "created",
+            "expires",
+            "admin",
+            "legacy",
+        ] {
+            assert!(
+                obj.contains_key(field),
+                "`{field}` belongs to the created key and must be returned: {obj:?}"
+            );
+        }
+    }
+
+    /// The same thing end to end: the rendered content carries the id the
+    /// caller needs to manage the key later, not just the secret.
+    #[tokio::test]
+    async fn auth_api_key_create_returns_the_full_key_object() {
+        let (router, _captured) = router_answering(
+            br#"{"result":"yes","api_key":"secret-value","id":"key-abc123","memo":"ci-key","legacy":false}"#,
+        )
+        .await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("api-key-create".to_owned()),
+        );
+        args.insert("org".to_owned(), Value::String("123".to_owned()));
+        args.insert("admin".to_owned(), Value::Bool(true));
+        let res = router.call_tool("auth", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+
+        assert!(
+            text.contains("key-abc123") && text.contains("ci-key"),
+            "the created key's id and memo must be returned, got: {text}"
+        );
+        assert!(
+            text.contains("secret-value"),
+            "the key value itself must still be returned, got: {text}"
+        );
+    }
+
+    /// `oauth-narrow` must reach `PATCH /oauth/sessions/{id}/` with the
+    /// resolved scopes in the body. Asserted at the wire because a scope
+    /// resolved in memory and never sent looks identical from inside the
+    /// handler.
+    #[tokio::test]
+    async fn auth_oauth_narrow_sends_scopes_to_the_session_endpoint() {
+        let (router, captured) = capture_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("oauth-narrow".to_owned()),
+        );
+        args.insert("session_id".to_owned(), Value::String("sess-1".to_owned()));
+        args.insert("workspace".to_owned(), Value::String("456".to_owned()));
+        args.insert("read_only".to_owned(), Value::Bool(true));
+        let _ = router.call_tool("auth", args).await.expect("call_tool ok");
+
+        let req = captured.lock().expect("capture lock").clone();
+        assert!(!req.is_empty(), "the capture server saw no request at all");
+        assert!(
+            req.contains("PATCH /oauth/sessions/sess-1/"),
+            "oauth-narrow must PATCH the session endpoint:\n{req}"
+        );
+        assert!(
+            req.contains("scopes="),
+            "the narrowed scopes must reach the body:\n{req}"
+        );
+        assert!(
+            req.contains("workspace") && req.contains("%3Ar"),
+            "the resolved read-only workspace scope must be what is sent:\n{req}"
+        );
+    }
+
+    /// `oauth-narrow` with no scopes at all is a caller mistake, not a no-op:
+    /// there is no other field on this action to change.
+    #[tokio::test]
+    async fn auth_oauth_narrow_requires_scopes() {
+        let router = authed_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("oauth-narrow".to_owned()),
+        );
+        args.insert("session_id".to_owned(), Value::String("sess-1".to_owned()));
+        let res = router.call_tool("auth", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        // The WHOLE message, not a prefix: the tail is where it names the
+        // selectors, and a prefix assertion cannot see the tail drift out of
+        // step with the resolver.
+        assert!(
+            text.contains(
+                "oauth-narrow needs the scopes to narrow to: supply `scopes` (a JSON array of \
+                 entity scope strings), or org/workspace/share/all (optionally with admin or \
+                 read_only), and/or account_settings"
+            ),
+            "an empty narrow must be rejected with the full guidance, got: {text}"
+        );
+    }
+
+    /// A key the schema does not declare is a MISSPELLED selector, and a
+    /// misspelled selector used to be dropped in silence — the credential then
+    /// came back wider than the one asked for, reported as success.
+    ///
+    /// The list is the observed spellings: the hyphen form of a `snake_case`
+    /// param, the CLI flag form, the singular, a stray suffix, a plural.
+    #[test]
+    fn undeclared_scope_keys_are_refused_rather_than_dropped() {
+        // Positive control: the declared spelling still resolves, so the
+        // assertions below cannot pass by refusing everything.
+        let good = scope_args(vec![
+            ("org", Value::String("123".to_owned())),
+            ("read_only", Value::Bool(true)),
+        ]);
+        assert_eq!(
+            super::resolve_scopes_from_args(&good).expect("the declared spelling resolves"),
+            Some(r#"["org:123:r"]"#.to_owned())
+        );
+
+        for key in [
+            "read-only",
+            "account-settings",
+            "--org",
+            "--workspace",
+            "--share",
+            "--all",
+            "scope",
+            "scopes_",
+            "orgs",
+        ] {
+            let args = scope_args(vec![
+                ("org", Value::String("123".to_owned())),
+                (key, Value::Bool(true)),
+            ]);
+            let err = super::resolve_scopes_from_args(&args)
+                .expect_err("an undeclared key must be refused");
+            let text = result_to_string(&err);
+            assert!(
+                text.contains(&format!("unknown parameter `{key}`")),
+                "the refusal must NAME the unknown key `{key}`: {text}"
+            );
+            assert!(
+                text.contains("Accepted parameters:")
+                    && text.contains("read_only")
+                    && text.contains("account_settings"),
+                "the refusal must list the accepted spellings: {text}"
+            );
+        }
+    }
+
+    /// The hyphen form specifically: `read-only` must NOT fall through to the
+    /// default `rw`, which is a WIDER credential than the one requested.
+    #[test]
+    fn a_hyphenated_read_only_never_resolves_to_read_write() {
+        let args = scope_args(vec![
+            ("org", Value::String("123".to_owned())),
+            ("read-only", Value::Bool(true)),
+        ]);
+        let err = super::resolve_scopes_from_args(&args)
+            .expect_err("`read-only` must not be silently dropped");
+        let text = result_to_string(&err);
+        assert!(
+            text.contains("unknown parameter `read-only`"),
+            "the misspelling must be named: {text}"
+        );
+        assert!(
+            !text.contains("org:123:rw"),
+            "the request must not have resolved to the wider rw mode: {text}"
+        );
+
+        // The mode it was asking for, spelled the declared way.
+        let correct = scope_args(vec![
+            ("org", Value::String("123".to_owned())),
+            ("read_only", Value::Bool(true)),
+        ]);
+        assert_eq!(
+            super::resolve_scopes_from_args(&correct).expect("the declared spelling resolves"),
+            Some(r#"["org:123:r"]"#.to_owned())
+        );
+    }
+
+    /// The accepted set is DERIVED from the published schema, not hand-listed.
+    ///
+    /// A hand-written list goes stale the next time a parameter is added, and a
+    /// stale accepted-set is the same defect wearing the guard's clothes: the
+    /// new parameter is refused, or a removed one is still waved through.
+    #[test]
+    fn the_accepted_keys_are_exactly_the_published_schema_properties() {
+        let props = auth_schema_properties();
+        assert!(
+            props.contains_key("scopes") && props.contains_key("action"),
+            "the auth schema did not resolve, so this test would pass vacuously: {props:?}"
+        );
+
+        let accepted: Vec<&str> = super::auth_declared_params().collect();
+        for key in props.keys() {
+            assert!(
+                accepted.contains(&key.as_str()),
+                "`{key}` is advertised by the schema but not accepted: {accepted:?}"
+            );
+        }
+        for key in &accepted {
+            assert!(
+                props.contains_key(*key),
+                "`{key}` is accepted but not advertised by the schema"
+            );
+        }
+    }
+
+    /// The wire half of the guard: a misspelled selector is refused BEFORE any
+    /// request, so no credential is minted at all.
+    #[tokio::test]
+    async fn auth_api_key_create_with_an_unknown_key_sends_nothing() {
+        let (router, captured) = capture_router().await;
+        let mut args = Map::new();
+        args.insert(
+            "action".to_owned(),
+            Value::String("api-key-create".to_owned()),
+        );
+        args.insert("name".to_owned(), Value::String("ci".to_owned()));
+        args.insert("--workspace".to_owned(), json!(["999"]));
+        let res = router.call_tool("auth", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("unknown parameter `--workspace`"),
+            "the flag spelling must be refused by name, got: {text}"
+        );
+        assert!(
+            captured.lock().expect("capture lock").is_empty(),
+            "a refused create must not reach the server"
+        );
+    }
+
+    /// A blank raw `scopes` is the same request as none at all — forwarding it
+    /// would narrow the session to an empty grant instead of saying what is
+    /// wrong.
+    #[tokio::test]
+    async fn auth_oauth_narrow_refuses_a_blank_raw_scopes() {
+        for value in ["", "   "] {
+            let (router, captured) = capture_router().await;
+            let mut args = Map::new();
+            args.insert(
+                "action".to_owned(),
+                Value::String("oauth-narrow".to_owned()),
+            );
+            args.insert("session_id".to_owned(), Value::String("sess-1".to_owned()));
+            args.insert("scopes".to_owned(), Value::String(value.to_owned()));
+            let res = router.call_tool("auth", args).await.expect("call_tool ok");
+            let text = result_to_string(&res);
+            assert!(
+                text.contains("oauth-narrow needs the scopes to narrow to"),
+                "scopes = {value:?} must be refused, got: {text}"
+            );
+            assert!(
+                captured.lock().expect("capture lock").is_empty(),
+                "a refused narrow must not reach the server (scopes = {value:?})"
+            );
+        }
+    }
+
+    /// An access param that expresses NO intent must not block a sign-in.
+    ///
+    /// `admin: false` and `org: ""` are how a client spells "no"; refusing the
+    /// call over them turns a legitimate sign-in into an error the caller
+    /// cannot act on.
+    #[tokio::test]
+    async fn auth_signin_proceeds_when_access_params_express_no_intent() {
+        for (key, value) in [
+            ("admin", Value::Bool(false)),
+            ("admin", Value::String("false".to_owned())),
+            ("org", Value::String(String::new())),
+            ("scopes", Value::String(String::new())),
+        ] {
+            let (router, captured) = capture_router().await;
+            let mut args = Map::new();
+            args.insert("action".to_owned(), Value::String("signin".to_owned()));
+            args.insert(
+                "email".to_owned(),
+                Value::String("someone@example.com".to_owned()),
+            );
+            args.insert("password".to_owned(), Value::String("pw".to_owned()));
+            args.insert(key.to_owned(), value.clone());
+            let res = router.call_tool("auth", args).await.expect("call_tool ok");
+            let text = result_to_string(&res);
+            assert!(
+                !text.contains("is not accepted by action=signin"),
+                "{key} = {value} expresses no intent and must not be refused, got: {text}"
+            );
+            let req = captured.lock().expect("capture lock").clone();
+            assert!(
+                req.contains("GET /user/auth/"),
+                "{key} = {value} must still reach the sign-in endpoint:\n{req}"
+            );
+        }
+    }
+
+    /// The negative control for the test above: a param that DOES express
+    /// intent is still refused, so the relaxation did not open the guard.
+    #[tokio::test]
+    async fn auth_signin_still_refuses_an_access_param_that_asks_for_something() {
+        let (router, captured) = capture_router().await;
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("signin".to_owned()));
+        args.insert(
+            "email".to_owned(),
+            Value::String("someone@example.com".to_owned()),
+        );
+        args.insert("password".to_owned(), Value::String("pw".to_owned()));
+        args.insert("admin".to_owned(), Value::Bool(true));
+        let res = router.call_tool("auth", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("`admin` is not accepted by action=signin"),
+            "admin = true must still be refused, got: {text}"
+        );
+        assert!(
+            captured.lock().expect("capture lock").is_empty(),
+            "a refused signin must not reach the server"
         );
     }
 }

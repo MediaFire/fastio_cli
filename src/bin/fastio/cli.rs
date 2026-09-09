@@ -1318,6 +1318,24 @@ pub enum AuthCommands {
         /// per agent process to keep them separable.
         #[arg(long)]
         agent_name: Option<String>,
+        /// Request an admin (`rwa`) access mode for the resulting credential.
+        ///
+        /// This asks for a CEILING, not a role: `rwa` is the most the login may
+        /// be granted, and the consent page may narrow it to less. Run
+        /// `fastio auth scopes` after signing in to see what was actually
+        /// granted. Applies to browser (PKCE) login only.
+        #[arg(long, conflicts_with = "read_only")]
+        admin: bool,
+        /// Request a read-only (`r`) access mode for the resulting credential.
+        ///
+        /// A ceiling like --admin: the consent page may narrow it further.
+        /// Applies to browser (PKCE) login only.
+        #[arg(long)]
+        read_only: bool,
+        /// Also request permission to change account settings
+        /// (`userdetails:*:rw`). Applies to browser (PKCE) login only.
+        #[arg(long)]
+        account_settings: bool,
     },
     /// Clear stored credentials for the current profile (local only).
     Logout,
@@ -1461,6 +1479,78 @@ pub enum TwoFaCommands {
     },
 }
 
+/// Structured scope selectors shared by `api-key create`, `api-key update`
+/// and `oauth narrow`.
+///
+/// The selectors (`--org` / `--workspace` / `--share` / `--all`) name WHAT the
+/// credential may reach; the mode flags (`--admin` / `--read-only`) set the
+/// access mode applied to them, defaulting to read/write. They resolve to the
+/// same `entity_type:entity_id:access_mode` array a raw `--scopes` would carry,
+/// so the two are mutually exclusive.
+// The four bools are independent command-line switches, not a state machine —
+// same reasoning as `SearchModeArgs`: clap models a `--flag` as a bool, and the
+// combinations are enforced declaratively by `conflicts_with` plus the shared
+// resolver.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct KeyScopeArgs {
+    /// Select an organization by id. Repeatable.
+    #[arg(long)]
+    pub org: Vec<String>,
+    /// Select a workspace by id. Repeatable.
+    #[arg(long)]
+    pub workspace: Vec<String>,
+    /// Select a share by id. Repeatable.
+    #[arg(long)]
+    pub share: Vec<String>,
+    /// Select every resource on the account (`user:*`).
+    #[arg(long, conflicts_with_all = ["org", "workspace", "share"])]
+    pub all: bool,
+    /// Select an admin (`rwa`) access mode for the selected resources.
+    ///
+    /// A CEILING, never a role: `rwa` is the most the resulting credential may
+    /// do. These commands send an EXACT scope set — the server REFUSES a set
+    /// wider than the credential you are calling with, it never silently
+    /// narrows one. (`auth login --admin` is the other rule: there the request
+    /// is a ceiling the consent page MAY narrow.)
+    #[arg(long, conflicts_with = "read_only")]
+    pub admin: bool,
+    /// Select a read-only (`r`) access mode for the selected resources.
+    #[arg(long)]
+    pub read_only: bool,
+    /// Also include account settings changes (`userdetails:*:rw`).
+    #[arg(long)]
+    pub account_settings: bool,
+}
+
+impl KeyScopeArgs {
+    /// Resolve the flags into the shared library scope specification.
+    #[must_use]
+    pub fn to_spec(&self) -> fastio_cli::api::auth::ApiKeyScopeSpec {
+        fastio_cli::api::auth::ApiKeyScopeSpec {
+            org: self.org.clone(),
+            workspace: self.workspace.clone(),
+            share: self.share.clone(),
+            all: self.all,
+            admin: self.admin,
+            read_only: self.read_only,
+            account_settings: self.account_settings,
+        }
+    }
+}
+
+/// Every clap arg id contributed by [`KeyScopeArgs`], for the raw `--scopes`
+/// conflict lists. Keep in step with the struct above.
+const KEY_SCOPE_ARG_IDS: [&str; 7] = [
+    "org",
+    "workspace",
+    "share",
+    "all",
+    "admin",
+    "read_only",
+    "account_settings",
+];
+
 /// API key subcommands.
 #[derive(Subcommand, Debug)]
 #[non_exhaustive]
@@ -1470,8 +1560,10 @@ pub enum ApiKeyCommands {
         /// Key label / memo.
         #[arg(long)]
         name: Option<String>,
-        /// Scopes as a JSON array string.
-        #[arg(long)]
+        /// Scopes as a JSON array string. Mutually exclusive with the
+        /// structured selectors (--org / --workspace / --share / --all /
+        /// --admin / --read-only / --account-settings).
+        #[arg(long, conflicts_with_all = KEY_SCOPE_ARG_IDS)]
         scopes: Option<String>,
         /// Agent or application name for tracking (max 128 characters).
         #[arg(long = "agent-name")]
@@ -1481,6 +1573,10 @@ pub enum ApiKeyCommands {
         /// expiration.
         #[arg(long)]
         expires: Option<String>,
+        /// Structured spelling of the new key's scope set, in place of a raw
+        /// `--scopes` array.
+        #[command(flatten)]
+        scope_selectors: KeyScopeArgs,
     },
     /// List all API keys.
     List,
@@ -1496,14 +1592,24 @@ pub enum ApiKeyCommands {
         key_id: String,
     },
     /// Update an API key.
+    ///
+    /// Scope changes are a WHOLESALE REPLACEMENT: whatever the scope flags (or
+    /// `--scopes`) resolve to becomes the key's entire scope set. Run `fastio
+    /// auth api-key get <key-id>` first and re-state every scope the key should
+    /// keep. The new set takes effect immediately.
     Update {
         /// The API key ID.
         key_id: String,
         /// New label / memo.
         #[arg(long)]
         name: Option<String>,
-        /// New scopes.
-        #[arg(long)]
+        /// New scopes as a JSON array string. An empty string ("") or "null"
+        /// clears the key's scope set, RESTORING FULL ACCESS to everything the
+        /// issuing credential can reach — it does not leave the key with no
+        /// access. Mutually exclusive with the structured selectors (--org /
+        /// --workspace / --share / --all / --admin / --read-only /
+        /// --account-settings).
+        #[arg(long, conflicts_with_all = KEY_SCOPE_ARG_IDS)]
         scopes: Option<String>,
         /// New agent or application name (max 128 characters; empty string clears).
         #[arg(long = "agent-name")]
@@ -1512,6 +1618,10 @@ pub enum ApiKeyCommands {
         /// an existing expiration.
         #[arg(long)]
         expires: Option<String>,
+        /// Structured spelling of the replacement scope set, in place of a raw
+        /// `--scopes` array. Wholesale, like `--scopes`.
+        #[command(flatten)]
+        scope_selectors: KeyScopeArgs,
     },
 }
 
@@ -1536,6 +1646,26 @@ pub enum OauthCommands {
         /// New agent name (max 128 characters; empty string clears to null).
         #[arg(long = "agent-name")]
         agent_name: Option<String>,
+    },
+    /// Narrow a session's granted scopes.
+    ///
+    /// The server accepts a narrower-or-equal set only and refuses anything
+    /// that would widen the session, so this can give up authority but never
+    /// add it. The change takes effect at the session's next token refresh —
+    /// an access token already issued keeps its original scopes until then.
+    Narrow {
+        /// Session ID.
+        session_id: String,
+        /// Replacement scopes as a JSON array string. Mutually exclusive with
+        /// the structured selectors (--org / --workspace / --share / --all /
+        /// --admin / --read-only / --account-settings).
+        #[arg(long, conflicts_with_all = KEY_SCOPE_ARG_IDS)]
+        scopes: Option<String>,
+        /// Structured spelling of the session's replacement scope set, in place
+        /// of a raw `--scopes` array. Must be narrower than, or equal to, what
+        /// the session already holds.
+        #[command(flatten)]
+        scope_selectors: KeyScopeArgs,
     },
     /// Revoke a single session.
     Revoke {
@@ -7020,11 +7150,17 @@ impl fmt::Debug for AuthCommands {
                 email,
                 password: _,
                 agent_name,
+                admin,
+                read_only,
+                account_settings,
             } => f
                 .debug_struct("Login")
                 .field("email", email)
                 .field("password", &"[REDACTED]")
                 .field("agent_name", agent_name)
+                .field("admin", admin)
+                .field("read_only", read_only)
+                .field("account_settings", account_settings)
                 .finish(),
             Self::Signup {
                 email,
@@ -9373,5 +9509,294 @@ mod content_surface_tests {
                 assert_eq!(actual, expected, "{label} with {arg:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod key_scope_flag_tests {
+    use super::{ApiKeyCommands, AuthCommands, Cli, Commands, OauthCommands};
+    use clap::Parser;
+
+    /// Every surface that carries the structured scope selectors, as the argv
+    /// prefix that reaches them.
+    const SCOPED_SURFACES: [&[&str]; 3] = [
+        &["fastio", "auth", "api-key", "create"],
+        &["fastio", "auth", "api-key", "update", "k1"],
+        &["fastio", "auth", "oauth", "narrow", "s1"],
+    ];
+
+    /// Parse argv, panicking on a parse error with the clap message (so the
+    /// cause is visible).
+    fn cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).unwrap_or_else(|e| panic!("parse failed: {e}"))
+    }
+
+    fn parse_with(prefix: &[&str], extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv: Vec<&str> = prefix.to_vec();
+        argv.extend_from_slice(extra);
+        Cli::try_parse_from(argv)
+    }
+
+    /// The access-mode ceiling is a single choice, so the two mode flags must
+    /// be refused together on EVERY surface that offers them — including
+    /// `login`, which carries its own copies rather than the flattened struct.
+    #[test]
+    fn admin_and_read_only_conflict_everywhere() {
+        assert!(
+            Cli::try_parse_from(["fastio", "auth", "login", "--admin", "--read-only"]).is_err(),
+            "login must refuse both mode flags"
+        );
+        for prefix in SCOPED_SURFACES {
+            assert!(
+                parse_with(prefix, &["--admin", "--read-only"]).is_err(),
+                "{prefix:?} must refuse both mode flags"
+            );
+        }
+    }
+
+    /// `--all` already names every resource, so pairing it with a specific
+    /// selector is an incoherent request, not a union.
+    #[test]
+    fn all_conflicts_with_each_specific_selector() {
+        for prefix in SCOPED_SURFACES {
+            for selector in [
+                ["--org", "12345"],
+                ["--workspace", "222"],
+                ["--share", "333"],
+            ] {
+                let extra = ["--all", selector[0], selector[1]];
+                assert!(
+                    parse_with(prefix, &extra).is_err(),
+                    "{prefix:?} must refuse --all with {}",
+                    selector[0]
+                );
+            }
+        }
+    }
+
+    /// A raw `--scopes` array and the structured selectors are two spellings of
+    /// the same field. Refusing the combination at the clap layer is what makes
+    /// "which one wins?" a question nobody has to answer.
+    #[test]
+    fn raw_scopes_conflicts_with_every_structured_flag() {
+        let structured: [&[&str]; 7] = [
+            &["--org", "12345"],
+            &["--workspace", "222"],
+            &["--share", "333"],
+            &["--all"],
+            &["--admin"],
+            &["--read-only"],
+            &["--account-settings"],
+        ];
+        for prefix in SCOPED_SURFACES {
+            for flags in structured {
+                let mut extra = vec!["--scopes", "[]"];
+                extra.extend_from_slice(flags);
+                assert!(
+                    parse_with(prefix, &extra).is_err(),
+                    "{prefix:?} must refuse --scopes with {flags:?}"
+                );
+            }
+        }
+    }
+
+    /// POSITIVE CONTROL for the three tests above: the combinations that must
+    /// still work, proving the conflicts are targeted rather than a blanket
+    /// refusal that would make every negative assertion pass for free.
+    #[test]
+    fn valid_scope_combinations_parse() {
+        for prefix in SCOPED_SURFACES {
+            for extra in [
+                vec!["--org", "12345", "--admin"],
+                vec!["--all", "--read-only"],
+                vec!["--account-settings"],
+                vec!["--scopes", "[]"],
+                vec!["--org", "12345", "--org", "67890", "--workspace", "222"],
+            ] {
+                assert!(
+                    parse_with(prefix, &extra).is_ok(),
+                    "{prefix:?} must accept {extra:?}"
+                );
+            }
+        }
+        // The same combinations on `login`, which has no selectors — only the
+        // mode flags and the account-settings request.
+        for extra in [
+            vec!["--admin"],
+            vec!["--read-only"],
+            vec!["--account-settings"],
+            vec!["--admin", "--account-settings"],
+        ] {
+            let mut argv = vec!["fastio", "auth", "login"];
+            argv.extend_from_slice(&extra);
+            assert!(
+                Cli::try_parse_from(argv).is_ok(),
+                "login must accept {extra:?}"
+            );
+        }
+    }
+
+    /// The selectors are repeatable and land on the right fields — a conflict
+    /// matrix alone cannot show that the values survive parsing.
+    #[test]
+    fn selectors_collect_repeated_values() {
+        let parsed = cli(&[
+            "fastio",
+            "auth",
+            "api-key",
+            "create",
+            "--org",
+            "12345",
+            "--org",
+            "67890",
+            "--workspace",
+            "222",
+            "--share",
+            "333",
+            "--admin",
+            "--account-settings",
+        ]);
+        let Commands::Auth(AuthCommands::ApiKey(ApiKeyCommands::Create {
+            scope_selectors, ..
+        })) = parsed.command
+        else {
+            panic!("expected auth api-key create");
+        };
+        assert_eq!(scope_selectors.org, ["12345", "67890"]);
+        assert_eq!(scope_selectors.workspace, ["222"]);
+        assert_eq!(scope_selectors.share, ["333"]);
+        assert!(scope_selectors.admin);
+        assert!(scope_selectors.account_settings);
+        assert!(!scope_selectors.all);
+        assert!(!scope_selectors.read_only);
+
+        let spec = scope_selectors.to_spec();
+        assert_eq!(spec.org, ["12345", "67890"]);
+        assert!(spec.admin && spec.account_settings);
+    }
+
+    /// `oauth narrow` takes the session id positionally and accepts either
+    /// spelling of the scope set.
+    #[test]
+    fn oauth_narrow_parses_both_scope_spellings() {
+        let parsed = cli(&["fastio", "auth", "oauth", "narrow", "s1", "--org", "12345"]);
+        let Commands::Auth(AuthCommands::Oauth(OauthCommands::Narrow {
+            session_id,
+            scopes,
+            scope_selectors,
+        })) = parsed.command
+        else {
+            panic!("expected auth oauth narrow");
+        };
+        assert_eq!(session_id, "s1");
+        assert!(scopes.is_none());
+        assert_eq!(scope_selectors.org, ["12345"]);
+
+        let parsed = cli(&[
+            "fastio",
+            "auth",
+            "oauth",
+            "narrow",
+            "s1",
+            "--scopes",
+            r#"["org:1:r"]"#,
+        ]);
+        let Commands::Auth(AuthCommands::Oauth(OauthCommands::Narrow { scopes, .. })) =
+            parsed.command
+        else {
+            panic!("expected auth oauth narrow");
+        };
+        assert_eq!(scopes.as_deref(), Some(r#"["org:1:r"]"#));
+    }
+
+    /// `--access-mode` is already taken elsewhere in the CLI, so the scope
+    /// surface must never claim it (nor the shorter `--mode`) — a collision
+    /// would silently change what an existing command parses.
+    #[test]
+    fn scope_surface_never_claims_access_mode_or_mode() {
+        for prefix in SCOPED_SURFACES {
+            for flag in ["--access-mode", "--mode"] {
+                assert!(
+                    parse_with(prefix, &[flag, "rwa"]).is_err(),
+                    "{prefix:?} must not define {flag}"
+                );
+            }
+        }
+    }
+
+    /// The login flags reach the parsed command and render through the manual
+    /// `Debug` impl, which must keep redacting the password while showing the
+    /// three new (non-secret) switches.
+    #[test]
+    fn login_flags_parse_and_render_in_debug() {
+        let parsed = cli(&[
+            "fastio",
+            "auth",
+            "login",
+            "--email",
+            "a@example.com",
+            "--admin",
+            "--account-settings",
+        ]);
+        let Commands::Auth(ref auth) = parsed.command else {
+            panic!("expected auth");
+        };
+        let AuthCommands::Login {
+            ref email,
+            admin,
+            read_only,
+            account_settings,
+            ..
+        } = *auth
+        else {
+            panic!("expected auth login");
+        };
+        assert_eq!(email.as_deref(), Some("a@example.com"));
+        assert!(admin);
+        assert!(!read_only);
+        assert!(account_settings);
+
+        let rendered = format!("{auth:?}");
+        assert!(rendered.contains("admin: true"), "{rendered}");
+        assert!(rendered.contains("read_only: false"), "{rendered}");
+        assert!(rendered.contains("account_settings: true"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    }
+
+    /// Help text is where these rules are stated, and they are TWO DIFFERENT
+    /// rules — a reader who conflates them either asks for a set the server
+    /// will reject, or clears a key's scopes expecting no access and gets full
+    /// access instead.
+    #[test]
+    fn scope_help_states_the_containment_and_restore_rules() {
+        // Help wraps at whatever width the runner reports, so compare on
+        // whitespace-normalized text rather than on the wrapped lines.
+        fn long_help(args: &[&str]) -> String {
+            let err = Cli::try_parse_from(args).expect_err("--help exits through an error");
+            err.to_string()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        let update = long_help(&["fastio", "auth", "api-key", "update", "k1", "--help"]);
+        assert!(update.contains("RESTORING FULL ACCESS"), "{update}");
+        assert!(
+            update.contains(r#"An empty string ("") or "null" clears"#),
+            "the restore trigger must be spelled out: {update}"
+        );
+        assert!(
+            update.contains("the server REFUSES a set wider"),
+            "the containment rule must be visible: {update}"
+        );
+        // Operation-neutral: the same group also serves `oauth narrow`.
+        assert!(update.contains("Select an organization by id"), "{update}");
+
+        // The OTHER rule, on the one surface it applies to.
+        let login = long_help(&["fastio", "auth", "login", "--help"]);
+        assert!(
+            login.contains("the consent page may narrow it"),
+            "login asks for a ceiling, not an exact set: {login}"
+        );
     }
 }

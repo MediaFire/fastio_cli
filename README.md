@@ -78,9 +78,18 @@ The CLI supports multiple authentication methods, checked in this order:
 
 ```bash
 fastio auth login
+
+# Request an admin (`rwa`) access mode, or a read-only one
+fastio auth login --admin
+fastio auth login --read-only
+
+# Also request permission to change account settings (`userdetails:*:rw`)
+fastio auth login --account-settings
 ```
 
 Opens your browser for secure OAuth authentication. Tokens are stored locally and automatically refreshed.
+
+`--admin` and `--read-only` request a **ceiling**, not a role: the consent page may grant less than you asked for. Run `fastio auth scopes` afterwards for the live view of what the credential may do — `fastio auth status` only shows the scopes cached when the profile signed in.
 
 ### Email/Password Login
 
@@ -94,10 +103,15 @@ fastio auth login --email user@example.com --password ****
 # Create an API key
 fastio auth api-key create --name "CI pipeline"
 
+# Create one scoped to a single organization, with admin access
+fastio auth api-key create --name "release bot" --org 1234567890123456789 --admin
+
 # Use it for subsequent commands
 export FASTIO_API_KEY=your-key-here
 fastio org list
 ```
+
+Scopes are `entity_type:entity_id:access_mode` strings, where the access mode is `r`, `rw`, or `rwa` (admin). `--org` / `--workspace` / `--share` (repeatable) and `--all` select the entities, `--admin` / `--read-only` set the access mode, and `--account-settings` adds `userdetails:*:rw` for password, email, and 2FA-enrolment changes — `rwa` alone does not grant those. An `api-key update` **replaces** the key's entire scope set, so run `fastio auth api-key get <key-id>` first and re-state every scope it should keep. If those scopes do not all use the same access mode, re-state them with the raw `--scopes '[...]'` form: `--admin` and `--read-only` apply to every entity in the request, so neither can express a mixed set. A blanket `--admin` escalates a read-only scope to admin along with the one you meant to raise; a blanket `--read-only` downgrades a writable or admin scope along with the one you meant to narrow. `fastio auth oauth narrow <session-id>` gives up authority on a login session and takes effect at its next token refresh.
 
 ### Two-Factor Authentication
 

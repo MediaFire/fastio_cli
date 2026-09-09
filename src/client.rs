@@ -6023,9 +6023,93 @@ mod tests {
             "state-1",
             "http://127.0.0.1/callback",
             None,
+            crate::api::auth::AuthorizeAccess::default(),
         )
         .await;
         assert_not_replayed(&result, &seen, "the PKCE authorize");
+    }
+
+    /// The default access ceiling must change the wire not at all: no
+    /// `access_mode`, and `account_settings` OMITTED rather than sent as `0`.
+    /// A default that started sending `account_settings=0` would ask the
+    /// consent page a question the user never asked to be asked.
+    #[tokio::test]
+    async fn pkce_authorize_default_ceiling_sends_neither_new_param() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&seen);
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut acc: Vec<u8> = Vec::new();
+                let mut buf = vec![0u8; 4096];
+                // Read until the `\r\n\r\n` that ends the headers. A single
+                // `read` can return a short first segment, and every assertion
+                // here is NEGATIVE — a truncated capture would satisfy all of
+                // them while measuring nothing. This is a GET, so the headers
+                // are the whole request and no `Content-Length` is involved.
+                for _ in 0..8 {
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    acc.extend_from_slice(&buf[..n]);
+                    if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                *sink.lock().expect("capture lock") = String::from_utf8_lossy(&acc).into_owned();
+                let body =
+                    br#"{"result":"yes","response":{"auth_request_id":"ar1","expires_in":600}}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let client = ApiClient::new(&format!("http://{addr}"), None).expect("client builds");
+        let _ = crate::api::auth::pkce_authorize(
+            &client,
+            "client-1",
+            "challenge",
+            "state-1",
+            "http://127.0.0.1/callback",
+            None,
+            crate::api::auth::AuthorizeAccess::default(),
+        )
+        .await;
+
+        let request = seen.lock().expect("capture lock").clone();
+        let line = request.lines().next().unwrap_or_default();
+        // Positive control: every assertion below is negative, so a request
+        // line that was never captured — or was captured short — would pass
+        // them all. `client_id` is sent on every authorize, so its presence
+        // proves the query string reached the capture intact.
+        assert!(
+            line.contains("client_id="),
+            "the capture saw no complete authorize request line, so the \
+             assertions below would pass vacuously: {request:?}"
+        );
+        assert!(
+            !line.contains("account_settings"),
+            "the default ceiling must not send account_settings at all, got: {line}"
+        );
+        assert!(
+            !line.contains("access_mode"),
+            "the default ceiling must not send access_mode, got: {line}"
+        );
     }
 
     #[tokio::test]

@@ -68,6 +68,10 @@ If not authenticated, either:
 - Run `fastio auth login` in a terminal (recommended for browser-based login)
 - Use the `auth` tool with `action: \"signin\"` and provide email/password
 
+Once authenticated, call the `auth` tool with `action: \"scopes\"` to learn what
+the credential is actually allowed to do — the access mode it holds on each
+entity, and whether it has admin.
+
 ## Step 2: Explore Your Organizations
 Use the `org` tool with `action: \"list\"` to see your organizations.
 

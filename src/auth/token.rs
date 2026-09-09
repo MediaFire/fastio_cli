@@ -30,6 +30,34 @@ pub fn resolve_token(
     profile_name: &str,
     config_dir: &Path,
 ) -> Result<Option<String>, CliError> {
+    let env_token = std::env::var("FASTIO_TOKEN").ok();
+    let env_api_key = std::env::var("FASTIO_API_KEY").ok();
+    resolve_token_with_env(
+        flag_token,
+        env_token.as_deref(),
+        env_api_key.as_deref(),
+        profile_name,
+        config_dir,
+    )
+}
+
+/// [`resolve_token`] with the two environment credentials passed in rather than
+/// read from the process environment.
+///
+/// Mirrors [`refresh_if_needed_with_env`]: the environment lookup is ambient
+/// input that decides which credential wins, so a test that reads it is really
+/// testing whatever the test runner inherited. The public wrapper reads the
+/// environment; this takes the values.
+///
+/// # Errors
+/// Same as [`resolve_token`] — an expired stored token is a [`CliError::Auth`].
+pub fn resolve_token_with_env(
+    flag_token: Option<&str>,
+    env_token: Option<&str>,
+    env_api_key: Option<&str>,
+    profile_name: &str,
+    config_dir: &Path,
+) -> Result<Option<String>, CliError> {
     // 1. Explicit --token flag (filter empty strings like env var checks)
     if let Some(t) = flag_token
         && !t.is_empty()
@@ -38,17 +66,17 @@ pub fn resolve_token(
     }
 
     // 2. FASTIO_TOKEN env var
-    if let Ok(t) = std::env::var("FASTIO_TOKEN")
+    if let Some(t) = env_token
         && !t.is_empty()
     {
-        return Ok(Some(t));
+        return Ok(Some(t.to_owned()));
     }
 
     // 3. FASTIO_API_KEY env var
-    if let Ok(k) = std::env::var("FASTIO_API_KEY")
+    if let Some(k) = env_api_key
         && !k.is_empty()
     {
-        return Ok(Some(k));
+        return Ok(Some(k.to_owned()));
     }
 
     // 4. Profile stored credentials (specified profile)
@@ -169,11 +197,39 @@ pub async fn refresh_if_needed(
     config_dir: &Path,
     flag_token: Option<&str>,
 ) -> Result<RefreshOutcome, CliError> {
+    let env_token = std::env::var("FASTIO_TOKEN").ok();
+    let env_api_key = std::env::var("FASTIO_API_KEY").ok();
+    refresh_if_needed_with_env(
+        api_base,
+        profile_name,
+        config_dir,
+        flag_token,
+        env_token.as_deref(),
+        env_api_key.as_deref(),
+    )
+    .await
+}
+
+/// [`refresh_if_needed`] with the two environment credentials passed in rather
+/// than read from the process environment.
+///
+/// The environment lookup is the only ambient input this path has, and it
+/// decides whether a refresh happens at all — so reading it inside made the
+/// behaviour untestable except by whatever the test runner happened to inherit.
+/// The public wrapper reads the environment; everything else takes the values.
+async fn refresh_if_needed_with_env(
+    api_base: &str,
+    profile_name: &str,
+    config_dir: &Path,
+    flag_token: Option<&str>,
+    env_token: Option<&str>,
+    env_api_key: Option<&str>,
+) -> Result<RefreshOutcome, CliError> {
     // Higher-precedence credentials win in `resolve_token`, so refreshing the
     // profile would be wasted work that the caller would not even use.
     if flag_token.is_some_and(|t| !t.is_empty())
-        || std::env::var("FASTIO_TOKEN").is_ok_and(|v| !v.is_empty())
-        || std::env::var("FASTIO_API_KEY").is_ok_and(|v| !v.is_empty())
+        || env_token.is_some_and(|v| !v.is_empty())
+        || env_api_key.is_some_and(|v| !v.is_empty())
     {
         return Ok(RefreshOutcome::NotNeeded);
     }
@@ -184,13 +240,13 @@ pub async fn refresh_if_needed(
         return Ok(RefreshOutcome::NotNeeded);
     };
 
-    // Clone the whole record: it must outlive the borrow across the `await`,
-    // and carrying it wholesale is what lets the write below use struct-update
-    // syntax instead of re-listing fields.
-    let Some(existing) = creds_file.get(&target).cloned() else {
-        return Ok(RefreshOutcome::NotNeeded);
-    };
-    let Some(refresh) = existing.expose_refresh_token().map(ToOwned::to_owned) else {
+    // Only the refresh token is carried across the `await`; every other field
+    // written below comes from the RE-LOAD after the round-trip, so a
+    // concurrent write is not reverted by stale values.
+    let Some(refresh) = creds_file
+        .get(&target)
+        .and_then(|c| c.expose_refresh_token().map(ToOwned::to_owned))
+    else {
         return Ok(RefreshOutcome::NotNeeded);
     };
 
@@ -227,6 +283,19 @@ pub async fn refresh_if_needed(
         return Ok(RefreshOutcome::NotNeeded);
     }
 
+    // The record the write is built FROM is the re-loaded one, so anything a
+    // concurrent process changed during the round-trip is carried forward
+    // rather than overwritten with the pre-network copy.
+    let Some(current) = creds_file.get(&target).cloned() else {
+        return Ok(RefreshOutcome::NotNeeded);
+    };
+    let kept_refresh = current.refresh_token.clone();
+    // Overwrite the stored grant ONLY when the response states one. A refresh
+    // response that omits `scopes` says nothing about the grant, so keeping the
+    // stored value is the only reading that cannot silently widen or erase it.
+    // The legacy `scope` word is deliberately never consulted.
+    let scopes = resp.scopes.or_else(|| current.scopes.clone());
+
     let now = chrono::Utc::now().timestamp();
     if creds_file
         .set(
@@ -239,15 +308,18 @@ pub async fn refresh_if_needed(
                 // say the refresh token is "returned unchanged (no per-refresh
                 // rotation)" — and RFC 6749 §6 says the same, so this stays
                 // correct if rotation is ever added.)
-                refresh_token: Some(secrecy::SecretString::from(
-                    resp.refresh_token.unwrap_or(refresh),
-                )),
+                refresh_token: resp
+                    .refresh_token
+                    .map(secrecy::SecretString::from)
+                    .or(kept_refresh)
+                    .or_else(|| Some(secrecy::SecretString::from(refresh))),
                 expires_at: Some(now + resp.expires_in),
                 auth_method: Some("pkce".to_owned()),
+                scopes,
                 // Every other field is carried over rather than re-listed, so a
                 // field added to `StoredCredentials` later is not silently
-                // dropped on every refresh. Matches `commands/auth.rs:740`.
-                ..existing
+                // dropped on every refresh.
+                ..current
             },
             config_dir,
         )
@@ -312,7 +384,10 @@ fn profile_needs_refresh(creds_file: &CredentialsFile, profile: &str) -> bool {
 
 #[cfg(test)]
 mod refresh_tests {
-    use super::{DEFAULT_PROFILE, profile_needs_refresh, select_refresh_target};
+    use super::{
+        DEFAULT_PROFILE, RefreshOutcome, profile_needs_refresh, refresh_if_needed_with_env,
+        select_refresh_target,
+    };
     use crate::auth::credentials::{CredentialsFile, StoredCredentials};
     use secrecy::SecretString;
 
@@ -330,6 +405,7 @@ mod refresh_tests {
             user_id: None,
             email: None,
             auth_method: Some("pkce".to_owned()),
+            scopes: None,
         }
     }
 
@@ -500,5 +576,145 @@ mod refresh_tests {
             creds(Some("t2"), Some("r2"), None, Some(expiring())),
         );
         assert_eq!(select_refresh_target(&f, "work"), Some("work".to_owned()));
+    }
+
+    // ─── Scope carry-forward across a refresh ────────────────────────────────
+    //
+    // The bug these pin: a refresh response that says nothing about the grant
+    // silently erasing (or a stale pre-network copy silently restoring) the
+    // stored scopes. The whole record written back is rebuilt from the
+    // RE-LOADED profile, and `scopes` is replaced only when the response
+    // actually carries one.
+
+    /// Serve one canned `/oauth/token/` body and close.
+    async fn spawn_token_server(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        addr
+    }
+
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("fastio-refresh-{tag}-{}-{n}", std::process::id()))
+    }
+
+    /// Store a profile whose token is expired, run one refresh against a server
+    /// returning `body`, and hand back the grant that ended up on disk.
+    async fn refresh_and_read_scopes(
+        tag: &str,
+        stored_scopes: Option<&str>,
+        body: &'static str,
+    ) -> Option<String> {
+        // The env credentials are passed in rather than inherited, so the run
+        // is identical whether or not FASTIO_TOKEN / FASTIO_API_KEY happen to
+        // be set in the shell that invoked the test binary. `set_var` is not an
+        // option here — it is unsafe in this edition and races the harness.
+        let dir = unique_dir(tag);
+        let mut on_disk = CredentialsFile::default();
+        let mut record = creds(Some("old-token"), Some("r"), None, Some(past()));
+        record.scopes = stored_scopes.map(ToOwned::to_owned);
+        on_disk
+            .set(DEFAULT_PROFILE, record, &dir)
+            .expect("seed credentials");
+
+        let addr = spawn_token_server(body).await;
+        let outcome = refresh_if_needed_with_env(
+            &format!("http://{addr}"),
+            DEFAULT_PROFILE,
+            &dir,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("refresh runs");
+        assert_eq!(
+            outcome,
+            RefreshOutcome::Refreshed,
+            "the canned response must produce a persisted refresh"
+        );
+
+        let reloaded = CredentialsFile::load(&dir).expect("reload credentials");
+        let scopes = reloaded.get(DEFAULT_PROFILE).and_then(|c| c.scopes.clone());
+        let _ = std::fs::remove_dir_all(&dir);
+        scopes
+    }
+
+    /// POSITIVE CONTROL for the injection: an env credential still wins, it is
+    /// just supplied rather than inherited. No server is spawned, so reaching
+    /// the network at all would hang or fail rather than pass.
+    #[tokio::test]
+    async fn an_injected_env_credential_skips_the_refresh() {
+        for (token, key) in [(Some("t"), None), (None, Some("k"))] {
+            let dir = unique_dir("skip");
+            let mut on_disk = CredentialsFile::default();
+            on_disk
+                .set(
+                    DEFAULT_PROFILE,
+                    creds(Some("old-token"), Some("r"), None, Some(past())),
+                    &dir,
+                )
+                .expect("seed credentials");
+
+            let outcome = refresh_if_needed_with_env(
+                "http://127.0.0.1:1",
+                DEFAULT_PROFILE,
+                &dir,
+                None,
+                token,
+                key,
+            )
+            .await
+            .expect("refresh runs");
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(outcome, RefreshOutcome::NotNeeded);
+        }
+    }
+
+    /// A response that says nothing about the grant must not erase it.
+    #[tokio::test]
+    async fn refresh_without_scopes_keeps_the_stored_grant() {
+        let body = r#"{"access_token":"new","token_type":"Bearer","expires_in":3600}"#;
+        let scopes = refresh_and_read_scopes("keep", Some("[\"org:1:rwa\"]"), body).await;
+        assert_eq!(scopes.as_deref(), Some("[\"org:1:rwa\"]"));
+    }
+
+    /// A response that DOES carry a grant replaces the stored one — a narrowed
+    /// credential must not keep advertising its old, wider scopes.
+    #[tokio::test]
+    async fn refresh_with_scopes_overwrites_the_stored_grant() {
+        let body = r#"{"access_token":"new","token_type":"Bearer","expires_in":3600,"scopes":"[\"org:2:r\"]"}"#;
+        let scopes = refresh_and_read_scopes("overwrite", Some("[\"org:1:rwa\"]"), body).await;
+        assert_eq!(scopes.as_deref(), Some("[\"org:2:r\"]"));
+    }
+
+    /// The legacy `scope` WORD is not the grant. A response carrying only
+    /// `scope: "user"` must persist nothing — writing `"user"` into `scopes`
+    /// would make later reads believe the credential holds an entity scope.
+    #[tokio::test]
+    async fn legacy_scope_word_is_never_persisted_as_the_grant() {
+        let body =
+            r#"{"access_token":"new","token_type":"Bearer","expires_in":3600,"scope":"user"}"#;
+        let scopes = refresh_and_read_scopes("legacy", None, body).await;
+        assert_eq!(scopes, None, "the legacy scope word is not an entity grant");
     }
 }
