@@ -137,18 +137,14 @@ impl FastioMcpServer {
         })
     }
 
-    /// Whether any tool is visible after applying BOTH the E-Sign rule and the
-    /// `--tools` allow-list. Delegates to the router; used by `serve` to refuse a
-    /// server that would start with an empty effective tool surface.
+    /// Whether any tool is visible after applying BOTH the cloud-import rule
+    /// and the `--tools` allow-list. Delegates to the router; used by `serve` to
+    /// refuse a server that would start with an empty effective tool surface.
     fn has_visible_tools(&self) -> bool {
         self.tool_router.has_visible_tools()
     }
 
     /// Build the server intro `instructions` text.
-    ///
-    /// The e-signature (`sign`) mention is CONDITIONAL on the E-Sign kill-switch
-    /// (read once at router construction). When E-Sign is disabled the `sign`
-    /// tool is filtered from `list_tools`, so the intro must not advertise it.
     ///
     /// When a `--tools` allow-list is active the intro enumerates ONLY the
     /// visible tools instead of pitching the full default surface, so a client
@@ -192,8 +188,7 @@ impl FastioMcpServer {
                 );
             }
         }
-        // The `sign` blurb requires `sign` to be visible, which already implies
-        // E-Sign is enabled (`tool_visible` hides `sign` when it is off).
+        // The `sign` blurb is carried only when `sign` is actually visible.
         if visible.contains(&"sign") {
             text.push_str(
                 "The `sign` tool exposes READ + DRAFT-DRIVE actions only -- \
@@ -441,16 +436,16 @@ pub async fn serve(
     )?;
 
     // Refuse to start with an empty EFFECTIVE tool surface — BEFORE stdio. This
-    // catches the case name-validation alone cannot: `--tools sign` with E-Sign
-    // disabled passes the all-unknown check (`sign` is a known name) yet the
-    // E-Sign rule hides it, leaving zero visible tools. Failing here (rather than
-    // starting a live server that advertises nothing) mirrors the all-unknown
-    // fail-fast and gives the operator an actionable hint.
+    // catches the case name-validation alone cannot: `--tools import` with cloud
+    // import disabled passes the all-unknown check (`import` is a known name) yet
+    // the cloud-import rule hides it, leaving zero visible tools. Failing here
+    // (rather than starting a live server that advertises nothing) mirrors the
+    // all-unknown fail-fast and gives the operator an actionable hint.
     if tools_filter.is_some() && !server.has_visible_tools() {
         anyhow::bail!(
             "--tools left no tools visible on this server. If you requested only \
-             `sign`, set FASTIO_ENABLE_ESIGN=1 (and enable signing for your org); \
-             otherwise include at least one enabled tool."
+             `import`, set FASTIO_ENABLE_CLOUD_IMPORT=1; otherwise include at least \
+             one enabled tool."
         );
     }
 
@@ -557,9 +552,8 @@ mod tests {
         assert_eq!(out.unknown.len(), 2, "both unknown names surfaced");
     }
 
-    /// `sign` is a KNOWN name even though it is gated by the E-Sign kill-switch:
-    /// `--tools sign` must not be warned about as unknown (the runtime E-Sign
-    /// gate hides/refuses it separately).
+    /// `sign` is a registered tool name, so `--tools sign` must not be warned
+    /// about as unknown.
     #[test]
     fn normalize_tools_filter_sign_is_known() {
         let out = super::normalize_tools_filter(&["sign".to_owned()]);
@@ -603,7 +597,7 @@ mod tests {
             ["org", "id"].iter().map(|s| (*s).to_owned()).collect();
         let server = FastioMcpServer {
             state: Arc::clone(&state),
-            tool_router: tools::ToolRouter::new_with_filter(state, false, Some(filter)),
+            tool_router: tools::ToolRouter::new_with_filter(state, true, Some(filter)),
         };
         let text = server.instructions_text();
         assert!(
@@ -638,7 +632,7 @@ mod tests {
                 tools.iter().map(|s| (*s).to_owned()).collect();
             let server = FastioMcpServer {
                 state: Arc::clone(&state),
-                tool_router: tools::ToolRouter::new_with_filter(state, false, Some(filter)),
+                tool_router: tools::ToolRouter::new_with_filter(state, true, Some(filter)),
             };
             server.instructions_text()
         };
@@ -668,7 +662,7 @@ mod tests {
         ));
         let server = FastioMcpServer {
             state: Arc::clone(&state),
-            tool_router: tools::ToolRouter::new_with_filter(state, false, None),
+            tool_router: tools::ToolRouter::new_with_filter(state, true, None),
         };
         let text = server.instructions_text();
         assert!(

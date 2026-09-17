@@ -236,22 +236,13 @@ fn render_chain_dedup(err: &anyhow::Error) -> String {
     out
 }
 
-/// Whether the E-Sign kill-switch should block this command.
-///
-/// Factored out of `run()` so the gate predicate is unit-testable WITHOUT
-/// mutating the process environment (`FASTIO_ENABLE_ESIGN` is process-global and
-/// unsafe to set under Rust 2024): `esign_enabled` is passed in. Blocks iff the
-/// command is a `sign` subcommand AND E-Sign is not enabled; every non-sign
-/// command passes regardless of the flag.
-fn sign_gate_blocks(command: &Commands, esign_enabled: bool) -> bool {
-    matches!(command, Commands::Sign(_)) && !esign_enabled
-}
-
 /// Whether the cloud-import kill-switch should block this command.
 ///
-/// Same shape as [`sign_gate_blocks`], and factored out for the same reason:
-/// `FASTIO_ENABLE_CLOUD_IMPORT` is process-global and unsafe to set under Rust
-/// 2024, so the predicate takes the flag as a parameter and stays unit-testable.
+/// Factored out of `run()` so the gate predicate is unit-testable WITHOUT
+/// mutating the process environment (`FASTIO_ENABLE_CLOUD_IMPORT` is
+/// process-global and unsafe to set under Rust 2024): the flag is passed in.
+/// Blocks iff the command is an `import` subcommand AND cloud import is not
+/// enabled; every other command passes regardless of the flag.
 fn import_gate_blocks(command: &Commands, cloud_import_enabled: bool) -> bool {
     matches!(command, Commands::Import(_)) && !cloud_import_enabled
 }
@@ -298,23 +289,9 @@ async fn run() -> Result<()> {
         colored::control::set_override(false);
     }
 
-    // E-Sign kill-switch (feature sunset 2026-07): gate the sign surface here,
-    // BEFORE config/profile resolution, so the disabled error always wins over
-    // any config/auth error. Enabled only via `FASTIO_ENABLE_ESIGN=1`; the
-    // platform enforces its own org-level flag server-side as well. Returning a
-    // `CliError::FeatureDisabled` (rather than a bare `anyhow::bail!`) routes the
-    // failure through `main`'s red `error:` + yellow `hint:` render.
-    if sign_gate_blocks(&cli.command, commands::sign::esign_enabled()) {
-        return Err(fastio_cli::error::CliError::FeatureDisabled {
-            message: "E-Sign is currently disabled.",
-            hint: "Set FASTIO_ENABLE_ESIGN=1 to use sign commands (signing must also be enabled for your organization).",
-        }
-        .into());
-    }
-
     // Cloud-import kill-switch: cloud import has not launched, so the surface is
-    // off by default. Gated here alongside E-Sign — BEFORE config/profile
-    // resolution — so the disabled error always wins over any config/auth error.
+    // off by default. Gated here — BEFORE config/profile resolution — so the
+    // disabled error always wins over any config/auth error.
     // The platform gates it server-side too (dev environments only); this is
     // belt-and-braces so the commands are not merely broken-on-prod but
     // explicitly unavailable.
@@ -3214,25 +3191,25 @@ mod tests {
         );
     }
 
-    /// D3: the E-Sign kill-switch failure is a `CliError::FeatureDisabled`, so
-    /// it renders through the same red `error:` + yellow `hint:` path as every
+    /// D3: the cloud-import kill-switch failure is a `CliError::FeatureDisabled`,
+    /// so it renders through the same red `error:` + yellow `hint:` path as every
     /// other `CliError`. The headline is the message (no
     /// "Configuration/Authentication error:" prefix), and the hint is the
     /// re-enable guidance.
     #[test]
     fn feature_disabled_renders_message_and_hint_without_prefix() {
         let cli_err = CliError::FeatureDisabled {
-            message: "E-Sign is currently disabled.",
-            hint: "Set FASTIO_ENABLE_ESIGN=1 to use sign commands (signing must also be enabled for your organization).",
+            message: "Cloud import is not yet available.",
+            hint: "Set FASTIO_ENABLE_CLOUD_IMPORT=1 to use import commands (cloud import must also be enabled for your workspace).",
         };
         let err = anyhow::Error::from(CliError::FeatureDisabled {
-            message: "E-Sign is currently disabled.",
-            hint: "Set FASTIO_ENABLE_ESIGN=1 to use sign commands (signing must also be enabled for your organization).",
+            message: "Cloud import is not yet available.",
+            hint: "Set FASTIO_ENABLE_CLOUD_IMPORT=1 to use import commands (cloud import must also be enabled for your workspace).",
         });
         let (headline, hint) = cli_error_render(&err, &cli_err);
         // The headline is the message verbatim — NO "Configuration error:" /
         // "Authentication error:" prefix (those come from other variants).
-        assert_eq!(headline, "E-Sign is currently disabled.");
+        assert_eq!(headline, "Cloud import is not yet available.");
         assert!(
             !headline.contains("Configuration error:")
                 && !headline.contains("Authentication error:"),
@@ -3241,15 +3218,15 @@ mod tests {
         // The hint line is the re-enable guidance.
         let hint = hint.unwrap_or_default();
         assert!(
-            hint.contains("FASTIO_ENABLE_ESIGN=1"),
+            hint.contains("FASTIO_ENABLE_CLOUD_IMPORT=1"),
             "hint must steer to the enable flag: {hint}"
         );
     }
 
-    /// D1: the E-Sign gate predicate blocks a `sign` command iff E-Sign is
-    /// disabled, and never blocks a non-sign command — exercised without
+    /// D1: the cloud-import gate predicate blocks an `import` command iff cloud
+    /// import is disabled, and never blocks another command — exercised without
     /// mutating the process environment by passing the flag in and parsing the
-    /// command via clap (sign parses even though it is hidden).
+    /// command via clap.
     #[test]
     fn import_gate_blocks_only_import_when_disabled() {
         use super::import_gate_blocks;
@@ -3276,18 +3253,14 @@ mod tests {
         assert!(!import_gate_blocks(&org, false));
         assert!(!import_gate_blocks(&org, true));
 
-        // The two kill-switches are independent: a `sign` command must not be
-        // blocked by the import gate, nor `import` by the E-Sign gate.
+        // The gate is import-specific: an ungated surface such as `sign` passes
+        // regardless of the flag.
         let sign = Cli::try_parse_from(["fastio", "sign", "envelope", "list", "--workspace", "1"])
             .expect("sign command parses")
             .command;
         assert!(
             !import_gate_blocks(&sign, false),
             "the import gate must not block sign"
-        );
-        assert!(
-            !super::sign_gate_blocks(&import, false),
-            "the E-Sign gate must not block import"
         );
     }
 
@@ -3304,39 +3277,6 @@ mod tests {
             );
         }
         assert!(!cloud_import_enabled_from(None));
-    }
-
-    #[test]
-    fn sign_gate_blocks_only_sign_when_disabled() {
-        use super::sign_gate_blocks;
-        use crate::cli::Cli;
-        use clap::Parser;
-
-        let sign = Cli::try_parse_from(["fastio", "sign", "envelope", "list", "--workspace", "1"])
-            .expect("sign command parses even though hidden")
-            .command;
-        // Disabled → the sign command is blocked; enabled → it passes.
-        assert!(
-            sign_gate_blocks(&sign, false),
-            "sign must be blocked when E-Sign is disabled"
-        );
-        assert!(
-            !sign_gate_blocks(&sign, true),
-            "sign must pass when E-Sign is enabled"
-        );
-
-        // A non-sign command is never blocked, regardless of the flag.
-        let non_sign = Cli::try_parse_from(["fastio", "org", "list"])
-            .expect("org list parses")
-            .command;
-        assert!(
-            !sign_gate_blocks(&non_sign, false),
-            "non-sign command must never be blocked (E-Sign disabled)"
-        );
-        assert!(
-            !sign_gate_blocks(&non_sign, true),
-            "non-sign command must never be blocked (E-Sign enabled)"
-        );
     }
 
     /// MEDIUM B regression: the dedup is TYPE-AWARE — it collapses ONLY the

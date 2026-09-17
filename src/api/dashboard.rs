@@ -4,14 +4,14 @@
 //!
 //! Maps to the Dashboard surface described in the published API docs:
 //! a ranked, paginated feed of **actionable cards** for the calling workspace
-//! member (@mentions, file-added, file-version, and synthesis lanes, plus a
-//! signature lane only when E-Sign is enabled platform-side), plus per-member
+//! member (@mentions, file-added, file-version, synthesis, and signature
+//! lanes), plus per-member
 //! dismiss / snooze / undismiss of a card. Dismiss and snooze are
 //! **out-of-band**: they hide a card from the caller's own feed only and never
 //! advance, resolve, or otherwise change the underlying card subject.
 //!
-//! When E-Sign is enabled, a signature card's primary action — minting the
-//! caller's own signing link — lives in [`crate::api::signing::my_sign_link`]
+//! A signature card's primary action — minting the caller's own signing
+//! link — lives in [`crate::api::signing::my_sign_link`]
 //! (it is envelope-scoped) and is surfaced as `fastio sign envelope my-sign-link`.
 
 use std::collections::HashMap;

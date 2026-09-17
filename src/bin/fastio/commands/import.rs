@@ -18,8 +18,7 @@ use fastio_cli::api;
 ///
 /// The platform enforces its own gate server-side (`CLOUD_IMPORT_DEPLOY_MODE`
 /// resolves to dev environments only), so this local switch is belt-and-braces
-/// and controls only surface visibility/dispatch. Mirrors the E-Sign switch in
-/// [`crate::commands::sign::esign_enabled`].
+/// and controls only surface visibility/dispatch.
 pub(crate) fn cloud_import_enabled() -> bool {
     cloud_import_enabled_from(std::env::var("FASTIO_ENABLE_CLOUD_IMPORT").ok().as_deref())
 }

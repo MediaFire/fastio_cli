@@ -501,9 +501,7 @@ struct ToolDef {
 ///
 /// The single source of truth for validating the `--tools` allow-list (the
 /// `serve()` entry point drops any requested name not in this set, with a
-/// startup warning). Includes `sign` regardless of the E-Sign kill-switch — a
-/// `--tools sign` on a disabled server is a KNOWN name (so it is not warned
-/// about as unknown); the E-Sign gate then hides/refuses it at runtime.
+/// startup warning).
 pub fn known_tool_names() -> impl Iterator<Item = &'static str> {
     TOOL_DEFS.iter().map(|def| def.name)
 }
@@ -2052,7 +2050,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "dashboard",
-        description: "Per-workspace dashboard: the calling member's ranked, paginated feed of ACTIONABLE cards (@mentions, file activity, file versions, synthesis, and — when E-Sign is enabled — pending signatures). Actions: get (read the feed; paginate with limit 1-200 / offset), dismiss (hide a card from YOUR feed — permanently, or snooze it until a future time via snooze_until 'YYYY-MM-DD HH:MM:SS UTC'), undismiss (restore a card; idempotent). Dismiss / snooze / undismiss are PER-MEMBER and OUT-OF-BAND — they change only YOUR view and never advance, resolve, or modify the underlying card subject. card_key comes from a card's card_key field (URL-encoding is handled for you). Signature cards carry a sign-ceremony link for their primary action (requires E-Sign to be enabled).",
+        description: "Per-workspace dashboard: the calling member's ranked, paginated feed of ACTIONABLE cards (@mentions, file activity, file versions, synthesis, and pending signatures). Actions: get (read the feed; paginate with limit 1-200 / offset), dismiss (hide a card from YOUR feed — permanently, or snooze it until a future time via snooze_until 'YYYY-MM-DD HH:MM:SS UTC'), undismiss (restore a card; idempotent). Dismiss / snooze / undismiss are PER-MEMBER and OUT-OF-BAND — they change only YOUR view and never advance, resolve, or modify the underlying card subject. card_key comes from a card's card_key field (URL-encoding is handled for you). Signature cards carry a sign-ceremony link for their primary action.",
         actions: &[
             "get",
             "dismiss",
@@ -2560,7 +2558,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "sign",
-        description: "E-signature (SignEnvelope): draft and drive electronic-signature envelopes (PDFs sent to recipients). Every envelope is parented to a workspace (workspace_id; the former org surface was removed). This tool exposes READ, reversible-DRAFT-drive, and idempotent-RECOVERY actions: envelope-create (creates a DRAFT — reversible), envelope-update (draft-only; recipients are a full replacement; expires_at/policy_json are DECLARATIVE — omitting them CLEARS those fields, re-send to retain), envelope-list (filter via envelope_status / created_after / created_before), envelope-get, envelope-retry (re-drives a STUCK envelope through self-healing recovery — admin; idempotent + no-op-success; notifies no one; a permanent failure cascades to Failed), envelope-my-sign-link (mints YOUR OWN signing link for an envelope — the dashboard signature-card primary action; reversible/idempotent and notifies no one; requires a WRITE-scope token, so a read-only token is rejected with 10754; the structured result tells you the state — sign_url non-null = sign now, is_terminal = completed/void/declined, reauth_required = re-authenticate first, else you are blocked by routing order per blocked_signers), document-download (covers preview needs — the download bytes ARE the source/preview PDF, so there is no separate MCP preview action), signed-download, audit-download, describe. SIGN TEMPLATES (reusable envelope blueprints, template id sa…): template-list, template-details, and template-instantiate (resolves recipient_bindings/documents against the blueprint and creates a reversible DRAFT envelope) are exposed over MCP (reads + reversible draft creation); template-create, template-update, and template-delete are intentionally CLI-binary-only (`fastio sign template create|update|delete …`) and are NOT routable over MCP (mirrors the send/void boundary). The OUTWARD-FACING / TERMINAL actions — send (EMAILS REAL RECIPIENTS) and void (terminal) — are intentionally CLI-binary-only (`fastio sign envelope send|void …`) and are NOT routable over MCP. Envelopes are voided, not deleted — there is no delete action. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Signing is a paid-plan feature (a non-entitled org returns 1670; access also requires workspace membership). Call action='describe' for the authoritative per-action reference.",
+        description: "E-signature (SignEnvelope): draft and drive electronic-signature envelopes (PDFs sent to recipients). Every envelope is parented to a workspace (workspace_id; the former org surface was removed). This tool exposes READ, reversible-DRAFT-drive, and idempotent-RECOVERY actions: envelope-create (creates a DRAFT — reversible), envelope-update (draft-only; recipients are a full replacement; expires_at/policy_json are DECLARATIVE — omitting them CLEARS those fields, re-send to retain), envelope-list (filter via envelope_status / created_after / created_before), envelope-get, envelope-retry (re-drives a STUCK envelope through self-healing recovery — admin; idempotent + no-op-success; notifies no one; a permanent failure cascades to Failed), envelope-my-sign-link (mints YOUR OWN signing link for an envelope — the dashboard signature-card primary action; reversible/idempotent and notifies no one; requires a WRITE-scope token, so a read-only token is rejected with 10754; the structured result tells you the state — sign_url non-null = sign now, is_terminal = completed/void/declined, reauth_required = re-authenticate first, else you are blocked by routing order per blocked_signers), document-download (covers preview needs — the download bytes ARE the source/preview PDF, so there is no separate MCP preview action), signed-download, audit-download, describe. SIGN TEMPLATES (reusable envelope blueprints, template id sa…): template-list, template-details, and template-instantiate (resolves recipient_bindings/documents against the blueprint and creates a reversible DRAFT envelope) are exposed over MCP (reads + reversible draft creation); template-create, template-update, and template-delete are intentionally CLI-binary-only (`fastio sign template create|update|delete …`) and are NOT routable over MCP (mirrors the send/void boundary). The OUTWARD-FACING / TERMINAL actions — send (EMAILS REAL RECIPIENTS) and void (terminal) — are intentionally CLI-binary-only (`fastio sign envelope send|void …`) and are NOT routable over MCP. Envelopes are voided, not deleted — there is no delete action. Binary downloads write to the agent's local filesystem and return a path + byte count (NOT base64). Signing is available on every plan; the org resource's capabilities.signing confirms availability, and the server rejects calls with a feature-disabled error (1670) if an org's plan does not grant it. Access also requires workspace membership. Call action='describe' for the authoritative per-action reference.",
         actions: &[
             "describe",
             "envelope-create",
@@ -2895,23 +2893,16 @@ const TOOL_DEFS: &[ToolDef] = &[
 #[derive(Clone)]
 pub struct ToolRouter {
     state: Arc<McpState>,
-    /// E-Sign kill-switch (feature sunset 2026-07): read ONCE at construction
-    /// via [`crate::commands::sign::esign_enabled`]. When false the `sign` tool
-    /// is filtered out of `list_tools` and its `call_tool` arm returns the
-    /// disabled error before any auth/client/arg work.
-    esign_enabled: bool,
     /// Cloud-import kill-switch: read ONCE at construction via
     /// [`crate::commands::import::cloud_import_enabled`]. When false the
     /// `import` tool is filtered out of `list_tools` and its `call_tool` arm
-    /// returns the disabled error before any auth/client/arg work. Same shape
-    /// as `esign_enabled`.
+    /// returns the disabled error before any auth/client/arg work.
     cloud_import_enabled: bool,
     /// Optional `--tools` allow-list captured at server startup. `None` means
     /// "all tools" (the default). When `Some`, a tool is advertised in
     /// `list_tools` and callable in `call_tool` ONLY if its name is in the set;
     /// every other tool is hidden and its dispatch returns a not-enabled error.
-    /// The E-Sign rule composes with this: `sign` requires BOTH E-Sign enabled
-    /// AND (filter is None or contains "sign"). The set contains only names that
+    /// The set contains only names that
     /// match a [`TOOL_DEFS`] entry (unknown names are dropped, with a startup
     /// warning, before the router is built).
     tools_filter: Option<std::collections::HashSet<String>>,
@@ -2921,8 +2912,8 @@ impl ToolRouter {
     /// Create a new tool router with shared state and an optional `--tools`
     /// allow-list.
     ///
-    /// Reads the E-Sign kill-switch (`FASTIO_ENABLE_ESIGN=1`) once here so the
-    /// flag is fixed for the lifetime of the server rather than re-read per call.
+    /// Reads the cloud-import kill-switch once here so the flag is fixed for
+    /// the lifetime of the server rather than re-read per call.
     /// `tools_filter` is `None` for the default (all tools) or the validated
     /// allow-list set built by the `serve()` entry point.
     pub fn new(
@@ -2931,23 +2922,18 @@ impl ToolRouter {
     ) -> Self {
         Self {
             state,
-            esign_enabled: crate::commands::sign::esign_enabled(),
             cloud_import_enabled: crate::commands::import::cloud_import_enabled(),
             tools_filter,
         }
     }
 
-    /// Construct a router with an explicit E-Sign flag (no `--tools` filter),
-    /// for unit tests that must assert both the enabled and disabled surfaces
-    /// without mutating the process environment (unsafe under Rust 2024 and
-    /// process-global).
+    /// Construct a router with every gate open and no `--tools` filter, for
+    /// unit tests that exercise ordinary dispatch without mutating the process
+    /// environment (unsafe under Rust 2024 and process-global).
     #[cfg(test)]
-    pub fn new_with_esign(state: Arc<McpState>, esign_enabled: bool) -> Self {
+    pub fn new_for_tests(state: Arc<McpState>) -> Self {
         Self {
             state,
-            esign_enabled,
-            // Tests that pin the E-Sign surface must not also trip the
-            // cloud-import gate; enable it so those assertions stay about sign.
             cloud_import_enabled: true,
             tools_filter: None,
         }
@@ -2960,35 +2946,32 @@ impl ToolRouter {
     pub fn new_with_cloud_import(state: Arc<McpState>, cloud_import_enabled: bool) -> Self {
         Self {
             state,
-            esign_enabled: false,
             cloud_import_enabled,
             tools_filter: None,
         }
     }
 
-    /// Construct a router with an explicit E-Sign flag AND a `--tools`
+    /// Construct a router with an explicit cloud-import flag AND a `--tools`
     /// allow-list, for the filter unit tests.
     #[cfg(test)]
     pub fn new_with_filter(
         state: Arc<McpState>,
-        esign_enabled: bool,
+        cloud_import_enabled: bool,
         tools_filter: Option<std::collections::HashSet<String>>,
     ) -> Self {
         Self {
             state,
-            esign_enabled,
-            // Filter tests assert on the allow-list, not the import gate.
-            cloud_import_enabled: true,
+            cloud_import_enabled,
             tools_filter,
         }
     }
 
-    /// List all registered tools as MCP `Tool` descriptors, honoring the E-Sign
-    /// kill-switch AND the `--tools` allow-list captured at router construction.
-    /// This instance method is the sole production listing path: it reads
-    /// `self.esign_enabled` and `self.tools_filter` (both fixed at construction),
-    /// so the advertised tool surface can never diverge from the callable surface
-    /// `call_tool` gates on the same fields.
+    /// List all registered tools as MCP `Tool` descriptors, honoring the
+    /// cloud-import kill-switch AND the `--tools` allow-list captured at router
+    /// construction. This instance method is the sole production listing path:
+    /// it reads `self.cloud_import_enabled` and `self.tools_filter` (both fixed
+    /// at construction), so the advertised tool surface can never diverge from
+    /// the callable surface `call_tool` gates on the same fields.
     pub fn list_tools(&self) -> ListToolsResult {
         let tools = TOOL_DEFS
             .iter()
@@ -3013,9 +2996,9 @@ impl ToolRouter {
     /// `None` filter = admits everything. Shared by [`Self::tool_visible`] (the
     /// listing gate) and [`Self::call_tool`] (the dispatch gate) so the allow-list
     /// half is defined exactly once and the advertised set can never diverge from
-    /// the callable set. The E-Sign rule is applied ALONGSIDE this (see
-    /// `tool_visible` / the `sign` match arm), not inside it, because the two
-    /// gates surface DIFFERENT refuse messages (not-enabled vs E-Sign-disabled).
+    /// the callable set. The cloud-import rule is applied ALONGSIDE this (see
+    /// `tool_visible` / the `import` match arm), not inside it, because the two
+    /// gates surface DIFFERENT refuse messages (not-enabled vs not-yet-available).
     fn filter_admits(&self, name: &str) -> bool {
         match &self.tools_filter {
             None => true,
@@ -3024,26 +3007,23 @@ impl ToolRouter {
     }
 
     /// Whether a tool `name` is exposed in `list_tools` (the advertised set). A
-    /// tool is visible iff the E-Sign rule allows it (`sign` requires
-    /// `esign_enabled`) AND the `--tools` allow-list admits it
+    /// tool is visible iff the cloud-import rule allows it (`import` requires
+    /// `cloud_import_enabled`) AND the `--tools` allow-list admits it
     /// ([`Self::filter_admits`]). `call_tool` applies the SAME two rules at
-    /// dispatch time (allow-list via `filter_admits`, E-Sign via its `sign` match
-    /// arm), so advertised and callable stay in lockstep.
+    /// dispatch time (allow-list via `filter_admits`, cloud import via its
+    /// `import` match arm), so advertised and callable stay in lockstep.
     fn tool_visible(&self, name: &str) -> bool {
-        if name == "sign" && !self.esign_enabled {
-            return false;
-        }
         if name == "import" && !self.cloud_import_enabled {
             return false;
         }
         self.filter_admits(name)
     }
 
-    /// Whether, after applying BOTH the E-Sign rule and the `--tools` allow-list,
-    /// any tool at all remains visible. Used at startup to refuse a server that
-    /// would advertise an empty tool surface (e.g. `--tools sign` with E-Sign
-    /// disabled — `sign` is a known name so name-validation passes, but the
-    /// effective surface is empty).
+    /// Whether, after applying BOTH the cloud-import rule and the `--tools`
+    /// allow-list, any tool at all remains visible. Used at startup to refuse a
+    /// server that would advertise an empty tool surface (e.g. `--tools import`
+    /// with cloud import disabled — `import` is a known name so name-validation
+    /// passes, but the effective surface is empty).
     pub fn has_visible_tools(&self) -> bool {
         TOOL_DEFS.iter().any(|def| self.tool_visible(def.name))
     }
@@ -3057,7 +3037,7 @@ impl ToolRouter {
     }
 
     /// The canonical names of the tools currently VISIBLE on this router (both
-    /// the E-Sign rule and the `--tools` allow-list applied), in `TOOL_DEFS`
+    /// the cloud-import rule and the `--tools` allow-list applied), in `TOOL_DEFS`
     /// order. The advertised set `list_tools` returns, as names — used by the
     /// server intro to enumerate a filtered surface honestly.
     pub fn visible_tool_names(&self) -> Vec<&'static str> {
@@ -3068,17 +3048,14 @@ impl ToolRouter {
             .collect()
     }
 
-    /// Core of the legacy `list_tools`, parameterized on the E-Sign flag so
-    /// tests can exercise both surfaces without touching the process environment
-    /// or a `--tools` filter. When `esign_enabled` is false the `sign` tool is
-    /// filtered out; the `TOOL_DEFS` static array is left intact. (The
-    /// production listing path is the instance [`Self::list_tools`], which also
-    /// applies the `--tools` allow-list.)
+    /// The full registered tool surface, with no gate and no `--tools` filter
+    /// applied, so tests can assert on a tool's descriptor without touching the
+    /// process environment. (The production listing path is the instance
+    /// [`Self::list_tools`], which also applies the `--tools` allow-list.)
     #[cfg(test)]
-    pub fn list_tools_with(esign_enabled: bool) -> ListToolsResult {
+    pub fn list_tools_all() -> ListToolsResult {
         let tools = TOOL_DEFS
             .iter()
-            .filter(|def| esign_enabled || def.name != "sign")
             .map(|def| {
                 Tool::new(
                     def.name,
@@ -3107,8 +3084,8 @@ impl ToolRouter {
         // with, BEFORE any dispatch. The check uses the CANONICAL tool name (via
         // the SAME `filter_admits` predicate `list_tools` uses) so the hidden
         // aliases (`ai` → `ripley`, `how-to` → `howto`) are gated by the name a
-        // caller would pass to `--tools`. The E-Sign `sign` gate stays below; a
-        // `sign` call must satisfy BOTH the filter and the flag.
+        // caller would pass to `--tools`. The cloud-import gate stays below; an
+        // `import` call must satisfy BOTH the filter and the flag.
         let canonical = canonical_tool_name(name);
         if !self.filter_admits(canonical) {
             return Ok(error_text(&format!(
@@ -3120,13 +3097,8 @@ impl ToolRouter {
         // to sit ABOVE the universal describe below, not in the `match` arms:
         // describe short-circuits before dispatch ever runs, so without it
         // `import describe` would answer in full on a server where every other
-        // `import` action is refused. `sign` would only escape that because it
-        // is named in the fall-through list for an unrelated reason (a richer
-        // hand-written payload) — an accident, not a gate. Both are gated
-        // by the same explicit check, using the same strings the arms return.
-        if !self.esign_enabled && canonical == "sign" {
-            return Ok(error_text(ESIGN_DISABLED_MSG));
-        }
+        // `import` action is refused. It is gated here using the same string
+        // the dispatch arm returns.
         if !self.cloud_import_enabled && canonical == "import" {
             return Ok(error_text(CLOUD_IMPORT_DISABLED_MSG));
         }
@@ -3172,7 +3144,6 @@ impl ToolRouter {
             "import" => handle_import(&self.state, action, &args).await,
             "lock" => handle_lock(&self.state, action, &args).await,
             "metadata" => handle_metadata(&self.state, action, &args).await,
-            "sign" if !self.esign_enabled => Ok(error_text(ESIGN_DISABLED_MSG)),
             "sign" => handle_sign(&self.state, action, &args).await,
             "fileshare" => handle_fileshare(&self.state, action, &args).await,
             "system" => handle_system(&self.state, action, &args).await,
@@ -9086,9 +9057,6 @@ fn json_value_id_to_string(v: &Value) -> Option<String> {
 /// did, which is how `import describe` answered while `import list` refused.
 const CLOUD_IMPORT_DISABLED_MSG: &str = "Cloud import is not yet available. Set FASTIO_ENABLE_CLOUD_IMPORT=1 to use import commands (cloud import must also be enabled for your workspace).";
 
-/// The message a disabled E-Sign surface returns.
-const ESIGN_DISABLED_MSG: &str = "E-Sign is currently disabled. Set FASTIO_ENABLE_ESIGN=1 to use sign commands (signing must also be enabled for your organization).";
-
 /// Resolve the storage context — a workspace OR a share — for the `files` tool.
 ///
 /// The published API docs document each of these storage endpoints for shares
@@ -13761,22 +13729,15 @@ mod ripley_tool_tests {
     }
 
     fn unauthed_router() -> ToolRouter {
-        // Inject `esign_enabled = true` so the existing `sign` dispatch tests
-        // exercise the real handler without mutating the process environment
-        // (unsafe under Rust 2024). The kill-switch's own gate is covered by the
-        // dedicated `sign_*_disabled` tests below.
-        ToolRouter::new_with_esign(
-            Arc::new(McpState::new_unauthenticated_for_test(
-                "https://api.fast.io/current",
-            )),
-            true,
-        )
+        ToolRouter::new_for_tests(Arc::new(McpState::new_unauthenticated_for_test(
+            "https://api.fast.io/current",
+        )))
     }
 
     /// An AUTHENTICATED router whose client points at a DEAD loopback port.
     ///
     /// Callers exercise what runs AFTER `require_auth`: argument validation,
-    /// dispatch reachability, kill-switch gates. MOST arms reject their input
+    /// dispatch reachability, the cloud-import gate. MOST arms reject their input
     /// before building a request and never open a socket — but some do proceed
     /// to a connection attempt (the arms that assert on the resulting transport
     /// error say so at their call sites). `127.0.0.1:1` is what makes that
@@ -13785,12 +13746,12 @@ mod ripley_tool_tests {
     async fn authed_router() -> ToolRouter {
         let state = Arc::new(McpState::new_unauthenticated_for_test("http://127.0.0.1:1"));
         state.set_token("test-token".to_owned()).await;
-        ToolRouter::new_with_esign(state, true)
+        ToolRouter::new_for_tests(state)
     }
 
     #[test]
     fn list_tools_advertises_ripley_not_ai() {
-        let tools = ToolRouter::list_tools_with(true).tools;
+        let tools = ToolRouter::list_tools_all().tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(names.contains(&"ripley"), "ripley tool must be advertised");
         assert!(
@@ -13955,7 +13916,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn dashboard_and_howto_tools_are_advertised() {
-        let tools = ToolRouter::list_tools_with(true).tools;
+        let tools = ToolRouter::list_tools_all().tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(
             names.contains(&"dashboard"),
@@ -14148,7 +14109,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn ripley_tool_description_leads_with_offload_framing() {
-        let tools = ToolRouter::list_tools_with(true).tools;
+        let tools = ToolRouter::list_tools_all().tools;
         let ripley = tools
             .iter()
             .find(|t| t.name.as_ref() == "ripley")
@@ -14270,7 +14231,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn ripley_tool_advertises_phase2_actions() {
-        let tools = ToolRouter::list_tools_with(true).tools;
+        let tools = ToolRouter::list_tools_all().tools;
         let ripley = tools
             .iter()
             .find(|t| t.name.as_ref() == "ripley")
@@ -14310,7 +14271,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn metadata_tool_advertises_extract_and_wait_action() {
-        let tools = ToolRouter::list_tools_with(true).tools;
+        let tools = ToolRouter::list_tools_all().tools;
         let metadata = tools
             .iter()
             .find(|t| t.name.as_ref() == "metadata")
@@ -14362,7 +14323,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn workspace_tool_advertises_metadata_extract_and_wait_action() {
-        let tools = ToolRouter::list_tools_with(true).tools;
+        let tools = ToolRouter::list_tools_all().tools;
         let workspace = tools
             .iter()
             .find(|t| t.name.as_ref() == "workspace")
@@ -14413,7 +14374,7 @@ mod ripley_tool_tests {
             "sort_dir",
         ];
 
-        let tools = ToolRouter::list_tools_with(true).tools;
+        let tools = ToolRouter::list_tools_all().tools;
         for tool_name in ["metadata", "workspace"] {
             let tool = tools
                 .iter()
@@ -15010,7 +14971,7 @@ mod ripley_tool_tests {
             "http://{addr}"
         )));
         state.set_token("test-token".to_owned()).await;
-        ToolRouter::new_with_esign(state, true)
+        ToolRouter::new_for_tests(state)
     }
 
     /// Dispatch `workspace/metadata-details` with `id_key = id_value`.
@@ -15074,7 +15035,7 @@ mod ripley_tool_tests {
         // "the caller's" and have no successor), so this test locks the ABSENCE
         // of the four saved-view actions and the `config` param. An agent
         // reading a stale schema would call an action that no longer dispatches.
-        let tools = ToolRouter::list_tools_with(true).tools;
+        let tools = ToolRouter::list_tools_all().tools;
         let workspace = tools
             .iter()
             .find(|t| t.name.as_ref() == "workspace")
@@ -15098,8 +15059,8 @@ mod ripley_tool_tests {
     }
 
     /// The import tool must vanish from the advertised surface when the
-    /// cloud-import kill-switch is off, and reappear when it is on — mirroring
-    /// the E-Sign rule so advertised and callable stay in lockstep.
+    /// cloud-import kill-switch is off, and reappear when it is on, so
+    /// advertised and callable stay in lockstep.
     #[test]
     fn import_tool_hidden_when_cloud_import_disabled() {
         let state = Arc::new(McpState::new_unauthenticated_for_test(
@@ -15154,7 +15115,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn import_tool_advertises_list_drives_and_drive_params() {
-        let tools = ToolRouter::list_tools_with(true).tools;
+        let tools = ToolRouter::list_tools_all().tools;
         let import = tools
             .iter()
             .find(|t| t.name.as_ref() == "import")
@@ -16029,7 +15990,7 @@ mod ripley_tool_tests {
              earlier description never ships"
         );
 
-        let tools = ToolRouter::list_tools_with(true).tools;
+        let tools = ToolRouter::list_tools_all().tools;
         let files = tools
             .iter()
             .find(|t| t.name.as_ref() == "files")
@@ -16081,7 +16042,7 @@ mod ripley_tool_tests {
         // so — a schema-validating client rejects the array against a bare
         // `"type": "string"`, making the accepted spelling unreachable for
         // exactly the callers that validate.
-        let tools = ToolRouter::list_tools_with(true).tools;
+        let tools = ToolRouter::list_tools_all().tools;
         let search = tools
             .iter()
             .find(|t| t.name.as_ref() == "search")
@@ -16263,7 +16224,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn workspace_and_metadata_schemas_advertise_confirm_ai_spend() {
-        let tools = ToolRouter::list_tools_with(true).tools;
+        let tools = ToolRouter::list_tools_all().tools;
         for tool_name in ["workspace", "metadata"] {
             let tool = tools
                 .iter()
@@ -16466,11 +16427,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn sign_tool_is_registered_and_read_draft_oriented() {
-        // Explicitly list with E-Sign enabled: the production `list_tools()`
-        // reads the construction-time flag (disabled unless FASTIO_ENABLE_ESIGN=1
-        // at server startup) and would omit `sign`. The disabled surface is
-        // covered by `sign_*_disabled` below.
-        let tools = ToolRouter::list_tools_with(true).tools;
+        let tools = ToolRouter::list_tools_all().tools;
         let sign = tools
             .iter()
             .find(|t| t.name.as_ref() == "sign")
@@ -16488,149 +16445,6 @@ mod ripley_tool_tests {
         );
     }
 
-    // ─── E-Sign kill-switch (feature sunset 2026-07) ─────────────────────────
-
-    /// The disabled surface (`list_tools_with(false)`) drops `sign` while every
-    /// other tool is untouched — the filter is sign-specific, not a truncation.
-    #[test]
-    fn list_tools_disabled_omits_sign_only() {
-        let disabled = ToolRouter::list_tools_with(false).tools;
-        let has = |name: &str| disabled.iter().any(|t| t.name.as_ref() == name);
-        assert!(
-            !has("sign"),
-            "sign must be filtered out when E-Sign is disabled"
-        );
-        // Every other registered tool is still present — only `sign` was dropped.
-        for def in TOOL_DEFS {
-            if def.name == "sign" {
-                continue;
-            }
-            assert!(
-                has(def.name),
-                "non-sign tool '{}' must remain when E-Sign is disabled",
-                def.name
-            );
-        }
-        assert_eq!(
-            ToolRouter::list_tools_with(true).tools.len(),
-            disabled.len() + 1,
-            "disabling E-Sign removes exactly one tool (sign)"
-        );
-    }
-
-    /// The enabled surface (`list_tools_with(true)`) advertises `sign`.
-    #[test]
-    fn list_tools_enabled_contains_sign() {
-        let tools = ToolRouter::list_tools_with(true).tools;
-        assert!(
-            tools.iter().any(|t| t.name.as_ref() == "sign"),
-            "sign must be advertised when E-Sign is enabled"
-        );
-    }
-
-    /// A disabled router's `sign` dispatch returns the kill-switch error text
-    /// BEFORE any auth/client/arg work — a tool-level error, not an auth error.
-    #[tokio::test]
-    async fn call_tool_sign_disabled_returns_disabled_error() {
-        let router = ToolRouter::new_with_esign(
-            Arc::new(McpState::new_unauthenticated_for_test(
-                "https://api.fast.io/current",
-            )),
-            false,
-        );
-        let mut args = Map::new();
-        args.insert(
-            "action".to_owned(),
-            Value::String("envelope-list".to_owned()),
-        );
-        args.insert("workspace_id".to_owned(), Value::String("1".to_owned()));
-        let res = router.call_tool("sign", args).await.expect("call_tool ok");
-        // The disabled gate returns an ERROR result (is_error == Some(true)), not
-        // a success payload.
-        assert_eq!(
-            res.is_error,
-            Some(true),
-            "disabled sign call must be an error result"
-        );
-        let text = result_to_string(&res);
-        assert!(
-            text.contains(
-                "E-Sign is currently disabled. Set FASTIO_ENABLE_ESIGN=1 to use sign commands"
-            ),
-            "disabled sign call must return the kill-switch error, got: {text}"
-        );
-        // It is the kill-switch error, not the auth gate — the gate wins first.
-        assert!(
-            !text.contains("Not authenticated"),
-            "disabled sign gate must win over the auth gate, got: {text}"
-        );
-    }
-
-    /// D4: the disabled INSTANCE listing path (`list_tools()` on a router built
-    /// with E-Sign disabled) omits `sign` — this exercises the production
-    /// instance method, not just the parameterized `list_tools_with(false)`.
-    #[test]
-    fn instance_list_tools_disabled_omits_sign() {
-        let router = ToolRouter::new_with_esign(
-            Arc::new(McpState::new_unauthenticated_for_test(
-                "https://api.fast.io/current",
-            )),
-            false,
-        );
-        let tools = router.list_tools().tools;
-        assert!(
-            !tools.iter().any(|t| t.name.as_ref() == "sign"),
-            "disabled instance list_tools() must omit sign"
-        );
-        // Every other registered tool is still advertised.
-        for def in TOOL_DEFS {
-            if def.name == "sign" {
-                continue;
-            }
-            assert!(
-                tools.iter().any(|t| t.name.as_ref() == def.name),
-                "non-sign tool '{}' must remain on a disabled instance",
-                def.name
-            );
-        }
-    }
-
-    /// D4: the disabled `sign` gate beats ARG EXTRACTION, not just auth — a call
-    /// with only `action` (no `workspace_id`, which the handler would otherwise
-    /// require) still returns the disabled error, proving the gate short-circuits
-    /// before any parameter validation.
-    #[tokio::test]
-    async fn call_tool_sign_disabled_beats_arg_extraction() {
-        let router = ToolRouter::new_with_esign(
-            Arc::new(McpState::new_unauthenticated_for_test(
-                "https://api.fast.io/current",
-            )),
-            false,
-        );
-        let mut args = Map::new();
-        // Minimal args: action only, deliberately NO workspace_id.
-        args.insert(
-            "action".to_owned(),
-            Value::String("envelope-list".to_owned()),
-        );
-        let res = router.call_tool("sign", args).await.expect("call_tool ok");
-        assert_eq!(
-            res.is_error,
-            Some(true),
-            "disabled sign call must be an error result"
-        );
-        let text = result_to_string(&res);
-        assert!(
-            text.contains("E-Sign is currently disabled"),
-            "gate must win over arg extraction, got: {text}"
-        );
-        // Not a missing-parameter error — the gate ran before arg extraction.
-        assert!(
-            !text.contains("workspace_id"),
-            "the disabled gate must short-circuit before requiring workspace_id, got: {text}"
-        );
-    }
-
     // ─── `--tools` allow-list filter (P1) ────────────────────────────────────
 
     // Deliberately Some-wrapped so call sites read `filter_of(&[...])` next to
@@ -16641,14 +16455,14 @@ mod ripley_tool_tests {
     }
 
     fn filtered_router(
-        esign_enabled: bool,
+        cloud_import_enabled: bool,
         filter: Option<std::collections::HashSet<String>>,
     ) -> ToolRouter {
         ToolRouter::new_with_filter(
             Arc::new(McpState::new_unauthenticated_for_test(
                 "https://api.fast.io/current",
             )),
-            esign_enabled,
+            cloud_import_enabled,
             filter,
         )
     }
@@ -16762,25 +16576,26 @@ mod ripley_tool_tests {
         );
     }
 
-    /// `has_visible_tools` reflects BOTH gates: a filter of only `sign` with
-    /// E-Sign disabled leaves zero visible tools (the empty-effective-surface
-    /// case `serve` refuses), whereas any other allow-listed tool keeps it true.
+    /// `has_visible_tools` reflects BOTH gates: a filter of only `import` with
+    /// cloud import disabled leaves zero visible tools (the
+    /// empty-effective-surface case `serve` refuses), whereas any other
+    /// allow-listed tool keeps it true.
     #[test]
-    fn has_visible_tools_reflects_esign_and_filter() {
-        let sign_only_disabled = filtered_router(false, filter_of(&["sign"]));
+    fn has_visible_tools_reflects_gate_and_filter() {
+        let import_only_disabled = filtered_router(false, filter_of(&["import"]));
         assert!(
-            !sign_only_disabled.has_visible_tools(),
-            "sign-only + E-Sign disabled has no visible tools"
+            !import_only_disabled.has_visible_tools(),
+            "import-only + cloud import disabled has no visible tools"
         );
-        let sign_only_enabled = filtered_router(true, filter_of(&["sign"]));
+        let import_only_enabled = filtered_router(true, filter_of(&["import"]));
         assert!(
-            sign_only_enabled.has_visible_tools(),
-            "sign-only + E-Sign enabled has a visible tool"
+            import_only_enabled.has_visible_tools(),
+            "import-only + cloud import enabled has a visible tool"
         );
         let org_only = filtered_router(false, filter_of(&["org"]));
         assert!(
             org_only.has_visible_tools(),
-            "org is visible regardless of E-Sign"
+            "org is visible regardless of the cloud-import gate"
         );
         assert!(
             filtered_router(false, None).has_visible_tools(),
@@ -16815,39 +16630,9 @@ mod ripley_tool_tests {
         }
     }
 
-    /// A filter that includes `sign` still respects the E-Sign kill-switch: with
-    /// E-Sign disabled, `sign` is neither advertised nor callable even when it is
-    /// in the allow-list (BOTH gates must pass).
-    #[tokio::test]
-    async fn filter_sign_still_gated_by_esign_flag() {
-        let router = filtered_router(false, filter_of(&["sign", "org"]));
-        // Not advertised: E-Sign disabled overrides the allow-list inclusion.
-        assert!(
-            !router
-                .list_tools()
-                .tools
-                .iter()
-                .any(|t| t.name.as_ref() == "sign"),
-            "sign must stay hidden when E-Sign is disabled, even if allow-listed"
-        );
-        // Not callable: returns the E-Sign disabled error (the filter admits it,
-        // then the E-Sign gate refuses it).
-        let mut args = Map::new();
-        args.insert(
-            "action".to_owned(),
-            Value::String("envelope-list".to_owned()),
-        );
-        let res = router.call_tool("sign", args).await.expect("ok");
-        assert_eq!(res.is_error, Some(true));
-        assert!(
-            result_to_string(&res).contains("E-Sign is currently disabled"),
-            "an allow-listed sign is still refused by the E-Sign gate when disabled"
-        );
-    }
-
     /// A `None` filter (the default) leaves the full surface intact — every
-    /// registered tool (sign included, since E-Sign is enabled here) is
-    /// advertised, matching the un-filtered production behavior.
+    /// registered tool is advertised, matching the un-filtered production
+    /// behavior.
     #[test]
     fn filter_none_is_full_surface() {
         let router = filtered_router(true, None);
@@ -16868,34 +16653,6 @@ mod ripley_tool_tests {
             names.len(),
             TOOL_DEFS.len(),
             "None filter advertises exactly the full TOOL_DEFS surface"
-        );
-    }
-
-    /// Disabling E-Sign does NOT affect any other tool: `howto` still routes to
-    /// its own handler (reaching the auth gate) rather than the sign gate.
-    #[tokio::test]
-    async fn call_tool_disabled_sign_does_not_affect_other_tools() {
-        let router = ToolRouter::new_with_esign(
-            Arc::new(McpState::new_unauthenticated_for_test(
-                "https://api.fast.io/current",
-            )),
-            false,
-        );
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("ask".to_owned()));
-        args.insert(
-            "question".to_owned(),
-            Value::String("How do I create a share?".to_owned()),
-        );
-        let res = router.call_tool("howto", args).await.expect("call_tool ok");
-        let text = result_to_string(&res);
-        assert!(
-            text.contains("Not authenticated"),
-            "howto must reach its own handler, got: {text}"
-        );
-        assert!(
-            !text.contains("E-Sign is currently disabled"),
-            "the E-Sign gate must not leak into other tools, got: {text}"
         );
     }
 
@@ -18316,14 +18073,9 @@ mod ripley_tool_tests {
 
     /// The cloud-import kill-switch must outrank introspection too.
     ///
-    /// `sign` gets this only by accident — it is named in the generic-describe
-    /// fall-through list because it has a hand-written payload, and that
-    /// happens to route it past the short-circuit into its gated match arm.
-    /// `import` has no hand-written payload, so without an explicit gate
-    /// `import describe` would answer in full on a server where every other
-    /// `import` action is refused. A gate that holds for one tool because of an
-    /// unrelated implementation detail is not a gate; this pins the behaviour
-    /// directly.
+    /// `import` has no hand-written describe payload, so without an explicit
+    /// gate `import describe` would answer in full on a server where every
+    /// other `import` action is refused. This pins the behaviour directly.
     #[tokio::test]
     async fn import_describe_respects_disabled_gate() {
         let router = ToolRouter::new_with_cloud_import(
@@ -18366,25 +18118,6 @@ mod ripley_tool_tests {
         );
     }
 
-    /// The E-Sign kill-switch outranks introspection: `sign describe` on a
-    /// DISABLED server returns the disabled error, not a describe payload.
-    #[tokio::test]
-    async fn sign_describe_respects_disabled_gate() {
-        let router = filtered_router(false, None);
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("describe".to_owned()));
-        let result = router
-            .call_tool("sign", args)
-            .await
-            .expect("disabled sign must not MCP-error");
-        assert_eq!(result.is_error, Some(true), "disabled sign is an error");
-        let text = format!("{:?}", result.content);
-        assert!(
-            text.contains("disabled"),
-            "must surface the kill-switch message: {text}"
-        );
-    }
-
     fn fileshare_tool_actions() -> Vec<&'static str> {
         super::TOOL_DEFS
             .iter()
@@ -18405,7 +18138,7 @@ mod ripley_tool_tests {
 
     #[test]
     fn fileshare_tool_is_registered_and_drive_oriented() {
-        let tools = ToolRouter::list_tools_with(true).tools;
+        let tools = ToolRouter::list_tools_all().tools;
         let fs = tools
             .iter()
             .find(|t| t.name.as_ref() == "fileshare")
@@ -19782,7 +19515,7 @@ mod ripley_tool_tests {
             "http://{addr}"
         )));
         state.set_token("test-token".to_owned()).await;
-        (ToolRouter::new_with_esign(state, true), captured)
+        (ToolRouter::new_for_tests(state), captured)
     }
 
     /// A 19-digit id sent as a JSON NUMBER must still scope the search.
@@ -19961,11 +19694,6 @@ mod ripley_tool_tests {
     #[tokio::test]
     async fn every_declared_describe_actually_answers() {
         for def in TOOL_DEFS {
-            // `sign` and `import` are kill-switched off on this router by
-            // default; their gated behaviour has its own dedicated tests.
-            if matches!(def.name, "sign" | "import") {
-                continue;
-            }
             let router = unauthed_router();
             let mut args = Map::new();
             args.insert("action".to_owned(), Value::String("describe".to_owned()));
@@ -20284,7 +20012,7 @@ mod ripley_tool_tests {
 
     /// The `auth` tool's published `properties` object.
     fn auth_schema_properties() -> serde_json::Map<String, Value> {
-        let tools = ToolRouter::list_tools_with(true).tools;
+        let tools = ToolRouter::list_tools_all().tools;
         let auth = tools
             .iter()
             .find(|t| t.name.as_ref() == "auth")

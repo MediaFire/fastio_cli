@@ -83,11 +83,10 @@ Use the `files` tool with `action: \"list\"` and provide your workspace_id —
 or skip the manual browse and let `ripley` `ask` answer over the content.
 
 ## E-signature
-E-sign tools appear only when enabled by the operator (feature sunset 2026-07;
-set `FASTIO_ENABLE_ESIGN=1`, and signing must also be enabled for the org). When
-enabled, the `sign` tool drives workspace-scoped e-signature envelopes (read +
+The `sign` tool drives workspace-scoped e-signature envelopes (read +
 draft-drive only; `send`/`void` are CLI-binary-only — envelopes are voided, not
-deleted).
+deleted). Signing is available on every plan; the org resource's
+`capabilities.signing` confirms availability.
 
 ## Available Tool Domains
 This is the FULL default surface; the operator may restrict it by starting the
@@ -99,8 +98,8 @@ for the authoritative live set.
 - ripley, member, comment, event, invitation, dashboard
 - preview, asset, apps, import, lock, metadata
 - system, id, howto
-- sign (only when E-Sign is enabled)
+- sign
 
 Each tool uses an `action` parameter to select the operation; the
-fileshare and id tools (and sign, when E-Sign is enabled) support
+fileshare, id and sign tools support
 `action: \"describe\"` for an authoritative per-action reference.";

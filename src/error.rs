@@ -150,13 +150,15 @@ pub enum CliError {
     /// that variant carries an HTTP status / code from the server). Both the
     /// `message` and the `hint` are static, caller-supplied strings so the
     /// variant stays resource-agnostic — the feature-specific wording lives at
-    /// the gate that constructs it (e.g. the E-Sign kill-switch in `main.rs`),
-    /// not here. Rendering flows through the same red `error:` + yellow `hint:`
-    /// path as every other `CliError`, via [`CliError::suggestion`].
+    /// the gate that constructs it (e.g. the cloud-import kill-switch in
+    /// `main.rs`), not here. Rendering flows through the same red `error:` +
+    /// yellow `hint:` path as every other `CliError`, via
+    /// [`CliError::suggestion`].
     #[error("{message}")]
     FeatureDisabled {
-        /// The user-facing headline (e.g. "E-Sign is currently disabled."). A
-        /// static string owned by the gate that constructs the variant.
+        /// The user-facing headline (e.g. "Cloud import is not yet
+        /// available."). A static string owned by the gate that constructs the
+        /// variant.
         message: &'static str,
         /// The recovery hint rendered on the yellow `hint:` line (e.g. how to
         /// re-enable the feature). A static string owned by the gate.

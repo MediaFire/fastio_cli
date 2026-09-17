@@ -247,7 +247,7 @@ The CLI includes a built-in [Model Context Protocol](https://modelcontextprotoco
 fastio mcp
 ```
 
-This exposes the CLI's action-routed tool surface as MCP tools over stdio, compatible with Claude Desktop, VS Code, and other MCP-compatible clients. A few high-risk or local-byte operations (sign send/void, fileshare upload write-back and ws-token) remain CLI-only, and the sign tool appears only when E-Sign is enabled.
+This exposes the CLI's action-routed tool surface as MCP tools over stdio, compatible with Claude Desktop, VS Code, and other MCP-compatible clients. A few high-risk or local-byte operations (sign send/void, fileshare upload write-back and ws-token) remain CLI-only.
 
 Tool responses are rendered as GitHub-flavored Markdown by default,
 byte-equivalent to the Fastio API's `?output=markdown` output.
