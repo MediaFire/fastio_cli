@@ -388,13 +388,23 @@ fastio files content --workspace WS_ID NODE_ID --cursor "NEXT_CURSOR"
 `indexed: false` is a normal answer, not a failure — that version has no
 extracted text yet, or carries none at all.
 
-## E-signature (disabled by default)
+## E-signature
 
-The e-signature surface (`fastio sign` and the `sign` MCP tool) is **disabled by
-default** as of the 2026-07 feature sunset. An operator re-enables it by setting
-`FASTIO_ENABLE_ESIGN=1`; signing must **also** be enabled for the organization
-server-side. While disabled, the `sign` subcommand is hidden from help and its
-execution is gated, and the `sign` MCP tool is filtered from the tool list.
+`fastio sign` and the `sign` MCP tool drive **`SignEnvelopes`** — PDFs sent to
+recipients for electronic signature. Every envelope is parented to a
+**workspace**, so each subcommand takes a required `--workspace <id>`.
+
+Signing is available on **every plan**. The org resource exposes
+`capabilities.signing` (boolean) to confirm availability, and the server rejects
+calls with a feature-disabled error if an org's plan does not grant it — a `403`
+with error code `1670` ("Signing is not enabled for this organization"). Access
+also requires workspace membership.
+
+Over MCP the `sign` tool exposes reads, reversible draft-drive actions, and the
+idempotent recovery actions. The outward-facing and terminal actions — `send`
+(which emails real recipients) and `void` — are **CLI-binary-only**
+(`fastio sign envelope send|void …`), as are `template create|update|delete`.
+Envelopes are voided, never deleted.
 
 ## File Shares
 
@@ -537,11 +547,10 @@ fastio mcp
 ```
 
 It speaks MCP over stdio and exposes the CLI's operations as action-routed tools
-(`ripley`, `fileshare`, `files`, `org`, `workspace`, … plus `sign` only when
-E-Sign is enabled). The `files` tool mirrors the three ways to reach a file's
-words: `read` for raw bytes, `content` for one file's extracted text as
-addressed chunks, and `content-many` to score up to 10 files against one
-question in a single call. Tool results are
+(`ripley`, `fileshare`, `files`, `org`, `workspace`, `sign`, …). The `files`
+tool mirrors the three ways to reach a file's words: `read` for raw bytes,
+`content` for one file's extracted text as addressed chunks, and `content-many`
+to score up to 10 files against one question in a single call. Tool results are
 rendered as GitHub-flavored Markdown for compact, high-signal consumption. This
 same guide is available as the `skill://guide` MCP resource and via
 `fastio skill`.

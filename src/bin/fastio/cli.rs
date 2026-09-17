@@ -163,8 +163,8 @@ pub enum Commands {
     #[command(subcommand)]
     Event(EventCommands),
     /// Per-workspace dashboard: the calling member's ranked, actionable card
-    /// feed (@mentions, file activity, file versions, synthesis; signature cards
-    /// only when E-Sign is enabled platform-side). Dismiss / snooze / undismiss
+    /// feed (@mentions, file activity, file versions, synthesis, and signature
+    /// cards). Dismiss / snooze / undismiss
     /// are per-member and out-of-band — they only hide a card from your own feed,
     /// never resolving the underlying card subject.
     #[command(subcommand)]
@@ -252,13 +252,10 @@ pub enum Commands {
     /// E-signature: draft, send, void, and download `SignEnvelopes` (PDFs sent
     /// to recipients for electronic signature). Every envelope is parented to a
     /// workspace (each subcommand takes a required `--workspace <id>`). Signing
-    /// is a paid-plan feature.
-    ///
-    /// Disabled by default (feature sunset 2026-07): the runtime kill-switch in
-    /// `main.rs` blocks execution unless `FASTIO_ENABLE_ESIGN=1`, and `hide =
-    /// true` keeps the surface out of top-level `--help`. The env var does not
-    /// un-hide the entry (hide is static); only execution is gated.
-    #[command(subcommand, hide = true)]
+    /// is available on every plan; the org resource's `capabilities.signing`
+    /// confirms availability, and the server rejects calls with a
+    /// feature-disabled error if an org's plan does not grant it.
+    #[command(subcommand)]
     Sign(SignCommands),
 
     /// File Shares: durable, link-shareable views of a single workspace file
@@ -485,9 +482,10 @@ pub enum SearchCommands {
 ///
 /// `SignEnvelopes` are parented to a Workspace; every subcommand takes a
 /// required `--workspace <id>` flag. Drafts are created and edited via these
-/// commands, then `send` emails real recipients. Signing is a paid-plan feature
-/// (a non-entitled org returns `1670`; access also requires workspace
-/// membership).
+/// commands, then `send` emails real recipients. Signing is available on every
+/// plan; the org resource's `capabilities.signing` confirms availability, and
+/// the server rejects calls with a feature-disabled error (`1670`) if an org's
+/// plan does not grant it. Access also requires workspace membership.
 // Justification: the envelope-lifecycle variant carries the create/update
 // flag set and is larger than the download variants. This is a clap subcommand
 // enum constructed once at parse time and immediately dispatched (never stored
