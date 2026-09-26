@@ -209,7 +209,7 @@ Pipelines that need machine-parseable output can opt back in with
 | `share` | Share CRUD, files, members, password auth |
 | `fileshare` | File Shares — durable single-file link shares (replaces the retired QuickShare): create/list/info/update/delete, grants, download/versions/preview, upload write-back, activity, ws-token |
 | `comment` | Comments, replies, reactions, attachments |
-| `event` | Activity events, search, polling |
+| `event` | Activity events, search, polling, org-wide storage change feed (`event changes`) |
 | `preview` | File preview URLs and transforms |
 | `asset` | Org/workspace/user asset management |
 

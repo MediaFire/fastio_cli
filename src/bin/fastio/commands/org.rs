@@ -441,7 +441,7 @@ fn validate_org_id(org_id: &str) -> Result<()> {
 fn validate_email_or_user_id(target: &str) -> Result<()> {
     let target = target.trim();
     anyhow::ensure!(!target.is_empty(), "email or user ID must not be empty");
-    if is_user_id(target) {
+    if super::is_profile_id(target) {
         return Ok(());
     }
     anyhow::ensure!(
@@ -450,11 +450,6 @@ fn validate_email_or_user_id(target: &str) -> Result<()> {
          19-digit user ID (to add an existing user)"
     );
     Ok(())
-}
-
-/// A 19-digit numeric profile id, per the platform's id convention.
-fn is_user_id(target: &str) -> bool {
-    target.len() == 19 && target.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Validate that a role is one of the accepted values.
