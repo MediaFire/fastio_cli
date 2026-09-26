@@ -1917,7 +1917,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "event",
-        description: "Events & audit log: search, summarize, details, ack, activity-list, activity-poll. PAGING: STOP ON AN EMPTY PAGE, NEVER A SHORT ONE. SUMMARIZE SPENDS AI CREDITS AND SUMMARISES ONLY WHAT THIS CALLER CAN SEE: it is built from the same page search returns, after inaccessible rows are dropped, so on partial access it narrates a fraction of what happened in confident prose with NO marker that anything was withheld — and the reported date range is derived from the surviving rows, so it can assert a period it never saw. Credits are spent the same either way. Do not present a summary as complete without checking search with identical filters first. Rows you cannot see are removed AFTER the page is cut, so a short page does NOT mean end-of-data — the usual loop-while-page-size-equals-limit exits early and reports success, silently reading a fraction of what exists. A small count is therefore not a measure of how much happened. Narrow with event/category so the page is spent on rows of the kind you asked for. search AND summarize forward the same audit-log filters — visibility (external_audit_log|external), created_min/created_max time bounds, parent_event_id (serial/batch drill; cannot combine with filters other than acknowledged/limit/offset), acknowledged, calling_user_id (distinct from user_id), object_id, and subcategory; summarize additionally takes user_context. Pass the global --detail (terse|standard|full) on the CLI to select the server output verbosity.",
+        description: "Events & audit log: search, summarize, details, ack, activity-list, activity-poll, changes. SEARCH/SUMMARIZE PAGING: STOP ON AN EMPTY PAGE, NEVER A SHORT ONE (this rule does NOT apply to changes — see CHANGES below). SUMMARIZE SPENDS AI CREDITS AND SUMMARISES ONLY WHAT THIS CALLER CAN SEE: it is built from the same page search returns, after inaccessible rows are dropped, so on partial access it narrates a fraction of what happened in confident prose with NO marker that anything was withheld — and the reported date range is derived from the surviving rows, so it can assert a period it never saw. Credits are spent the same either way. Do not present a summary as complete without checking search with identical filters first. Rows you cannot see are removed AFTER the page is cut, so a short page does NOT mean end-of-data — the usual loop-while-page-size-equals-limit exits early and reports success, silently reading a fraction of what exists. A small count is therefore not a measure of how much happened. Narrow with event/category so the page is spent on rows of the kind you asked for. search AND summarize forward the same audit-log filters — visibility (external_audit_log|external), created_min/created_max time bounds, parent_event_id (serial/batch drill; cannot combine with filters other than acknowledged/limit/offset), acknowledged, calling_user_id (distinct from user_id), object_id, and subcategory; summarize additionally takes user_context. Pass the global --detail (terse|standard|full) on the CLI to select the server output verbosity. CHANGES (org storage change feed; org_id REQUIRED): one call and one forward-only cursor cover every storage change across every workspace and share of the org this caller can read. BOOTSTRAP: omit cursor → changes:[] plus a head cursor; then list every workspace/share in profiles.items in full — that listing plus the feed from then on is the complete picture. FOLLOW: send the returned cursor back unchanged. PACING: has_more=true → call again now; has_more=true AND the returned cursor equals the one you sent → the newest changes are still settling, wait about 10 seconds before calling again (never tight-loop); has_more=false → caught up, poll again slowly. An EMPTY changes page with has_more=true is NOT caught up. DEDUPE BY event_id: a row can be redelivered, and the LATEST delivered copy wins. When profiles.version changes, re-list profiles.items and reconcile. An expired (cursor_expired) or invalid cursor → re-bootstrap (omit cursor) and do a full re-list. A missing calling_user_id means the actor is not visible to you, not a system action. COVERAGE GAPS — reconcile with a periodic full listing: no purge (permanent delete) events; a rename arrives as an _updated event; some share-only operations have no workspace twin; a commit later than the ~10 s settling window can be missed; user-owned shares are in no org feed (poll those per share); a folder share you can also read through its workspace is omitted from profiles.items and its changes arrive once, via the workspace.",
         actions: &[
             "search",
             "summarize",
@@ -1925,6 +1925,7 @@ const TOOL_DEFS: &[ToolDef] = &[
             "ack",
             "activity-list",
             "activity-poll",
+            "changes",
             // Universal: every tool self-describes. Declared so a STRICT
             // client will actually send it — the router has always accepted
             // it, but a schema that omits it makes the call look invalid.
@@ -1948,7 +1949,11 @@ const TOOL_DEFS: &[ToolDef] = &[
                  calling_user_id, which has its own caveats",
                 false,
             ),
-            ("org_id", "Organization ID", false),
+            (
+                "org_id",
+                "Organization ID (19-digit, as a string). Filter for search/summarize; REQUIRED for changes",
+                false,
+            ),
             ("event_id", "Event ID (details, ack)", false),
             ("event", "Event type filter", false),
             (
@@ -2043,8 +2048,16 @@ const TOOL_DEFS: &[ToolDef] = &[
             ("entity_id", "Entity ID (activity-poll)", false),
             ("lastactivity", "Last activity timestamp", false),
             ("wait", "Long-poll seconds (activity-poll)", false),
-            ("cursor", "Cursor (activity-list)", false),
-            ("limit", "Pagination limit (integer)", false),
+            (
+                "cursor",
+                "Cursor (activity-list; changes: the previous response's cursor, sent back unchanged — omit to bootstrap; a non-empty string)",
+                false,
+            ),
+            (
+                "limit",
+                "Pagination limit (integer; changes: 1-1000, default 250)",
+                false,
+            ),
             ("offset", "Pagination offset (integer)", false),
         ],
     },
@@ -9922,6 +9935,43 @@ async fn handle_event(
             {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
+            }
+        }
+        "changes" => {
+            // org_id is the whole scope of the call, so it is required here
+            // (and only here) — a string or a JSON number, like every id.
+            let org_id = match optional_id(args, "org_id") {
+                Ok(Some(v)) => v,
+                Ok(None) => return Ok(error_text("Missing required parameter: org_id")),
+                Err(e) => return Ok(e),
+            };
+            let org_id = org_id.trim();
+            if !crate::commands::is_profile_id(org_id) {
+                return Ok(error_text(&format!(
+                    "invalid org_id '{org_id}': expected a 19-digit numeric ID"
+                )));
+            }
+            // Strict: a mistyped or empty cursor must never read as "omitted",
+            // which would silently re-bootstrap and skip every pending change.
+            let cursor = match optional_str_strict(args, "cursor") {
+                Ok(Some("")) => {
+                    return Ok(error_text(
+                        "cursor must not be empty — omit it (or send null) to bootstrap",
+                    ));
+                }
+                Ok(c) => c,
+                Err(e) => return Ok(e),
+            };
+            let limit = match optional_u32_strict(args, "limit") {
+                Ok(Some(l)) if !(1..=1000).contains(&l) => {
+                    return Ok(error_text("limit must be between 1 and 1000"));
+                }
+                Ok(l) => l,
+                Err(e) => return Ok(e),
+            };
+            match api::event::org_changes(&client, org_id, cursor, limit).await {
+                Ok(v) => Ok(success_json(&v)),
+                Err(e) => Ok(cli_err_to_result(&api::event::map_org_changes_error(e))),
             }
         }
         _ => Ok(error_text(&format!("Unknown event action: {action}"))),
@@ -19557,6 +19607,175 @@ mod ripley_tool_tests {
         assert!(
             text.contains("must be an ID string"),
             "an object in a scope-id slot must be rejected, not ignored, got: {text}"
+        );
+    }
+
+    fn event_changes_args(extra: &[(&str, Value)]) -> Map<String, Value> {
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("changes".to_owned()));
+        for (k, v) in extra {
+            args.insert((*k).to_owned(), v.clone());
+        }
+        args
+    }
+
+    /// `changes` is advertised: in the schema's action list and in describe.
+    #[tokio::test]
+    async fn event_changes_is_listed_in_actions_and_describe() {
+        let def = TOOL_DEFS
+            .iter()
+            .find(|d| d.name == "event")
+            .expect("event tool");
+        assert!(def.actions.contains(&"changes"));
+        let router = unauthed_router();
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("describe".to_owned()));
+        let res = router.call_tool("event", args).await.expect("ok");
+        let text = result_to_string(&res);
+        assert!(text.contains("- changes"), "got: {text}");
+        assert!(text.contains("DEDUPE BY event_id"), "got: {text}");
+    }
+
+    /// `org_id` is required for `changes` (and only there), and must be an id.
+    #[tokio::test]
+    async fn event_changes_requires_org_id() {
+        let router = authed_router().await;
+        let res = router
+            .call_tool("event", event_changes_args(&[]))
+            .await
+            .expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("Missing required parameter: org_id"),
+            "got: {text}"
+        );
+        let res = router
+            .call_tool(
+                "event",
+                event_changes_args(&[("org_id", json!("not-an-id"))]),
+            )
+            .await
+            .expect("call_tool ok");
+        assert!(
+            result_to_string(&res).contains("19-digit"),
+            "a malformed org_id must be refused before the request"
+        );
+    }
+
+    /// A numeric `org_id` reaches the path exactly, and a cursor carrying `+`,
+    /// `/` and `=` is encoded exactly once.
+    #[tokio::test]
+    async fn event_changes_numeric_org_id_and_cursor_encoded_once() {
+        let (router, captured) = capture_router().await;
+        let args = event_changes_args(&[
+            ("org_id", json!(1_111_111_111_111_111_111_u64)),
+            ("cursor", json!("ab+c/d==")),
+            ("limit", json!(5)),
+        ]);
+        let _ = router.call_tool("event", args).await.expect("call_tool ok");
+        let req = captured.lock().expect("capture lock").clone();
+        assert!(
+            req.contains("GET /org/1111111111111111111/events/changes/?"),
+            "request:\n{req}"
+        );
+        assert!(req.contains("cursor=ab%2Bc%2Fd%3D%3D"), "request:\n{req}");
+        assert!(!req.contains("%25"), "double-encoded:\n{req}");
+        assert!(req.contains("limit=5"), "request:\n{req}");
+    }
+
+    /// A string `org_id` works, and no cursor means a bootstrap with no query.
+    #[tokio::test]
+    async fn event_changes_string_org_id_bootstraps_without_query() {
+        let (router, captured) = capture_router().await;
+        let args = event_changes_args(&[("org_id", json!("1111111111111111111"))]);
+        let _ = router.call_tool("event", args).await.expect("call_tool ok");
+        let req = captured.lock().expect("capture lock").clone();
+        assert!(
+            req.contains("GET /org/1111111111111111111/events/changes/ HTTP"),
+            "request:\n{req}"
+        );
+    }
+
+    /// `limit` outside 1..=1000, or not an integer, is refused before the
+    /// request.
+    #[tokio::test]
+    async fn event_changes_rejects_out_of_range_limit() {
+        let router = authed_router().await;
+        for bad in [json!(0), json!(1001)] {
+            let args =
+                event_changes_args(&[("org_id", json!("1111111111111111111")), ("limit", bad)]);
+            let res = router.call_tool("event", args).await.expect("call_tool ok");
+            let text = result_to_string(&res);
+            assert!(text.contains("between 1 and 1000"), "got: {text}");
+        }
+        let args = event_changes_args(&[
+            ("org_id", json!("1111111111111111111")),
+            ("limit", json!("many")),
+        ]);
+        let res = router.call_tool("event", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(text.contains("non-negative integer"), "got: {text}");
+    }
+
+    /// A non-string or empty cursor is an error — never a silent re-bootstrap.
+    #[tokio::test]
+    async fn event_changes_rejects_non_string_or_empty_cursor() {
+        let router = authed_router().await;
+        let args = event_changes_args(&[
+            ("org_id", json!("1111111111111111111")),
+            ("cursor", json!(12)),
+        ]);
+        let res = router.call_tool("event", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(text.contains("must be a string"), "got: {text}");
+        let args = event_changes_args(&[
+            ("org_id", json!("1111111111111111111")),
+            ("cursor", json!("")),
+        ]);
+        let res = router.call_tool("event", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(text.contains("must not be empty"), "got: {text}");
+    }
+
+    /// The measured invalid-cursor body gets the same re-bootstrap hint as the
+    /// CLI, through the shared mapper.
+    #[tokio::test]
+    async fn event_changes_invalid_cursor_carries_the_rebootstrap_hint() {
+        let (router, _) = router_answering_status(
+            "HTTP/1.1 406 Not Acceptable",
+            br#"{"result":false,"error":{"code":158008,"text":"Invalid cursor.","resource":"GET Org [param] Events Changes"}}"#,
+        )
+        .await;
+        let args = event_changes_args(&[
+            ("org_id", json!("1111111111111111111")),
+            ("cursor", json!("abc")),
+        ]);
+        let res = router.call_tool("event", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains(fastio_cli::api::event::HINT_CHANGES_CURSOR_INVALID),
+            "got: {text}"
+        );
+    }
+
+    /// The expired-cursor body (object-shaped `params`) survives extraction and
+    /// gets the resync hint.
+    #[tokio::test]
+    async fn event_changes_expired_cursor_carries_the_resync_hint() {
+        let (router, _) = router_answering_status(
+            "HTTP/1.1 406 Not Acceptable",
+            br#"{"result":false,"error":{"code":187907,"text":"The cursor has expired.","params":{"reason":"cursor_expired"}}}"#,
+        )
+        .await;
+        let args = event_changes_args(&[
+            ("org_id", json!("1111111111111111111")),
+            ("cursor", json!("abc")),
+        ]);
+        let res = router.call_tool("event", args).await.expect("call_tool ok");
+        let text = result_to_string(&res);
+        assert!(
+            text.contains(fastio_cli::api::event::HINT_CHANGES_CURSOR_EXPIRED),
+            "got: {text}"
         );
     }
 

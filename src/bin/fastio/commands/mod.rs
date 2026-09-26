@@ -200,6 +200,12 @@ impl CommandContext<'_> {
     }
 }
 
+/// A 19-digit numeric profile id (user, org, workspace, share), per the
+/// platform's id convention.
+pub(crate) fn is_profile_id(target: &str) -> bool {
+    target.len() == 19 && target.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Parse an optional JSON-object argument, supporting an `@path` form that reads
 /// the JSON from a file (`@@` escapes a literal leading `@`).
 ///

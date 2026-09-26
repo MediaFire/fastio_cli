@@ -349,6 +349,33 @@ fastio search share SHARE_ID "query" --only files,comments
 either form to attach extracted metadata facts to file and note hits in the
 files bucket (workspace only; a share accepts the flag and returns no facts).
 
+### Watching an org for storage changes
+
+`fastio event changes` reads one page of the org-wide storage change feed: one
+call and one cursor cover every workspace and share of the org you can read.
+It is a single call — loop it yourself:
+
+```bash
+# 1. Bootstrap: no cursor. Returns no changes, a head cursor, and profiles.items.
+fastio event changes --org-id ORG_ID --format json
+# 2. Immediately list every workspace/share in profiles.items in full.
+# 3. Follow: send the returned cursor back unchanged.
+fastio event changes --org-id ORG_ID --cursor CURSOR --format json
+```
+
+- `has_more: true` → call again now. `has_more: true` with the SAME cursor you
+  sent → the newest changes are still settling; wait ~10 seconds first.
+  `has_more: false` → caught up; poll again later. An empty page with
+  `has_more: true` is not the end.
+- Dedupe by `event_id`; a row can be redelivered and the latest copy wins.
+- `profiles.version` changed → re-list `profiles.items`. An expired or invalid
+  cursor → re-bootstrap and re-list.
+- Reconcile with a periodic full listing: the feed has no purge events, reports
+  a rename as `_updated`, can miss some share-only operations and very late
+  commits, and never covers user-owned shares.
+
+Over MCP this is the `event` tool's `changes` action (`org_id` required).
+
 ### Reading a document's text (locate and quote)
 
 `fastio files read` returns a file's raw bytes. `fastio files content` returns

@@ -5060,6 +5060,55 @@ pub enum EventCommands {
         #[arg(long)]
         offset: Option<u32>,
     },
+    /// Read one page of the org-wide storage change feed.
+    ///
+    /// One call and one cursor cover every storage change (file/folder add,
+    /// update, delete, move, copy, restore, links, cloud-sync adds) across every
+    /// workspace and share of the org you can read. This is a single call:
+    /// loop it yourself.
+    ///
+    /// **Bootstrap:** omit `--cursor`. You get no changes and a head cursor;
+    /// then list every workspace/share in `profiles.items` in full. That
+    /// listing plus the feed from here on is the complete picture.
+    ///
+    /// **Follow:** pass the returned `cursor` back unchanged.
+    /// - `has_more: true` → call again now.
+    /// - `has_more: true` with the SAME cursor you sent → the newest changes
+    ///   are still settling; wait about 10 seconds first.
+    /// - `has_more: false` → caught up; poll again later.
+    ///
+    /// An empty `changes` page with `has_more: true` is NOT the end.
+    ///
+    /// **Dedupe by `event_id`** — a change can be redelivered; the latest
+    /// delivered copy wins. When `profiles.version` changes, re-list
+    /// `profiles.items`. An expired or invalid cursor means re-bootstrap and
+    /// re-list.
+    ///
+    /// **Coverage gaps — reconcile with a periodic full listing:**
+    /// - no permanent-delete (purge) events;
+    /// - a rename arrives as an `_updated` event;
+    /// - some share-only operations have no workspace twin;
+    /// - a very late commit (beyond the ~10 s window) can be missed;
+    /// - user-owned shares are in no org feed;
+    /// - a folder share you can also read through its workspace is left out
+    ///   of `profiles.items`; its changes are reported once, via the workspace.
+    ///
+    /// Table and CSV output show the `changes` rows (an empty table on
+    /// bootstrap) and print `cursor`, `has_more` and `profiles.version` to
+    /// stderr (suppressed by `--quiet`). Use `--format json` for the full
+    /// response. See <https://api.fast.io/current/llms/full/>.
+    Changes {
+        /// Organization ID (19-digit).
+        #[arg(long)]
+        org_id: String,
+        /// Cursor from the previous response, sent back unchanged. Omit to
+        /// bootstrap.
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        cursor: Option<String>,
+        /// Maximum number of changes to return (1-1000; server default 250).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        limit: Option<u32>,
+    },
 }
 
 // ─── Dashboard ──────────────────────────────────────────────────────────────

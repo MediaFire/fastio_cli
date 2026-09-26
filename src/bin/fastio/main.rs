@@ -2151,6 +2151,15 @@ fn map_event_command(cmd: cli::EventCommands) -> EventCommand {
             limit,
             offset,
         },
+        cli::EventCommands::Changes {
+            org_id,
+            cursor,
+            limit,
+        } => EventCommand::Changes {
+            org_id,
+            cursor,
+            limit,
+        },
     }
 }
 
