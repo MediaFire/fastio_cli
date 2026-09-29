@@ -94,7 +94,7 @@ pub struct ChatCreateOptions {
 pub fn new_idempotency_key() -> String {
     use base64::Engine as _;
     let mut buf = [0u8; 16];
-    if getrandom_crate::getrandom(&mut buf).is_err() {
+    if getrandom_crate::fill(&mut buf).is_err() {
         // Randomness is unavailable — extremely unlikely, and NOT worth failing
         // the request over. Returning an empty key omits the field, which is the
         // documented "let the server generate one" behaviour: no replay guard,

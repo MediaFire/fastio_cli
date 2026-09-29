@@ -36,6 +36,32 @@ get_latest_version() {
         | sed 's/.*"tag_name": *"//;s/".*//'
 }
 
+# Verify a downloaded file against its entry in a SHA256SUMS file
+# Usage: verify_checksum <file> <SHA256SUMS> <asset name>
+verify_checksum() {
+    expected=$(awk -v name="$3" '$2 == name || $2 == "*" name { print $1; exit }' "$2")
+    if [ -z "$expected" ]; then
+        echo "Error: no checksum for $3 in SHA256SUMS" >&2
+        return 1
+    fi
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$1" | awk '{ print $1 }')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 "$1" | awk '{ print $1 }')
+    else
+        echo "Error: sha256sum or shasum is required to verify the download" >&2
+        return 1
+    fi
+
+    if [ "$actual" != "$expected" ]; then
+        echo "Error: checksum mismatch for $3" >&2
+        echo "  expected: $expected" >&2
+        echo "  actual:   $actual" >&2
+        return 1
+    fi
+}
+
 main() {
     echo "Fast.io CLI installer"
     echo ""
@@ -61,6 +87,17 @@ main() {
         echo "Error: download failed. Check that a release exists for your platform." >&2
         exit 1
     fi
+
+    if ! curl -fsSL -o "${TMP}/SHA256SUMS" "https://github.com/${REPO}/releases/download/${VERSION}/SHA256SUMS"; then
+        echo "Error: could not download SHA256SUMS for ${VERSION}" >&2
+        exit 1
+    fi
+
+    if ! verify_checksum "${TMP}/fastio" "${TMP}/SHA256SUMS" "$BINARY"; then
+        echo "Error: refusing to install an unverified binary" >&2
+        exit 1
+    fi
+    echo "Checksum verified"
 
     chmod +x "${TMP}/fastio"
 

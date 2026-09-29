@@ -83,7 +83,7 @@ fn base64url_encode(bytes: &[u8]) -> String {
 
 /// Fill a buffer with cryptographically secure random bytes.
 fn fill_random(buf: &mut [u8]) -> Result<(), CliError> {
-    getrandom_crate::getrandom(buf)
+    getrandom_crate::fill(buf)
         .map_err(|e| CliError::Auth(format!("failed to generate random bytes: {e}")))
 }
 
