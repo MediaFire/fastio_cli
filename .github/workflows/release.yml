@@ -7,15 +7,53 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  verify-version:
+    name: Verify version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Cargo.toml and npm/package.json must agree, and a tag must name that
+      # version, so a mismatched tag builds and publishes nothing.
+      - name: Check tag, Cargo.toml and npm/package.json versions
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          cargo_version=$(awk '/^\[/ { in_pkg = ($0 == "[package]") } in_pkg && /^version *=/ { gsub(/^version *= *"|".*$/, ""); print; exit }' Cargo.toml)
+          npm_version=$(node -p 'require("./npm/package.json").version')
+          echo "Cargo.toml: ${cargo_version:-<missing>}"
+          echo "npm/package.json: ${npm_version:-<missing>}"
+          if [ -z "$cargo_version" ] || [ -z "$npm_version" ]; then
+            echo "::error::Could not read the version from Cargo.toml or npm/package.json"
+            exit 1
+          fi
+          if [ "$cargo_version" != "$npm_version" ]; then
+            echo "::error::Cargo.toml ($cargo_version) and npm/package.json ($npm_version) versions differ"
+            exit 1
+          fi
+          if [ "$REF_TYPE" = "tag" ]; then
+            if [ "$REF_NAME" != "v$cargo_version" ]; then
+              echo "::error::Tag $REF_NAME does not match version v$cargo_version"
+              exit 1
+            fi
+            echo "Tag $REF_NAME matches"
+          else
+            echo "Not a tag ref ($REF_NAME); skipping tag comparison"
+          fi
+
   build:
     name: Build ${{ matrix.target }}
+    needs: verify-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -49,6 +87,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -87,8 +127,12 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -118,6 +162,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v7
         with:
