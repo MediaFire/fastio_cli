@@ -931,8 +931,16 @@ const TOOL_DEFS: &[ToolDef] = &[
         ],
         params: &[
             ("workspace_id", "Workspace ID", false),
-            ("org_id", "Organization ID (list, create)", false),
-            ("name", "Workspace name", false),
+            (
+                "org_id",
+                "Organization ID (list, create, check-name)",
+                false,
+            ),
+            (
+                "name",
+                "Workspace name (check-name: the folder name to check)",
+                false,
+            ),
             ("folder_name", "Folder name / slug (create)", false),
             ("description", "Description", false),
             ("intelligence", "Enable AI (true/false)", false),
@@ -5688,11 +5696,15 @@ async fn handle_workspace(
             Err(e) => Ok(cli_err_to_result(&e)),
         },
         "check-name" => {
+            let org_id = match required_str(args, "org_id") {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
             let name = match required_str(args, "name") {
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            match api::workspace::check_workspace_name(&client, name).await {
+            match api::workspace::check_workspace_name(&client, org_id, name).await {
                 Ok(v) => Ok(success_json(&v)),
                 Err(e) => Ok(cli_err_to_result(&e)),
             }

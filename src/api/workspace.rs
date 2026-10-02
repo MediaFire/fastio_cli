@@ -301,11 +301,22 @@ pub async fn available_workspaces(client: &ApiClient) -> Result<Value, CliError>
     client.get("/workspaces/available/").await
 }
 
-/// Check workspace name availability.
+/// Check workspace folder name availability.
 ///
-/// `GET /workspaces/check/name/{name}/`
-pub async fn check_workspace_name(client: &ApiClient, name: &str) -> Result<Value, CliError> {
-    let path = format!("/workspaces/check/name/{}/", urlencoding::encode(name));
+/// The caller must be a member of `org_id`. A free name returns
+/// `{"result": true}`; a taken name is an API error (code `10073`).
+///
+/// `GET /workspaces/check/name/{org_id}/{name}/`
+pub async fn check_workspace_name(
+    client: &ApiClient,
+    org_id: &str,
+    name: &str,
+) -> Result<Value, CliError> {
+    let path = format!(
+        "/workspaces/check/name/{}/{}/",
+        urlencoding::encode(org_id),
+        urlencoding::encode(name)
+    );
     client.get(&path).await
 }
 
