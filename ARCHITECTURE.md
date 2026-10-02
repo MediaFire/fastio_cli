@@ -114,8 +114,18 @@ Both modes share a common API layer, ensuring zero code duplication.
 #### `pkce.rs`
 - RFC 7636 PKCE S256 implementation
 - CSPRNG via `getrandom` crate for code_verifier and state
-- Local TCP server on port 19836 for OAuth callback
-- Authorization code + state extraction and CSRF validation
+- Client id and the legacy fixed redirect constant (code + `state` extraction and CSRF validation
+  live in `loopback.rs`)
+- `--no-browser` variant: fixed legacy redirect `http://localhost:19836/callback`, `display_code=true`,
+  user pastes the displayed code back
+
+#### `loopback.rs`
+- One-shot RFC 8252 ("OAuth 2.0 for Native Apps") loopback callback listener for the browser PKCE flow
+- Binds `127.0.0.1:0` (OS-assigned ephemeral port) before the authorize request, so the `redirect_uri`
+  is known up front
+- Completes on the first valid callback (a matching `state`, or `error=access_denied` with no
+  `state`, treated as a deny; a different `state` is refused), refusing invalid requests while it
+  waits, then shuts down — bounded by a 10-minute timeout
 
 ### `api/` — 28 Modules
 
@@ -186,7 +196,7 @@ Each module handles one command group, orchestrating API calls and output render
 - `--tools` allow-list: a validated set (unknown names warned to stderr and ignored; an all-unknown list is a fail-fast error) threaded into `ToolRouter` and enforced in BOTH `list_tools` (advertised set) and `call_tool` (callable set), so the two never diverge; `None` = all tools. Hidden aliases (`ai`→`ripley`, `how-to`→`howto`) are gated by their canonical name
 - `list_tools` also filters out the `import` tool when the cloud-import kill-switch is off (read once at `ToolRouter` construction); the intro `instructions` enumerate only the visible tools. `import` requires BOTH the cloud-import flag AND allow-list inclusion
 - Auth resolved at startup from credential chain
-- In-session token updates via `auth` tool's `signin`/`set-api-key` actions
+- In-session token updates via `auth` tool's `login-start`/`login-status`/`set-api-key` actions
 - Tracing disabled to keep stdout clean for JSON-RPC
 
 #### `tools.rs`
@@ -278,26 +288,32 @@ The `ApiClient::handle_response()` method:
 
 ## Authentication Flows
 
-### Basic Auth
-1. User provides `--email` and `--password`
-2. Base64-encode `email:password`
-3. GET `/user/auth/` with `Authorization: Basic <encoded>`
-4. Receive JWT token (1-hour lifetime), store in credentials
-5. If `2factor: true`, prompt for 2FA verification
+Password sign-in has moved out of the CLI entirely — it, and 2FA, now happen on the browser-hosted
+sign-in page. `auth login` always drives the PKCE flow below, in either its browser or `--no-browser`
+variant.
 
 ### PKCE Browser Flow
 1. Generate code_verifier (32 random bytes via `getrandom`, base64url)
 2. Derive code_challenge (SHA-256, base64url)
 3. Generate random state parameter
-4. GET `/oauth/authorize/` with challenge, state, client_id — plus `access_mode`
-   (`r`/`rwa`, from `--read-only`/`--admin`) and `account_settings=1` when requested;
+4. Bind a one-shot loopback listener on `127.0.0.1:0` (OS-assigned ephemeral port) — see
+   `auth/loopback.rs`
+5. GET `/oauth/authorize/` with challenge, state, client_id, the loopback `redirect_uri` — plus
+   `access_mode` (`r`/`rwa`, from `--read-only`/`--admin`) and `account_settings=1` when requested;
    both are a CEILING the consent page may narrow
-5. Open browser to `https://go.fast.io/connect?auth_request_id=...`
-6. Start local TCP server on `127.0.0.1:19836`
-7. User authenticates in browser, callback received
-8. Verify state matches (CSRF protection)
-9. POST `/oauth/token/` to exchange code + verifier for tokens
-10. Store access_token, refresh_token, and the granted `scopes` echoed by the exchange
+6. Open the browser to the server-returned `login_url`
+7. User signs in (including 2FA, if enrolled) on that page; await the callback on the loopback
+   listener, verifying the `state` (CSRF protection) with a 10-minute timeout
+8. POST `/oauth/token/` to exchange code + verifier for tokens, using the same `redirect_uri` as step 5
+9. Store access_token, refresh_token, and the granted `scopes` echoed by the exchange
+
+### PKCE `--no-browser` Variant
+1. Same as steps 1-3 and 5 above (no listener is bound), but the authorize request sets
+   `display_code=true` and uses the legacy fixed redirect `http://localhost:19836/callback` instead of an ephemeral loopback port
+2. The CLI prints the `login_url` instead of opening it, for the user to open on any device
+3. The user signs in there and is shown a short code
+4. The user pastes that code back into the CLI prompt, which the CLI exchanges for tokens
+5. Store access_token, refresh_token, and the granted `scopes`, same as the browser flow
 
 ### API Key
 1. Create via `fastio auth api-key create --name "..."`

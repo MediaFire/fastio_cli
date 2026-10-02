@@ -1299,15 +1299,25 @@ impl fmt::Debug for FileshareCommands {
 #[derive(Subcommand)]
 #[non_exhaustive]
 pub enum AuthCommands {
-    /// Log in to Fast.io. Uses browser PKCE flow by default.
-    /// Provide --email and --password for direct authentication.
+    /// Log in to Fast.io in your browser.
+    ///
+    /// Opens the sign-in page and receives the result on a local
+    /// `127.0.0.1` callback. On a remote or SSH session, use --no-browser to
+    /// paste the code shown after signing in instead. For automation, use an
+    /// API key.
     Login {
-        /// Email address for basic auth login.
-        #[arg(long)]
+        /// Removed: password sign-in moved to the browser. Kept only so the
+        /// command can explain that instead of failing to parse.
+        #[arg(long, hide = true)]
         email: Option<String>,
-        /// Password for basic auth login.
-        #[arg(long)]
+        /// Removed: password sign-in moved to the browser. Kept only so the
+        /// command can explain that instead of failing to parse.
+        #[arg(long, hide = true)]
         password: Option<String>,
+        /// Don't open a browser or listen locally: print the sign-in URL and
+        /// read the code the page displays (for remote/SSH sessions).
+        #[arg(long)]
+        no_browser: bool,
         /// Label this agent instance on the resulting credential (browser/PKCE
         /// login only). Defaults to `$FASTIO_AGENT_NAME`.
         ///
@@ -5602,8 +5612,8 @@ pub enum ConfigureCommands {
         /// API base URL.
         #[arg(long)]
         api_base: Option<String>,
-        /// Authentication method: pkce, basic, or `api_key`.
-        #[arg(long, value_parser = ["pkce", "basic", "api_key"])]
+        /// Authentication method: pkce or `api_key`.
+        #[arg(long, value_parser = ["pkce", "api_key"])]
         auth_method: Option<String>,
     },
     /// List all configured profiles.
@@ -7196,6 +7206,7 @@ impl fmt::Debug for AuthCommands {
             Self::Login {
                 email,
                 password: _,
+                no_browser,
                 agent_name,
                 admin,
                 read_only,
@@ -7204,6 +7215,7 @@ impl fmt::Debug for AuthCommands {
                 .debug_struct("Login")
                 .field("email", email)
                 .field("password", &"[REDACTED]")
+                .field("no_browser", no_browser)
                 .field("agent_name", agent_name)
                 .field("admin", admin)
                 .field("read_only", read_only)
@@ -9844,6 +9856,37 @@ mod key_scope_flag_tests {
         assert!(
             login.contains("the consent page may narrow it"),
             "login asks for a ceiling, not an exact set: {login}"
+        );
+    }
+
+    /// Login help offers browser sign-in only: `--no-browser` is listed, and
+    /// the removed password flags are hidden and never described.
+    #[test]
+    fn login_help_offers_only_browser_sign_in() {
+        for args in [
+            &["fastio", "auth", "login", "--help"][..],
+            &["fastio", "auth", "login", "-h"][..],
+        ] {
+            let help = Cli::try_parse_from(args)
+                .expect_err("help exits through an error")
+                .to_string();
+            assert!(help.contains("--no-browser"), "{help}");
+            for gone in [
+                "--email",
+                "--password",
+                "basic auth",
+                "direct authentication",
+            ] {
+                assert!(!help.contains(gone), "{gone} must not appear: {help}");
+            }
+        }
+        let configure = Cli::try_parse_from(["fastio", "configure", "init", "--help"])
+            .expect_err("help exits through an error")
+            .to_string();
+        assert!(!configure.contains("basic"), "{configure}");
+        assert!(
+            Cli::try_parse_from(["fastio", "configure", "init", "--auth-method", "basic"]).is_err(),
+            "basic is no longer an auth method"
         );
     }
 }

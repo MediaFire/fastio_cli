@@ -37,11 +37,8 @@ cargo install --path .
 ## Quick Start
 
 ```bash
-# Log in (opens browser for PKCE authentication)
+# Log in (opens browser for secure authentication)
 fastio auth login
-
-# Or log in with email/password
-fastio auth login --email user@example.com --password ****
 
 # Check auth status
 fastio auth status
@@ -74,7 +71,7 @@ The CLI supports multiple authentication methods, checked in this order:
 3. `FASTIO_API_KEY` environment variable
 4. Stored credentials from `--profile` (or default profile)
 
-### PKCE Browser Login (Recommended)
+### Browser Login (Recommended)
 
 ```bash
 fastio auth login
@@ -87,15 +84,23 @@ fastio auth login --read-only
 fastio auth login --account-settings
 ```
 
-Opens your browser for secure OAuth authentication. Tokens are stored locally and automatically refreshed.
+`auth login` opens your browser to Fastio's sign-in page (including 2FA, if enabled on your account)
+and receives the result on a short-lived local callback. Tokens are stored locally and automatically
+refreshed.
 
 `--admin` and `--read-only` request a **ceiling**, not a role: the consent page may grant less than you asked for. Run `fastio auth scopes` afterwards for the live view of what the credential may do — `fastio auth status` only shows the scopes cached when the profile signed in.
 
-### Email/Password Login
+No browser on this machine? Use `--no-browser`:
 
 ```bash
-fastio auth login --email user@example.com --password ****
+fastio auth login --no-browser
 ```
+
+This prints the sign-in URL instead of opening it. Open it on any device, sign in, and paste the
+code it displays back into the CLI prompt.
+
+Password sign-in from the CLI has been removed — it's handled on the browser sign-in page above. For
+unattended or CI use, create an API key instead (below).
 
 ### API Key
 
@@ -122,9 +127,12 @@ fastio auth 2fa status
 # Enable 2FA
 fastio auth 2fa setup --channel totp
 
-# Verify 2FA code after login
+# Verify a pending 2FA code
 fastio auth 2fa verify --code <CODE>
 ```
+
+2FA during `auth login` is handled on the browser sign-in page, not in the CLI — these commands are
+for managing your 2FA settings (enrollment, status, disabling).
 
 ## Output Formats
 

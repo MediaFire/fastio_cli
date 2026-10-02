@@ -9,28 +9,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::CliError;
 
-/// Sign-in response from `GET /user/auth/`.
-#[derive(Deserialize)]
-pub struct SignInResponse {
-    /// Token lifetime in seconds.
-    pub expires_in: i64,
-    /// JWT access token.
-    pub auth_token: String,
-    /// Whether 2FA verification is required.
-    #[serde(rename = "2factor", default)]
-    pub two_factor: bool,
-}
-
-impl fmt::Debug for SignInResponse {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SignInResponse")
-            .field("expires_in", &self.expires_in)
-            .field("auth_token", &"[REDACTED]")
-            .field("two_factor", &self.two_factor)
-            .finish()
-    }
-}
-
 /// Token check response from `GET /user/auth/check/`.
 #[derive(Debug, Deserialize)]
 pub struct AuthCheckResponse {
@@ -57,13 +35,33 @@ where
     }
 }
 
-/// Sign-up response (the account creation itself returns minimal data).
-#[derive(Debug, Deserialize)]
+/// Sign-up response from `POST /user/`.
+///
+/// A successful sign-up may carry a session (`auth_token` + `expires_in`). A
+/// success WITHOUT a token is a normal outcome too — the server does not reveal
+/// whether the address already had an account — so both fields are optional.
+///
+/// `Debug` is implemented manually so the token can never reach a log.
+#[derive(Deserialize)]
 pub struct SignUpResponse {
-    /// Placeholder for any fields returned on account creation.
-    #[allow(dead_code)]
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
+    /// JWT session token, when the server signed the new account in.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    /// Session lifetime in seconds.
+    #[serde(default)]
+    pub expires_in: Option<i64>,
+}
+
+impl fmt::Debug for SignUpResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignUpResponse")
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 /// 2FA verification response.
@@ -111,6 +109,11 @@ pub struct TwoFactorEnableResponse {
 pub struct PkceAuthorizeResponse {
     /// The authorization request ID.
     pub auth_request_id: String,
+    /// The sign-in page to open, exactly as the server built it (it already
+    /// encodes the handback mode). `None` from a server that predates browser
+    /// sign-in; callers must refuse rather than construct a URL themselves.
+    #[serde(default)]
+    pub login_url: Option<String>,
 }
 
 /// PKCE token exchange response from `POST /oauth/token/`.
@@ -524,7 +527,46 @@ mod search_mode_tests {
 
 #[cfg(test)]
 mod auth_response_tests {
-    use super::{ApiKeyCreateResponse, PkceTokenResponse};
+    use super::{ApiKeyCreateResponse, PkceAuthorizeResponse, PkceTokenResponse, SignUpResponse};
+
+    /// The sign-up session token must never appear in `{:?}`.
+    #[test]
+    fn signup_response_debug_redacts_the_token() {
+        let json = r#"{"auth_token":"jwt-sekrit-value","expires_in":2592000,"2factor":false}"#;
+        let resp: SignUpResponse = serde_json::from_str(json).expect("signup parses");
+        assert_eq!(resp.auth_token.as_deref(), Some("jwt-sekrit-value"));
+        assert_eq!(resp.expires_in, Some(2_592_000));
+        let rendered = format!("{resp:?}");
+        assert!(!rendered.contains("jwt-sekrit-value"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    }
+
+    /// A sign-up success without a session is a normal response, not a parse
+    /// failure.
+    #[test]
+    fn signup_response_without_a_token_parses() {
+        let resp: SignUpResponse = serde_json::from_str("{}").expect("empty signup parses");
+        assert!(resp.auth_token.is_none());
+        assert!(resp.expires_in.is_none());
+    }
+
+    /// `login_url` is optional on the wire so an older server still parses —
+    /// the caller decides what its absence means.
+    #[test]
+    fn authorize_response_login_url_is_optional() {
+        let old: PkceAuthorizeResponse =
+            serde_json::from_str(r#"{"auth_request_id":"ar1","expires_in":600}"#)
+                .expect("old shape parses");
+        assert!(old.login_url.is_none());
+        let new: PkceAuthorizeResponse = serde_json::from_str(
+            r#"{"auth_request_id":"ar1","login_url":"https://login.example/x?a=1"}"#,
+        )
+        .expect("new shape parses");
+        assert_eq!(
+            new.login_url.as_deref(),
+            Some("https://login.example/x?a=1")
+        );
+    }
 
     /// The grant arrives as a JSON-ENCODED STRING and is kept verbatim — it is
     /// stored and re-sent as-is, so re-encoding it would change the bytes.

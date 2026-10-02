@@ -889,11 +889,12 @@ impl ApiClient {
     /// `get_no_auth_with_params`, `get_partial_envelope`, `get_with_password`,
     /// `get_markdown`, `get_raw_text`), **172 call sites across 24 files** —
     /// and asking one question of each: **does a replay SEND, MINT, SPEND, or
-    /// CREATE anything?** The nine that answer yes:
+    /// CREATE anything?** The ones that answer yes (password sign-in,
+    /// `GET /user/auth/`, was on this list until the CLI stopped sending Basic
+    /// credentials):
     ///
     /// | endpoint | what a replay would do |
     /// |---|---|
-    /// | `/user/auth/` (sign-in) | mint a second JWT, or burn a second failed attempt against lockout |
     /// | `/user/auth/2factor/send/{channel}/` | deliver a second SMS, call, or chat message |
     /// | `/oauth/authorize/` | create a second pending authorization request |
     /// | `/websocket/auth/{id}` | mint a second realtime token |
@@ -904,7 +905,7 @@ impl ApiClient {
     /// | `/events/search/summarize/` | spend AI credits twice |
     ///
     /// An earlier sweep enumerated only `client.get(` call sites and therefore
-    /// MISSED sign-in, which reaches the retrying path via `get_with_auth`.
+    /// MISSED sign-in, which reached the retrying path via `get_with_auth`.
     /// That is why the boundary above is stated in terms of HELPERS: enumerate
     /// every helper, not one spelling.
     ///
@@ -1017,17 +1018,12 @@ impl ApiClient {
         .await
     }
 
-    /// Perform a GET request with a custom `Authorization` header (e.g. Basic auth).
+    /// Perform a GET request with a custom `Authorization` header.
     ///
-    /// **Pure reads only** — see [`Self::get`]. The side-effecting counterpart
-    /// is [`Self::get_with_auth_side_effecting`].
-    ///
-    /// **Sign-in was moved OFF this helper and must not be moved back.**
-    /// `GET /user/auth/` MINTS A JWT, so a re-send after the server has already
-    /// answered mints a second one. It rode this helper until 2026-08-10 and now
-    /// uses [`Self::get_with_auth_side_effecting`]; this one is retained only for
-    /// genuinely pure custom-auth reads. Restoring an actionful caller here
-    /// re-opens that defect silently — nothing in the type system objects.
+    /// **Pure reads only** — see [`Self::get`]. This helper RETRIES, so an
+    /// actionful GET (one that mints, sends, spends, or creates) must never
+    /// ride it; nothing in the type system objects. The CLI sends no Basic
+    /// credentials anywhere: password sign-in is browser-only.
     #[allow(dead_code)]
     pub async fn get_with_auth<T: DeserializeOwned>(
         &self,
@@ -1037,32 +1033,6 @@ impl ApiClient {
         tracing::trace!(method = "GET", path, "api request (custom auth)");
         let auth_owned = auth_value.to_owned();
         self.send_with_retry(|| {
-            let req = self.inject_output_query(self.inner.get(self.url(path)), path, false);
-            req.header(AUTHORIZATION, auth_owned.clone())
-        })
-        .await
-    }
-
-    /// Perform a GET with a custom `Authorization` header whose handling has a
-    /// SERVER-SIDE EFFECT, and unwrap the API envelope.
-    ///
-    /// The custom-auth shape of [`Self::get_side_effecting`]: same URL and
-    /// header handling as [`Self::get_with_auth`], but never re-sent on a
-    /// failure the server may already have acted on. Exists for
-    /// `GET /user/auth/` (sign-in), which MINTS a JWT on every call. See the
-    /// ledger on [`Self::get_side_effecting`].
-    pub async fn get_with_auth_side_effecting<T: DeserializeOwned>(
-        &self,
-        path: &str,
-        auth_value: &str,
-    ) -> Result<T, CliError> {
-        tracing::trace!(
-            method = "GET",
-            path,
-            "api request (custom auth, side-effecting)"
-        );
-        let auth_owned = auth_value.to_owned();
-        self.send_with_retry_no_replay(|| {
             let req = self.inject_output_query(self.inner.get(self.url(path)), path, false);
             req.header(AUTHORIZATION, auth_owned.clone())
         })
@@ -2766,8 +2736,7 @@ impl ApiClient {
 
                     if status.as_u16() == 429 {
                         // Body-first, and the account lockout keeps its identity
-                        // — this is the API-envelope retry path (the one sign-in
-                        // reaches via `get_with_auth_side_effecting`), so body
+                        // — this is the API-envelope retry path, so body
                         // promotion is permitted. See `allow_body_promotion` on
                         // [`Self::rate_limit_error`].
                         return Err(Self::rate_limit_error(resp, true).await);
@@ -6024,6 +5993,7 @@ mod tests {
             "http://127.0.0.1/callback",
             None,
             crate::api::auth::AuthorizeAccess::default(),
+            false,
         )
         .await;
         assert_not_replayed(&result, &seen, "the PKCE authorize");
@@ -6088,6 +6058,7 @@ mod tests {
             "http://127.0.0.1/callback",
             None,
             crate::api::auth::AuthorizeAccess::default(),
+            false,
         )
         .await;
 
@@ -6110,22 +6081,6 @@ mod tests {
             !line.contains("access_mode"),
             "the default ceiling must not send access_mode, got: {line}"
         );
-    }
-
-    #[tokio::test]
-    async fn sign_in_is_never_replayed() {
-        // MINTS A JWT. A replay yields two live tokens on success, and on a
-        // failed sign-in burns a second attempt against lockout / rate-limit
-        // accounting. Reached via `get_with_auth`, which is why an enumeration
-        // of `client.get(` call sites could not see it.
-        let (_addr, seen, client) = spawn_lost_body_server().await;
-        // Project to a NON-SECRET field before asserting: `SignInResponse`
-        // carries the JWT and deliberately has no `Debug`, so the failure
-        // message can never print a token.
-        let result = crate::api::auth::sign_in(&client, "user@example.com", "pw")
-            .await
-            .map(|resp| resp.expires_in);
-        assert_not_replayed(&result, &seen, "the sign-in");
     }
 
     // ----- gateway errors (502-504): the second door -----

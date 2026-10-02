@@ -768,21 +768,22 @@ fn scope_refusal_hint(reason: &str, credential_type: Option<&str>) -> Option<&'s
 /// still required, because a cause-free hint is not the same as a *specific*
 /// recovery, and this code has one.
 ///
-/// The generic 401 fallback told a user who had **just run `fastio auth login`**
-/// to run `fastio auth login` — advice that cannot help (the credentials are
-/// simply wrong) and that spends **another of the four remaining attempts**, five
-/// of which lock the account for 30 minutes. Same trap as `10175`, reached
-/// through a different code: the hint is not merely useless, it is pointed at
-/// the one action that makes the situation worse.
+/// At the time, `fastio auth login` took a password, so the generic 401
+/// fallback told a user who had **just** failed a password sign-in to repeat
+/// it — advice that spent another counted attempt toward the lockout.
 ///
 /// In the three-meanings taxonomy of the platform's 401 surface (2026-08-23)
 /// this is the third case — *"these credentials are wrong: don't retry, don't
 /// clear, count it"* — as distinct from `10011`
 /// ("credential is dead", clear it) and `10175` ("real but not authorized here",
 /// keep it). All three ship as HTTP 401 today, so only the CODE separates them.
-pub const HINT_CREDENTIALS_INVALID: &str = "The email or password is incorrect — re-running `fastio auth login` with the same details will fail again. \
-     Check both, and note that each failed attempt counts toward a temporary account lockout. \
-     If you have forgotten the password, reset it rather than retrying.";
+///
+/// Password sign-in now happens only on the browser sign-in page, so
+/// `fastio auth login` spends no counted attempt and pointing at it is the
+/// correct recovery. The hint stays neutral about which credential was
+/// rejected.
+pub const HINT_CREDENTIALS_INVALID: &str = "The credentials or token were rejected. \
+     Run `fastio auth login` to sign in again in the browser, or check the API key if you use one.";
 
 /// The per-account failed-login lockout (code `10760`, HTTP 429).
 ///
@@ -1377,16 +1378,12 @@ impl ApiError {
             // them is wrong, and why the 401 one is actively harmful.
             10175 => return Some(HINT_SCOPE_INCORRECT),
             // `10008` is a WRONG-CREDENTIALS answer, not a missing-login state.
-            // The generic 401 fallback points the user back at `auth login`,
-            // which is what they just ran and which spends another counted
-            // attempt — measured live, see [`HINT_CREDENTIALS_INVALID`].
-            // `10008` is a WRONG-CREDENTIALS answer — EXCEPT on the response
-            // that establishes the lock, which still carries 10008 alongside
-            // `attempts_remaining: 0`. There, "check the password" is the wrong
-            // advice: the next request is refused before any password is
-            // evaluated. Observed live — the fifth failure rendered
-            // "Account temporarily locked" and "The email or password is
-            // incorrect" together, a dual message review of this path predicted.
+            // Password sign-in happens only on the browser page now, so
+            // pointing at `fastio auth login` is the correct recovery — see
+            // [`HINT_CREDENTIALS_INVALID`]. The exception is the response that
+            // establishes the lock, which still carries 10008 alongside
+            // `attempts_remaining: 0`: the next request is refused before any
+            // credential is evaluated, so the lockout hint is shown instead.
             ERR_CREDENTIALS_INVALID => {
                 // Shares [`Self::is_locked_out`] with `lockout_note()` so the
                 // rendered note and the hint can never contradict each other.
@@ -2906,22 +2903,16 @@ mod tests {
     }
 
     #[test]
-    fn invalid_credentials_hint_does_not_point_back_at_auth_login() {
-        // Regression pin for a defect MEASURED live (2026-08-23): a
-        // failed `fastio auth login` rendered the generic 401 hint "Run `fastio
-        // auth login` to sign in" — telling the user to repeat the action that
-        // just failed, spending another of five attempts before a 30-minute
-        // lockout.
+    fn invalid_credentials_hint_is_neutral_and_points_at_browser_login() {
+        // `10008` keeps its own hint, but password sign-in is gone: the advice
+        // is the browser login or the API key, not "check the password".
         let hint = api_err(10008, 401).suggestion().expect("hint expected");
         assert_eq!(hint, HINT_CREDENTIALS_INVALID);
-        assert!(
-            !hint.contains("Run `fastio auth login`"),
-            "must not steer the user into another counted attempt: {hint}"
-        );
-        assert!(
-            hint.contains("lockout"),
-            "must warn that attempts are counted: {hint}"
-        );
+        assert!(hint.contains("rejected"), "{hint}");
+        assert!(hint.contains("fastio auth login"), "{hint}");
+        assert!(hint.contains("browser"), "{hint}");
+        assert!(hint.contains("API key"), "{hint}");
+        assert!(!hint.to_lowercase().contains("password"), "{hint}");
     }
 
     #[test]

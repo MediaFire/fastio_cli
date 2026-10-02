@@ -17,12 +17,13 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::{CallToolResult, ContentBlock, ListToolsResult, Tool};
 use serde_json::{Map, Value, json};
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret as _, SecretString};
 
 use fastio_cli::api;
 use fastio_cli::auth::credentials::{CredentialsFile, StoredCredentials};
+use fastio_cli::auth::{loopback, pkce};
 
-use super::McpState;
+use super::{LoginResult, McpState, PendingLogin};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -232,8 +233,9 @@ async fn require_auth(state: &McpState) -> Result<(), CallToolResult> {
         Ok(())
     } else {
         Err(CallToolResult::error(vec![ContentBlock::text(
-            "Not authenticated. Run `fastio auth login` in a terminal first, \
-             or use the auth tool with action=\"signin\" to sign in with email/password.",
+            "Not authenticated. Use the auth tool with action=\"login-start\" to sign in \
+             through the browser (then action=\"login-status\"), or action=\"set-api-key\" \
+             with an API key. Running `fastio auth login` in a terminal also works.",
         )]))
     }
 }
@@ -509,9 +511,10 @@ pub fn known_tool_names() -> impl Iterator<Item = &'static str> {
 const TOOL_DEFS: &[ToolDef] = &[
     ToolDef {
         name: "auth",
-        description: "Authentication: sign in, sign out, check status, manage API keys, 2FA, OAuth sessions, email/password management, token introspection. NOTE: 'email-check' is DEPRECATED and is NOT an availability check — it does no account lookup and returns success for ANY well-formed address, so a true result says nothing about whether the email is registered; to handle an already-registered email just call signup, which notifies the existing account and returns the same success. NOTE: 'signout' is LOCAL-ONLY — it clears this MCP session's in-memory token and the locally stored credential but does NOT revoke the server-side session or API key (run `fastio auth signout` in a terminal to revoke a revocable server session; use 'api-key-delete' to revoke an API key).",
+        description: "Authentication: browser sign-in (login-start, then login-status), sign out, check status, manage API keys, 2FA, OAuth sessions, email/password management, token introspection. NOTE: 'email-check' is DEPRECATED and is NOT an availability check — it does no account lookup and returns success for ANY well-formed address, so a true result says nothing about whether the email is registered; to handle an already-registered email just call signup, which notifies the existing account and returns the same success. NOTE: 'signout' is LOCAL-ONLY — it clears this MCP session's in-memory token and the locally stored credential but does NOT revoke the server-side session or API key (run `fastio auth signout` in a terminal to revoke a revocable server session; use 'api-key-delete' to revoke an API key). NOTE: 'login-start' returns a login_url for the USER to open in a browser and sign in; it takes no parameters (access is chosen on the consent page). Then poll 'login-status' until it reports authenticated, denied, expired, or failed. Neither action ever returns a token. For unattended use, 'set-api-key' with an API key instead.",
         actions: &[
-            "signin",
+            "login-start",
+            "login-status",
             "signout",
             "status",
             "set-api-key",
@@ -544,10 +547,9 @@ const TOOL_DEFS: &[ToolDef] = &[
         params: &[
             (
                 "email",
-                "Email address (signin, email-check, password-reset-request)",
+                "Email address (email-check, password-reset-request)",
                 false,
             ),
-            ("password", "Password (signin)", false),
             ("api_key", "API key value (set-api-key)", false),
             (
                 "name",
@@ -3223,12 +3225,13 @@ fn generic_describe(def: &ToolDef) -> CallToolResult {
 }
 /// Auth tool handler.
 async fn handle_auth(
-    state: &McpState,
+    state: &Arc<McpState>,
     action: &str,
     args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
     match action {
-        "signin" => handle_auth_signin(state, args).await,
+        "login-start" => Ok(handle_auth_login_start(state, args).await),
+        "login-status" => Ok(handle_auth_login_status(state).await),
         "signout" => Ok(handle_auth_signout(state, args).await),
         "status" => handle_auth_status(state, args).await,
         "set-api-key" => handle_auth_set_api_key(state, args).await,
@@ -3253,6 +3256,12 @@ async fn handle_auth(
         "oauth-revoke-all" => handle_auth_oauth_revoke_all(state, args).await,
         "scopes" => handle_auth_scopes(state, args).await,
         "password-reset-check" => handle_auth_password_reset_check(state, args).await,
+        // Removed, not advertised: an older client still sending it gets told
+        // what replaced it instead of a bare "unknown action".
+        "signin" => Ok(error_text(
+            "Password sign-in was removed. Use action=\"login-start\" to sign in through the \
+             browser (then action=\"login-status\"), or action=\"set-api-key\" with an API key.",
+        )),
         _ => Ok(error_text(&format!("Unknown auth action: {action}"))),
     }
 }
@@ -3272,20 +3281,20 @@ const STRUCTURED_SCOPE_PARAMS: &[&str] = &[
     "account_settings",
 ];
 
-/// The scope and access-mode selectors `signin` refuses.
+/// The scope, access-mode, and labelling parameters `login-start` refuses.
 ///
-/// Basic auth issues the credential's default access; there is no consent step
-/// in which to narrow or raise it, so accepting these params would let a caller
-/// ask for something the request cannot express — and get a credential that
-/// silently differs from what it asked for. The narrowing selectors are
-/// refused for the same reason as the ceilings: a caller that asked for a
-/// scoped credential and got a full-access one has no way to notice.
+/// The MCP browser login requests the default access and lets the user narrow
+/// it on the consent page; it does not forward any of these. Accepting them
+/// silently would let a caller ask for something the request never sends — and
+/// get a credential that differs from what it asked for, with nothing to notice
+/// it by. `access_mode` is not a declared `auth` parameter; it is listed so the
+/// refusal names the browser-login reason rather than "unknown parameter".
 ///
 /// Refused only when the value EXPRESSES that intent — see
-/// [`signin_access_intent`]. A supplied-but-empty `org`, or `admin: false`, is
+/// [`login_access_intent`]. A supplied-but-empty `org`, or `admin: false`, is
 /// an explicit NO: refusing those blocks a legitimate sign-in over a parameter
 /// that asked for nothing.
-const SIGNIN_REJECTED_ACCESS_PARAMS: &[&str] = &[
+const LOGIN_REJECTED_ACCESS_PARAMS: &[&str] = &[
     "scopes",
     "org",
     "workspace",
@@ -3294,9 +3303,11 @@ const SIGNIN_REJECTED_ACCESS_PARAMS: &[&str] = &[
     "admin",
     "read_only",
     "account_settings",
+    "access_mode",
+    "agent_name",
 ];
 
-/// Does this `signin` call actually ASK for the access parameter `key`?
+/// Does this `login-start` call actually ASK for the parameter `key`?
 ///
 /// Presence is not intent. `admin: false` and `org: ""` are how a client
 /// spells "no" — a caller that sent them asked for nothing, so refusing the
@@ -3305,18 +3316,18 @@ const SIGNIN_REJECTED_ACCESS_PARAMS: &[&str] = &[
 ///
 /// - the four booleans: only a parsed `true`;
 /// - `org` / `workspace` / `share`: only a non-empty parsed id list;
-/// - `scopes`: only a non-blank string or a non-empty array (a wrong-typed
-///   value is still an attempt to scope, so it is treated as intent and
-///   refused rather than read as absent).
+/// - `scopes`, `access_mode`, `agent_name`: only a non-blank string (or, for
+///   `scopes`, a non-empty array). A wrong-typed value is still an attempt to
+///   ask, so it is treated as intent and refused rather than read as absent.
 ///
 /// A malformed value returns the extractor's own error, which is a refusal
 /// either way — never a silent "no intent".
-fn signin_access_intent(args: &Map<String, Value>, key: &str) -> Result<bool, CallToolResult> {
+fn login_access_intent(args: &Map<String, Value>, key: &str) -> Result<bool, CallToolResult> {
     match key {
         "admin" | "read_only" | "account_settings" | "all" => {
             Ok(optional_bool_strict(args, key)? == Some(true))
         }
-        "scopes" => Ok(match args.get(key) {
+        "scopes" | "access_mode" | "agent_name" => Ok(match args.get(key) {
             None | Some(Value::Null) => false,
             Some(Value::String(s)) => !s.trim().is_empty(),
             Some(Value::Array(items)) => !items.is_empty(),
@@ -3581,79 +3592,307 @@ fn api_key_create_payload(resp: &api::types::ApiKeyCreateResponse) -> Value {
     Value::Object(out)
 }
 
-async fn handle_auth_signin(
-    state: &McpState,
+/// Refusal for a `login-start` while another browser login is still running.
+const LOGIN_ALREADY_PENDING: &str =
+    "a login is already pending; call action=login-status to check on it";
+
+/// A `CliError` as one line of text, with its recovery hint when it has one —
+/// the same rendering [`cli_err_to_result`] uses.
+fn cli_error_message(err: &fastio_cli::error::CliError) -> String {
+    err.suggestion()
+        .map_or_else(|| err.to_string(), |hint| format!("{err} ({hint})"))
+}
+
+/// Start a browser login (`login-start`).
+///
+/// Reserves the single login slot, spawns the login task, and returns the
+/// server's `login_url` as soon as the task has authorized — it never waits for
+/// the user. The slot lock is held only to check and insert, never across
+/// network I/O: the task does the I/O and hands the URL back over a oneshot.
+async fn handle_auth_login_start(
+    state: &Arc<McpState>,
     args: &Map<String, Value>,
-) -> Result<CallToolResult, McpError> {
-    // `signin` is the email/password path: the server issues the credential's
-    // default access and there is no consent step to raise or narrow it.
-    // Accepting these silently would hand back a credential whose access does
-    // not match what was asked for, with no error to notice. Only a value that
-    // EXPRESSES that intent is refused: `admin: false` and `org: ""` ask for
-    // nothing, and blocking a sign-in over them is a false refusal.
-    for key in SIGNIN_REJECTED_ACCESS_PARAMS {
-        match signin_access_intent(args, key) {
+) -> CallToolResult {
+    for key in LOGIN_REJECTED_ACCESS_PARAMS {
+        match login_access_intent(args, key) {
             Ok(false) => continue,
-            Err(e) => return Ok(e),
+            Err(e) => return e,
             Ok(true) => {}
         }
-        return Ok(error_text(&format!(
-            "`{key}` is not accepted by action=signin — email/password sign-in issues the \
-             credential's default access and cannot request scopes or an access mode. \
-             Access-mode ceilings (admin rwa, read-only), the account-settings scope and a \
-             narrowed grant are chosen on the consent page of the browser (PKCE) login: run \
-             `fastio auth login` in a terminal. For a scoped credential instead, use \
-             action=api-key-create with scopes, or with org/workspace/share/all — admin and \
-             read_only are optional there, and the default without either is read-write — \
-             and/or account_settings."
-        )));
+        return error_text(&format!(
+            "`{key}` is not accepted by action=login-start — the browser login requests the \
+             default access and the user narrows it on the consent page, so it cannot request \
+             scopes, an access mode, or an app label. For an access-mode ceiling (admin rwa, \
+             read-only), the account-settings scope, or an agent name, run `fastio auth login` \
+             in a terminal with --admin, --read-only, --account-settings, or --agent-name. For \
+             a scoped credential instead, use action=api-key-create with scopes, or with \
+             org/workspace/share/all — admin and read_only are optional there, and the default \
+             without either is read-write — and/or account_settings."
+        ));
     }
-    let email = match required_str(args, "email") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let password = match required_str(args, "password") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let client = state.client().read().await;
-    match api::auth::sign_in(&client, email, password).await {
-        Ok(resp) => {
-            // Store the token in memory for this session
-            let token = resp.auth_token.clone();
-            drop(client);
-            state.set_token(token.clone()).await;
-            // Also persist to credentials file
-            if let Ok(dir) = fastio_cli::config::Config::default_dir()
-                && let Ok(mut creds_file) = CredentialsFile::load(&dir)
-                && let Err(e) = creds_file.set(
-                    "default",
-                    StoredCredentials {
-                        token: Some(SecretString::from(token)),
-                        expires_at: Some(chrono::Utc::now().timestamp() + resp.expires_in),
-                        email: Some(email.to_owned()),
-                        auth_method: Some("basic".to_owned()),
-                        ..StoredCredentials::default()
-                    },
-                    &dir,
-                )
-            {
-                tracing::warn!("failed to persist credentials: {e}");
-            }
-            Ok(success_json(&json!({
-                "status": "authenticated",
-                "two_factor_required": resp.two_factor,
-                "expires_in": resp.expires_in,
-            })))
+    if let Err(e) = reject_undeclared_auth_args(args) {
+        return e;
+    }
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let task_id = {
+        let mut slot = state.pending_login().lock().await;
+        if slot.as_ref().is_some_and(|p| !p.task.is_finished()) {
+            return error_text(LOGIN_ALREADY_PENDING);
         }
-        Err(e) => Ok(cli_err_to_result(&e)),
+        // A finished login whose result was never read is replaced. It has
+        // already stopped, so the abort is a formality — but it keeps "every
+        // replaced task is aborted" true without exception.
+        if let Some(old) = slot.take() {
+            old.task.abort();
+        }
+        let task = tokio::spawn(run_browser_login(Arc::clone(state), started_tx));
+        let id = task.id();
+        *slot = Some(PendingLogin { task });
+        id
+    };
+
+    match started_rx.await {
+        Ok(Ok(login_url)) => success_json(&json!({
+            "status": "pending",
+            "login_url": login_url,
+            "instructions": "Open login_url in a browser and sign in, then call auth login-status.",
+        })),
+        Ok(Err(message)) => {
+            release_login_slot(state, task_id).await;
+            error_text(&message)
+        }
+        // The task dropped the sender without answering: it was cancelled (by
+        // signout or set-api-key) before it authorized.
+        Err(_) => {
+            release_login_slot(state, task_id).await;
+            error_text(
+                "the login stopped before it produced a sign-in URL (it was cancelled by \
+                 signout or set-api-key); call action=login-start again",
+            )
+        }
     }
+}
+
+/// Free the login slot if it still holds the task `id` — a login that never
+/// produced a sign-in URL. A slot already cleared, or holding a newer login,
+/// is left alone.
+async fn release_login_slot(state: &McpState, id: tokio::task::Id) {
+    let mut slot = state.pending_login().lock().await;
+    if let Some(pending) = slot.take_if(|p| p.task.id() == id) {
+        pending.task.abort();
+    }
+}
+
+/// A browser login that has been authorized and is ready for the user.
+struct AuthorizedLogin {
+    /// The PKCE verifier and `state` for this login.
+    challenge: pkce::PkceChallenge,
+    /// The bound listener the browser is redirected to.
+    listener: loopback::LoopbackListener,
+    /// The listener's redirect URI, repeated verbatim at token exchange.
+    redirect_uri: String,
+    /// The checked sign-in page for the user to open.
+    login_url: String,
+}
+
+/// Bind the loopback listener and authorize with its redirect URI, returning
+/// the checked `login_url`. An error is a message for `login-start`.
+async fn authorize_browser_login(state: &McpState) -> Result<AuthorizedLogin, String> {
+    let challenge = pkce::generate_challenge()
+        .map_err(|e| format!("failed to generate the PKCE challenge: {e}"))?;
+    let listener = loopback::bind().await.map_err(|e| e.to_string())?;
+    // The token exchange must repeat this exact string: the server matches the
+    // authorize and exchange redirect URIs exactly.
+    let redirect_uri = listener.redirect_uri().to_owned();
+    let authorized = {
+        let client = state.client().read().await;
+        api::auth::pkce_authorize(
+            &client,
+            pkce::PKCE_CLIENT_ID,
+            &challenge.code_challenge,
+            &challenge.state,
+            &redirect_uri,
+            None,
+            api::auth::AuthorizeAccess::default(),
+            false,
+        )
+        .await
+    }
+    .map_err(|e| {
+        format!(
+            "failed to start the browser login: {}",
+            cli_error_message(&e)
+        )
+    })?;
+    let login_url = crate::commands::auth::checked_login_url(authorized.login_url.as_deref())
+        .map_err(|e| e.to_string())?
+        .to_owned();
+    Ok(AuthorizedLogin {
+        challenge,
+        listener,
+        redirect_uri,
+        login_url,
+    })
+}
+
+/// The browser-login task behind `login-start`.
+///
+/// Authorizes (see [`authorize_browser_login`]), hands the `login_url` — or
+/// the failure — back to `login-start`, waits for the redirect (the listener's
+/// deadline is the only deadline), exchanges the code with the IDENTICAL
+/// redirect URI, then installs the token and saves `pkce` credentials to the
+/// profile and config dir the server was started with.
+///
+/// The code is exchanged the moment it arrives and never leaves this task; the
+/// result carries neither the code nor the token. A failed save is a warning,
+/// not a failed login: the session is already signed in.
+async fn run_browser_login(
+    state: Arc<McpState>,
+    started: tokio::sync::oneshot::Sender<Result<String, String>>,
+) -> LoginResult {
+    let AuthorizedLogin {
+        challenge,
+        listener,
+        redirect_uri,
+        login_url,
+    } = match authorize_browser_login(&state).await {
+        Ok(authorized) => authorized,
+        Err(message) => {
+            let _ = started.send(Err(message.clone()));
+            return LoginResult::Failed(message);
+        }
+    };
+    if started.send(Ok(login_url)).is_err() {
+        // `login-start` went away before delivering the URL, so nobody can
+        // sign in with it. End now rather than hold the slot until the deadline.
+        return LoginResult::Failed(
+            "login-start ended before the sign-in URL was delivered; call login-start again"
+                .to_owned(),
+        );
+    }
+
+    let code = match listener
+        .wait(challenge.state.clone(), state.login_deadline())
+        .await
+    {
+        Ok(loopback::LoopbackOutcome::Code(code)) => code,
+        Ok(loopback::LoopbackOutcome::Denied) => return LoginResult::Denied,
+        Ok(_) => {
+            return LoginResult::Failed(
+                "the sign-in did not complete in the browser; call login-start again".to_owned(),
+            );
+        }
+        Err(loopback::LoopbackError::Expired) => return LoginResult::Expired,
+        Err(e) => return LoginResult::Failed(format!("browser sign-in failed: {e}")),
+    };
+
+    let exchanged = {
+        let client = state.client().read().await;
+        api::auth::pkce_token_exchange(
+            &client,
+            code.expose_secret(),
+            &challenge.code_verifier,
+            pkce::PKCE_CLIENT_ID,
+            &redirect_uri,
+        )
+        .await
+    };
+    drop(code);
+    let token_resp = match exchanged {
+        Ok(t) => t,
+        Err(e) => {
+            return LoginResult::Failed(format!(
+                "failed to exchange the authorization code: {}",
+                cli_error_message(&e)
+            ));
+        }
+    };
+
+    let creds = crate::commands::auth::pkce_credentials(&token_resp);
+    state.set_token(token_resp.access_token.clone()).await;
+    let warning = CredentialsFile::load(state.config_dir())
+        .and_then(|mut file| file.set(state.profile_name(), creds, state.config_dir()))
+        .err()
+        .map(|e| {
+            format!(
+                "signed in for this MCP session, but the credential could not be saved to \
+                 profile `{}`: {e}",
+                state.profile_name()
+            )
+        });
+    LoginResult::Authenticated {
+        expires_in: token_resp.expires_in,
+        warning,
+    }
+}
+
+/// Report on the browser login (`login-status`).
+///
+/// `pending` while the task runs; a terminal result (`authenticated`,
+/// `denied`, `expired`, `failed`) is reported once and the slot cleared;
+/// `none` when no login was started. Never blocks on the task, and never
+/// returns a token or code.
+async fn handle_auth_login_status(state: &McpState) -> CallToolResult {
+    let mut slot = state.pending_login().lock().await;
+    let Some(done) = slot.take_if(|p| p.task.is_finished()) else {
+        let value = if slot.is_some() {
+            json!({
+                "status": "pending",
+                "hint": "Waiting for the user to sign in at the login_url from login-start. \
+                         Call login-status again shortly.",
+            })
+        } else {
+            json!({
+                "status": "none",
+                "hint": "No browser login is in progress. Call action=login-start to begin one.",
+            })
+        };
+        return success_json(&value);
+    };
+    drop(slot);
+
+    // The task has finished, so this resolves at once. A join error here can
+    // only be a panic: cancelled tasks are removed from the slot by whoever
+    // cancelled them.
+    let result = done.task.await.unwrap_or_else(|_| {
+        LoginResult::Failed("the login stopped unexpectedly; call login-start again".to_owned())
+    });
+    let value = match result {
+        LoginResult::Authenticated {
+            expires_in,
+            warning,
+        } => {
+            let mut value = json!({
+                "status": "authenticated",
+                "expires_in": expires_in,
+                "profile": state.profile_name(),
+            });
+            if let Some(warning) = warning {
+                value["warning"] = Value::String(warning);
+            }
+            value
+        }
+        LoginResult::Denied => json!({
+            "status": "denied",
+            "message": "The user declined the sign-in. Call login-start to try again.",
+        }),
+        LoginResult::Expired => json!({
+            "status": "expired",
+            "message": "The sign-in was not completed in time. Call login-start to try again.",
+        }),
+        LoginResult::Failed(message) => json!({
+            "status": "failed",
+            "message": message,
+        }),
+    };
+    success_json(&value)
 }
 
 /// Sign out of the LOCAL MCP session only.
 ///
 /// The MCP server holds a single ambiguous bearer token (resolved at startup
-/// from `--token` / env / stored creds, or set live via `signin` / `set-api-key`)
+/// from `--token` / env / stored creds, or set live via `login-start` / `set-api-key`)
 /// that is most commonly an **API key** — the documented MCP auth path
 /// (`FASTIO_MCP_API_KEY` → `set-api-key`). The server-side sign-out
 /// (`POST /user/auth/sign-out/`) is the WRONG operation for that model: per
@@ -3663,25 +3902,32 @@ async fn handle_auth_signin(
 /// would not expect).
 /// So this action is deliberately local-only: it clears this session's in-memory
 /// token (genuinely de-authenticating the live MCP session) and removes the
-/// locally stored `default` credential. Server-side revocation has dedicated
+/// locally stored credential of the profile the server was started with — the
+/// same profile `login-start` and `set-api-key` save to. Server-side revocation has dedicated
 /// paths — `fastio auth signout` (revocable session) and `api-key-delete`.
 async fn handle_auth_signout(state: &McpState, _args: &Map<String, Value>) -> CallToolResult {
+    // A browser login still in flight would otherwise sign the session back in
+    // after this sign-out; stop it first.
+    state.cancel_pending_login().await;
     // Genuinely de-authenticate the live MCP session (the previous behavior left
     // the in-memory token in place, so the session stayed authenticated).
     state.clear_token().await;
-    if let Ok(dir) = fastio_cli::config::Config::default_dir()
-        && let Ok(mut creds_file) = CredentialsFile::load(&dir)
-        && let Err(e) = creds_file.remove("default", &dir)
+    let dir = state.config_dir();
+    if let Ok(mut creds_file) = CredentialsFile::load(dir)
+        && let Err(e) = creds_file.remove(state.profile_name(), dir)
     {
         tracing::warn!("failed to clear stored credentials: {e}");
     }
     success_json(&json!({
         "status": "local_session_cleared",
-        "note": "Cleared this MCP session's in-memory token and removed the locally \
-                 stored 'default' credential. This does NOT revoke the server-side \
-                 session or API key. To revoke a revocable server session, run \
-                 `fastio auth signout` in a terminal; to revoke an API key, use \
-                 action=api-key-delete.",
+        "note": format!(
+            "Cleared this MCP session's in-memory token and removed the locally \
+             stored '{}' credential. This does NOT revoke the server-side \
+             session or API key. To revoke a revocable server session, run \
+             `fastio auth signout` in a terminal; to revoke an API key, use \
+             action=api-key-delete.",
+            state.profile_name()
+        ),
     }))
 }
 
@@ -3693,7 +3939,8 @@ async fn handle_auth_status(
     if !authenticated {
         return Ok(success_json(&json!({
             "authenticated": false,
-            "hint": "Run `fastio auth login` or use action=signin"
+            "hint": "Use action=login-start to sign in through the browser, or action=set-api-key \
+                     with an API key. Running `fastio auth login` in a terminal also works."
         })));
     }
     let client = state.client().read().await;
@@ -3714,17 +3961,20 @@ async fn handle_auth_set_api_key(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    // A browser login still in flight would otherwise replace this key when it
+    // completes; stop it first.
+    state.cancel_pending_login().await;
     state.set_token(key.to_owned()).await;
-    if let Ok(dir) = fastio_cli::config::Config::default_dir()
-        && let Ok(mut creds_file) = CredentialsFile::load(&dir)
+    let dir = state.config_dir();
+    if let Ok(mut creds_file) = CredentialsFile::load(dir)
         && let Err(e) = creds_file.set(
-            "default",
+            state.profile_name(),
             StoredCredentials {
                 api_key: Some(SecretString::from(key.to_owned())),
                 auth_method: Some("api_key".to_owned()),
                 ..StoredCredentials::default()
             },
-            &dir,
+            dir,
         )
     {
         tracing::warn!("failed to persist credentials: {e}");
@@ -20677,44 +20927,499 @@ mod ripley_tool_tests {
         );
     }
 
-    /// `signin` is basic auth: it cannot request an access mode, so refusing is
-    /// the only honest answer. Ignoring the param would hand back a credential
-    /// that differs from the one asked for, with nothing to notice.
-    /// A value of `param` that actually ASKS for the access it names.
+    use super::CredentialsFile;
+    use secrecy::ExposeSecret as _;
+
+    // ─── browser login (login-start / login-status) ─────────────────────────
+
+    /// A value of `param` that actually ASKS for what it names.
     ///
     /// `true` is intent for a boolean but nonsense for an id list — and a
     /// wrong-typed value would be refused by the extractor rather than by the
-    /// sign-in guard, which would make the assertions below pass for the wrong
+    /// login guard, which would make the assertions below pass for the wrong
     /// reason.
-    fn signin_intent_value(param: &str) -> Value {
+    fn login_intent_value(param: &str) -> Value {
         match param {
             "admin" | "read_only" | "account_settings" | "all" => Value::Bool(true),
             "scopes" => json!(["org:123:rwa"]),
+            "access_mode" => Value::String("read_only".to_owned()),
+            "agent_name" => Value::String("my-agent".to_owned()),
             _ => Value::String("123".to_owned()),
         }
     }
 
-    #[tokio::test]
-    async fn auth_signin_rejects_access_mode_params() {
-        for param in super::SIGNIN_REJECTED_ACCESS_PARAMS {
-            let router = authed_router().await;
-            let mut args = Map::new();
-            args.insert("action".to_owned(), Value::String("signin".to_owned()));
-            args.insert(
-                "email".to_owned(),
-                Value::String("someone@example.com".to_owned()),
-            );
-            args.insert("password".to_owned(), Value::String("pw".to_owned()));
-            args.insert((*param).to_owned(), signin_intent_value(param));
-            let res = router.call_tool("auth", args).await.expect("call_tool ok");
-            let text = result_to_string(&res);
+    /// Call the `auth` tool with `action` plus `extra` params; the rendered result.
+    async fn call_auth(router: &ToolRouter, action: &str, extra: &[(&str, Value)]) -> String {
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String(action.to_owned()));
+        for (key, value) in extra {
+            args.insert((*key).to_owned(), value.clone());
+        }
+        let res = router.call_tool("auth", args).await.expect("call_tool ok");
+        result_to_string(&res)
+    }
+
+    const MOCK_LOGIN_URL: &str = "https://login.example.test/connect?r=ar1";
+    const MOCK_ACCESS_TOKEN: &str = "mcp-access-token-1";
+    const MOCK_REFRESH_TOKEN: &str = "mcp-refresh-token-1";
+    const BROWSER_CODE: &str = "mcp-browser-code-1";
+
+    /// One request the login mock API saw: its request line and form body.
+    #[derive(Clone, Debug)]
+    struct LoginApiRequest {
+        line: String,
+        body: String,
+    }
+
+    impl LoginApiRequest {
+        /// A decoded query parameter from the request line.
+        fn query(&self, key: &str) -> Option<String> {
+            let target = self.line.split_whitespace().nth(1)?;
+            let url = url::Url::parse(&format!("http://h{target}")).ok()?;
+            url.query_pairs()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.into_owned())
+        }
+
+        /// A decoded form field from the body.
+        fn form(&self, key: &str) -> Option<String> {
+            url::form_urlencoded::parse(self.body.as_bytes())
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.into_owned())
+        }
+    }
+
+    type LoginApiLog = Arc<std::sync::Mutex<Vec<LoginApiRequest>>>;
+
+    /// A mock API for the browser login: `GET /oauth/authorize/` answers with
+    /// a `login_url`, `POST /oauth/token/` with tokens. Every request is
+    /// recorded. Returns `127.0.0.1:<port>`.
+    async fn spawn_login_api() -> (String, LoginApiLog) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let log: LoginApiLog = Arc::default();
+        let sink = Arc::clone(&log);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut acc: Vec<u8> = Vec::new();
+                let mut buf = vec![0u8; 8192];
+                let mut head_end = None;
+                loop {
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    acc.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = capture_header_end(&acc)
+                        && acc.len() >= pos + capture_content_length(&acc[..pos])
+                    {
+                        head_end = Some(pos);
+                        break;
+                    }
+                }
+                let pos = head_end.unwrap_or(acc.len());
+                let head = String::from_utf8_lossy(&acc[..pos]).into_owned();
+                let req = LoginApiRequest {
+                    line: head.lines().next().unwrap_or_default().to_owned(),
+                    body: String::from_utf8_lossy(&acc[pos..]).into_owned(),
+                };
+                let body = if req.line.starts_with("GET /oauth/authorize/") {
+                    json!({
+                        "result": "yes",
+                        "response": {"auth_request_id": "ar1", "login_url": MOCK_LOGIN_URL},
+                    })
+                } else if req.line.starts_with("POST /oauth/token/") {
+                    json!({
+                        "access_token": MOCK_ACCESS_TOKEN,
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "refresh_token": MOCK_REFRESH_TOKEN,
+                        "scopes": "[\"user:*:rw\"]",
+                    })
+                } else {
+                    json!({"result": "no", "error": {"code": 1, "text": "no route"}})
+                }
+                .to_string();
+                sink.lock().expect("log lock").push(req);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (addr, log)
+    }
+
+    /// A fresh, empty config dir for one test.
+    fn login_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("fastio-mcp-login-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// An UNAUTHENTICATED router on `api_addr`, started with profile `work`
+    /// and a temp config dir, whose browser login waits at most `deadline`.
+    fn login_router(
+        api_addr: &str,
+        tag: &str,
+        deadline: std::time::Duration,
+    ) -> (ToolRouter, Arc<McpState>, std::path::PathBuf) {
+        let dir = login_temp_dir(tag);
+        let state = Arc::new(
+            McpState::new_unauthenticated_for_test(&format!("http://{api_addr}"))
+                .with_login_config("work", &dir, deadline),
+        );
+        (ToolRouter::new_for_tests(Arc::clone(&state)), state, dir)
+    }
+
+    const LONG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The `(redirect_uri, state)` the most recent authorize request sent.
+    fn last_authorize(log: &LoginApiLog) -> (String, String) {
+        let reqs = log.lock().expect("log lock");
+        let authorize = reqs
+            .iter()
+            .rev()
+            .find(|r| r.line.starts_with("GET /oauth/authorize/"))
+            .expect("an authorize request was made");
+        (
+            authorize.query("redirect_uri").expect("redirect_uri"),
+            authorize.query("state").expect("state"),
+        )
+    }
+
+    /// Play the browser: GET `<redirect_uri>?<query>` and return the response.
+    async fn browser_get(redirect_uri: &str, query: &str) -> std::io::Result<String> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let url = url::Url::parse(redirect_uri).expect("redirect uri parses");
+        let host = format!(
+            "{}:{}",
+            url.host_str().expect("host"),
+            url.port().expect("port")
+        );
+        let mut sock = tokio::net::TcpStream::connect(host).await?;
+        let get = format!("GET {}?{query} HTTP/1.1\r\nHost: x\r\n\r\n", url.path());
+        sock.write_all(get.as_bytes()).await?;
+        let mut out = Vec::new();
+        sock.read_to_end(&mut out).await?;
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// Wait (bounded) until the slot is empty or its task has finished,
+    /// without consuming the result.
+    async fn wait_until_login_finished(state: &McpState) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if state
+                .pending_login()
+                .lock()
+                .await
+                .as_ref()
+                .is_none_or(|p| p.task.is_finished())
+            {
+                return;
+            }
             assert!(
-                text.contains(&format!("`{param}` is not accepted by action=signin")),
-                "signin must refuse `{param}`, got: {text}"
+                tokio::time::Instant::now() < deadline,
+                "the login task did not finish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    fn assert_no_secrets(text: &str) {
+        for secret in [MOCK_ACCESS_TOKEN, MOCK_REFRESH_TOKEN, BROWSER_CODE] {
+            assert!(
+                !text.contains(secret),
+                "a tool result must never carry `{secret}`: {text}"
+            );
+        }
+    }
+
+    /// An old client sending the removed `signin` action is told what replaced
+    /// it, and `signin` stays out of the advertised actions.
+    #[tokio::test]
+    async fn removed_signin_action_names_its_replacements() {
+        let (router, _state, dir) = login_router("127.0.0.1:1", "signin-removed", LONG_DEADLINE);
+        let text = call_auth(&router, "signin", &[]).await;
+        assert!(text.contains("Password sign-in was removed"), "{text}");
+        assert!(text.contains("login-start"), "{text}");
+        assert!(text.contains("set-api-key"), "{text}");
+        assert!(!text.contains("Unknown auth action"), "{text}");
+        let auth = TOOL_DEFS
+            .iter()
+            .find(|d| d.name == "auth")
+            .expect("auth tool");
+        assert!(!auth.actions.contains(&"signin"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole loopback round trip: `login-start` returns the server's
+    /// `login_url` while the listener is up, `login-status` is pending, the
+    /// browser's callback completes the login, the token is live and saved to
+    /// the SELECTED profile, the terminal result is reported once, and a new
+    /// login can then start. No result ever carries the token or the code.
+    #[tokio::test]
+    async fn login_start_round_trip_authenticates_and_saves_the_selected_profile() {
+        let (addr, log) = spawn_login_api().await;
+        let (router, state, dir) = login_router(&addr, "roundtrip", LONG_DEADLINE);
+
+        let started = call_auth(&router, "login-start", &[]).await;
+        assert!(started.contains("pending"), "{started}");
+        assert!(started.contains("login.example.test/connect"), "{started}");
+        assert!(started.contains("login-status"), "{started}");
+        let (redirect_uri, oauth_state) = last_authorize(&log);
+        assert!(
+            redirect_uri.starts_with("http://127.0.0.1:") && redirect_uri.ends_with("/callback"),
+            "{redirect_uri}"
+        );
+        {
+            let reqs = log.lock().expect("log lock");
+            let authorize = &reqs[0];
+            assert_eq!(authorize.query("display_code"), None, "{}", authorize.line);
+            assert_eq!(authorize.query("agent_name"), None, "{}", authorize.line);
+            assert_eq!(authorize.query("access_mode"), None, "{}", authorize.line);
+            assert_eq!(
+                authorize.query("account_settings"),
+                None,
+                "{}",
+                authorize.line
+            );
+        }
+
+        let pending = call_auth(&router, "login-status", &[]).await;
+        assert!(pending.contains("pending"), "{pending}");
+        assert!(!state.is_authenticated().await);
+
+        let page = browser_get(
+            &redirect_uri,
+            &format!("code={BROWSER_CODE}&state={oauth_state}"),
+        )
+        .await
+        .expect("the listener is up");
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+        wait_until_login_finished(&state).await;
+
+        let done = call_auth(&router, "login-status", &[]).await;
+        assert!(done.contains("authenticated"), "{done}");
+        assert!(done.contains("work"), "the saved profile is named: {done}");
+        assert!(!done.contains("warning"), "{done}");
+        for text in [&started, &pending, &done] {
+            assert_no_secrets(text);
+        }
+
+        assert!(state.is_authenticated().await);
+        assert_eq!(
+            state.client().read().await.get_token(),
+            Some(MOCK_ACCESS_TOKEN)
+        );
+        {
+            let reqs = log.lock().expect("log lock");
+            let exchange = reqs
+                .iter()
+                .find(|r| r.line.starts_with("POST /oauth/token/"))
+                .expect("the code was exchanged");
+            assert_eq!(exchange.form("code").as_deref(), Some(BROWSER_CODE));
+            assert_eq!(
+                exchange.form("redirect_uri").as_deref(),
+                Some(redirect_uri.as_str()),
+                "the exchange repeats the authorize redirect_uri"
+            );
+        }
+        let file = CredentialsFile::load(&dir).expect("load");
+        let stored = file.get("work").expect("saved to the selected profile");
+        assert_eq!(stored.auth_method.as_deref(), Some("pkce"));
+        assert_eq!(
+            stored.token.as_ref().map(|t| t.expose_secret().to_owned()),
+            Some(MOCK_ACCESS_TOKEN.to_owned())
+        );
+        assert_eq!(
+            stored
+                .refresh_token
+                .as_ref()
+                .map(|t| t.expose_secret().to_owned()),
+            Some(MOCK_REFRESH_TOKEN.to_owned())
+        );
+        assert_eq!(stored.scopes.as_deref(), Some("[\"user:*:rw\"]"));
+        assert!(stored.expires_at.is_some());
+        assert!(file.get("default").is_none(), "only the selected profile");
+
+        // Reported once, then cleared.
+        let after = call_auth(&router, "login-status", &[]).await;
+        assert!(after.contains("No browser login is in progress"), "{after}");
+
+        // A cleared slot accepts a new login.
+        let again = call_auth(&router, "login-start", &[]).await;
+        assert!(again.contains("pending"), "{again}");
+        state.cancel_pending_login().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only one browser login at a time: of two concurrent `login-start`
+    /// calls exactly one wins, and a later one is refused while it runs.
+    #[tokio::test]
+    async fn a_second_login_start_is_refused_while_one_is_pending() {
+        let (addr, _log) = spawn_login_api().await;
+        let (router, state, dir) = login_router(&addr, "concurrent", LONG_DEADLINE);
+
+        let (a, b) = tokio::join!(
+            call_auth(&router, "login-start", &[]),
+            call_auth(&router, "login-start", &[])
+        );
+        let refused = |t: &str| t.contains("a login is already pending");
+        assert!(
+            refused(&a) != refused(&b),
+            "exactly one concurrent start wins:\n{a}\n{b}"
+        );
+        let winner = if refused(&a) { &b } else { &a };
+        assert!(winner.contains("pending"), "{winner}");
+
+        let third = call_auth(&router, "login-start", &[]).await;
+        assert!(refused(&third), "{third}");
+        assert!(third.contains("login-status"), "{third}");
+
+        state.cancel_pending_login().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The user declining (`error=access_denied`) reports `denied`, exchanges
+    /// nothing, and leaves the session unauthenticated.
+    #[tokio::test]
+    async fn a_declined_browser_login_reports_denied() {
+        let (addr, log) = spawn_login_api().await;
+        let (router, state, dir) = login_router(&addr, "denied", LONG_DEADLINE);
+
+        call_auth(&router, "login-start", &[]).await;
+        let (redirect_uri, _) = last_authorize(&log);
+        browser_get(&redirect_uri, "error=access_denied")
+            .await
+            .expect("the listener is up");
+        wait_until_login_finished(&state).await;
+
+        let done = call_auth(&router, "login-status", &[]).await;
+        assert!(done.contains("denied"), "{done}");
+        assert!(!state.is_authenticated().await);
+        assert!(
+            !log.lock()
+                .expect("log lock")
+                .iter()
+                .any(|r| r.line.starts_with("POST /oauth/token/")),
+            "a declined login exchanges nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No callback before the listener's deadline reports `expired`.
+    #[tokio::test]
+    async fn an_unfinished_browser_login_reports_expired() {
+        let (addr, _log) = spawn_login_api().await;
+        let (router, state, dir) =
+            login_router(&addr, "expired", std::time::Duration::from_millis(200));
+
+        let started = call_auth(&router, "login-start", &[]).await;
+        assert!(started.contains("pending"), "{started}");
+        wait_until_login_finished(&state).await;
+
+        let done = call_auth(&router, "login-status", &[]).await;
+        assert!(done.contains("expired"), "{done}");
+        assert!(!state.is_authenticated().await);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `signout` stops a pending login: the slot is emptied, the listener is
+    /// gone (the task really stopped), and a late callback cannot sign the
+    /// session back in.
+    #[tokio::test]
+    async fn signout_aborts_a_pending_login() {
+        let (addr, log) = spawn_login_api().await;
+        let (router, state, dir) = login_router(&addr, "signout", LONG_DEADLINE);
+
+        call_auth(&router, "login-start", &[]).await;
+        let (redirect_uri, oauth_state) = last_authorize(&log);
+        let out = call_auth(&router, "signout", &[]).await;
+        assert!(out.contains("local_session_cleared"), "{out}");
+
+        assert!(state.pending_login().lock().await.is_none());
+        let late = browser_get(
+            &redirect_uri,
+            &format!("code={BROWSER_CODE}&state={oauth_state}"),
+        )
+        .await;
+        assert!(late.is_err(), "the listener must be closed: {late:?}");
+        assert!(!state.is_authenticated().await);
+        assert!(
+            !log.lock()
+                .expect("log lock")
+                .iter()
+                .any(|r| r.line.starts_with("POST /oauth/token/")),
+            "an aborted login exchanges nothing"
+        );
+        let status = call_auth(&router, "login-status", &[]).await;
+        assert!(
+            status.contains("No browser login is in progress"),
+            "{status}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `set-api-key` also stops a pending login, so the key it installs cannot
+    /// be replaced later by that login completing.
+    #[tokio::test]
+    async fn set_api_key_aborts_a_pending_login() {
+        let (addr, log) = spawn_login_api().await;
+        let (router, state, dir) = login_router(&addr, "apikey", LONG_DEADLINE);
+
+        call_auth(&router, "login-start", &[]).await;
+        let (redirect_uri, _) = last_authorize(&log);
+        call_auth(
+            &router,
+            "set-api-key",
+            &[("api_key", Value::String("key-1".to_owned()))],
+        )
+        .await;
+
+        assert!(state.pending_login().lock().await.is_none());
+        assert!(browser_get(&redirect_uri, "code=x&state=y").await.is_err());
+        assert_eq!(state.client().read().await.get_token(), Some("key-1"));
+        let file = CredentialsFile::load(&dir).expect("load");
+        assert_eq!(
+            file.get("work").and_then(|c| c.auth_method.as_deref()),
+            Some("api_key"),
+            "the key is saved to the server's profile"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `login-start` forwards no scope, access mode, or label, so a param
+    /// that asks for one is refused — before any request or reservation.
+    #[tokio::test]
+    async fn login_start_refuses_scope_access_and_label_params() {
+        for param in super::LOGIN_REJECTED_ACCESS_PARAMS {
+            let (router, state, dir) = login_router("127.0.0.1:1", "refuse", LONG_DEADLINE);
+            let text = call_auth(
+                &router,
+                "login-start",
+                &[(*param, login_intent_value(param))],
+            )
+            .await;
+            assert!(
+                text.contains(&format!("`{param}` is not accepted by action=login-start")),
+                "login-start must refuse `{param}`, got: {text}"
             );
             assert!(
                 text.contains("fastio auth login"),
-                "the refusal must name the browser login path, got: {text}"
+                "the refusal must name the terminal login, got: {text}"
             );
             assert!(
                 text.contains("api-key-create"),
@@ -20722,55 +21427,29 @@ mod ripley_tool_tests {
                  credential, got: {text}"
             );
             // The mode flags are OPTIONAL on api-key-create — the default
-            // without either is read-write. Advice that reads as "you must
-            // also pass admin or read_only" sends the reader to a second,
-            // avoidable error.
-            assert!(
-                text.contains("optional"),
-                "the recovery must say the access-mode flags are optional, \
-                 got: {text}"
-            );
+            // without either is read-write.
+            assert!(text.contains("optional"), "{text}");
+            assert!(state.pending_login().lock().await.is_none());
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
-    /// The narrowing selectors are refused for the same reason as the
-    /// ceilings: basic auth issues the credential's default access, so a
-    /// caller that asked for a scoped credential and got a full-access one has
-    /// nothing to notice it by.
+    /// Every structured selector, the raw `scopes`, `access_mode`, and
+    /// `agent_name` are refused by `login-start`.
     #[test]
-    fn signin_refuses_every_scope_and_access_parameter() {
-        for key in ["scopes", "org", "workspace", "share", "all"] {
+    fn login_start_refuses_every_scope_access_and_label_parameter() {
+        for key in ["scopes", "access_mode", "agent_name"] {
             assert!(
-                super::SIGNIN_REJECTED_ACCESS_PARAMS.contains(&key),
-                "`{key}` must be refused by signin"
+                super::LOGIN_REJECTED_ACCESS_PARAMS.contains(&key),
+                "`{key}` must be refused by login-start"
             );
         }
         for key in super::STRUCTURED_SCOPE_PARAMS {
             assert!(
-                super::SIGNIN_REJECTED_ACCESS_PARAMS.contains(key),
-                "every structured selector must be refused by signin, `{key}` is not"
+                super::LOGIN_REJECTED_ACCESS_PARAMS.contains(key),
+                "every structured selector must be refused by login-start, `{key}` is not"
             );
         }
-    }
-
-    /// The negative control for the test above: a plain signin is untouched.
-    /// Without it, a guard that rejected EVERY signin would still pass.
-    #[tokio::test]
-    async fn auth_signin_without_access_params_is_not_refused() {
-        let router = authed_router().await;
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("signin".to_owned()));
-        args.insert(
-            "email".to_owned(),
-            Value::String("someone@example.com".to_owned()),
-        );
-        args.insert("password".to_owned(), Value::String("pw".to_owned()));
-        let res = router.call_tool("auth", args).await.expect("call_tool ok");
-        let text = result_to_string(&res);
-        assert!(
-            !text.contains("is not accepted by action=signin"),
-            "a plain signin must reach the network attempt, got: {text}"
-        );
     }
 
     /// `POST /user/auth/key/` answers with the whole envelope, so the flattened
@@ -21129,38 +21808,30 @@ mod ripley_tool_tests {
         }
     }
 
-    /// An access param that expresses NO intent must not block a sign-in.
+    /// An access param that expresses NO intent must not block a login.
     ///
     /// `admin: false` and `org: ""` are how a client spells "no"; refusing the
-    /// call over them turns a legitimate sign-in into an error the caller
-    /// cannot act on.
+    /// call over them turns a legitimate login into an error the caller cannot
+    /// act on.
     #[tokio::test]
-    async fn auth_signin_proceeds_when_access_params_express_no_intent() {
+    async fn login_start_proceeds_when_access_params_express_no_intent() {
         for (key, value) in [
             ("admin", Value::Bool(false)),
             ("admin", Value::String("false".to_owned())),
             ("org", Value::String(String::new())),
             ("scopes", Value::String(String::new())),
+            ("agent_name", Value::String("  ".to_owned())),
         ] {
             let (router, captured) = capture_router().await;
-            let mut args = Map::new();
-            args.insert("action".to_owned(), Value::String("signin".to_owned()));
-            args.insert(
-                "email".to_owned(),
-                Value::String("someone@example.com".to_owned()),
-            );
-            args.insert("password".to_owned(), Value::String("pw".to_owned()));
-            args.insert(key.to_owned(), value.clone());
-            let res = router.call_tool("auth", args).await.expect("call_tool ok");
-            let text = result_to_string(&res);
+            let text = call_auth(&router, "login-start", &[(key, value.clone())]).await;
             assert!(
-                !text.contains("is not accepted by action=signin"),
+                !text.contains("is not accepted by action=login-start"),
                 "{key} = {value} expresses no intent and must not be refused, got: {text}"
             );
             let req = captured.lock().expect("capture lock").clone();
             assert!(
-                req.contains("GET /user/auth/"),
-                "{key} = {value} must still reach the sign-in endpoint:\n{req}"
+                req.contains("GET /oauth/authorize/"),
+                "{key} = {value} must still reach the authorize endpoint:\n{req}"
             );
         }
     }
@@ -21168,25 +21839,16 @@ mod ripley_tool_tests {
     /// The negative control for the test above: a param that DOES express
     /// intent is still refused, so the relaxation did not open the guard.
     #[tokio::test]
-    async fn auth_signin_still_refuses_an_access_param_that_asks_for_something() {
+    async fn login_start_still_refuses_an_access_param_that_asks_for_something() {
         let (router, captured) = capture_router().await;
-        let mut args = Map::new();
-        args.insert("action".to_owned(), Value::String("signin".to_owned()));
-        args.insert(
-            "email".to_owned(),
-            Value::String("someone@example.com".to_owned()),
-        );
-        args.insert("password".to_owned(), Value::String("pw".to_owned()));
-        args.insert("admin".to_owned(), Value::Bool(true));
-        let res = router.call_tool("auth", args).await.expect("call_tool ok");
-        let text = result_to_string(&res);
+        let text = call_auth(&router, "login-start", &[("admin", Value::Bool(true))]).await;
         assert!(
-            text.contains("`admin` is not accepted by action=signin"),
+            text.contains("`admin` is not accepted by action=login-start"),
             "admin = true must still be refused, got: {text}"
         );
         assert!(
             captured.lock().expect("capture lock").is_empty(),
-            "a refused signin must not reach the server"
+            "a refused login-start must not reach the server"
         );
     }
 }

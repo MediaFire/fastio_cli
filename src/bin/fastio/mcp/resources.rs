@@ -55,7 +55,7 @@ pub async fn read_resource(state: &McpState, uri: &str) -> Result<ReadResourceRe
                 serde_json::json!({
                     "authenticated": false,
                     "api_base": state.api_base(),
-                    "hint": "Not authenticated. Run `fastio auth login` in a terminal, or use the auth tool with action=signin."
+                    "hint": "Not authenticated. Use the auth tool with action=login-start to sign in through the browser (then action=login-status), or action=set-api-key with an API key. Running `fastio auth login` in a terminal also works."
                 })
             };
             // Constructor, not a struct literal: these types are
