@@ -11,7 +11,9 @@ pub mod resources;
 pub mod tools;
 
 use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rmcp::model::{
@@ -25,11 +27,43 @@ use rmcp::transport::stdio;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use tokio::sync::RwLock;
 
+use fastio_cli::auth::loopback;
 use fastio_cli::auth::token::resolve_token;
 use fastio_cli::client::ApiClient;
 use fastio_cli::config::{Config, DEFAULT_API_BASE};
 
 use self::tools::ToolRouter;
+
+/// The terminal result of a browser login started by the `login-start` action.
+///
+/// Returned by the login task. Carries no token or code: the token goes
+/// straight into the session and the credentials file.
+#[derive(Debug)]
+pub enum LoginResult {
+    /// The browser sign-in completed and this session is authenticated.
+    Authenticated {
+        /// Lifetime of the new access token, in seconds.
+        expires_in: i64,
+        /// Set when the credential could not be saved to the profile.
+        warning: Option<String>,
+    },
+    /// The user declined the sign-in.
+    Denied,
+    /// The sign-in was not completed before the listener's deadline.
+    Expired,
+    /// The sign-in failed; the message says why.
+    Failed(String),
+}
+
+/// The one browser login this server may have in flight.
+///
+/// The task listens for the browser redirect, exchanges the code, installs the
+/// token, and saves it. Dropping a `JoinHandle` does NOT cancel the task, so
+/// every cancellation goes through [`McpState::cancel_pending_login`].
+pub struct PendingLogin {
+    /// The login task; its output is the terminal result.
+    pub task: tokio::task::JoinHandle<LoginResult>,
+}
 
 /// Shared state accessible by all MCP tool handlers.
 pub struct McpState {
@@ -39,6 +73,16 @@ pub struct McpState {
     api_base: String,
     /// Whether the user is authenticated.
     authenticated: RwLock<bool>,
+    /// The profile the server was started with; browser logins save to it.
+    profile_name: String,
+    /// The config directory the server was started with.
+    config_dir: PathBuf,
+    /// The browser login in flight, if any. Locked only to check, reserve,
+    /// take, or cancel — never across network I/O.
+    pending_login: tokio::sync::Mutex<Option<PendingLogin>>,
+    /// How long a browser login waits for the redirect. Always
+    /// [`loopback::DEFAULT_DEADLINE`] outside tests.
+    login_deadline: Duration,
 }
 
 impl McpState {
@@ -61,6 +105,41 @@ impl McpState {
     pub async fn set_token(&self, token: String) {
         self.client.write().await.set_token(token);
         *self.authenticated.write().await = true;
+    }
+
+    /// The profile name the server was started with.
+    pub fn profile_name(&self) -> &str {
+        &self.profile_name
+    }
+
+    /// The config directory the server was started with.
+    pub fn config_dir(&self) -> &Path {
+        &self.config_dir
+    }
+
+    /// The pending browser-login slot.
+    pub fn pending_login(&self) -> &tokio::sync::Mutex<Option<PendingLogin>> {
+        &self.pending_login
+    }
+
+    /// How long a browser login waits for the redirect.
+    pub fn login_deadline(&self) -> Duration {
+        self.login_deadline
+    }
+
+    /// Cancel the pending browser login, if any, and wait for its task to stop.
+    ///
+    /// Waiting matters: `abort` only takes effect at the task's next await
+    /// point, so without the wait a login could still install its token after
+    /// the caller's own auth change. Once this returns, the task can no longer
+    /// touch auth state. The task never takes the slot lock, so holding it here
+    /// cannot deadlock.
+    pub async fn cancel_pending_login(&self) {
+        let mut slot = self.pending_login.lock().await;
+        if let Some(pending) = slot.take() {
+            pending.task.abort();
+            let _ = pending.task.await;
+        }
     }
 
     /// Clear the in-memory token for this session, de-authenticating it.
@@ -93,7 +172,27 @@ impl McpState {
             client: RwLock::new(client),
             api_base: api_base.to_owned(),
             authenticated: RwLock::new(false),
+            profile_name: "default".to_owned(),
+            // Never the real config dir: a test that saves credentials picks
+            // its own directory with `with_login_config`.
+            config_dir: std::env::temp_dir().join("fastio-mcp-test-unused-config"),
+            pending_login: tokio::sync::Mutex::new(None),
+            login_deadline: loopback::DEFAULT_DEADLINE,
         }
+    }
+
+    /// Override the profile, config dir, and login deadline, for unit tests.
+    #[cfg(test)]
+    pub fn with_login_config(
+        mut self,
+        profile_name: &str,
+        config_dir: &Path,
+        login_deadline: Duration,
+    ) -> Self {
+        profile_name.clone_into(&mut self.profile_name);
+        config_dir.clone_into(&mut self.config_dir);
+        self.login_deadline = login_deadline;
+        self
     }
 }
 
@@ -116,7 +215,7 @@ impl FastioMcpServer {
         api_base: &str,
         token_override: Option<&str>,
         profile_name: &str,
-        config_dir: &std::path::Path,
+        config_dir: &Path,
         tools_filter: Option<std::collections::HashSet<String>>,
     ) -> Result<Self> {
         let token = resolve_token(token_override, profile_name, config_dir)
@@ -129,6 +228,10 @@ impl FastioMcpServer {
             client: RwLock::new(client),
             api_base: api_base.to_owned(),
             authenticated: RwLock::new(authenticated),
+            profile_name: profile_name.to_owned(),
+            config_dir: config_dir.to_owned(),
+            pending_login: tokio::sync::Mutex::new(None),
+            login_deadline: loopback::DEFAULT_DEADLINE,
         });
 
         Ok(Self {

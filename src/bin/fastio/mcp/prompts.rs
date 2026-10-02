@@ -65,8 +65,11 @@ hidden alias.)
 Check if you're authenticated by reading the `session://status` resource.
 
 If not authenticated, either:
-- Run `fastio auth login` in a terminal (recommended for browser-based login)
-- Use the `auth` tool with `action: \"signin\"` and provide email/password
+- Use the `auth` tool with `action: \"login-start\"`, ask the user to open the
+  returned `login_url` in a browser and sign in, then call `action: \"login-status\"`
+  until it reports `authenticated`
+- Use the `auth` tool with `action: \"set-api-key\"` and an API key
+- Or run `fastio auth login` in a terminal
 
 Once authenticated, call the `auth` tool with `action: \"scopes\"` to learn what
 the credential is actually allowed to do — the access mode it holds on each

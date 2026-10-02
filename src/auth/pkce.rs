@@ -2,8 +2,8 @@
 
 /// PKCE (Proof Key for Code Exchange) flow for the Fast.io CLI.
 ///
-/// Implements RFC 7636 S256 challenge generation, authorization URL
-/// construction, and a local HTTP server for receiving the callback.
+/// Implements RFC 7636 S256 challenge generation. The browser handback is
+/// received by [`crate::auth::loopback`] (or pasted, in `--no-browser` mode).
 use base64::Engine;
 use sha2::{Digest, Sha256};
 
@@ -36,7 +36,10 @@ impl std::fmt::Debug for PkceChallenge {
 /// OAuth client ID registered for the CLI.
 pub const PKCE_CLIENT_ID: &str = "fastio-cli";
 
-/// Redirect URI for the CLI PKCE flow.
+/// Registered redirect URI used by the `--no-browser` (paste-the-code) flow.
+///
+/// The default flow uses an ephemeral `http://127.0.0.1:<port>/callback`
+/// from [`crate::auth::loopback`] instead.
 pub const PKCE_REDIRECT_URI: &str = "http://localhost:19836/callback";
 
 /// Generate a new PKCE challenge with random verifier and state.
@@ -85,37 +88,4 @@ fn base64url_encode(bytes: &[u8]) -> String {
 fn fill_random(buf: &mut [u8]) -> Result<(), CliError> {
     getrandom_crate::fill(buf)
         .map_err(|e| CliError::Auth(format!("failed to generate random bytes: {e}")))
-}
-
-/// Build the authorization URL for the PKCE flow.
-///
-/// The caller should open this URL in the user's browser.
-#[allow(dead_code)]
-#[must_use]
-pub fn build_authorize_url(
-    api_base: &str,
-    challenge: &PkceChallenge,
-    email_hint: Option<&str>,
-) -> String {
-    let mut params = vec![
-        ("client_id", PKCE_CLIENT_ID.to_owned()),
-        ("response_type", "code".to_owned()),
-        ("code_challenge", challenge.code_challenge.clone()),
-        ("code_challenge_method", "S256".to_owned()),
-        ("state", challenge.state.clone()),
-        ("redirect_uri", PKCE_REDIRECT_URI.to_owned()),
-        ("response_format", "json".to_owned()),
-    ];
-
-    if let Some(email) = email_hint {
-        params.push(("login_hint", email.to_owned()));
-    }
-
-    let query: String = params
-        .iter()
-        .map(|(k, v)| format!("{k}={}", urlencoding::encode(v)))
-        .collect::<Vec<_>>()
-        .join("&");
-
-    format!("{api_base}/oauth/authorize?{query}")
 }

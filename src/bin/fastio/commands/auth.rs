@@ -1,10 +1,12 @@
 /// Auth command implementations for `fastio auth *`.
 ///
-/// Handles login (basic + PKCE), logout, status, signup, email
+/// Handles browser login (PKCE), logout, status, signup, email
 /// verification, 2FA management, and API key management.
 use anyhow::{Context, Result};
 use colored::Colorize;
-use secrecy::SecretString;
+use std::time::Duration;
+
+use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Value, json};
 
 use fastio_cli::api;
@@ -13,6 +15,7 @@ use fastio_cli::api::auth::{
     map_scope_update_conflict,
 };
 use fastio_cli::auth::credentials::{CredentialsFile, StoredCredentials};
+use fastio_cli::auth::loopback;
 use fastio_cli::auth::pkce;
 use fastio_cli::auth::token;
 use fastio_cli::client::ApiClient;
@@ -30,52 +33,28 @@ pub async fn execute(
 ) -> Result<()> {
     match command {
         AuthCommand::Login {
-            email,
-            password,
+            password_flags,
+            no_browser,
             agent_name,
             access,
         } => {
-            if let (Some(email), Some(password)) = (email.as_deref(), password.as_deref()) {
-                // Refuse rather than ignore: basic auth does not carry an agent
-                // label, so accepting the flag here would silently produce a
-                // credential the operator believes is named and is not.
-                if agent_name.is_some() {
-                    anyhow::bail!(
-                        "--agent-name applies to browser (PKCE) login only; basic auth \
-                         does not carry an agent label. Omit --email/--password to use \
-                         browser login, or name an API key with \
-                         `fastio auth api-key create --agent-name`."
-                    )
-                }
-                // Same class of refusal: the access-mode ceiling and the
-                // account-settings request are asked for at the consent page,
-                // which basic auth never reaches. Accepting them here would
-                // hand back a credential the operator believes is scoped and
-                // is not.
-                if let Some(flag) = access.first_unsupported_by_basic_auth() {
-                    anyhow::bail!(
-                        "{flag} applies to browser (PKCE) login only; basic auth cannot \
-                         reach the consent page that grants it. Omit --email/--password \
-                         to use browser login, or scope an API key with \
-                         `fastio auth api-key create`."
-                    )
-                }
-                login_basic(config, ctx, email, password).await
-            } else if password.is_some() {
-                anyhow::bail!(
-                    "--password requires --email. Provide both for direct login, \
-                     or omit both for browser login."
-                )
-            } else {
-                login_pkce(
-                    config,
-                    ctx,
-                    email.as_deref(),
-                    agent_name.as_deref(),
-                    *access,
-                )
-                .await
+            // Before anything else — no client, no request: the removed
+            // password flags get an explanation, never a sign-in attempt.
+            if *password_flags {
+                anyhow::bail!(PASSWORD_LOGIN_MOVED);
             }
+            let handback = if *no_browser {
+                Handback::Paste {
+                    read_line: read_stdin_line,
+                }
+            } else {
+                Handback::Loopback {
+                    listener: loopback::bind().await.context("browser sign-in failed")?,
+                    open_browser: open_in_browser,
+                    deadline: loopback::DEFAULT_DEADLINE,
+                }
+            };
+            login_pkce(ctx, agent_name.as_deref(), *access, handback).await
         }
         AuthCommand::Logout => logout(ctx),
         AuthCommand::Signout => signout(config, ctx).await,
@@ -133,21 +112,6 @@ pub struct LoginAccess {
 }
 
 impl LoginAccess {
-    /// The first flag set here that basic auth cannot honour, spelled as the
-    /// user typed it — `None` when nothing was requested.
-    #[must_use]
-    pub fn first_unsupported_by_basic_auth(self) -> Option<&'static str> {
-        if self.admin {
-            Some("--admin")
-        } else if self.read_only {
-            Some("--read-only")
-        } else if self.account_settings {
-            Some("--account-settings")
-        } else {
-            None
-        }
-    }
-
     /// The wire form for the PKCE initiate call. `--admin` and `--read-only`
     /// are mutually exclusive at the clap layer, so at most one can be set.
     #[must_use]
@@ -170,15 +134,18 @@ impl LoginAccess {
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum AuthCommand {
-    /// Log in with optional email/password or PKCE browser flow.
+    /// Log in through the browser (PKCE): a loopback callback by default, or
+    /// a pasted code with `--no-browser`.
     Login {
-        /// Email address for basic auth login.
-        email: Option<String>,
-        /// Password for basic auth login.
-        password: Option<String>,
-        /// Agent instance label for the resulting credential (PKCE only).
+        /// Whether the removed `--email`/`--password` flags were given. The
+        /// command refuses with [`PASSWORD_LOGIN_MOVED`]; their values are
+        /// never carried.
+        password_flags: bool,
+        /// Paste the displayed code instead of using a loopback listener.
+        no_browser: bool,
+        /// Agent instance label for the resulting credential.
         agent_name: Option<String>,
-        /// Access-mode ceiling requested at the consent page (PKCE only).
+        /// Access-mode ceiling requested at the consent page.
         access: LoginAccess,
     },
     /// Clear stored credentials (local only).
@@ -367,66 +334,6 @@ pub enum OauthCommand {
     },
 }
 
-/// Login via email/password (HTTP Basic Auth).
-async fn login_basic(
-    _config: &Config,
-    ctx: &CommandContext<'_>,
-    email: &str,
-    password: &str,
-) -> Result<()> {
-    let client = ApiClient::new(ctx.api_base, None).context("failed to create API client")?;
-
-    let result = api::auth::sign_in(&client, email, password)
-        .await
-        .context("login failed")?;
-
-    // Store credentials
-    let now = chrono::Utc::now().timestamp();
-    let creds = StoredCredentials {
-        token: Some(SecretString::from(result.auth_token.clone())),
-        refresh_token: None,
-        api_key: None,
-        expires_at: Some(now + result.expires_in),
-        user_id: None,
-        email: Some(email.to_owned()),
-        auth_method: Some("basic".to_owned()),
-        // Basic auth never reaches the consent page, so there is no granted
-        // entity list to record.
-        scopes: None,
-    };
-
-    let mut creds_file =
-        CredentialsFile::load(ctx.config_dir).context("failed to load credentials")?;
-    creds_file
-        .set(ctx.profile_name, creds, ctx.config_dir)
-        .context("failed to save credentials")?;
-
-    let value = if result.two_factor {
-        json!({
-            "status": "two_factor_required",
-            // `--code` is REQUIRED — there is no positional form, and the
-            // positional spelling exits with "unexpected argument". This message
-            // is the SUCCESS path of every 2FA login, so it is the most likely
-            // place a user meets this command: getting it wrong strands them
-            // mid-2FA, and the stored token is `twofactor`-scoped, so their next
-            // command hits `10175`. `HINT_SCOPE_INCORRECT` carries the same
-            // wording and the two must stay in step.
-            "message": "2FA verification required. Run: fastio auth 2fa verify --code <CODE>",
-            "expires_in": result.expires_in,
-        })
-    } else {
-        json!({
-            "status": "authenticated",
-            "email": email,
-            "expires_in": result.expires_in,
-            "profile": ctx.profile_name,
-        })
-    };
-
-    ctx.output.render(&value)?;
-    Ok(())
-}
-
 /// Environment variable naming the agent instance behind a sign-in.
 const AGENT_NAME_ENV: &str = "FASTIO_AGENT_NAME";
 
@@ -453,13 +360,102 @@ fn resolve_agent_name(flag: Option<&str>) -> Option<String> {
     })
 }
 
-/// Login via PKCE browser flow.
+/// Error for the removed `--email`/`--password` login flags.
+const PASSWORD_LOGIN_MOVED: &str = "Password sign-in moved to the browser: run `fastio auth login`. \
+     For automation, use an API key.";
+
+/// How the browser hands the authorization code back to `auth login`.
+enum Handback {
+    /// Default: the browser is redirected to a bound `127.0.0.1` listener.
+    Loopback {
+        /// The listener, bound BEFORE authorizing so the redirect URI names
+        /// the port that is actually listening.
+        listener: loopback::LoopbackListener,
+        /// Opens the sign-in page. Failure is the opener's to ignore: the
+        /// URL is always printed too.
+        open_browser: fn(&str),
+        /// Absolute deadline for the browser handback.
+        deadline: Duration,
+    },
+    /// `--no-browser`: the page displays the code and the user pastes it.
+    Paste {
+        /// Reads one line of input (`""` at end of input).
+        read_line: fn() -> std::io::Result<String>,
+    },
+}
+
+/// Open `url` in the default browser, ignoring failure (the URL is printed).
+///
+/// Detached, so a launcher that blocks until the browser exits cannot delay
+/// the loopback wait that starts after it.
+fn open_in_browser(url: &str) {
+    let _ = open::that_detached(url);
+}
+
+/// Read one line from stdin; `""` at end of input.
+fn read_stdin_line() -> std::io::Result<String> {
+    use std::io::BufRead as _;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line)
+}
+
+/// Check the server-supplied sign-in page before printing or opening it.
+///
+/// The URL is used as the server built it — never constructed or amended
+/// here. A server without browser sign-in sends none, and that is an error
+/// rather than a reason to guess one.
+pub(crate) fn checked_login_url(login_url: Option<&str>) -> Result<&str> {
+    let Some(login_url) = login_url.map(str::trim).filter(|u| !u.is_empty()) else {
+        anyhow::bail!(
+            "server does not support browser sign-in yet (no login_url); update the server \
+             or try again later"
+        );
+    };
+    if login_url.chars().any(char::is_control) {
+        anyhow::bail!("refusing the server's sign-in URL: it contains control characters");
+    }
+    let parsed = url::Url::parse(login_url)
+        .map_err(|_| anyhow::anyhow!("refusing the server's sign-in URL: it is not a valid URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("refusing the server's sign-in URL: only http(s) URLs can be opened");
+    }
+    Ok(login_url)
+}
+
+/// The `pkce` credentials to store for a completed token exchange: access
+/// token, refresh token, expiry, and the granted scopes.
+pub(crate) fn pkce_credentials(token_resp: &api::types::PkceTokenResponse) -> StoredCredentials {
+    StoredCredentials {
+        token: Some(SecretString::from(token_resp.access_token.clone())),
+        refresh_token: token_resp.refresh_token.clone().map(SecretString::from),
+        api_key: None,
+        // An overflowing server lifetime is stored as no known expiry rather
+        // than wrapping into a bogus timestamp (same rule as sign-up).
+        expires_at: chrono::Utc::now()
+            .timestamp()
+            .checked_add(token_resp.expires_in),
+        user_id: None,
+        email: None,
+        auth_method: Some("pkce".to_owned()),
+        // The granted entity array, normalized to the server's string form by
+        // `deserialize_optional_scopes`: a string arrives as received, an array
+        // is re-encoded to the same rendering, and a blank one reads as absent
+        // rather than erasing a real grant.
+        scopes: token_resp.scopes.clone(),
+    }
+}
+
+/// Log in through the browser (PKCE).
+///
+/// One flow for both handbacks: authorize with the handback's redirect URI,
+/// show (and, for loopback, open) the server's `login_url`, receive the code,
+/// exchange it with the IDENTICAL redirect URI, and store `pkce` credentials.
 async fn login_pkce(
-    _config: &Config,
     ctx: &CommandContext<'_>,
-    email_hint: Option<&str>,
     agent_name: Option<&str>,
     access: LoginAccess,
+    handback: Handback,
 ) -> Result<()> {
     let client = ApiClient::new(ctx.api_base, None).context("failed to create API client")?;
 
@@ -467,63 +463,69 @@ async fn login_pkce(
 
     let agent_name = resolve_agent_name(agent_name);
 
-    // Initiate the PKCE flow
+    // The token exchange must repeat this exact string: the server matches the
+    // authorize and exchange redirect URIs exactly.
+    let redirect_uri = match &handback {
+        Handback::Loopback { listener, .. } => listener.redirect_uri().to_owned(),
+        Handback::Paste { .. } => pkce::PKCE_REDIRECT_URI.to_owned(),
+    };
+    let display_code = matches!(handback, Handback::Paste { .. });
+
     let auth_resp = api::auth::pkce_authorize(
         &client,
         pkce::PKCE_CLIENT_ID,
         &challenge.code_challenge,
         &challenge.state,
-        pkce::PKCE_REDIRECT_URI,
+        &redirect_uri,
         agent_name.as_deref(),
         access.to_authorize_access(),
+        display_code,
     )
     .await
     .context("failed to initiate PKCE authorization")?;
 
-    // Build the browser URL
-    let browser_url = format!(
-        "https://go.fast.io/connect?auth_request_id={}&display_code=true",
-        urlencoding::encode(&auth_resp.auth_request_id)
-    );
+    let login_url = checked_login_url(auth_resp.login_url.as_deref())?;
 
-    eprintln!("Opening browser for authentication...");
-    eprintln!("If the browser does not open, visit:");
-    eprintln!("  {browser_url}");
-    eprintln!();
+    let code = match handback {
+        Handback::Loopback {
+            listener,
+            open_browser,
+            deadline,
+        } => {
+            eprintln!("Opening your browser to sign in. If it does not open, visit:");
+            eprintln!("  {login_url}");
+            eprintln!("Remote/SSH session? Rerun with --no-browser");
+            open_browser(login_url);
+            match listener.wait(challenge.state.clone(), deadline).await {
+                Ok(loopback::LoopbackOutcome::Code(code)) => code,
+                Ok(loopback::LoopbackOutcome::Denied) => anyhow::bail!("sign-in was declined"),
+                Ok(_) => anyhow::bail!(
+                    "sign-in did not complete in the browser; run `fastio auth login` again"
+                ),
+                Err(loopback::LoopbackError::Expired) => {
+                    anyhow::bail!("sign-in timed out; run `fastio auth login` again")
+                }
+                Err(e) => return Err(e).context("browser sign-in failed"),
+            }
+        }
+        Handback::Paste { read_line } => {
+            eprintln!("Open this URL in a browser to sign in, then paste the code it shows:");
+            eprintln!("  {login_url}");
+            prompt_for_code(read_line)?
+        }
+    };
 
-    // Try to open the browser
-    let _ = open::that(&browser_url);
-
-    // Prompt the user to paste the authorization code from the browser
-    let (code, _state) = prompt_for_code(&challenge.state)?;
-
-    // Exchange code for tokens
     let token_resp = api::auth::pkce_token_exchange(
         &client,
-        &code,
+        code.expose_secret(),
         &challenge.code_verifier,
         pkce::PKCE_CLIENT_ID,
-        pkce::PKCE_REDIRECT_URI,
+        &redirect_uri,
     )
     .await
     .context("failed to exchange authorization code for tokens")?;
 
-    // Store credentials
-    let now = chrono::Utc::now().timestamp();
-    let creds = StoredCredentials {
-        token: Some(SecretString::from(token_resp.access_token.clone())),
-        refresh_token: token_resp.refresh_token.map(SecretString::from),
-        api_key: None,
-        expires_at: Some(now + token_resp.expires_in),
-        user_id: None,
-        email: email_hint.map(String::from),
-        auth_method: Some("pkce".to_owned()),
-        // The granted entity array, normalized to the server's string form by
-        // `deserialize_optional_scopes`: a string arrives as received, an array
-        // is re-encoded to the same rendering, and a blank one reads as absent
-        // rather than erasing a real grant.
-        scopes: token_resp.scopes.clone(),
-    };
+    let creds = pkce_credentials(&token_resp);
 
     let mut creds_file =
         CredentialsFile::load(ctx.config_dir).context("failed to load credentials")?;
@@ -560,6 +562,23 @@ async fn login_pkce(
 
     ctx.output.render(&value)?;
     Ok(())
+}
+
+/// Prompt for the code the sign-in page displays (`--no-browser`).
+///
+/// Empty input or end of input is an error, so no exchange is attempted.
+fn prompt_for_code(read_line: fn() -> std::io::Result<String>) -> Result<SecretString> {
+    use std::io::Write as _;
+
+    eprint!("Authorization code: ");
+    std::io::stderr().flush()?;
+
+    let line = read_line().context("failed to read authorization code from stdin")?;
+    let code = line.trim();
+    if code.is_empty() {
+        anyhow::bail!("no authorization code provided");
+    }
+    Ok(SecretString::from(code.to_owned()))
 }
 
 /// The post-login admin confirmation, with `--quiet` applied to the OUTPUT
@@ -605,29 +624,6 @@ async fn admin_grant_warning(client: &ApiClient) -> Option<String> {
              Run `fastio auth scopes` to see what this login actually holds."
         )),
     }
-}
-
-/// Prompt the user to manually paste an authorization code (sync wrapper).
-fn prompt_for_code(state: &str) -> Result<(String, String)> {
-    use std::io::{self, BufRead, Write};
-
-    eprint!("Authorization code: ");
-    io::stderr().flush()?;
-
-    let mut code = String::new();
-    io::stdin()
-        .lock()
-        .read_line(&mut code)
-        .context("failed to read authorization code from stdin")?;
-
-    let code = code.trim().to_owned();
-    if code.is_empty() {
-        anyhow::bail!("no authorization code provided");
-    }
-
-    // For manual entry, we trust the state since the user is pasting
-    // the code from the same browser session we initiated.
-    Ok((code, state.to_owned()))
 }
 
 /// Clear stored credentials for the active profile.
@@ -1188,66 +1184,60 @@ async fn signup(
 ) -> Result<()> {
     let client = ApiClient::new(ctx.api_base, None).context("failed to create API client")?;
 
-    api::auth::sign_up(&client, email, password, first_name, last_name, agent)
+    let resp = api::auth::sign_up(&client, email, password, first_name, last_name, agent)
         .await
         .context("signup failed")?;
 
-    // Auto-login after signup.
-    //
-    // The failure is CAPTURED, not discarded. Reporting only "Auto-login
-    // failed; run: fastio auth login" would throw away the server's reason and,
-    // if the failure was a wrong-credentials or lockout response, point the
-    // user at the one action that spends another counted attempt. Same class as
-    // the `10008` hint in `error.rs`.
-    let auto_login = api::auth::sign_in(&client, email, password).await;
-    let login_failure = match &auto_login {
-        Ok(_) => None,
-        Err(e) => Some(e.to_string()),
-    };
-    if let Ok(login) = auto_login {
-        let now = chrono::Utc::now().timestamp();
-        let creds = StoredCredentials {
-            token: Some(SecretString::from(login.auth_token)),
-            refresh_token: None,
-            api_key: None,
-            expires_at: Some(now + login.expires_in),
-            user_id: None,
-            email: Some(email.to_owned()),
-            auth_method: Some("basic".to_owned()),
-            // Auto-login after signup is basic auth: no consent page, no
-            // granted entity list.
-            scopes: None,
-        };
-
-        let mut creds_file =
-            CredentialsFile::load(ctx.config_dir).context("failed to load credentials")?;
-        creds_file
-            .set(ctx.profile_name, creds, ctx.config_dir)
-            .context("failed to save credentials")?;
-
+    // A success WITHOUT a session is the server declining to say whether the
+    // address already had an account. Stay neutral: never "created", never
+    // "already exists", and leave any stored credentials alone.
+    let Some(token) = resp.auth_token.filter(|t| !t.trim().is_empty()) else {
         let value = json!({
+            "status": "signed_up",
+            "message": "Check your email to finish, then run `fastio auth login`.",
+            "email": email,
+        });
+        ctx.output.render(&value)?;
+        return Ok(());
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let creds = StoredCredentials {
+        token: Some(SecretString::from(token)),
+        // The sign-up session is a plain token: there is nothing to refresh.
+        refresh_token: None,
+        api_key: None,
+        // Overflow is stored as no known expiry (same rule as `pkce_credentials`).
+        expires_at: resp.expires_in.and_then(|secs| now.checked_add(secs)),
+        user_id: None,
+        email: Some(email.to_owned()),
+        auth_method: Some("signup".to_owned()),
+        // No consent page was involved, so there is no granted entity list.
+        scopes: None,
+    };
+    let persisted = CredentialsFile::load(ctx.config_dir)
+        .and_then(|mut creds_file| creds_file.set(ctx.profile_name, creds, ctx.config_dir));
+
+    let value = match persisted {
+        Ok(()) => json!({
             "status": "signed_up_and_authenticated",
+            "message": "This session is not refreshed automatically; run `fastio auth login` \
+                        for a refreshable session.",
             "email": email,
             "profile": ctx.profile_name,
-        });
-        ctx.output.render(&value)?;
-    } else {
-        let mut value = json!({
+        }),
+        // The account exists and the server signed it in; only the local save
+        // failed. Saying so keeps the user from retrying the sign-up.
+        Err(e) => json!({
             "status": "signed_up",
-            "message": "Account created, but the automatic sign-in did not succeed. \
-                        Check the reason before retrying: repeating a failed sign-in \
-                        counts toward a temporary account lockout.",
+            "message": format!(
+                "Account created, but the session could not be saved ({e}). \
+                 Run `fastio auth login` to sign in."
+            ),
             "email": email,
-        });
-        // Surface the server's own reason rather than a generic "run auth login".
-        if let Some(reason) = login_failure
-            && let Some(map) = value.as_object_mut()
-        {
-            map.insert("auto_login_error".to_owned(), json!(reason));
-        }
-        ctx.output.render(&value)?;
-    }
-
+        }),
+    };
+    ctx.output.render(&value)?;
     Ok(())
 }
 
@@ -1898,9 +1888,10 @@ mod tests {
 mod admin_scope_tests {
     use super::{
         ApiKeyCommand, ApiKeyScopeSpec, AuthCommand, CommandContext, HINT_KEY_SCOPES_CHANGED,
-        HINT_SESSION_SCOPES_CHANGED, LoginAccess, OauthCommand, admin_grant_warning,
-        api_key_create_value, apply_stored_scopes, execute, read_only_signout_warning,
-        scopes_rows_for_table, signout_with_env,
+        HINT_SESSION_SCOPES_CHANGED, Handback, LoginAccess, OauthCommand, PASSWORD_LOGIN_MOVED,
+        admin_grant_warning, api_key_create_value, apply_stored_scopes, checked_login_url, execute,
+        login_pkce, pkce, pkce_credentials, read_only_signout_warning, scopes_rows_for_table,
+        signout_with_env,
     };
     use fastio_cli::api::types::ApiKeyCreateResponse;
     use fastio_cli::auth::credentials::{CredentialsFile, StoredCredentials};
@@ -1909,7 +1900,7 @@ mod admin_scope_tests {
     use fastio_cli::error::CliError;
     use fastio_cli::output::OutputConfig;
     use fastio_cli::output::format::filter_fields;
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret as _, SecretString};
     use serde_json::{Value, json};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1951,15 +1942,177 @@ mod admin_scope_tests {
         ApiClient::new(&format!("http://{addr}"), Some("token".to_owned())).expect("client builds")
     }
 
-    // ─── the basic-auth refusal ────────────────────────────────────────────
+    // ─── browser-only sign-in ──────────────────────────────────────────────
 
-    /// The access-mode ceiling and the account-settings request are granted at
-    /// the consent page, which basic auth never reaches. Accepting them there
-    /// would hand back a credential the operator believes is scoped and is not
-    /// — the same failure the `--agent-name` refusal exists to prevent.
+    /// One captured request: its request line and its (form) body.
+    #[derive(Clone, Debug)]
+    struct Captured {
+        line: String,
+        body: String,
+    }
+
+    impl Captured {
+        /// A decoded query parameter from the request line.
+        fn query(&self, key: &str) -> Option<String> {
+            let target = self.line.split_whitespace().nth(1)?;
+            let url = url::Url::parse(&format!("http://h{target}")).ok()?;
+            url.query_pairs()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.into_owned())
+        }
+
+        /// A decoded form field from the body.
+        fn form(&self, key: &str) -> Option<String> {
+            url::form_urlencoded::parse(self.body.as_bytes())
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.into_owned())
+        }
+    }
+
+    /// Read one whole HTTP request (headers plus `Content-Length` body).
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> Captured {
+        use tokio::io::AsyncReadExt as _;
+        let mut acc: Vec<u8> = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let Ok(n) = sock.read(&mut buf).await else {
+                break;
+            };
+            if n == 0 {
+                break;
+            }
+            acc.extend_from_slice(&buf[..n]);
+            if let Some(end) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&acc[..end]).into_owned();
+                let len = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                if acc.len() >= end + 4 + len {
+                    let body = String::from_utf8_lossy(&acc[end + 4..end + 4 + len]).into_owned();
+                    let line = head.lines().next().unwrap_or_default().to_owned();
+                    return Captured { line, body };
+                }
+            }
+        }
+        Captured {
+            line: String::new(),
+            body: String::new(),
+        }
+    }
+
+    /// Serve canned responses by request-line prefix and record every request.
+    ///
+    /// When `browser_code` is set, the authorize request also plays the
+    /// browser: it reads `state` and `redirect_uri` back off the request and
+    /// GETs `<redirect_uri>?code=<browser_code>&state=<state>` — exactly what
+    /// the sign-in page's redirect does.
+    async fn spawn_route_server(
+        routes: Vec<(&'static str, String)>,
+        browser_code: Option<&'static str>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<Captured>>>) {
+        use tokio::io::AsyncWriteExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let req = read_request(&mut sock).await;
+                sink.lock().expect("capture lock").push(req.clone());
+                let body = routes
+                    .iter()
+                    .find(|(prefix, _)| req.line.starts_with(prefix))
+                    .map_or_else(
+                        || r#"{"result":"no","error":{"code":1,"text":"no route"}}"#.to_owned(),
+                        |(_, body)| body.clone(),
+                    );
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+                drop(sock);
+                if let (Some(code), true) =
+                    (browser_code, req.line.starts_with("GET /oauth/authorize/"))
+                {
+                    let state = req.query("state").expect("authorize carries state");
+                    let redirect = req.query("redirect_uri").expect("authorize carries uri");
+                    tokio::spawn(async move {
+                        let url = url::Url::parse(&redirect).expect("redirect uri parses");
+                        let host = format!(
+                            "{}:{}",
+                            url.host_str().expect("host"),
+                            url.port().expect("port")
+                        );
+                        let mut b = tokio::net::TcpStream::connect(host)
+                            .await
+                            .expect("browser reaches the listener");
+                        let get = format!(
+                            "GET {}?code={code}&state={state} HTTP/1.1\r\nHost: x\r\n\r\n",
+                            url.path()
+                        );
+                        let _ = b.write_all(get.as_bytes()).await;
+                        let mut sink = Vec::new();
+                        let _ = tokio::io::AsyncReadExt::read_to_end(&mut b, &mut sink).await;
+                    });
+                }
+            }
+        });
+        (addr, seen)
+    }
+
+    fn authorize_ok(login_url: Option<&str>) -> String {
+        match login_url {
+            Some(u) => format!(
+                r#"{{"result":"yes","response":{{"auth_request_id":"ar1","login_url":"{u}"}}}}"#
+            ),
+            None => r#"{"result":"yes","response":{"auth_request_id":"ar1"}}"#.to_owned(),
+        }
+    }
+
+    const TOKEN_OK: &str = r#"{"access_token":"at-1","token_type":"Bearer","expires_in":3600,
+        "refresh_token":"rt-1","scopes":"[\"user:*:rw\"]"}"#;
+
+    fn noop_opener(_: &str) {}
+
+    #[allow(clippy::unnecessary_wraps)] // must match the `read_line` fn-pointer type
+    fn pasted_code() -> std::io::Result<String> {
+        Ok("pasted-code-1\n".to_owned())
+    }
+
+    #[allow(clippy::unnecessary_wraps)] // must match the `read_line` fn-pointer type
+    fn pasted_nothing() -> std::io::Result<String> {
+        Ok(String::new())
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "fastio-login-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// The removed password flags — either alone or both — fail before any
+    /// client is built. The API base is a CLOSED port: an attempted request
+    /// would surface as a connection error, not this message.
     #[tokio::test]
-    async fn basic_auth_refuses_each_consent_page_flag() {
-        let dir = std::env::temp_dir().join(format!("fastio-admin-basic-{}", std::process::id()));
+    async fn the_removed_password_flags_error_before_any_request() {
+        let dir = temp_dir("oldflags");
         let output = OutputConfig::from_flags(Some("json"), None, true, true);
         let base = format!("http://{}", closed_loopback_addr());
         let ctx = CommandContext {
@@ -1969,60 +2122,43 @@ mod admin_scope_tests {
             flag_token: None,
             config_dir: &dir,
         };
-        let config = Config::default();
-
-        for (flag, access) in [
-            (
-                "--admin",
-                LoginAccess {
-                    admin: true,
-                    ..LoginAccess::default()
-                },
-            ),
-            (
-                "--read-only",
-                LoginAccess {
-                    read_only: true,
-                    ..LoginAccess::default()
-                },
-            ),
-            (
-                "--account-settings",
-                LoginAccess {
-                    account_settings: true,
-                    ..LoginAccess::default()
-                },
-            ),
-        ] {
-            let cmd = AuthCommand::Login {
-                email: Some("someone@example.com".to_owned()),
-                password: Some("pw".to_owned()),
-                agent_name: None,
-                access,
-            };
-            let err = execute(&cmd, &config, &ctx)
-                .await
-                .expect_err("basic auth must refuse a consent-page flag");
-            let msg = format!("{err:#}");
-            assert!(msg.contains(flag), "the refusal must name the flag: {msg}");
-            assert!(
-                msg.contains("browser (PKCE) login only"),
-                "the refusal must point at browser login: {msg}"
-            );
-        }
+        let cmd = AuthCommand::Login {
+            password_flags: true,
+            no_browser: false,
+            agent_name: None,
+            access: LoginAccess::default(),
+        };
+        let err = execute(&cmd, &Config::default(), &ctx)
+            .await
+            .expect_err("the removed flags must fail");
+        assert_eq!(format!("{err:#}"), PASSWORD_LOGIN_MOVED);
+        assert!(
+            CredentialsFile::load(&dir)
+                .expect("load")
+                .get("default")
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// POSITIVE CONTROL for the refusal above: `--email` WITHOUT `--password`
-    /// is still browser login, so the same flags must sail through to the
-    /// initiate call. Reaching the network at all is the proof — the refusal
-    /// short-circuits before any client is built.
+    /// The default (loopback) flow: the authorize request carries the BOUND
+    /// listener's redirect URI and no `display_code`, the exchange repeats the
+    /// identical redirect URI with the code the browser delivered, and `pkce`
+    /// credentials are stored with the refresh token and grant. The consent
+    /// ceiling and agent label still reach the wire.
     #[tokio::test]
-    async fn email_only_login_accepts_the_consent_page_flags() {
-        let dir = std::env::temp_dir().join(format!("fastio-admin-pkce-{}", std::process::id()));
+    async fn loopback_login_round_trips_the_bound_redirect_uri() {
+        let dir = temp_dir("loopback");
         let output = OutputConfig::from_flags(Some("json"), None, true, true);
-        let addr = spawn_json_server(
-            "HTTP/1.1 500 Internal Server Error",
-            r#"{"result":false,"error":{"code":1,"text":"nope"}}"#,
+        let (addr, seen) = spawn_route_server(
+            vec![
+                (
+                    "GET /oauth/authorize/",
+                    authorize_ok(Some("https://login.example.test/connect?r=ar1")),
+                ),
+                ("POST /oauth/token/", TOKEN_OK.to_owned()),
+            ],
+            Some("browser-code-1"),
         )
         .await;
         let base = format!("http://{addr}");
@@ -2033,28 +2169,362 @@ mod admin_scope_tests {
             flag_token: None,
             config_dir: &dir,
         };
-        let cmd = AuthCommand::Login {
-            email: Some("someone@example.com".to_owned()),
-            password: None,
-            agent_name: None,
-            access: LoginAccess {
-                admin: true,
-                account_settings: true,
-                ..LoginAccess::default()
-            },
+        let listener = fastio_cli::auth::loopback::bind().await.expect("bind");
+        let bound = listener.redirect_uri().to_owned();
+        let handback = Handback::Loopback {
+            listener,
+            open_browser: noop_opener,
+            deadline: std::time::Duration::from_secs(10),
         };
-        let err = execute(&cmd, &Config::default(), &ctx)
+        let access = LoginAccess {
+            account_settings: true,
+            ..LoginAccess::default()
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            login_pkce(&ctx, Some("agent-7"), access, handback),
+        )
+        .await
+        .expect("login completes")
+        .expect("login succeeds");
+
+        let reqs = seen.lock().expect("capture lock").clone();
+        assert_eq!(reqs.len(), 2, "authorize + exchange only: {reqs:?}");
+        let authorize = &reqs[0];
+        assert!(bound.starts_with("http://127.0.0.1:"), "{bound}");
+        assert_eq!(
+            authorize.query("redirect_uri").as_deref(),
+            Some(bound.as_str())
+        );
+        assert_eq!(authorize.query("display_code"), None, "{}", authorize.line);
+        assert_eq!(authorize.query("agent_name").as_deref(), Some("agent-7"));
+        assert_eq!(authorize.query("account_settings").as_deref(), Some("1"));
+        let exchange = &reqs[1];
+        assert!(exchange.line.starts_with("POST /oauth/token/"));
+        assert_eq!(
+            exchange.form("redirect_uri").as_deref(),
+            Some(bound.as_str())
+        );
+        assert_eq!(exchange.form("code").as_deref(), Some("browser-code-1"));
+
+        let file = CredentialsFile::load(&dir).expect("load");
+        let stored = file.get("default").expect("stored");
+        assert_eq!(stored.auth_method.as_deref(), Some("pkce"));
+        assert_eq!(
+            stored.token.as_ref().map(|t| t.expose_secret().to_owned()),
+            Some("at-1".to_owned())
+        );
+        assert_eq!(
+            stored
+                .refresh_token
+                .as_ref()
+                .map(|t| t.expose_secret().to_owned()),
+            Some("rt-1".to_owned())
+        );
+        assert_eq!(stored.scopes.as_deref(), Some("[\"user:*:rw\"]"));
+        assert!(stored.expires_at.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--no-browser`: `display_code=true` with the registered redirect URI
+    /// on authorize, the same URI on the exchange, and the pasted code.
+    #[tokio::test]
+    async fn no_browser_login_uses_display_code_and_the_registered_uri() {
+        let dir = temp_dir("paste");
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let (addr, seen) = spawn_route_server(
+            vec![
+                (
+                    "GET /oauth/authorize/",
+                    authorize_ok(Some("https://login.example.test/connect?r=ar1")),
+                ),
+                ("POST /oauth/token/", TOKEN_OK.to_owned()),
+            ],
+            None,
+        )
+        .await;
+        let base = format!("http://{addr}");
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "default",
+            api_base: &base,
+            flag_token: None,
+            config_dir: &dir,
+        };
+        let handback = Handback::Paste {
+            read_line: pasted_code,
+        };
+        login_pkce(&ctx, None, LoginAccess::default(), handback)
             .await
-            .expect_err("the canned 500 fails the initiate call");
-        let msg = format!("{err:#}");
-        assert!(
-            !msg.contains("applies to browser (PKCE) login only"),
-            "browser login must not refuse its own flags: {msg}"
+            .expect("login succeeds");
+
+        let reqs = seen.lock().expect("capture lock").clone();
+        assert_eq!(reqs.len(), 2, "{reqs:?}");
+        assert_eq!(reqs[0].query("display_code").as_deref(), Some("true"));
+        assert_eq!(
+            reqs[0].query("redirect_uri").as_deref(),
+            Some(pkce::PKCE_REDIRECT_URI)
         );
-        assert!(
-            msg.contains("failed to initiate PKCE authorization"),
-            "the flags must have been carried into the initiate call: {msg}"
+        assert_eq!(
+            reqs[1].form("redirect_uri").as_deref(),
+            Some(pkce::PKCE_REDIRECT_URI)
         );
+        assert_eq!(reqs[1].form("code").as_deref(), Some("pasted-code-1"));
+        let file = CredentialsFile::load(&dir).expect("load");
+        assert_eq!(
+            file.get("default")
+                .and_then(|c| c.auth_method.clone())
+                .as_deref(),
+            Some("pkce")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Empty input (or end of input) at the paste prompt exits WITHOUT an
+    /// exchange.
+    #[tokio::test]
+    async fn no_browser_login_with_no_pasted_code_never_exchanges() {
+        let dir = temp_dir("paste-empty");
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let (addr, seen) = spawn_route_server(
+            vec![
+                (
+                    "GET /oauth/authorize/",
+                    authorize_ok(Some("https://login.example.test/c")),
+                ),
+                ("POST /oauth/token/", TOKEN_OK.to_owned()),
+            ],
+            None,
+        )
+        .await;
+        let base = format!("http://{addr}");
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "default",
+            api_base: &base,
+            flag_token: None,
+            config_dir: &dir,
+        };
+        let handback = Handback::Paste {
+            read_line: pasted_nothing,
+        };
+        let err = login_pkce(&ctx, None, LoginAccess::default(), handback)
+            .await
+            .expect_err("no code, no login");
+        assert!(format!("{err:#}").contains("no authorization code provided"));
+        assert_eq!(seen.lock().expect("capture lock").len(), 1, "no exchange");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A server without browser sign-in sends no `login_url`: a dedicated
+    /// error, no constructed fallback URL, and no exchange.
+    #[tokio::test]
+    async fn a_missing_login_url_is_a_dedicated_error() {
+        let dir = temp_dir("nourl");
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let (addr, seen) =
+            spawn_route_server(vec![("GET /oauth/authorize/", authorize_ok(None))], None).await;
+        let base = format!("http://{addr}");
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "default",
+            api_base: &base,
+            flag_token: None,
+            config_dir: &dir,
+        };
+        let handback = Handback::Loopback {
+            listener: fastio_cli::auth::loopback::bind().await.expect("bind"),
+            open_browser: noop_opener,
+            deadline: std::time::Duration::from_secs(5),
+        };
+        let err = login_pkce(&ctx, None, LoginAccess::default(), handback)
+            .await
+            .expect_err("no login_url, no login");
+        assert!(
+            format!("{err:#}").contains("server does not support browser sign-in yet"),
+            "{err:#}"
+        );
+        assert_eq!(seen.lock().expect("capture lock").len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `login_url` is shown and opened only when it is a plain http(s) URL.
+    #[test]
+    fn login_url_is_checked_before_it_is_opened() {
+        for missing in [None, Some(""), Some("   ")] {
+            let err = checked_login_url(missing).expect_err("missing must fail");
+            assert!(
+                err.to_string()
+                    .contains("server does not support browser sign-in yet"),
+                "{err}"
+            );
+        }
+        for bad in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "ftp://login.example.test/",
+            "not a url",
+            "https://login.example.test/\u{1b}[31m",
+        ] {
+            let err = checked_login_url(Some(bad)).expect_err("must refuse");
+            assert!(err.to_string().contains("refusing"), "{bad}: {err}");
+        }
+        for good in [
+            "https://login.example.test/connect?auth_request_id=ar1",
+            "http://localhost:8080/connect",
+        ] {
+            assert_eq!(checked_login_url(Some(good)).expect("accepted"), good);
+        }
+    }
+
+    fn signup_cmd() -> AuthCommand {
+        AuthCommand::Signup {
+            email: "new@example.com".to_owned(),
+            password: "pw".to_owned(),
+            first_name: None,
+            last_name: None,
+            agent: false,
+        }
+    }
+
+    /// Sign-up makes ONE request and stores the session it returns as
+    /// `signup`, with no refresh token.
+    #[tokio::test]
+    async fn signup_stores_the_returned_session_from_one_request() {
+        let dir = temp_dir("signup");
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let (addr, seen) = spawn_route_server(
+            vec![(
+                "POST /user/",
+                r#"{"result":"yes","response":{"auth_token":"jwt-signup","expires_in":2592000,"2factor":false}}"#
+                    .to_owned(),
+            )],
+            None,
+        )
+        .await;
+        let base = format!("http://{addr}");
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "default",
+            api_base: &base,
+            flag_token: None,
+            config_dir: &dir,
+        };
+        execute(&signup_cmd(), &Config::default(), &ctx)
+            .await
+            .expect("signup succeeds");
+        let reqs = seen.lock().expect("capture lock").clone();
+        assert_eq!(reqs.len(), 1, "exactly one request: {reqs:?}");
+        assert!(reqs[0].line.starts_with("POST /user/"), "{}", reqs[0].line);
+        let file = CredentialsFile::load(&dir).expect("load");
+        let stored = file.get("default").expect("stored");
+        assert_eq!(stored.auth_method.as_deref(), Some("signup"));
+        assert_eq!(
+            stored.token.as_ref().map(|t| t.expose_secret().to_owned()),
+            Some("jwt-signup".to_owned())
+        );
+        assert!(stored.refresh_token.is_none());
+        assert!(stored.expires_at.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An `expires_in` that would overflow the expiry timestamp is stored as no
+    /// known expiry instead of panicking or wrapping.
+    #[tokio::test]
+    async fn signup_overflowing_expires_in_stores_no_expiry() {
+        let dir = temp_dir("signup-overflow");
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let (addr, _seen) = spawn_route_server(
+            vec![(
+                "POST /user/",
+                format!(
+                    r#"{{"result":"yes","response":{{"auth_token":"jwt-signup","expires_in":{},"2factor":false}}}}"#,
+                    i64::MAX
+                ),
+            )],
+            None,
+        )
+        .await;
+        let base = format!("http://{addr}");
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "default",
+            api_base: &base,
+            flag_token: None,
+            config_dir: &dir,
+        };
+        execute(&signup_cmd(), &Config::default(), &ctx)
+            .await
+            .expect("signup succeeds");
+        let file = CredentialsFile::load(&dir).expect("load");
+        let stored = file.get("default").expect("stored");
+        assert!(stored.token.is_some());
+        assert_eq!(stored.expires_at, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same overflow rule for the PKCE token exchange.
+    #[test]
+    fn pkce_credentials_overflowing_expires_in_stores_no_expiry() {
+        let resp: fastio_cli::api::types::PkceTokenResponse = serde_json::from_str(&format!(
+            r#"{{"access_token":"at","token_type":"Bearer","expires_in":{}}}"#,
+            i64::MAX
+        ))
+        .expect("parses");
+        assert_eq!(pkce_credentials(&resp).expires_at, None);
+    }
+
+    /// A success without a session writes nothing and leaves existing
+    /// credentials intact.
+    #[tokio::test]
+    async fn signup_without_a_session_writes_no_credentials() {
+        let dir = temp_dir("signup-neutral");
+        let mut existing = CredentialsFile::load(&dir).expect("load");
+        existing
+            .set(
+                "default",
+                StoredCredentials {
+                    token: Some(SecretString::from("old-token".to_owned())),
+                    refresh_token: None,
+                    api_key: None,
+                    expires_at: None,
+                    user_id: None,
+                    email: None,
+                    auth_method: Some("pkce".to_owned()),
+                    scopes: None,
+                },
+                &dir,
+            )
+            .expect("seed");
+        let output = OutputConfig::from_flags(Some("json"), None, true, true);
+        let (addr, seen) = spawn_route_server(
+            vec![(
+                "POST /user/",
+                r#"{"result":"yes","response":{}}"#.to_owned(),
+            )],
+            None,
+        )
+        .await;
+        let base = format!("http://{addr}");
+        let ctx = CommandContext {
+            output: &output,
+            profile_name: "default",
+            api_base: &base,
+            flag_token: None,
+            config_dir: &dir,
+        };
+        execute(&signup_cmd(), &Config::default(), &ctx)
+            .await
+            .expect("a tokenless success is still a success");
+        assert_eq!(seen.lock().expect("capture lock").len(), 1);
+        let file = CredentialsFile::load(&dir).expect("load");
+        let stored = file.get("default").expect("still there");
+        assert_eq!(
+            stored.token.as_ref().map(|t| t.expose_secret().to_owned()),
+            Some("old-token".to_owned())
+        );
+        assert_eq!(stored.auth_method.as_deref(), Some("pkce"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The ceiling is a request for an access MODE, and the two mode flags map
@@ -2087,45 +2557,6 @@ mod admin_scope_tests {
         .to_authorize_access();
         assert_eq!(settings.access_mode, None);
         assert!(settings.account_settings);
-    }
-
-    /// Nothing requested means nothing to refuse — otherwise every basic-auth
-    /// login would start failing.
-    #[test]
-    fn nothing_requested_is_never_refused() {
-        assert_eq!(
-            LoginAccess::default().first_unsupported_by_basic_auth(),
-            None
-        );
-        for (expected, access) in [
-            (
-                "--admin",
-                LoginAccess {
-                    admin: true,
-                    ..LoginAccess::default()
-                },
-            ),
-            (
-                "--read-only",
-                LoginAccess {
-                    read_only: true,
-                    ..LoginAccess::default()
-                },
-            ),
-            (
-                "--account-settings",
-                LoginAccess {
-                    account_settings: true,
-                    ..LoginAccess::default()
-                },
-            ),
-        ] {
-            assert_eq!(
-                access.first_unsupported_by_basic_auth(),
-                Some(expected),
-                "{expected} must be named back to the user"
-            );
-        }
     }
 
     // ─── the post-login admin confirmation ─────────────────────────────────

@@ -495,13 +495,16 @@ fn map_auth_command(cmd: AuthCommands) -> AuthCommand {
         AuthCommands::Login {
             email,
             password,
+            no_browser,
             agent_name,
             admin,
             read_only,
             account_settings,
         } => AuthCommand::Login {
-            email,
-            password,
+            // Only the PRESENCE of the removed flags matters: their values are
+            // dropped here and never reach the command.
+            password_flags: email.is_some() || password.is_some(),
+            no_browser,
             agent_name,
             access: LoginAccess {
                 admin,
@@ -3271,6 +3274,43 @@ mod tests {
             !import_gate_blocks(&sign, false),
             "the import gate must not block sign"
         );
+    }
+
+    /// Either removed password flag — alone or together — reaches the command
+    /// as `password_flags`, so `auth login` refuses it; `--no-browser` maps
+    /// through, and a plain login carries neither.
+    #[test]
+    fn login_flags_map_into_the_auth_command() {
+        use super::map_auth_command;
+        use crate::cli::{Cli, Commands};
+        use crate::commands::auth::AuthCommand;
+        use clap::Parser;
+
+        fn mapped(flags: &[&str]) -> (bool, bool) {
+            let mut argv = vec!["fastio", "auth", "login"];
+            argv.extend_from_slice(flags);
+            let Commands::Auth(auth) = Cli::try_parse_from(argv).expect("parses").command else {
+                panic!("expected auth");
+            };
+            let AuthCommand::Login {
+                password_flags,
+                no_browser,
+                ..
+            } = map_auth_command(auth)
+            else {
+                panic!("expected login");
+            };
+            (password_flags, no_browser)
+        }
+
+        assert_eq!(mapped(&["--email", "a@example.com"]), (true, false));
+        assert_eq!(mapped(&["--password", "pw"]), (true, false));
+        assert_eq!(
+            mapped(&["--email", "a@example.com", "--password", "pw"]),
+            (true, false)
+        );
+        assert_eq!(mapped(&["--no-browser"]), (false, true));
+        assert_eq!(mapped(&[]), (false, false));
     }
 
     #[test]

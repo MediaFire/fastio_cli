@@ -6,42 +6,20 @@
 /// `/current/oauth/`, and `/current/user/2fa/`.
 use std::collections::HashMap;
 
-use base64::Engine;
 use serde_json::Value;
 
 use crate::api::types::{
     ApiKeyCreateResponse, ApiKeyListResponse, AuthCheckResponse, EmptyResponse,
-    PkceAuthorizeResponse, PkceTokenResponse, SignInResponse, SignUpResponse,
-    TwoFactorEnableResponse, TwoFactorStatusResponse, TwoFactorVerifyResponse,
+    PkceAuthorizeResponse, PkceTokenResponse, SignUpResponse, TwoFactorEnableResponse,
+    TwoFactorStatusResponse, TwoFactorVerifyResponse,
 };
 use crate::client::ApiClient;
 use crate::error::CliError;
 
-/// Sign in with email and password via HTTP Basic Auth.
-///
-/// `GET /user/auth/` with `Authorization: Basic base64(email:password)`.
-///
-/// A GET that ACTS: it MINTS a JWT. Routed through
-/// [`ApiClient::get_with_auth_side_effecting`] so a lost response is never
-/// recovered by re-sending — a replay would mint a second live token (audit
-/// noise, two valid sessions), and on a failed sign-in it would burn a second
-/// attempt against lockout and rate-limit accounting.
-pub async fn sign_in(
-    client: &ApiClient,
-    email: &str,
-    password: &str,
-) -> Result<SignInResponse, CliError> {
-    let credentials =
-        base64::engine::general_purpose::STANDARD.encode(format!("{email}:{password}"));
-    let auth_header = format!("Basic {credentials}");
-    client
-        .get_with_auth_side_effecting("/user/auth/", &auth_header)
-        .await
-}
-
 /// Create a new user account.
 ///
-/// `POST /user/` with form-encoded body.
+/// `POST /user/` with form-encoded body. The response may carry a session
+/// (`auth_token`/`expires_in`); see [`SignUpResponse`].
 ///
 /// When `agent` is `true` the `agent` form field is sent as `"true"`, tagging
 /// the account as an AI-agent account (`account_type` becomes `"agent"`
@@ -70,7 +48,9 @@ pub async fn sign_up(
         form.insert("agent".to_owned(), "true".to_owned());
     }
 
-    client.post_no_auth("/user/", &form).await
+    // Single attempt: a retry after a lost success reply would be answered as
+    // an existing email, with no session, and the new account's token is lost.
+    client.post_no_auth_once("/user/", &form).await
 }
 
 /// Check whether a token is valid.
@@ -185,7 +165,15 @@ pub struct AuthorizeAccess<'a> {
 ///
 /// `access` carries the requested access ceiling; see [`AuthorizeAccess`].
 ///
+/// `display_code` asks the sign-in page to SHOW the code for pasting instead
+/// of redirecting to `redirect_uri` (the `--no-browser` flow). Sends
+/// `display_code=true` only when `true`; omitted otherwise — `false` is never
+/// sent.
+///
+/// The response's `login_url` is the page to open, verbatim.
+///
 /// [`PKCE_CLIENT_ID`]: crate::auth::pkce::PKCE_CLIENT_ID
+#[allow(clippy::too_many_arguments)] // each is a distinct authorize-request field
 pub async fn pkce_authorize(
     client: &ApiClient,
     client_id: &str,
@@ -194,6 +182,7 @@ pub async fn pkce_authorize(
     redirect_uri: &str,
     agent_name: Option<&str>,
     access: AuthorizeAccess<'_>,
+    display_code: bool,
 ) -> Result<PkceAuthorizeResponse, CliError> {
     let mut params = HashMap::new();
     params.insert("client_id".to_owned(), client_id.to_owned());
@@ -211,6 +200,9 @@ pub async fn pkce_authorize(
     }
     if access.account_settings {
         params.insert("account_settings".to_owned(), "1".to_owned());
+    }
+    if display_code {
+        params.insert("display_code".to_owned(), "true".to_owned());
     }
 
     client
@@ -801,7 +793,7 @@ pub async fn password_reset_check(client: &ApiClient, code: &str) -> Result<Valu
 mod tests {
     use super::{
         ApiKeyScopeSpec, AuthorizeAccess, HINT_KEY_SCOPES_CHANGED, HINT_SESSION_SCOPES_CHANGED,
-        map_scope_update_conflict, oauth_narrow, pkce_authorize, resolve_key_scopes,
+        map_scope_update_conflict, oauth_narrow, pkce_authorize, resolve_key_scopes, sign_up,
     };
     use crate::client::ApiClient;
     use crate::error::{ApiError, CliError};
@@ -905,9 +897,50 @@ mod tests {
         (addr, seen)
     }
 
+    /// Sign-up sends exactly once: a 502 is surfaced, never retried, because
+    /// a retry after a lost success reply would lose the new session.
+    #[tokio::test]
+    async fn sign_up_does_not_retry_a_gateway_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\
+                          Connection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = sock.flush().await;
+            }
+        });
+        let client = ApiClient::new(&format!("http://{addr}"), None).expect("client builds");
+        let result = sign_up(&client, "a@example.com", "pw", None, None, false).await;
+        assert!(result.is_err(), "a 502 must surface as an error");
+        // A retrying sender only returns after its retries, so the count is final.
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "sign-up must not retry");
+    }
+
     async fn authorize_request_line(
         agent_name: Option<&str>,
         access: AuthorizeAccess<'_>,
+    ) -> String {
+        authorize_request_line_with(agent_name, access, false).await
+    }
+
+    async fn authorize_request_line_with(
+        agent_name: Option<&str>,
+        access: AuthorizeAccess<'_>,
+        display_code: bool,
     ) -> String {
         let (addr, seen) = spawn_capturing_server().await;
         let client = ApiClient::new(&format!("http://{addr}"), None).expect("client builds");
@@ -919,10 +952,34 @@ mod tests {
             "http://localhost:19836/callback",
             agent_name,
             access,
+            display_code,
         )
         .await;
         let req = seen.lock().expect("capture lock").clone();
         req.lines().next().unwrap_or_default().to_owned()
+    }
+
+    /// `--no-browser` asks the page to display the code: `display_code=true`.
+    #[tokio::test]
+    async fn pkce_authorize_sends_display_code_when_requested() {
+        let line = authorize_request_line_with(None, AuthorizeAccess::default(), true).await;
+        assert_eq!(
+            query_param(&line, "display_code").as_deref(),
+            Some("true"),
+            "got: {line}"
+        );
+    }
+
+    /// The loopback flow omits `display_code` entirely — never `=false`.
+    #[tokio::test]
+    async fn pkce_authorize_omits_display_code_by_default() {
+        let line = authorize_request_line_with(None, AuthorizeAccess::default(), false).await;
+        // Positive control: the request line was captured intact.
+        assert!(line.contains("client_id="), "no request captured: {line}");
+        assert!(
+            !line.contains("display_code"),
+            "display_code must be omitted, never false: {line}"
+        );
     }
 
     /// Read one query-parameter value out of a captured request line.

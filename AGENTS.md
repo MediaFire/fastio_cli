@@ -48,9 +48,12 @@ Authenticate before using any command. Two methods:
 # Option 1: API key (best for agents/automation)
 fastio --token YOUR_API_KEY auth check
 
-# Option 2: PKCE browser login (interactive)
+# Option 2: browser login (interactive)
 fastio auth login
-# Opens a URL → sign in → paste the authorization code
+# Opens a URL → sign in (including 2FA, if enrolled) in the browser → done
+
+# No browser available? Print the URL, sign in elsewhere, paste the code back
+fastio auth login --no-browser
 ```
 
 For automation, pass `--token` on every command or set `FASTIO_TOKEN`:
@@ -120,8 +123,10 @@ factor (`auth 2fa setup` / `auth 2fa verify-setup`), and invalidating every
 session — needs the `userdetails:*:rw` scope, requested with
 `--account-settings`. **`rwa` does not grant it.** Administrative access to
 organizations and account-settings access are orthogonal; ask for each one
-explicitly. Signing in with 2FA (`auth 2fa send` / `auth 2fa verify`) is not
-gated by it.
+explicitly. 2FA during `auth login` itself happens on the browser sign-in
+page, not through the CLI, so it is unaffected by this scope; `auth 2fa send`
+/ `auth 2fa verify` manage a pending 2FA code outside of login and are also
+not gated by it.
 
 ### Issuing and narrowing credentials
 
