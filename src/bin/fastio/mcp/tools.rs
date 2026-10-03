@@ -1499,7 +1499,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "download",
-        description: "Downloads: get file download URLs, folder ZIP URLs. file-url returns a secret-bearing URL (short-lived scoped read token) — do not log or share it.",
+        description: "Downloads: get file download URLs, folder ZIP URLs. file-url returns a secret-bearing URL (short-lived scoped read token) — do not log or share it. zip-url returns a secret-bearing ~2h link that needs no Authorization header (do not log or share it); on servers without ZIP tokens it returns a URL that requires your Authorization header (requires_auth_header=true).",
         actions: &[
             "file-url", "zip-url",
             // Universal: every tool self-describes. Declared so a STRICT
@@ -1510,7 +1510,11 @@ const TOOL_DEFS: &[ToolDef] = &[
         params: &[
             ("context_type", "Context: workspace or share", false),
             ("context_id", "Workspace or share ID", false),
-            ("node_id", "File/folder node ID", false),
+            (
+                "node_id",
+                "File/folder node ID (zip-url: folder node ID or root)",
+                false,
+            ),
             ("version_id", "Version ID (file-url)", false),
         ],
     },
@@ -7995,10 +7999,68 @@ async fn handle_download(
                 Ok(v) => v,
                 Err(e) => return Ok(e),
             };
-            let url = api::download::get_zip_url_ctx(state.api_base(), ctx_type, ctx_id, node_id);
-            Ok(success_json(&json!({ "zip_url": url })))
+            if !matches!(ctx_type, "workspace" | "share") {
+                return Ok(error_text("context_type must be 'workspace' or 'share'"));
+            }
+            let minted = api::download::request_zip_token(&client, ctx_type, ctx_id, node_id).await;
+            Ok(zip_url_result(
+                state.api_base(),
+                ctx_type,
+                ctx_id,
+                node_id,
+                minted,
+            ))
         }
         _ => Ok(error_text(&format!("Unknown download action: {action}"))),
+    }
+}
+
+/// Note returned with a tokenized ZIP URL, mirroring the `file-url` note.
+const ZIP_URL_SECRET_NOTE: &str = "zip_url is secret-bearing (it carries a ~2h ZIP download token bound to this folder). Do not log or share it.";
+
+/// Note returned with a header-requiring ZIP URL from a server without ZIP tokens.
+const ZIP_URL_AUTH_HEADER_NOTE: &str = "This server does not issue ZIP download tokens yet; send your Authorization header when fetching zip_url.";
+
+/// Map the outcome of a ZIP token mint to the `download/zip-url` tool result.
+///
+/// A minted token yields a self-contained, secret-bearing URL; the token stays
+/// a [`SecretString`] until the moment that URL is built. A server that lacks
+/// the mint route (route-not-found) yields the bare URL, which needs the
+/// caller's Authorization header. Any other failure is returned as an error.
+fn zip_url_result(
+    api_base: &str,
+    ctx_type: &str,
+    ctx_id: &str,
+    node_id: &str,
+    minted: Result<SecretString, fastio_cli::error::CliError>,
+) -> CallToolResult {
+    match minted {
+        Ok(token) => {
+            let url = api::download::get_zip_url_with_token(
+                api_base,
+                ctx_type,
+                ctx_id,
+                node_id,
+                token.expose_secret(),
+            );
+            success_json(&json!({
+                "zip_url": url,
+                "expires_in_seconds": api::download::ZIP_TOKEN_TTL_SECS,
+                "requires_auth_header": false,
+                "note": ZIP_URL_SECRET_NOTE,
+            }))
+        }
+        Err(fastio_cli::error::CliError::Api(ref api_err))
+            if api_err.code == api::download::ERR_ROUTE_NOT_FOUND =>
+        {
+            let url = api::download::get_zip_url_ctx(api_base, ctx_type, ctx_id, node_id);
+            success_json(&json!({
+                "zip_url": url,
+                "requires_auth_header": true,
+                "note": ZIP_URL_AUTH_HEADER_NOTE,
+            }))
+        }
+        Err(e) => cli_err_to_result(&e),
     }
 }
 
@@ -20038,6 +20100,153 @@ mod ripley_tool_tests {
         assert!(
             text.contains(fastio_cli::api::event::HINT_CHANGES_CURSOR_EXPIRED),
             "got: {text}"
+        );
+    }
+
+    /// `download/zip-url` args for context `ws1`, folder `root`.
+    fn zip_url_args() -> Map<String, Value> {
+        let mut args = Map::new();
+        args.insert("action".to_owned(), Value::String("zip-url".to_owned()));
+        args.insert("context_id".to_owned(), Value::String("ws1".to_owned()));
+        args.insert("node_id".to_owned(), Value::String("root".to_owned()));
+        args
+    }
+
+    /// A minted ZIP token yields a self-contained link: the token rides in the
+    /// query string (URL-encoded) and no Authorization header is needed.
+    #[tokio::test]
+    async fn download_zip_url_returns_tokenized_link_when_minted() {
+        let (router, captured) = router_answering(br#"{"result":true,"token":"zt/+= abc"}"#).await;
+        let res = router
+            .call_tool("download", zip_url_args())
+            .await
+            .expect("call_tool ok");
+        assert_ne!(
+            res.is_error,
+            Some(true),
+            "mint success must not be an error"
+        );
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("/workspace/ws1/storage/root/zip/?token=zt%2F%2B%3D%20abc"),
+            "the zip URL must carry the URL-encoded token, got: {text}"
+        );
+        assert!(
+            text.contains("7200"),
+            "expiry must be reported, got: {text}"
+        );
+        assert!(
+            text.contains("zip_url is secret-bearing") && text.contains("Do not log or share it."),
+            "the minted link must carry the secret-bearing note, got: {text}"
+        );
+        let req = captured.lock().expect("capture lock").clone();
+        assert!(
+            req.starts_with("GET /workspace/ws1/storage/root/requestzip/ "),
+            "the token must be minted on the requestzip route, got: {req}"
+        );
+    }
+
+    /// A server without the mint route (route-not-found) falls back to the bare
+    /// URL and says the caller's Authorization header is required.
+    #[tokio::test]
+    async fn download_zip_url_falls_back_on_route_not_found() {
+        let (router, _) = router_answering_status(
+            "HTTP/1.1 404 Not Found",
+            br#"{"result":false,"error":{"code":9992,"text":"Resource not found."}}"#,
+        )
+        .await;
+        let res = router
+            .call_tool("download", zip_url_args())
+            .await
+            .expect("call_tool ok");
+        assert_ne!(
+            res.is_error,
+            Some(true),
+            "the fallback must not be an error"
+        );
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("/workspace/ws1/storage/root/zip/"),
+            "the bare zip URL must be returned, got: {text}"
+        );
+        assert!(
+            !text.contains("token="),
+            "the fallback URL must carry no token, got: {text}"
+        );
+        assert!(
+            text.contains("Authorization header"),
+            "the fallback must say the header is required, got: {text}"
+        );
+    }
+
+    /// Any other mint failure is an error result, not a silent bare URL.
+    #[tokio::test]
+    async fn download_zip_url_other_error_is_an_error_result() {
+        let (router, _) = router_answering_status(
+            "HTTP/1.1 403 Forbidden",
+            br#"{"result":false,"error":{"code":1680,"text":"Access denied."}}"#,
+        )
+        .await;
+        let res = router
+            .call_tool("download", zip_url_args())
+            .await
+            .expect("call_tool ok");
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "a non-9992 failure must be an error"
+        );
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("/zip/"),
+            "no URL may be returned on a real failure, got: {text}"
+        );
+    }
+
+    /// An unsupported `context_type` is rejected before anything is minted.
+    #[tokio::test]
+    async fn download_zip_url_rejects_invalid_context_type_without_request() {
+        let (router, captured) = router_answering(br#"{"result":true,"token":"tok"}"#).await;
+        let mut args = zip_url_args();
+        args.insert("context_type".to_owned(), Value::String("org".to_owned()));
+        let res = router
+            .call_tool("download", args)
+            .await
+            .expect("call_tool ok");
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "an invalid context_type must be an error"
+        );
+        let text = result_to_string(&res);
+        assert!(
+            text.contains("context_type must be 'workspace' or 'share'"),
+            "the error must name the accepted values, got: {text}"
+        );
+        let req = captured.lock().expect("capture lock").clone();
+        assert!(
+            req.is_empty(),
+            "no request may be sent for an invalid context_type, got: {req}"
+        );
+    }
+
+    /// A mint reply without a token is an error result, never a bare URL.
+    #[tokio::test]
+    async fn download_zip_url_missing_token_is_an_error_result() {
+        let (router, _) = router_answering(br#"{"result":true}"#).await;
+        let res = router
+            .call_tool("download", zip_url_args())
+            .await
+            .expect("call_tool ok");
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "a mint reply with no token must be an error"
+        );
+        let text = result_to_string(&res);
+        assert!(
+            !text.contains("/zip/"),
+            "no URL may be returned without a token, got: {text}"
         );
     }
 
