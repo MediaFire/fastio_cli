@@ -288,7 +288,10 @@ pub const HINT_FEATURE_LIMIT: &str =
 ///
 /// Consequences encoded here deliberately:
 /// - the copy sends nobody to "fix" arguments that may be correct;
-/// - nothing branches application logic on the number;
+/// - application logic branches on the number only where an older deployment
+///   legitimately lacks an endpoint and a safe fallback exists (the MCP
+///   `download` `zip-url` action falls back to a header-requiring URL when the
+///   ZIP token route is missing);
 /// - when the platform supplies a structured `reason`, branch on that instead
 ///   (see [`ApiError::field_reason`]) — never on the code.
 pub const HINT_UNKNOWN_ROUTE: &str = "The server's API director finished resolving this request path without matching an endpoint. \
