@@ -902,6 +902,7 @@ impl ApiClient {
     /// | `…/transform/image/requestread/` | mint a second download token |
     /// | `/workspace/{ws}/storage/{node}/requestread/` | mint a second download token |
     /// | `/{ctx}/{ctx_id}/storage/{node}/requestread/` | mint a second download token |
+    /// | `/{context_type}/{context_id}/storage/{folder_id}/requestzip/` | mint a second ZIP download token |
     /// | `/events/search/summarize/` | spend AI credits twice |
     ///
     /// An earlier sweep enumerated only `client.get(` call sites and therefore

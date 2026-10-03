@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
+use secrecy::SecretString;
 use serde_json::Value;
 
 use crate::client::ApiClient;
@@ -249,6 +250,62 @@ pub fn get_zip_url_ctx(
     )
 }
 
+/// Lifetime of a ZIP download token minted by [`request_zip_token`], in seconds.
+pub const ZIP_TOKEN_TTL_SECS: u64 = 7200;
+
+/// API error code returned when the server has no handler for the request path.
+///
+/// Servers that predate ZIP download tokens answer `requestzip` with this code.
+pub const ERR_ROUTE_NOT_FOUND: u32 = 9992;
+
+/// Request a ZIP download token for a folder in a workspace or share context.
+///
+/// `GET /{context_type}/{context_id}/storage/{folder_id}/requestzip/`
+///
+/// `folder_id` may be a node ID or `root`. The returned token is bound to that
+/// folder and replaces the Authorization header on the `/zip/` URL built by
+/// [`get_zip_url_with_token`]. It is a bearer capability, so it is returned as
+/// a [`SecretString`]: never log it, and expose it only to build that URL.
+///
+/// A GET that ACTS: it mints a token. Routed through the side-effecting path so
+/// a lost response body is never recovered by re-sending.
+pub async fn request_zip_token(
+    client: &ApiClient,
+    context_type: &str,
+    context_id: &str,
+    folder_id: &str,
+) -> Result<SecretString, CliError> {
+    let path = format!(
+        "/{}/{}/storage/{}/requestzip/",
+        urlencoding::encode(context_type),
+        urlencoding::encode(context_id),
+        urlencoding::encode(folder_id),
+    );
+    let resp: Value = client.get_side_effecting(&path).await?;
+    extract_download_token(&resp)
+        .filter(|t| !t.is_empty())
+        .map(SecretString::from)
+        .ok_or_else(|| CliError::Parse("ZIP token response did not include a token".to_owned()))
+}
+
+/// Build a self-contained ZIP download URL carrying a ZIP download token.
+///
+/// The URL needs no Authorization header and is secret-bearing.
+#[must_use]
+pub fn get_zip_url_with_token(
+    api_base: &str,
+    context_type: &str,
+    context_id: &str,
+    folder_id: &str,
+    zip_token: &str,
+) -> String {
+    format!(
+        "{}?token={}",
+        get_zip_url_ctx(api_base, context_type, context_id, folder_id),
+        urlencoding::encode(zip_token),
+    )
+}
+
 /// Extract filename from node details response.
 pub fn extract_filename(details: &Value) -> Option<String> {
     details
@@ -304,7 +361,37 @@ mod tests {
         );
     }
 
-    use super::{build_download_url_ctx, sanitize_filename};
+    use super::{build_download_url_ctx, get_zip_url_with_token, sanitize_filename};
+
+    #[test]
+    fn zip_url_with_token_encodes_token_and_path_segments() {
+        let url = get_zip_url_with_token(
+            "https://api.fast.io/current/",
+            "share",
+            "a b",
+            "fold/er",
+            "t/+= k&x",
+        );
+        assert_eq!(
+            url,
+            "https://api.fast.io/current/share/a%20b/storage/fold%2Fer/zip/?token=t%2F%2B%3D%20k%26x"
+        );
+    }
+
+    #[test]
+    fn zip_url_with_token_supports_root() {
+        let url = get_zip_url_with_token(
+            "https://api.fast.io/current",
+            "workspace",
+            "19",
+            "root",
+            "tok",
+        );
+        assert_eq!(
+            url,
+            "https://api.fast.io/current/workspace/19/storage/root/zip/?token=tok"
+        );
+    }
 
     #[test]
     fn ctx_url_workspace_no_version() {
