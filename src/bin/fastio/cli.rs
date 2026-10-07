@@ -2156,16 +2156,20 @@ pub enum OrgCommands {
             value_parser = ["Member or above", "Admin or above"],
         )]
         perm_member_manage: String,
-        /// AI indexing on the new workspace. Omit to take the platform default,
-        /// which is ON; pass `--intelligence false` to opt out.
+        /// Deep Indexing on the new workspace. Omit to take the platform
+        /// default, which is ON; pass `--deep-indexing false` to opt out.
         ///
-        /// Bare `--intelligence` still means true, so the flag keeps working the
-        /// way it always has — the change is that OMITTING it no longer sends
-        /// `false`.
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
-        intelligence: Option<bool>,
+        /// Bare `--deep-indexing` means true; OMITTING it sends nothing so the
+        /// platform default applies.
+        #[arg(
+            long,
+            alias = "intelligence",
+            num_args = 0..=1,
+            default_missing_value = "true"
+        )]
+        deep_indexing: Option<bool>,
         /// Automatic metadata extraction for newly uploaded files. An OPT-OUT
-        /// layered under --intelligence: omit to take the platform default,
+        /// layered under --deep-indexing: omit to take the platform default,
         /// which is ON, and pass `--metadata-extraction false` to withhold
         /// automatic extraction. Explicit per-file extraction requests are
         /// unaffected.
@@ -2319,7 +2323,7 @@ impl fmt::Debug for OrgCommands {
                 description,
                 perm_join,
                 perm_member_manage,
-                intelligence,
+                deep_indexing,
                 metadata_extraction,
             } => f
                 .debug_struct("CreateWorkspace")
@@ -2329,7 +2333,7 @@ impl fmt::Debug for OrgCommands {
                 .field("description", description)
                 .field("perm_join", perm_join)
                 .field("perm_member_manage", perm_member_manage)
-                .field("intelligence", intelligence)
+                .field("deep_indexing", deep_indexing)
                 .field("metadata_extraction", metadata_extraction)
                 .finish(),
         }
@@ -2632,11 +2636,11 @@ pub enum WorkspaceCommands {
         /// Workspace description.
         #[arg(long)]
         description: Option<String>,
-        /// Enable AI intelligence features.
-        #[arg(long)]
-        intelligence: Option<bool>,
+        /// Enable Deep Indexing.
+        #[arg(long, alias = "intelligence")]
+        deep_indexing: Option<bool>,
         /// Automatic metadata extraction for newly uploaded files. An OPT-OUT
-        /// layered under --intelligence: omit to take the platform default,
+        /// layered under --deep-indexing: omit to take the platform default,
         /// which is on, and pass `false` to withhold automatic extraction.
         /// Explicit per-file extraction requests are unaffected.
         #[arg(long)]
@@ -2660,15 +2664,15 @@ pub enum WorkspaceCommands {
         /// New folder name.
         #[arg(long)]
         folder_name: Option<String>,
-        /// Toggle AI indexing (intelligence). Enabling requires the
-        /// `content_ai` and `ai_agent` plan features; disabling flushes
-        /// embeddings and re-enabling re-indexes (costs AI credits).
-        #[arg(long)]
-        intelligence: Option<bool>,
+        /// Toggle Deep Indexing. Enabling requires the `content_ai` and
+        /// `ai_agent` plan features; disabling flushes embeddings and
+        /// re-enabling re-indexes (costs AI credits).
+        #[arg(long, alias = "intelligence")]
+        deep_indexing: Option<bool>,
         /// Automatic metadata extraction for newly uploaded files. An OPT-OUT
-        /// layered under --intelligence: it can withhold extraction, never
-        /// enable it where intelligence or the plan does not allow it. Unlike
-        /// --intelligence it deletes nothing and is not rate-limited. Explicit
+        /// layered under --deep-indexing: it can withhold extraction, never
+        /// enable it where Deep Indexing or the plan does not allow it. Unlike
+        /// --deep-indexing it deletes nothing and is not rate-limited. Explicit
         /// per-file extraction requests are unaffected.
         #[arg(long)]
         metadata_extraction: Option<bool>,
@@ -3182,8 +3186,8 @@ pub enum FilesCommands {
     ///
     /// Filename matching is literal and pattern-driven (see --name-match /
     /// --glob). Content matching covers the AI-generated summary plus semantic
-    /// results; instance intelligence gates the semantic half only, so
-    /// previously summarized files stay searchable with intelligence off.
+    /// results; Deep Indexing gates the semantic half only, so previously
+    /// summarized files stay searchable with Deep Indexing off.
     ///
     /// This is the FLAT file list. For one query across files, metadata and
     /// comments together, use `fastio search workspace` / `fastio search share`.
@@ -3995,9 +3999,9 @@ pub enum ShareCommands {
         /// Enable anonymous uploads.
         #[arg(long)]
         anonymous_uploads: Option<bool>,
-        /// AI indexing. Omit to take the platform default, which is ON.
-        #[arg(long)]
-        intelligence: Option<bool>,
+        /// Enable Deep Indexing (sent as `false` when omitted).
+        #[arg(long, alias = "intelligence")]
+        deep_indexing: Option<bool>,
         /// Download security level (high, medium, or off).
         #[arg(long, value_parser = ["high", "medium", "off"])]
         download_security: Option<String>,
@@ -4083,9 +4087,9 @@ pub enum ShareCommands {
         /// Enable or disable guest AI chat.
         #[arg(long)]
         guest_chat_enabled: Option<bool>,
-        /// Toggle AI indexing (intelligence).
-        #[arg(long)]
-        intelligence: Option<bool>,
+        /// Toggle Deep Indexing.
+        #[arg(long, alias = "intelligence")]
+        deep_indexing: Option<bool>,
         /// Enable or disable anonymous uploads.
         #[arg(long)]
         anonymous_uploads: Option<bool>,
@@ -4217,7 +4221,7 @@ impl fmt::Debug for ShareCommands {
                 display_type,
                 workspace_style,
                 anonymous_uploads,
-                intelligence,
+                deep_indexing,
                 download_security,
                 accent_color,
                 background_color1,
@@ -4248,7 +4252,7 @@ impl fmt::Debug for ShareCommands {
                 .field("display_type", display_type)
                 .field("workspace_style", workspace_style)
                 .field("anonymous_uploads", anonymous_uploads)
-                .field("intelligence", intelligence)
+                .field("deep_indexing", deep_indexing)
                 .field("download_security", download_security)
                 .field("accent_color", accent_color)
                 .field("background_color1", background_color1)
@@ -4278,7 +4282,7 @@ impl fmt::Debug for ShareCommands {
                 display_type,
                 workspace_style,
                 guest_chat_enabled,
-                intelligence,
+                deep_indexing,
                 anonymous_uploads,
                 accent_color,
                 background_color1,
@@ -4308,7 +4312,7 @@ impl fmt::Debug for ShareCommands {
                 .field("display_type", display_type)
                 .field("workspace_style", workspace_style)
                 .field("guest_chat_enabled", guest_chat_enabled)
-                .field("intelligence", intelligence)
+                .field("deep_indexing", deep_indexing)
                 .field("anonymous_uploads", anonymous_uploads)
                 .field("accent_color", accent_color)
                 .field("background_color1", background_color1)
@@ -9888,5 +9892,119 @@ mod key_scope_flag_tests {
             Cli::try_parse_from(["fastio", "configure", "init", "--auth-method", "basic"]).is_err(),
             "basic is no longer an auth method"
         );
+    }
+}
+
+#[cfg(test)]
+mod deep_indexing_flag_tests {
+    use super::{Cli, Commands, OrgCommands, ShareCommands, WorkspaceCommands};
+    use clap::{CommandFactory, Parser};
+
+    /// Every command carrying the Deep Indexing toggle, as the argv prefix
+    /// that reaches it.
+    const SURFACES: [(&str, &[&str]); 5] = [
+        (
+            "org create-workspace",
+            &["fastio", "org", "create-workspace", "1", "n"],
+        ),
+        (
+            "workspace create",
+            &["fastio", "workspace", "create", "n", "--org", "1"],
+        ),
+        (
+            "workspace update",
+            &["fastio", "workspace", "update", "ws1"],
+        ),
+        (
+            "share create",
+            &["fastio", "share", "create", "n", "--workspace", "1"],
+        ),
+        ("share update", &["fastio", "share", "update", "s1"]),
+    ];
+
+    /// Parse `prefix + extra` and return the parsed Deep Indexing value.
+    fn deep_indexing_of(label: &str, prefix: &[&str], extra: &[&str]) -> Option<bool> {
+        let mut argv: Vec<&str> = prefix.to_vec();
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("{label}: parse failed for {argv:?}: {e}"));
+        match cli.command {
+            Commands::Org(OrgCommands::CreateWorkspace { deep_indexing, .. })
+            | Commands::Workspace(
+                WorkspaceCommands::Create { deep_indexing, .. }
+                | WorkspaceCommands::Update { deep_indexing, .. },
+            )
+            | Commands::Share(
+                ShareCommands::Create { deep_indexing, .. }
+                | ShareCommands::Update { deep_indexing, .. },
+            ) => deep_indexing,
+            other => panic!("{label}: unexpected command {other:?}"),
+        }
+    }
+
+    /// `--deep-indexing <v>` and the hidden `--intelligence <v>` reach the same
+    /// field with the same value on all five commands; absent stays `None`.
+    #[test]
+    fn deep_indexing_and_hidden_intelligence_alias_parse_identically() {
+        for (label, prefix) in SURFACES {
+            assert_eq!(
+                deep_indexing_of(label, prefix, &[]),
+                None,
+                "{label}: absent"
+            );
+            for (v, expected) in [("true", Some(true)), ("false", Some(false))] {
+                assert_eq!(
+                    deep_indexing_of(label, prefix, &["--deep-indexing", v]),
+                    expected,
+                    "{label}: --deep-indexing {v}"
+                );
+                assert_eq!(
+                    deep_indexing_of(label, prefix, &["--intelligence", v]),
+                    expected,
+                    "{label}: --intelligence {v}"
+                );
+            }
+        }
+    }
+
+    /// On `org create-workspace` the bare flag (either spelling) means true.
+    #[test]
+    fn org_create_workspace_bare_flag_means_true() {
+        let (label, prefix) = SURFACES[0];
+        assert_eq!(
+            deep_indexing_of(label, prefix, &["--deep-indexing"]),
+            Some(true)
+        );
+        assert_eq!(
+            deep_indexing_of(label, prefix, &["--intelligence"]),
+            Some(true)
+        );
+    }
+
+    /// `--help` advertises `--deep-indexing` and never the hidden alias.
+    #[test]
+    fn help_shows_deep_indexing_and_hides_intelligence() {
+        for path in [
+            &["org", "create-workspace"][..],
+            &["workspace", "create"][..],
+            &["workspace", "update"][..],
+            &["share", "create"][..],
+            &["share", "update"][..],
+        ] {
+            let mut cmd = Cli::command();
+            for name in path {
+                cmd = cmd
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("no such subcommand: {name}"))
+                    .clone();
+            }
+            let help = cmd.render_long_help().to_string();
+            assert!(help.contains("--deep-indexing"), "{path:?} help: {help}");
+            assert!(!help.contains("--intelligence"), "{path:?} help: {help}");
+            assert!(
+                !help.to_ascii_lowercase().contains("intelligence"),
+                "{path:?} help must not mention the old name: {help}"
+            );
+        }
     }
 }

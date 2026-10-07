@@ -1549,7 +1549,7 @@ pub const COMPOUND_MAX_CLAUSES: usize = 5;
 /// searches only those candidates and ranks them by relevance.
 ///
 /// Workspace only — there is no share form. Requires Member plus **both** the
-/// `metadata` and `content_ai` plan features **and** Intelligence enabled on
+/// `metadata` and `content_ai` plan features **and** Deep Indexing enabled on
 /// the workspace; there is no keyword leg to fall back on, so where
 /// `/storage/search/` degrades, this endpoint refuses.
 ///

@@ -56,7 +56,7 @@ pub async fn list_shares(
 /// Parameters for creating a new share.
 ///
 /// Mirrors the documented `POST /workspace/{id}/create/share/` body
-/// (shares.txt "Create Share"). The server **requires** `intelligence`, so it
+/// (shares.txt "Create Share"). The server **requires** Deep Indexing, so it
 /// is a plain `bool` (default `false`) rather than an option; the server
 /// defaults `share_type` to `exchange` when it is omitted.
 pub struct CreateShareParams<'a> {
@@ -102,8 +102,8 @@ pub struct CreateShareParams<'a> {
     pub workspace_style: Option<&'a str>,
     /// Enable anonymous file uploads (Receive/Exchange + public + premium).
     pub anonymous_uploads_enabled: Option<bool>,
-    /// Enable AI indexing. **Required server-side** — always sent.
-    pub intelligence: bool,
+    /// Enable Deep Indexing. **Required server-side** — always sent.
+    pub deep_indexing: bool,
     /// Accent color (JSON color object).
     pub accent_color: Option<&'a str>,
     /// Primary background color (JSON color object).
@@ -126,8 +126,11 @@ pub struct CreateShareParams<'a> {
 fn build_create_share_form(params: &CreateShareParams<'_>) -> HashMap<String, String> {
     let mut form = HashMap::new();
     form.insert("title".to_owned(), params.title.to_owned());
-    // `intelligence` is `Assert\Required` server-side: always send it.
-    form.insert("intelligence".to_owned(), params.intelligence.to_string());
+    // Deep Indexing is `Assert\Required` server-side: always send it.
+    form.insert(
+        super::DEEP_INDEXING_FORM_KEY.to_owned(),
+        params.deep_indexing.to_string(),
+    );
     put_str(&mut form, "share_type", params.share_type);
     put_str(&mut form, "description", params.description);
     put_str(&mut form, "access_options", params.access_options);
@@ -224,8 +227,8 @@ pub struct UpdateShareParams<'a> {
     pub workspace_style: Option<&'a str>,
     /// Enable/disable guest AI chat.
     pub guest_chat_enabled: Option<bool>,
-    /// Toggle AI indexing. Enabling requires `content_ai` + `ai_agent`.
-    pub intelligence: Option<bool>,
+    /// Toggle Deep Indexing. Enabling requires `content_ai` + `ai_agent`.
+    pub deep_indexing: Option<bool>,
     /// Enable/disable anonymous uploads.
     pub anonymous_uploads_enabled: Option<bool>,
     /// Accent color (JSON color object), or `"null"`.
@@ -268,7 +271,11 @@ fn build_update_share_form(params: &UpdateShareParams<'_>) -> HashMap<String, St
     put_str(&mut form, "display_type", params.display_type);
     put_str(&mut form, "workspace_style", params.workspace_style);
     put_bool(&mut form, "guest_chat_enabled", params.guest_chat_enabled);
-    put_bool(&mut form, "intelligence", params.intelligence);
+    put_bool(
+        &mut form,
+        super::DEEP_INDEXING_FORM_KEY,
+        params.deep_indexing,
+    );
     put_bool(
         &mut form,
         "anonymous_uploads_enabled",
@@ -545,7 +552,7 @@ mod tests {
             display_type: None,
             workspace_style: None,
             anonymous_uploads_enabled: None,
-            intelligence: false,
+            deep_indexing: false,
             accent_color: None,
             background_color1: None,
             background_color2: None,
@@ -571,19 +578,27 @@ mod tests {
     }
 
     #[test]
-    fn create_form_always_sends_intelligence_default_false() {
-        // `intelligence` is Assert\Required server-side: it must ALWAYS be sent,
+    fn create_form_always_sends_deep_indexing_default_false() {
+        // Deep Indexing is Assert\Required server-side: it must ALWAYS be sent,
         // defaulting to false, or create returns a 400.
         let form = build_create_share_form(&minimal_create("ws", "t"));
-        assert_eq!(form.get("intelligence").map(String::as_str), Some("false"));
+        assert_eq!(
+            form.get(crate::api::DEEP_INDEXING_FORM_KEY)
+                .map(String::as_str),
+            Some("false")
+        );
     }
 
     #[test]
-    fn create_form_sends_intelligence_true_when_set() {
+    fn create_form_sends_deep_indexing_true_when_set() {
         let mut p = minimal_create("ws", "t");
-        p.intelligence = true;
+        p.deep_indexing = true;
         let form = build_create_share_form(&p);
-        assert_eq!(form.get("intelligence").map(String::as_str), Some("true"));
+        assert_eq!(
+            form.get(crate::api::DEEP_INDEXING_FORM_KEY)
+                .map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]
@@ -655,7 +670,7 @@ mod tests {
             display_type: None,
             workspace_style: None,
             guest_chat_enabled: None,
-            intelligence: Some(false),
+            deep_indexing: Some(false),
             anonymous_uploads_enabled: None,
             accent_color: None,
             background_color1: None,
@@ -679,7 +694,11 @@ mod tests {
             form.get("download_security").map(String::as_str),
             Some("high")
         );
-        assert_eq!(form.get("intelligence").map(String::as_str), Some("false"));
+        assert_eq!(
+            form.get(crate::api::DEEP_INDEXING_FORM_KEY)
+                .map(String::as_str),
+            Some("false")
+        );
         // Untouched fields must be absent (partial update).
         assert!(!form.contains_key("name"));
         assert!(!form.contains_key("password"));
@@ -708,7 +727,7 @@ mod tests {
             display_type: None,
             workspace_style: None,
             guest_chat_enabled: None,
-            intelligence: None,
+            deep_indexing: None,
             anonymous_uploads_enabled: None,
             accent_color: None,
             background_color1: None,

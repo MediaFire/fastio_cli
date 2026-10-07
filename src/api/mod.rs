@@ -57,3 +57,9 @@ pub mod upload;
 pub mod user;
 /// Workspace management endpoints.
 pub mod workspace;
+
+/// Form-field key for the workspace/share Deep Indexing setting.
+///
+/// The API field keeps its original name, `intelligence`; only the
+/// user-facing name is Deep Indexing.
+pub const DEEP_INDEXING_FORM_KEY: &str = "intelligence";

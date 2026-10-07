@@ -260,30 +260,35 @@ Over MCP this is the `id` tool (`action: "info"`, params `id` or `ids`). A
 29-char id whose 1-char code is unmapped is reported `unknown` (it may be a
 transitional code pending reassignment), never guessed.
 
-## Important: Intelligence (AI indexing) Setting
+## Important: Deep Indexing Setting
 
-Workspaces have an `intelligence` toggle. When **OFF** (default) the workspace is
-pure storage. When **ON**, documents are indexed with embeddings for AI-powered
-search, chat, and summarization. Ingestion is expensive (per-page cost), so only
-enable it on workspaces you intend to query.
+Workspaces have a Deep Indexing toggle (`--deep-indexing`). When **ON**,
+documents are indexed with embeddings for AI-powered search, chat, and
+summarization. When **OFF** the workspace is pure storage. A new workspace takes
+the platform default (on) unless you pass `--deep-indexing false`. Ingestion is
+expensive (per-page cost), so turn it off on workspaces you do not intend to
+query.
 
 ```bash
-# Storage-only (default, recommended)
-fastio workspace create --org ORG_ID --name "File Storage"
+# Storage-only
+fastio workspace create "File Storage" --org ORG_ID --deep-indexing false
 
-# AI/RAG use case
-fastio workspace create --org ORG_ID --name "Knowledge Base" --intelligence true
+# AI/RAG use case (platform default)
+fastio workspace create "Knowledge Base" --org ORG_ID
 
-# Toggle AI indexing on an existing workspace
-fastio workspace update WS_ID --intelligence true
+# Toggle Deep Indexing on an existing workspace
+fastio workspace update WS_ID --deep-indexing true
 
-# Keep AI indexing but stop extracting metadata from new uploads
+# Keep Deep Indexing but stop extracting metadata from new uploads
 fastio workspace update WS_ID --metadata-extraction false
 ```
 
-`--metadata-extraction` is a separate opt-OUT layered under `intelligence`: it
+`share create` and `share update` accept the same `--deep-indexing` flag;
+`share create` sends `false` when it is omitted.
+
+`--metadata-extraction` is a separate opt-OUT layered under Deep Indexing: it
 can withhold automatic extraction from newly uploaded files, but it can never
-enable extraction where the intelligence setting or the plan does not allow it.
+enable extraction where the Deep Indexing setting or the plan does not allow it.
 It defaults to on, it deletes nothing, and explicit per-file extraction requests
 are unaffected. It is accepted on `workspace create`, `workspace update` and
 `org create-workspace`.
@@ -330,7 +335,7 @@ fastio share guest-auth SHARE_ID
 
 ### Ripley (AI agent)
 
-Requires `intelligence` enabled on the workspace for content-aware queries.
+Requires Deep Indexing enabled on the workspace for content-aware queries.
 
 ```bash
 fastio ripley ask --workspace WS_ID "your question"      # headline verb
