@@ -59,16 +59,16 @@ pub struct CreateWorkspaceParams<'a> {
     pub name: &'a str,
     /// Optional workspace description.
     pub description: Option<&'a str>,
-    /// Enable AI-powered intelligence features.
-    pub intelligence: Option<bool>,
+    /// Enable Deep Indexing.
+    pub deep_indexing: Option<bool>,
     /// Automatic metadata extraction for newly uploaded files.
     ///
-    /// Like `intelligence` it **defaults to `true`** server-side, so `None`
+    /// Like Deep Indexing it **defaults to `true`** server-side, so `None`
     /// omits the field rather than sending `false`. It is an opt-OUT layered
-    /// under `intelligence` and the plan: automatic extraction runs only while
-    /// `intelligence` is on, the plan includes the `metadata` feature, and this
+    /// under Deep Indexing and the plan: automatic extraction runs only while
+    /// Deep Indexing is on, the plan includes the `metadata` feature, and this
     /// is not `false`. It can withhold extraction; it can never enable it where
-    /// the intelligence setting or the plan does not allow it.
+    /// the Deep Indexing setting or the plan does not allow it.
     pub metadata_extraction: Option<bool>,
 }
 
@@ -86,10 +86,10 @@ const DEFAULT_PERM_MEMBER_MANAGE: &str = "Admin or above";
 /// (see the published API docs), so this builder always sends the two perms
 /// defaulted, since the `workspace create` command exposes no flags for them.
 ///
-/// `intelligence` is **NOT** required and **defaults to `true`** (the published
+/// Deep Indexing is **NOT** required and **defaults to `true`** (the published
 /// API docs: "omitting the field means on, and is not an error"). Sending
 /// `unwrap_or(false)` unconditionally would give every workspace created through
-/// the CLI *or* MCP AI indexing OFF unless the caller opted in — the inverse of
+/// the CLI *or* MCP Deep Indexing OFF unless the caller opted in — the inverse of
 /// the platform default. Undoing that later is not free: re-enabling re-indexes
 /// every file and burns AI credits. It is therefore sent ONLY when the caller
 /// states a preference.
@@ -98,7 +98,7 @@ const DEFAULT_PERM_MEMBER_MANAGE: &str = "Admin or above";
 /// Build the form body for the minimal create-workspace path.
 ///
 /// Extracted for the same reason as [`crate::api::org::build_create_workspace_form`]:
-/// the hazard is an unconditional `intelligence=false`, and only an assertion
+/// the hazard is an unconditional Deep Indexing `false`, and only an assertion
 /// about the field's ABSENCE can catch it.
 fn build_create_workspace_form(params: &CreateWorkspaceParams<'_>) -> HashMap<String, String> {
     let mut form = HashMap::new();
@@ -109,8 +109,8 @@ fn build_create_workspace_form(params: &CreateWorkspaceParams<'_>) -> HashMap<St
         "perm_member_manage".to_owned(),
         DEFAULT_PERM_MEMBER_MANAGE.to_owned(),
     );
-    if let Some(v) = params.intelligence {
-        form.insert("intelligence".to_owned(), v.to_string());
+    if let Some(v) = params.deep_indexing {
+        form.insert(super::DEEP_INDEXING_FORM_KEY.to_owned(), v.to_string());
     }
     if let Some(v) = params.metadata_extraction {
         form.insert("metadata_extraction".to_owned(), v.to_string());
@@ -152,7 +152,7 @@ pub async fn get_workspace(client: &ApiClient, workspace_id: &str) -> Result<Val
 /// Takes the form fields verbatim, so every documented update key travels
 /// through here — including `metadata_extraction` (`"true"`/`"false"`), the
 /// automatic-extraction toggle whose create-time twin is
-/// [`CreateWorkspaceParams::metadata_extraction`]. Unlike `intelligence` it
+/// [`CreateWorkspaceParams::metadata_extraction`]. Unlike Deep Indexing it
 /// deletes nothing, is not rate-limited, and carries no plan requirement.
 #[allow(clippy::implicit_hasher)]
 pub async fn update_workspace(
@@ -489,7 +489,7 @@ pub async fn disable_import(client: &ApiClient, workspace_id: &str) -> Result<Va
 /// object with these children (each is either an object/`null` for
 /// singleton sweeps or an array for per-resource jobs):
 ///
-/// - `jobs.intelligence` — object or `null`. Workspace-wide AI-indexing
+/// - `jobs.intelligence` — object or `null`. Workspace-wide Deep Indexing
 ///   sweep status.
 /// - `jobs.summarize` — object or `null`. AI-summary generation sweep.
 /// - `jobs.upsert_file` — object or `null`. File upsert / bulk-write sweep.
@@ -663,27 +663,28 @@ mod tests {
         CreateWorkspaceParams, MetadataRequestKind, build_create_workspace_form,
         build_update_note_form, cloud_import_path, note_path, plan_metadata_request,
     };
+    use crate::api::DEEP_INDEXING_FORM_KEY;
 
-    /// The minimal create path must OMIT `intelligence` when unset.
+    /// The minimal create path must OMIT Deep Indexing when unset.
     ///
     /// Same contract as `api::org`'s builder: sending `unwrap_or(false)` would
     /// make `fastio workspace create` — and every MCP workspace creation, which
-    /// routes here — produce a workspace with AI indexing OFF against a
+    /// routes here — produce a workspace with Deep Indexing OFF against a
     /// platform default of ON.
     #[test]
-    fn minimal_create_omits_intelligence_when_unset() {
+    fn minimal_create_omits_deep_indexing_when_unset() {
         let params = CreateWorkspaceParams {
             org_id: "123",
             folder_name: "eng",
             name: "Engineering",
-            intelligence: None,
+            deep_indexing: None,
             metadata_extraction: None,
             description: None,
         };
         let form = build_create_workspace_form(&params);
         assert!(
-            !form.contains_key("intelligence"),
-            "unset `intelligence` must be omitted, got: {form:?}"
+            !form.contains_key(DEEP_INDEXING_FORM_KEY),
+            "unset Deep Indexing must be omitted, got: {form:?}"
         );
         // The two perms ARE required with no server default, so this path keeps
         // supplying them (see the published API docs).
@@ -691,18 +692,18 @@ mod tests {
         assert!(form.contains_key("perm_member_manage"));
 
         let explicit = build_create_workspace_form(&CreateWorkspaceParams {
-            intelligence: Some(false),
+            deep_indexing: Some(false),
             metadata_extraction: None,
             ..params
         });
         assert_eq!(
-            explicit.get("intelligence").map(String::as_str),
+            explicit.get(DEEP_INDEXING_FORM_KEY).map(String::as_str),
             Some("false"),
             "an EXPLICIT opt-out must still be transmitted"
         );
     }
 
-    /// `metadata_extraction` follows `intelligence`'s opt-OUT contract on this
+    /// `metadata_extraction` follows Deep Indexing's opt-OUT contract on this
     /// path too: absent unless the caller stated a preference.
     #[test]
     fn minimal_create_omits_metadata_extraction_when_unset() {
@@ -710,7 +711,7 @@ mod tests {
             org_id: "123",
             folder_name: "eng",
             name: "Engineering",
-            intelligence: None,
+            deep_indexing: None,
             metadata_extraction: None,
             description: None,
         };

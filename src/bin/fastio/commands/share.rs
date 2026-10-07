@@ -50,8 +50,8 @@ pub struct ShareCreateArgs {
     pub workspace_style: Option<String>,
     /// Enable anonymous uploads.
     pub anonymous_uploads: Option<bool>,
-    /// Enable AI intelligence features (default false).
-    pub intelligence: Option<bool>,
+    /// Enable Deep Indexing (default false).
+    pub deep_indexing: Option<bool>,
     /// Download security level ("high", "medium", or "off").
     pub download_security: Option<String>,
     /// Accent color (JSON color object).
@@ -110,8 +110,8 @@ pub struct ShareUpdateArgs {
     pub workspace_style: Option<String>,
     /// Enable/disable guest AI chat.
     pub guest_chat_enabled: Option<bool>,
-    /// Toggle AI indexing (intelligence).
-    pub intelligence: Option<bool>,
+    /// Toggle Deep Indexing.
+    pub deep_indexing: Option<bool>,
     /// Enable/disable anonymous uploads.
     pub anonymous_uploads: Option<bool>,
     /// Accent color (JSON color object), or "null".
@@ -474,8 +474,8 @@ async fn create(ctx: &CommandContext<'_>, args: &ShareCreateArgs) -> Result<()> 
             display_type: args.display_type.as_deref(),
             workspace_style: args.workspace_style.as_deref(),
             anonymous_uploads_enabled: args.anonymous_uploads,
-            // `intelligence` is required server-side; default to false (AI off).
-            intelligence: args.intelligence.unwrap_or(false),
+            // Deep Indexing is required server-side; default to false (off).
+            deep_indexing: args.deep_indexing.unwrap_or(false),
             accent_color: args.accent_color.as_deref(),
             background_color1: args.background_color1.as_deref(),
             background_color2: args.background_color2.as_deref(),
@@ -520,7 +520,7 @@ fn update_has_any_field(a: &ShareUpdateArgs) -> bool {
         || a.display_type.is_some()
         || a.workspace_style.is_some()
         || a.guest_chat_enabled.is_some()
-        || a.intelligence.is_some()
+        || a.deep_indexing.is_some()
         || a.anonymous_uploads.is_some()
         || a.accent_color.is_some()
         || a.background_color1.is_some()
@@ -561,7 +561,7 @@ async fn update(ctx: &CommandContext<'_>, args: &ShareUpdateArgs) -> Result<()> 
             display_type: args.display_type.as_deref(),
             workspace_style: args.workspace_style.as_deref(),
             guest_chat_enabled: args.guest_chat_enabled,
-            intelligence: args.intelligence,
+            deep_indexing: args.deep_indexing,
             anonymous_uploads_enabled: args.anonymous_uploads,
             accent_color: args.accent_color.as_deref(),
             background_color1: args.background_color1.as_deref(),

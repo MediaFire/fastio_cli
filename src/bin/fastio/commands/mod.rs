@@ -134,7 +134,7 @@ impl CommandContext<'_> {
         // treated as opaque and fall back to the generic advice.
         let detail = match meta.get("reason").and_then(serde_json::Value::as_str) {
             Some("intelligence_disabled") => {
-                " (AI intelligence is disabled here — an org admin can enable it)"
+                " (Deep Indexing is disabled here — an org admin can enable it)"
             }
             Some("summary_permission_denied") => {
                 " (this share does not grant access to file summaries)"

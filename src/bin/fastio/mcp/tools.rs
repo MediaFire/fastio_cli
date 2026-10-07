@@ -199,7 +199,7 @@ fn legacy_offset_args_supplied(args: &Map<String, Value>) -> bool {
 /// PRESENT-but-unparseable.
 ///
 /// The lenient [`optional_bool`] collapses "key omitted" and "key present but
-/// not a valid bool" to `None`, so a typo like `intelligence: "tru"` silently
+/// not a valid bool" to `None`, so a typo like `deep_indexing: "tru"` silently
 /// becomes the default rather than an error. For the constrained boolean
 /// params, a present-but-invalid value should error. Returns
 /// `Ok(None)` when absent, `Ok(Some(v))` when present and a valid bool
@@ -217,6 +217,35 @@ fn optional_bool_strict(
             .map(Some)
             .ok_or_else(|| error_text(&format!("{key} must be a boolean (true or false)"))),
     }
+}
+
+/// Advertised MCP argument for the Deep Indexing toggle (`org`, `workspace`,
+/// `share`).
+const DEEP_INDEXING_ARG: &str = "deep_indexing";
+/// Earlier spelling of [`DEEP_INDEXING_ARG`]. Still accepted, never advertised.
+const DEEP_INDEXING_ARG_ALIAS: &str = "intelligence";
+
+/// The key that carries the Deep Indexing toggle for this call:
+/// [`DEEP_INDEXING_ARG`] when it is present and non-null (it wins when both are
+/// sent), otherwise [`DEEP_INDEXING_ARG_ALIAS`].
+fn deep_indexing_key(args: &Map<String, Value>) -> &'static str {
+    if args.get(DEEP_INDEXING_ARG).is_some_and(|v| !v.is_null()) {
+        DEEP_INDEXING_ARG
+    } else {
+        DEEP_INDEXING_ARG_ALIAS
+    }
+}
+
+/// Lenient Deep Indexing toggle ([`optional_bool`] semantics) under either
+/// accepted key; see [`deep_indexing_key`].
+fn deep_indexing_arg(args: &Map<String, Value>) -> Option<bool> {
+    optional_bool(args, deep_indexing_key(args))
+}
+
+/// Strict Deep Indexing toggle ([`optional_bool_strict`] semantics) under
+/// either accepted key; the error names the key the caller actually sent.
+fn deep_indexing_arg_strict(args: &Map<String, Value>) -> Result<Option<bool>, CallToolResult> {
+    optional_bool_strict(args, deep_indexing_key(args))
 }
 
 /// Extract an optional u64 parameter (number or string-encoded).
@@ -875,13 +904,13 @@ const TOOL_DEFS: &[ToolDef] = &[
                 false,
             ),
             (
-                "intelligence",
-                "AI indexing on the new workspace (create-workspace) — boolean (true/false). OMIT to take the platform default, which is ON; the field is optional here. (The `share` tool's identically-named argument is REQUIRED and has no default — different contract, same name.)",
+                "deep_indexing",
+                "Deep Indexing on the new workspace (create-workspace) — boolean (true/false). OMIT to take the platform default, which is ON; the field is optional here. (The `share` tool's identically-named argument is required server-side and that tool sends false when it is omitted — different contract, same name.)",
                 false,
             ),
             (
                 "metadata_extraction",
-                "Automatic metadata extraction for newly uploaded files (create-workspace) — boolean (true/false). An OPT-OUT layered under `intelligence`: OMIT to take the platform default, which is ON, and send false to withhold automatic extraction. It can never enable extraction where `intelligence` or the plan does not allow it, and it does not affect explicit per-file extraction requests (the `metadata` tool's extract actions).",
+                "Automatic metadata extraction for newly uploaded files (create-workspace) — boolean (true/false). An OPT-OUT layered under `deep_indexing`: OMIT to take the platform default, which is ON, and send false to withhold automatic extraction. It can never enable extraction where `deep_indexing` or the plan does not allow it, and it does not affect explicit per-file extraction requests (the `metadata` tool's extract actions).",
                 false,
             ),
             ("accent_color", "Accent color (create-workspace)", false),
@@ -945,10 +974,10 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             ("folder_name", "Folder name / slug (create)", false),
             ("description", "Description", false),
-            ("intelligence", "Enable AI (true/false)", false),
+            ("deep_indexing", "Enable Deep Indexing (true/false)", false),
             (
                 "metadata_extraction",
-                "Automatic metadata extraction for newly uploaded files (create, update) — boolean (true/false). An OPT-OUT layered under `intelligence`: OMIT to take the platform default, which is ON, and send false to withhold automatic extraction. It can never enable extraction where `intelligence` or the plan does not allow it, and it does not affect explicit per-file extraction requests (the `metadata` tool's extract actions). Unlike `intelligence` it deletes nothing and is not rate-limited.",
+                "Automatic metadata extraction for newly uploaded files (create, update) — boolean (true/false). An OPT-OUT layered under `deep_indexing`: OMIT to take the platform default, which is ON, and send false to withhold automatic extraction. It can never enable extraction where `deep_indexing` or the plan does not allow it, and it does not affect explicit per-file extraction requests (the `metadata` tool's extract actions). Unlike `deep_indexing` it deletes nothing and is not rate-limited.",
                 false,
             ),
             (
@@ -1289,7 +1318,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "search",
-        description: "Unified search — ONE query across everything in a workspace or share, grouped into buckets: `files` (filename + content, blended with semantic matches when workspace intelligence is on), `metadata` (extracted metadata field values; workspace only), and `comments`. START HERE for any 'find X' request. Each bucket paginates independently and reports its own health, so a `degraded` bucket returns empty while the others still answer normally. Use `files search` instead only when you specifically want a single flat file list with no metadata or comment hits.",
+        description: "Unified search — ONE query across everything in a workspace or share, grouped into buckets: `files` (filename + content, blended with semantic matches when workspace Deep Indexing is on), `metadata` (extracted metadata field values; workspace only), and `comments`. START HERE for any 'find X' request. Each bucket paginates independently and reports its own health, so a `degraded` bucket returns empty while the others still answer normally. Use `files search` instead only when you specifically want a single flat file list with no metadata or comment hits.",
         actions: &[
             "workspace",
             "share",
@@ -1623,8 +1652,8 @@ const TOOL_DEFS: &[ToolDef] = &[
                 false,
             ),
             (
-                "intelligence",
-                "Enable AI intelligence (true/false; create defaults to false — required server-side)",
+                "deep_indexing",
+                "Enable Deep Indexing (true/false; create defaults to false — required server-side)",
                 false,
             ),
             (
@@ -5668,12 +5697,12 @@ async fn handle_org_create_workspace(
         Err(e) => return Ok(e),
     };
     // Parse the boolean toggles strictly: a PRESENT-but-invalid value (e.g.
-    // `intelligence: "tru"`) must surface a clear error rather than silently
+    // `deep_indexing: "tru"`) must surface a clear error rather than silently
     // default to `false`/omitted. ABSENT stays None → default/omit.
     // ABSENT stays None so the field is OMITTED and the server applies its own
     // default of `true`; `unwrap_or(false)` here used to defeat the very thing
     // the comment above promises.
-    let intelligence = match optional_bool_strict(args, "intelligence") {
+    let deep_indexing = match deep_indexing_arg_strict(args) {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
@@ -5682,8 +5711,8 @@ async fn handle_org_create_workspace(
         name,
         perm_join,
         perm_member_manage,
-        intelligence,
-        // Same opt-OUT contract as `intelligence`: ABSENT stays None so the
+        deep_indexing,
+        // Same opt-OUT contract as `deep_indexing`: ABSENT stays None so the
         // field is OMITTED and the server applies its own default of `true`.
         metadata_extraction: match optional_bool_strict(args, "metadata_extraction") {
             Ok(v) => v,
@@ -5702,10 +5731,11 @@ async fn handle_org_create_workspace(
 
 /// Build the form-field map for an MCP `workspace` update from the tool args.
 ///
-/// Forwards the advertised `intelligence` toggle as the string `"true"`/
-/// `"false"` (the `/workspace/{id}/update/` endpoint takes it as a string form
-/// field, per the published API docs) so AI indexing can be toggled through
-/// MCP.
+/// Forwards the advertised `deep_indexing` toggle (or its unadvertised
+/// `intelligence` spelling, see [`deep_indexing_arg`]) as the string
+/// `"true"`/`"false"` (the `/workspace/{id}/update/` endpoint takes it as a
+/// string form field, per the published API docs) so Deep Indexing can be
+/// toggled through MCP.
 fn build_workspace_update_fields(
     args: &Map<String, Value>,
 ) -> std::collections::HashMap<String, String> {
@@ -5719,8 +5749,8 @@ fn build_workspace_update_fields(
     if let Some(v) = optional_str(args, "folder_name") {
         fields.insert("folder_name".to_owned(), v.to_owned());
     }
-    if let Some(v) = optional_bool(args, "intelligence") {
-        fields.insert("intelligence".to_owned(), v.to_string());
+    if let Some(v) = deep_indexing_arg(args) {
+        fields.insert(api::DEEP_INDEXING_FORM_KEY.to_owned(), v.to_string());
     }
     if let Some(v) = optional_bool(args, "metadata_extraction") {
         fields.insert("metadata_extraction".to_owned(), v.to_string());
@@ -5793,7 +5823,7 @@ async fn handle_workspace(
                     folder_name,
                     name,
                     description: optional_str(args, "description"),
-                    intelligence: optional_bool(args, "intelligence"),
+                    deep_indexing: deep_indexing_arg(args),
                     metadata_extraction: optional_bool(args, "metadata_extraction"),
                 },
             )
@@ -7047,7 +7077,7 @@ fn attach_content_search_warning(payload: &mut Value) {
     // `reason` is share-only and its value set may grow; an unknown value falls
     // back to the generic advice rather than being reported as a known cause.
     let detail = match meta.get("reason").and_then(Value::as_str) {
-        Some("intelligence_disabled") => " (AI intelligence is disabled here)",
+        Some("intelligence_disabled") => " (Deep Indexing is disabled here)",
         Some("summary_permission_denied") => {
             " (this share does not grant access to file summaries)"
         }
@@ -8114,10 +8144,10 @@ async fn handle_share_create(
     state: &McpState,
     args: &Map<String, Value>,
 ) -> Result<CallToolResult, McpError> {
-    // `intelligence` is required server-side; default to false (AI off).
+    // Deep Indexing is required server-side; default to false (off).
     // STRICT: a present non-bool must not be read as absent — see the
     // silent-default sweep note on `optional_str_strict`.
-    let intelligence_flag = match optional_bool_strict(args, "intelligence") {
+    let deep_indexing_flag = match deep_indexing_arg_strict(args) {
         Ok(v) => v.unwrap_or(false),
         Err(e) => return Ok(e),
     };
@@ -8161,7 +8191,7 @@ async fn handle_share_create(
             display_type: optional_str(args, "display_type"),
             workspace_style: optional_str(args, "workspace_style"),
             anonymous_uploads_enabled: optional_bool(args, "anonymous_uploads_enabled"),
-            intelligence: intelligence_flag,
+            deep_indexing: deep_indexing_flag,
             accent_color: optional_str(args, "accent_color"),
             background_color1: optional_str(args, "background_color1"),
             background_color2: optional_str(args, "background_color2"),
@@ -8231,7 +8261,7 @@ async fn handle_share_update(
             display_type: optional_str(args, "display_type"),
             workspace_style: optional_str(args, "workspace_style"),
             guest_chat_enabled: optional_bool(args, "guest_chat_enabled"),
-            intelligence: optional_bool(args, "intelligence"),
+            deep_indexing: deep_indexing_arg(args),
             anonymous_uploads_enabled: optional_bool(args, "anonymous_uploads_enabled"),
             accent_color: optional_str(args, "accent_color"),
             background_color1: optional_str(args, "background_color1"),
@@ -16776,16 +16806,136 @@ mod ripley_tool_tests {
     }
 
     #[test]
-    fn workspace_update_fields_forward_intelligence() {
-        // FIX 1: the MCP workspace-update handler must forward the advertised
-        // `intelligence` toggle into the form body as a string.
+    fn workspace_update_fields_forward_deep_indexing() {
+        // The MCP workspace-update handler must forward the advertised
+        // `deep_indexing` toggle into the form body as a string.
+        let key = fastio_cli::api::DEEP_INDEXING_FORM_KEY;
         let mut args = Map::new();
-        args.insert("intelligence".to_owned(), Value::Bool(true));
+        args.insert("deep_indexing".to_owned(), Value::Bool(true));
         let fields = super::build_workspace_update_fields(&args);
-        assert_eq!(fields.get("intelligence").map(String::as_str), Some("true"));
+        assert_eq!(fields.get(key).map(String::as_str), Some("true"));
+
+        // The unadvertised `intelligence` spelling is still forwarded.
+        let mut legacy = Map::new();
+        legacy.insert("intelligence".to_owned(), json!("false"));
+        let fields = super::build_workspace_update_fields(&legacy);
+        assert_eq!(fields.get(key).map(String::as_str), Some("false"));
+
+        // Both present → `deep_indexing` wins.
+        let mut both = Map::new();
+        both.insert("deep_indexing".to_owned(), json!(false));
+        both.insert("intelligence".to_owned(), json!(true));
+        let fields = super::build_workspace_update_fields(&both);
+        assert_eq!(fields.get(key).map(String::as_str), Some("false"));
 
         // Omitted → not sent.
-        assert!(!super::build_workspace_update_fields(&Map::new()).contains_key("intelligence"));
+        assert!(!super::build_workspace_update_fields(&Map::new()).contains_key(key));
+    }
+
+    /// `deep_indexing` is the advertised argument; `intelligence` is accepted
+    /// silently; when both are sent `deep_indexing` wins. An explicit `null`
+    /// on `deep_indexing` counts as absent, so the alias still applies.
+    #[test]
+    fn deep_indexing_arg_accepts_both_spellings_and_prefers_the_new_one() {
+        use super::{deep_indexing_arg, deep_indexing_arg_strict};
+        let args = |pairs: &[(&str, Value)]| -> Map<String, Value> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect()
+        };
+
+        let none = Map::new();
+        assert_eq!(deep_indexing_arg(&none), None);
+        assert_eq!(deep_indexing_arg_strict(&none).ok().flatten(), None);
+
+        let new_only = args(&[("deep_indexing", json!(true))]);
+        assert_eq!(deep_indexing_arg(&new_only), Some(true));
+        assert_eq!(
+            deep_indexing_arg_strict(&new_only).ok().flatten(),
+            Some(true)
+        );
+
+        let old_only = args(&[("intelligence", json!("true"))]);
+        assert_eq!(deep_indexing_arg(&old_only), Some(true));
+        assert_eq!(
+            deep_indexing_arg_strict(&old_only).ok().flatten(),
+            Some(true)
+        );
+
+        let both = args(&[
+            ("deep_indexing", json!(false)),
+            ("intelligence", json!(true)),
+        ]);
+        assert_eq!(deep_indexing_arg(&both), Some(false));
+        assert_eq!(deep_indexing_arg_strict(&both).ok().flatten(), Some(false));
+
+        let null_new = args(&[
+            ("deep_indexing", Value::Null),
+            ("intelligence", json!(true)),
+        ]);
+        assert_eq!(deep_indexing_arg(&null_new), Some(true));
+        assert_eq!(
+            deep_indexing_arg_strict(&null_new).ok().flatten(),
+            Some(true)
+        );
+    }
+
+    /// The strict variant must reject a malformed value under EITHER key, and
+    /// name the key the caller actually sent; the lenient variant stays
+    /// lenient.
+    #[test]
+    fn deep_indexing_arg_strict_rejects_garbage_under_either_key() {
+        use super::{deep_indexing_arg, deep_indexing_arg_strict};
+        for key in ["deep_indexing", "intelligence"] {
+            let mut bad = Map::new();
+            bad.insert(key.to_owned(), json!("tru"));
+            let err =
+                deep_indexing_arg_strict(&bad).expect_err("a present-but-invalid bool must error");
+            let text = result_to_string(&err);
+            assert!(
+                text.contains(&format!("{key} must be a boolean")),
+                "the error must name the key that was sent (`{key}`): {text}"
+            );
+            assert_eq!(deep_indexing_arg(&bad), None, "lenient path stays lenient");
+        }
+        // Garbage under the winning key errors even when the alias is valid.
+        let mut mixed = Map::new();
+        mixed.insert("deep_indexing".to_owned(), json!("tru"));
+        mixed.insert("intelligence".to_owned(), json!(true));
+        let err = deep_indexing_arg_strict(&mixed).expect_err("winning key is malformed");
+        assert!(result_to_string(&err).contains("deep_indexing must be a boolean"));
+    }
+
+    /// The `org`, `workspace` and `share` tools advertise `deep_indexing` only;
+    /// the `intelligence` spelling is accepted but never published.
+    #[test]
+    fn deep_indexing_is_advertised_and_intelligence_is_not() {
+        let tools = ToolRouter::list_tools_all().tools;
+        for name in ["org", "workspace", "share"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("{name} tool present"));
+            let props = &tool.input_schema["properties"];
+            assert!(
+                props.get("deep_indexing").is_some(),
+                "{name} must advertise `deep_indexing`"
+            );
+            assert!(
+                props.get("intelligence").is_none(),
+                "{name} must not advertise `intelligence`"
+            );
+            let published = serde_json::to_string(&*tool.input_schema).unwrap_or_default();
+            assert!(
+                !published.contains("intelligence"),
+                "{name}'s published schema must not mention `intelligence`: {published}"
+            );
+            let desc = props["deep_indexing"]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(desc.contains("Deep Indexing"), "{name}: {desc}");
+        }
     }
 
     // ─── Sign (E-Signature) MCP discipline ────────────────────────────────────
@@ -19660,7 +19810,7 @@ mod ripley_tool_tests {
     }
 
     /// `optional_bool_strict` must reject a PRESENT-but-invalid value
-    /// (e.g. `intelligence: "tru"`) instead of silently defaulting to `false`,
+    /// (e.g. `deep_indexing: "tru"`) instead of silently defaulting to `false`,
     /// while passing through valid and absent values.
     #[test]
     fn optional_bool_strict_rejects_malformed_passes_valid_and_absent() {
@@ -19668,23 +19818,25 @@ mod ripley_tool_tests {
         // Absent → Ok(None).
         let empty = Map::new();
         assert_eq!(
-            optional_bool_strict(&empty, "intelligence").ok().flatten(),
+            optional_bool_strict(&empty, "deep_indexing").ok().flatten(),
             None,
             "an absent param must resolve to None"
         );
         // Native bool → Ok(Some(v)).
         let mut native = Map::new();
-        native.insert("intelligence".to_owned(), json!(true));
+        native.insert("deep_indexing".to_owned(), json!(true));
         assert_eq!(
-            optional_bool_strict(&native, "intelligence").ok().flatten(),
+            optional_bool_strict(&native, "deep_indexing")
+                .ok()
+                .flatten(),
             Some(true),
             "a native bool must parse"
         );
         // String "false" → Ok(Some(false)).
         let mut boolstr = Map::new();
-        boolstr.insert("intelligence".to_owned(), json!("false"));
+        boolstr.insert("deep_indexing".to_owned(), json!("false"));
         assert_eq!(
-            optional_bool_strict(&boolstr, "intelligence")
+            optional_bool_strict(&boolstr, "deep_indexing")
                 .ok()
                 .flatten(),
             Some(false),
@@ -19692,12 +19844,12 @@ mod ripley_tool_tests {
         );
         // Present-but-malformed → Err with a param-named message.
         let mut bad = Map::new();
-        bad.insert("intelligence".to_owned(), json!("tru"));
-        let err = optional_bool_strict(&bad, "intelligence")
+        bad.insert("deep_indexing".to_owned(), json!("tru"));
+        let err = optional_bool_strict(&bad, "deep_indexing")
             .expect_err("a present-but-invalid bool must error");
         let text = result_to_string(&err);
         assert!(
-            text.contains("intelligence") && text.contains("boolean"),
+            text.contains("deep_indexing") && text.contains("boolean"),
             "the error must name the bad param and say it must be a boolean: {text}"
         );
     }

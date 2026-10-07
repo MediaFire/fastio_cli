@@ -900,7 +900,7 @@ pub async fn search_files_share(
 /// shape `search_in=filename` always produces since it skips the semantic leg)
 /// returns a top-level `files` value that is a **MAP keyed by node `OpaqueId`**
 /// — e.g. `{"files": {"f3jm5-…": {"name": …}}}`. Note that "keyword-only" is not
-/// the same as "intelligence disabled": instance intelligence gates the semantic
+/// the same as "Deep Indexing disabled": Deep Indexing gates the semantic
 /// half of a content search only, so summaries indexed earlier remain searchable
 /// with it off.
 /// Rendered as-is, table/CSV would collapse it to a single row whose columns
@@ -1943,7 +1943,7 @@ mod tests {
 
     #[test]
     fn normalize_search_files_map_to_rows() {
-        // Keyword-only / intelligence-disabled shape: `files` is a MAP keyed by
+        // Keyword-only / Deep-Indexing-disabled shape: `files` is a MAP keyed by
         // node id. After normalization it must be an ARRAY with one record per
         // file, each carrying `id` and `node_id`.
         let resp = json!({

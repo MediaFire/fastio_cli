@@ -35,8 +35,8 @@ pub enum WorkspaceCommand {
         folder_name: Option<String>,
         /// Description.
         description: Option<String>,
-        /// Enable AI intelligence.
-        intelligence: Option<bool>,
+        /// Enable Deep Indexing.
+        deep_indexing: Option<bool>,
         /// Automatic metadata extraction for newly uploaded files (opt-out).
         metadata_extraction: Option<bool>,
     },
@@ -55,9 +55,9 @@ pub enum WorkspaceCommand {
         description: Option<String>,
         /// New folder name.
         folder_name: Option<String>,
-        /// Toggle AI indexing (intelligence).
-        intelligence: Option<bool>,
-        /// Toggle automatic metadata extraction (opt-out under intelligence).
+        /// Toggle Deep Indexing.
+        deep_indexing: Option<bool>,
+        /// Toggle automatic metadata extraction (opt-out under Deep Indexing).
         metadata_extraction: Option<bool>,
         /// Who can self-join the workspace (permission phrase).
         perm_join: Option<String>,
@@ -118,7 +118,7 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
             name,
             folder_name,
             description,
-            intelligence,
+            deep_indexing,
             metadata_extraction,
         } => {
             create(
@@ -127,7 +127,7 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
                 name,
                 folder_name.as_deref(),
                 description.as_deref(),
-                *intelligence,
+                *deep_indexing,
                 *metadata_extraction,
             )
             .await
@@ -138,7 +138,7 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
             name,
             description,
             folder_name,
-            intelligence,
+            deep_indexing,
             metadata_extraction,
             perm_join,
             perm_member_manage,
@@ -154,7 +154,7 @@ pub async fn execute(command: &WorkspaceCommand, ctx: &CommandContext<'_>) -> Re
                     name: name.as_deref(),
                     description: description.as_deref(),
                     folder_name: folder_name.as_deref(),
-                    intelligence: *intelligence,
+                    deep_indexing: *deep_indexing,
                     metadata_extraction: *metadata_extraction,
                     perm_join: perm_join.as_deref(),
                     perm_member_manage: perm_member_manage.as_deref(),
@@ -205,7 +205,7 @@ async fn create(
     name: &str,
     folder_name: Option<&str>,
     description: Option<&str>,
-    intelligence: Option<bool>,
+    deep_indexing: Option<bool>,
     metadata_extraction: Option<bool>,
 ) -> Result<()> {
     // Use folder_name if provided, otherwise derive from name
@@ -220,7 +220,7 @@ async fn create(
             folder_name: &effective_folder,
             name,
             description,
-            intelligence,
+            deep_indexing,
             metadata_extraction,
         },
     )
@@ -249,9 +249,9 @@ struct WorkspaceUpdate<'a> {
     description: Option<&'a str>,
     /// New URL-safe folder name.
     folder_name: Option<&'a str>,
-    /// AI-indexing (intelligence) toggle.
-    intelligence: Option<bool>,
-    /// Automatic metadata-extraction toggle (opt-out under intelligence).
+    /// Deep Indexing toggle.
+    deep_indexing: Option<bool>,
+    /// Automatic metadata-extraction toggle (opt-out under Deep Indexing).
     metadata_extraction: Option<bool>,
     /// Who can self-join the workspace (permission phrase).
     perm_join: Option<&'a str>,
@@ -273,7 +273,7 @@ impl WorkspaceUpdate<'_> {
         self.name.is_none()
             && self.description.is_none()
             && self.folder_name.is_none()
-            && self.intelligence.is_none()
+            && self.deep_indexing.is_none()
             && self.metadata_extraction.is_none()
             && self.perm_join.is_none()
             && self.perm_member_manage.is_none()
@@ -286,9 +286,9 @@ impl WorkspaceUpdate<'_> {
 
 /// Build the form-field map for a workspace update from the provided options.
 ///
-/// The `intelligence` bool toggle is serialized as the string `"true"`/`"false"`
-/// because the `/workspace/{id}/update/` endpoint takes it as a string form
-/// field (workspaces.txt). The brand-color and `owner_defined` fields are
+/// The Deep Indexing bool toggle is serialized as the string `"true"`/`"false"`
+/// under [`api::DEEP_INDEXING_FORM_KEY`] because the `/workspace/{id}/update/`
+/// endpoint takes it as a string form field. The brand-color and `owner_defined` fields are
 /// JSON-encoded strings forwarded verbatim.
 fn build_workspace_update_fields(u: &WorkspaceUpdate<'_>) -> HashMap<String, String> {
     let mut fields = HashMap::new();
@@ -301,8 +301,8 @@ fn build_workspace_update_fields(u: &WorkspaceUpdate<'_>) -> HashMap<String, Str
     if let Some(v) = u.folder_name {
         fields.insert("folder_name".to_owned(), v.to_owned());
     }
-    if let Some(v) = u.intelligence {
-        fields.insert("intelligence".to_owned(), v.to_string());
+    if let Some(v) = u.deep_indexing {
+        fields.insert(api::DEEP_INDEXING_FORM_KEY.to_owned(), v.to_string());
     }
     if let Some(v) = u.metadata_extraction {
         fields.insert("metadata_extraction".to_owned(), v.to_string());
@@ -414,40 +414,44 @@ async fn limits(ctx: &CommandContext<'_>, workspace_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{WorkspaceUpdate, build_workspace_update_fields};
+    use fastio_cli::api;
 
     #[test]
-    fn update_fields_carry_intelligence_true() {
-        // `workspace update --intelligence true` must reach the form body as
-        // the string "true" (workspaces.txt: intelligence is a string toggle).
+    fn update_fields_carry_deep_indexing_true() {
+        // `workspace update --deep-indexing true` must reach the form body as
+        // the string "true" (the toggle is a string form field).
         let fields = build_workspace_update_fields(&WorkspaceUpdate {
-            intelligence: Some(true),
+            deep_indexing: Some(true),
             ..WorkspaceUpdate::default()
         });
-        assert_eq!(fields.get("intelligence").map(String::as_str), Some("true"));
+        assert_eq!(
+            fields.get(api::DEEP_INDEXING_FORM_KEY).map(String::as_str),
+            Some("true")
+        );
         assert_eq!(fields.len(), 1);
     }
 
     #[test]
-    fn update_fields_carry_intelligence_false() {
+    fn update_fields_carry_deep_indexing_false() {
         let fields = build_workspace_update_fields(&WorkspaceUpdate {
-            intelligence: Some(false),
+            deep_indexing: Some(false),
             ..WorkspaceUpdate::default()
         });
         assert_eq!(
-            fields.get("intelligence").map(String::as_str),
+            fields.get(api::DEEP_INDEXING_FORM_KEY).map(String::as_str),
             Some("false")
         );
     }
 
     #[test]
-    fn update_fields_omit_intelligence_when_unset() {
-        // When --intelligence is not passed the toggle must NOT be sent, so an
-        // unrelated rename never accidentally flips AI indexing.
+    fn update_fields_omit_deep_indexing_when_unset() {
+        // When --deep-indexing is not passed the toggle must NOT be sent, so an
+        // unrelated rename never accidentally flips Deep Indexing.
         let fields = build_workspace_update_fields(&WorkspaceUpdate {
             name: Some("New Name"),
             ..WorkspaceUpdate::default()
         });
-        assert!(!fields.contains_key("intelligence"));
+        assert!(!fields.contains_key(api::DEEP_INDEXING_FORM_KEY));
         assert_eq!(fields.get("name").map(String::as_str), Some("New Name"));
     }
 

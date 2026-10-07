@@ -899,10 +899,10 @@ pub async fn billing_invoices(
 /// `perm_join` and `perm_member_manage` ARE hard-required with no server
 /// default, so the CLI/MCP layers supply sensible ones.
 ///
-/// `intelligence` is NOT in that group. It is optional and **defaults to
+/// Deep Indexing is NOT in that group. It is optional and **defaults to
 /// `true`**, so it is `Option<bool>` and is omitted entirely when the caller has
 /// no preference — sending `false` by default would silently create every
-/// workspace with AI indexing off.
+/// workspace with Deep Indexing off.
 #[derive(Debug, Clone)]
 pub struct CreateWorkspaceParams<'a> {
     /// Workspace folder name (must pass `Workspace::isValidName`).
@@ -913,15 +913,15 @@ pub struct CreateWorkspaceParams<'a> {
     pub perm_join: &'a str,
     /// Member-management permission: `Member or above` / `Admin or above`.
     pub perm_member_manage: &'a str,
-    /// AI indexing toggle, sent as the `BooleanString` `"true"`/`"false"`.
+    /// Deep Indexing toggle, sent as the `BooleanString` `"true"`/`"false"`.
     ///
     /// `None` omits the field, which the server reads as `true`.
-    pub intelligence: Option<bool>,
+    pub deep_indexing: Option<bool>,
     /// Automatic metadata extraction for newly uploaded files, sent as the
     /// `BooleanString` `"true"`/`"false"`.
     ///
     /// `None` omits the field, which the server reads as `true` — an opt-OUT
-    /// layered under `intelligence` and the plan, exactly like its twin on
+    /// layered under Deep Indexing and the plan, exactly like its twin on
     /// [`crate::api::workspace::CreateWorkspaceParams`].
     pub metadata_extraction: Option<bool>,
     /// Optional workspace description.
@@ -936,9 +936,9 @@ pub struct CreateWorkspaceParams<'a> {
 
 /// Build the create-workspace form body.
 ///
-/// Extracted so the OMISSION of `intelligence` is testable: the defect it
-/// replaces was an unconditional `intelligence=false`, and an assertion that the
-/// form merely *builds* would not have caught it.
+/// Extracted so the OMISSION of the Deep Indexing field is testable: an
+/// unconditional `false` would invert the platform default, and an assertion
+/// that the form merely *builds* would not catch it.
 fn build_create_workspace_form(params: &CreateWorkspaceParams<'_>) -> HashMap<String, String> {
     let mut form = HashMap::new();
     form.insert("folder_name".to_owned(), params.folder_name.to_owned());
@@ -948,8 +948,8 @@ fn build_create_workspace_form(params: &CreateWorkspaceParams<'_>) -> HashMap<St
         "perm_member_manage".to_owned(),
         params.perm_member_manage.to_owned(),
     );
-    if let Some(v) = params.intelligence {
-        form.insert("intelligence".to_owned(), v.to_string());
+    if let Some(v) = params.deep_indexing {
+        form.insert(super::DEEP_INDEXING_FORM_KEY.to_owned(), v.to_string());
     }
     if let Some(v) = params.metadata_extraction {
         form.insert("metadata_extraction".to_owned(), v.to_string());
@@ -973,7 +973,7 @@ fn build_create_workspace_form(params: &CreateWorkspaceParams<'_>) -> HashMap<St
 ///
 /// `POST /org/{org_id}/create/workspace/` — `org_id` is a URL **path** segment
 /// (not a body field). The required body fields are `folder_name`, `name`,
-/// `perm_join` and `perm_member_manage`; `intelligence`, `description` and the
+/// `perm_join` and `perm_member_manage`; Deep Indexing, `description` and the
 /// three color fields are optional. (The legacy flat `POST /workspace/create/`
 /// route is gone.)
 pub async fn create_workspace(
@@ -994,17 +994,18 @@ mod tests {
         billing_invoices_path, billing_invoices_query, billing_members_path, billing_meters_path,
         billing_meters_query, billing_root_path, build_create_workspace_form, update_org_form,
     };
+    use crate::api::DEEP_INDEXING_FORM_KEY;
     use crate::error::CliError;
 
-    // ─── create workspace: the `intelligence` default ──────────────────────
+    // ─── create workspace: the Deep Indexing default ───────────────────────
 
-    fn create_params(intelligence: Option<bool>) -> CreateWorkspaceParams<'static> {
+    fn create_params(deep_indexing: Option<bool>) -> CreateWorkspaceParams<'static> {
         CreateWorkspaceParams {
             folder_name: "eng",
             name: "Engineering",
             perm_join: "Member or above",
             perm_member_manage: "Admin or above",
-            intelligence,
+            deep_indexing,
             metadata_extraction: None,
             description: None,
             accent_color: None,
@@ -1013,20 +1014,20 @@ mod tests {
         }
     }
 
-    /// Omitting `--intelligence` must OMIT the field, not send `false`.
+    /// Omitting `--deep-indexing` must OMIT the field, not send `false`.
     ///
-    /// Per the published API docs, `intelligence` is optional and "Defaults to
+    /// Per the published API docs, the Deep Indexing field is optional and "Defaults to
     /// `"true"` when omitted", and "omitting the field means on, and is not an
     /// error". Sending `unwrap_or(false)` unconditionally would create every
-    /// workspace from the CLI or MCP with AI indexing OFF, inverting the
+    /// workspace from the CLI or MCP with Deep Indexing OFF, inverting the
     /// platform default. Re-enabling later re-indexes every file and burns AI
     /// credits, so this is not a cosmetic default.
     #[test]
-    fn create_workspace_omits_intelligence_when_unset() {
+    fn create_workspace_omits_deep_indexing_when_unset() {
         let form = build_create_workspace_form(&create_params(None));
         assert!(
-            !form.contains_key("intelligence"),
-            "unset `intelligence` must be OMITTED so the server applies its own \
+            !form.contains_key(DEEP_INDEXING_FORM_KEY),
+            "unset Deep Indexing must be OMITTED so the server applies its own \
              default of true, got: {form:?}"
         );
         // The required four are still always present.
@@ -1038,15 +1039,21 @@ mod tests {
     /// The negative control: an EXPLICIT preference must still be transmitted,
     /// in either direction. Omission is the default, not a silent drop.
     #[test]
-    fn create_workspace_sends_an_explicit_intelligence_choice() {
+    fn create_workspace_sends_an_explicit_deep_indexing_choice() {
         let off = build_create_workspace_form(&create_params(Some(false)));
-        assert_eq!(off.get("intelligence").map(String::as_str), Some("false"));
+        assert_eq!(
+            off.get(DEEP_INDEXING_FORM_KEY).map(String::as_str),
+            Some("false")
+        );
         let on = build_create_workspace_form(&create_params(Some(true)));
-        assert_eq!(on.get("intelligence").map(String::as_str), Some("true"));
+        assert_eq!(
+            on.get(DEEP_INDEXING_FORM_KEY).map(String::as_str),
+            Some("true")
+        );
     }
 
     /// `metadata_extraction` follows the same opt-OUT contract as
-    /// `intelligence`: unset must be ABSENT (the server default is on), and an
+    /// Deep Indexing: unset must be ABSENT (the server default is on), and an
     /// explicit choice must travel in either direction.
     #[test]
     fn create_workspace_omits_metadata_extraction_when_unset() {

@@ -152,8 +152,8 @@ pub enum OrgCommand {
         perm_join: String,
         /// Member-management permission.
         perm_member_manage: String,
-        /// Enable AI intelligence (indexing).
-        intelligence: Option<bool>,
+        /// Enable Deep Indexing.
+        deep_indexing: Option<bool>,
         /// Automatic metadata extraction for newly uploaded files (opt-out).
         metadata_extraction: Option<bool>,
     },
@@ -561,7 +561,7 @@ pub async fn execute(command: &OrgCommand, ctx: &CommandContext<'_>) -> Result<(
             description,
             perm_join,
             perm_member_manage,
-            intelligence,
+            deep_indexing,
             metadata_extraction,
         } => {
             create_workspace(
@@ -572,7 +572,7 @@ pub async fn execute(command: &OrgCommand, ctx: &CommandContext<'_>) -> Result<(
                 description.as_deref(),
                 perm_join,
                 perm_member_manage,
-                *intelligence,
+                *deep_indexing,
                 *metadata_extraction,
             )
             .await
@@ -1492,7 +1492,7 @@ async fn create_workspace(
     description: Option<&str>,
     perm_join: &str,
     perm_member_manage: &str,
-    intelligence: Option<bool>,
+    deep_indexing: Option<bool>,
     metadata_extraction: Option<bool>,
 ) -> Result<()> {
     validate_org_id(org_id)?;
@@ -1503,7 +1503,7 @@ async fn create_workspace(
         name,
         perm_join,
         perm_member_manage,
-        intelligence,
+        deep_indexing,
         metadata_extraction,
         description,
         accent_color: None,
