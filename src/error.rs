@@ -851,6 +851,21 @@ pub const HINT_INVALID_HEADER_VALUE: &str = "The supplied value contains a contr
 pub const HINT_INVALID_INPUT: &str = "The server rejected a value in this request as invalid or conflicting. \
      Check the error message above for the offending field (e.g. a name that already exists, or an out-of-range value), correct it, and retry.";
 
+/// Whole-file CRC-32C mismatch on upload (code `10778`, HTTP 406).
+///
+/// Terminal: the server compared the bytes it received with the file's
+/// CRC-32C, found a mismatch, and stored nothing. The session is
+/// `assembly_failed` and every later call on it returns the same code, so the
+/// only recovery is a fresh upload.
+pub const HINT_UPLOAD_CRC32C_MISMATCH: &str = "The bytes the server received did not match the file's CRC-32C checksum, so nothing was stored. \
+     Upload the file again (this starts a new upload session). If it keeps failing, check that the file is not being modified while it uploads.";
+
+/// A different whole-file CRC-32C is already set for the upload session (code
+/// `10779`, HTTP 409). The first value stands; a different one is never
+/// accepted, so the upload has to start over.
+pub const HINT_UPLOAD_CRC32C_CONFLICT: &str = "This upload session already has a different whole-file CRC-32C checksum, so the new value was refused. \
+     Upload the file again in a new session.";
+
 /// Comment DISPLAY-text limit (`166910`).
 ///
 /// This is the limit an ordinary commenter actually hits — **not** the 8192
@@ -1324,6 +1339,14 @@ impl ApiError {
             // hint, so map the code to actionable (resource-agnostic) guidance.
             1605 => return Some(HINT_INVALID_INPUT),
             10566 => return Some(HINT_INVALID_NODE_FIELD),
+            // Upload integrity (stable 5-digit codes): a whole-file CRC-32C
+            // mismatch is terminal; a conflicting value is never retried.
+            crate::api::upload_integrity::ERR_UPLOAD_CRC32C_MISMATCH => {
+                return Some(HINT_UPLOAD_CRC32C_MISMATCH);
+            }
+            crate::api::upload_integrity::ERR_UPLOAD_CRC32C_CONFLICT => {
+                return Some(HINT_UPLOAD_CRC32C_CONFLICT);
+            }
             107_184 => return Some(HINT_AGENT_NAME_INVALID),
             9992 => return Some(HINT_UNKNOWN_ROUTE),
             // Length-limit codes. Undocumented in the published code lists, and

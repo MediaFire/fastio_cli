@@ -1473,12 +1473,14 @@ const TOOL_DEFS: &[ToolDef] = &[
             ),
             (
                 "hash",
-                "Pre-computed hash of file content (stream, stream-send)",
+                "Pre-computed hash of file content (stream, stream-send). Optional: when hash and \
+                 hash_algo are both omitted, the CRC-32C of the content is computed and sent",
                 false,
             ),
             (
                 "hash_algo",
-                "Hash algorithm e.g. sha256 (stream, stream-send)",
+                "Hash algorithm for hash: crc32c (recommended, the default), md5, sha1, sha256 \
+                 or sha384 (stream, stream-send)",
                 false,
             ),
             (
@@ -7534,8 +7536,18 @@ async fn handle_upload_text(
             }
             // Extract the token from the client (already holding the read lock).
             let token = client.get_token().unwrap_or_default().to_owned();
-            match api::upload::upload_chunk(&token, state.api_base(), upload_id, 1, content_bytes)
-                .await
+            // The single chunk is also the last, so it carries the whole-file
+            // CRC-32C alongside its own.
+            let integrity = api::upload_integrity::ChunkIntegrity::for_only_chunk(&content_bytes);
+            match api::upload::upload_chunk(
+                &token,
+                state.api_base(),
+                upload_id,
+                1,
+                content_bytes,
+                &integrity,
+            )
+            .await
             {
                 Ok(_) => match api::upload::complete_upload(&client, upload_id).await {
                     Ok(v) => Ok(success_json(&v)),
@@ -7838,6 +7850,9 @@ async fn handle_upload_stream(
     let max_size = optional_str(args, "max_size").and_then(|s| s.parse::<u64>().ok());
     let hash = optional_str(args, "hash");
     let hash_algo = optional_str(args, "hash_algo");
+    if let Err(e) = api::upload_integrity::check_stream_hash_pair(hash, hash_algo) {
+        return Ok(error_text(&e.to_string()));
+    }
 
     // Acquire the read lock, extract what we need, then drop it before the
     // potentially long-running stream upload so we don't block token refreshes.
@@ -7928,6 +7943,9 @@ async fn handle_upload_stream_send(
     };
     let hash = optional_str(args, "hash");
     let hash_algo = optional_str(args, "hash_algo");
+    if let Err(e) = api::upload_integrity::check_stream_hash_pair(hash, hash_algo) {
+        return Ok(error_text(&e.to_string()));
+    }
 
     // Extract token then drop the read guard before the potentially
     // long-running stream upload so we don't block token refreshes.

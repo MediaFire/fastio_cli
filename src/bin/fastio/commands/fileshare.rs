@@ -39,7 +39,7 @@ use anyhow::{Context, Result};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 
-use fastio_cli::api::{event, fileshare, storage, upload};
+use fastio_cli::api::{event, fileshare, storage, upload, upload_integrity};
 use fastio_cli::error::CliError;
 
 use crate::cli::{FileshareCommands, FileshareGrantsCommands};
@@ -1121,7 +1121,15 @@ async fn chunked_writeback(
     // Upload chunks sequentially.
     let mut file_handle = std::fs::File::open(path)
         .with_context(|| format!("failed to open '{}'", path.display()))?;
-    send_writeback_chunks(&mut file_handle, &token, ctx.api_base, &upload_id, password).await?;
+    send_writeback_chunks(
+        &mut file_handle,
+        file_size,
+        &token,
+        ctx.api_base,
+        &upload_id,
+        password,
+    )
+    .await?;
 
     upload::complete_upload_with_password(client, &upload_id, password)
         .await
@@ -1146,8 +1154,13 @@ fn writeback_chunk_order(zero_based_index: u32) -> Result<u32> {
 
 /// Read the local file in `WRITEBACK_CHUNK_SIZE` pieces and upload each via the
 /// password-capable chunk path.
+///
+/// Every chunk carries its CRC-32C; the chunk that reaches `file_size` (the
+/// size the write-back session was created with) is the last and also carries
+/// the whole-file `file_crc32c`.
 async fn send_writeback_chunks(
     file_handle: &mut std::fs::File,
+    file_size: u64,
     token: &str,
     api_base: &str,
     upload_id: &str,
@@ -1161,29 +1174,38 @@ async fn send_writeback_chunks(
     // 0-based first chunk would be rejected server-side ("No `order` supplied" /
     // invalid order).
     let mut chunk_index: u32 = 0;
+    let mut read_total: u64 = 0;
+    let mut integrity_state = upload_integrity::SequentialChunkCrc32c::new(file_size);
     loop {
         let mut buf = vec![0u8; WRITEBACK_CHUNK_SIZE];
         let mut filled = 0usize;
+        let mut at_eof = false;
         // Fill a full chunk (read may return short).
         while filled < WRITEBACK_CHUNK_SIZE {
             let n = file_handle
                 .read(&mut buf[filled..])
                 .context("failed to read file chunk")?;
             if n == 0 {
+                at_eof = true;
                 break;
             }
             filled += n;
         }
+        read_total = read_total.saturating_add(filled as u64);
+        super::upload::check_read_against_declared(read_total, file_size, at_eof)?;
         if filled == 0 {
             break;
         }
         buf.truncate(filled);
         let order = writeback_chunk_order(chunk_index)?;
-        upload::upload_chunk_with_password(token, api_base, upload_id, order, buf, password)
-            .await
-            .map_err(|e| {
-                map_fileshare_error(e, "failed to upload a write-back chunk", FsOp::LinkAccess)
-            })?;
+        let integrity = integrity_state.next_chunk(&buf);
+        upload::upload_chunk_with_password(
+            token, api_base, upload_id, order, buf, &integrity, password,
+        )
+        .await
+        .map_err(|e| {
+            map_fileshare_error(e, "failed to upload a write-back chunk", FsOp::LinkAccess)
+        })?;
         chunk_index = chunk_index
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("too many write-back chunks"))?;
@@ -1255,6 +1277,10 @@ fn check_writeback_session(value: &Value) -> Result<()> {
         .unwrap_or("");
     if status != "assembly_failed" && status != "store_failed" {
         return Ok(());
+    }
+    // A whole-file CRC-32C mismatch is terminal: nothing was stored.
+    if let Some(integrity) = session.and_then(upload_integrity::session_integrity_failure) {
+        anyhow::bail!("write-back failed ({status}): {integrity}");
     }
     let message = session
         .and_then(|s| s.get("status_message"))
@@ -1950,6 +1976,33 @@ mod tests {
             err.downcast_ref::<CliError>()
                 .is_none_or(|c| !matches!(c, CliError::VersionConflict { .. })),
             "a non-conflict failure must not be a VersionConflict"
+        );
+    }
+
+    #[test]
+    fn check_writeback_session_integrity_failure_surfaces_both_crcs() {
+        let v = json!({
+            "session": {
+                "status": "assembly_failed",
+                "integrity_failure": {
+                    "reason": "file_crc32c_mismatch",
+                    "expected_crc32c": "7a3c19e4",
+                    "computed_crc32c": "1c2f9a07",
+                    "error_code": 10778
+                }
+            }
+        });
+        let err = check_writeback_session(&v).expect_err("integrity failure must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("assembly_failed"), "{msg}");
+        assert!(
+            msg.contains("7a3c19e4") && msg.contains("1c2f9a07"),
+            "must surface both CRC values: {msg}"
+        );
+        assert!(
+            err.downcast_ref::<CliError>()
+                .is_none_or(|c| !matches!(c, CliError::VersionConflict { .. })),
+            "an integrity failure is not a VersionConflict"
         );
     }
 
