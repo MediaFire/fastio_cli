@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use super::CommandContext;
 use fastio_cli::api;
+use fastio_cli::api::upload_integrity::{ChunkIntegrity, SequentialChunkCrc32c};
 use fastio_cli::auth::token;
 use fastio_cli::client::ApiClient;
 
@@ -544,9 +545,19 @@ async fn upload_chunk(
 ) -> Result<()> {
     let token_str = resolve_auth(ctx.profile_name, ctx.flag_token, ctx.config_dir)?;
     let data = std::fs::read(file).context("failed to read chunk file")?;
-    let value = api::upload::upload_chunk(&token_str, ctx.api_base, upload_key, chunk_num, data)
-        .await
-        .context("failed to upload chunk")?;
+    // A standalone chunk carries its own CRC-32C; the whole-file value is
+    // unknown here, so no `file_crc32c` is sent.
+    let integrity = ChunkIntegrity::for_chunk(&data);
+    let value = api::upload::upload_chunk(
+        &token_str,
+        ctx.api_base,
+        upload_key,
+        chunk_num,
+        data,
+        &integrity,
+    )
+    .await
+    .context("failed to upload chunk")?;
     ctx.output.render(&value)?;
     Ok(())
 }
@@ -780,6 +791,31 @@ fn create_progress_bar(file_size: u64, quiet: bool, no_color: bool) -> ProgressB
     pb
 }
 
+/// Check the bytes read so far against the size the upload session was
+/// created with.
+///
+/// `read_so_far` includes the chunk about to be sent; `at_eof` is true when the
+/// read that produced it hit end of file. A file that grows past `declared`
+/// would otherwise be streamed to EOF with the whole-file checksum attached to
+/// the wrong chunk; one that shrinks would leave the session short. Either way
+/// the local file changed underneath the upload, so stop before sending.
+pub(super) fn check_read_against_declared(
+    read_so_far: u64,
+    declared: u64,
+    at_eof: bool,
+) -> Result<()> {
+    if read_so_far > declared {
+        anyhow::bail!("file changed during upload (grew past {declared} bytes); upload it again");
+    }
+    if at_eof && read_so_far < declared {
+        anyhow::bail!(
+            "file changed during upload (shrank to {read_so_far} of {declared} bytes); \
+             upload it again"
+        );
+    }
+    Ok(())
+}
+
 /// Upload file chunks from a file handle, reporting progress.
 async fn send_chunks(
     file_handle: &mut std::fs::File,
@@ -796,15 +832,21 @@ async fn send_chunks(
     let total_chunks = file_size.div_ceil(chunk_size as u64);
     let mut chunk_number: u32 = 0;
     let mut bytes_uploaded: u64 = 0;
+    // Per-chunk CRC-32C plus the running whole-file value; the chunk that
+    // reaches `file_size` (the size the session was created with) is the last
+    // and carries `file_crc32c`.
+    let mut integrity_state = SequentialChunkCrc32c::new(file_size);
 
     loop {
         let mut buf = vec![0u8; chunk_size];
         let mut total_read = 0;
+        let mut at_eof = false;
         loop {
             let n = file_handle
                 .read(&mut buf[total_read..])
                 .context("failed to read file chunk")?;
             if n == 0 {
+                at_eof = true;
                 break;
             }
             total_read += n;
@@ -812,6 +854,11 @@ async fn send_chunks(
                 break;
             }
         }
+        check_read_against_declared(
+            bytes_uploaded.saturating_add(total_read as u64),
+            file_size,
+            at_eof,
+        )?;
         if total_read == 0 {
             break;
         }
@@ -821,9 +868,17 @@ async fn send_chunks(
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("too many chunks"))?;
 
-        api::upload::upload_chunk(token_str, api_base, upload_id, chunk_number, buf)
-            .await
-            .with_context(|| format!("failed to upload chunk {chunk_number}/{total_chunks}"))?;
+        let integrity = integrity_state.next_chunk(&buf);
+        api::upload::upload_chunk(
+            token_str,
+            api_base,
+            upload_id,
+            chunk_number,
+            buf,
+            &integrity,
+        )
+        .await
+        .with_context(|| format!("failed to upload chunk {chunk_number}/{total_chunks}"))?;
 
         bytes_uploaded = bytes_uploaded.saturating_add(total_read as u64);
         pb.set_position(std::cmp::min(bytes_uploaded, file_size));
@@ -855,6 +910,12 @@ async fn poll_upload_completion(
         match status_str {
             "stored" | "complete" => return Ok(status_str.to_owned()),
             "assembly_failed" | "store_failed" => {
+                // A whole-file CRC-32C mismatch is terminal: nothing was stored.
+                if let Some(integrity) =
+                    api::upload_integrity::session_integrity_failure(&status_resp)
+                {
+                    anyhow::bail!("upload failed ({status_str}): {integrity}");
+                }
                 let msg = status_resp
                     .get("session")
                     .and_then(|s| s.get("status_message"))
@@ -871,6 +932,23 @@ async fn poll_upload_completion(
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         }
+    }
+}
+
+/// Build one batch manifest item from a file's bytes, attaching the entry
+/// checksum (CRC-32C) the server verifies.
+fn batch_item(
+    filename: String,
+    relative_path: Option<String>,
+    raw: Vec<u8>,
+) -> api::upload::BatchUploadItem {
+    let entry_hash = api::upload_integrity::batch_entry_hash(&raw);
+    api::upload::BatchUploadItem {
+        filename,
+        relative_path,
+        data: bytes::Bytes::from(raw),
+        hash: Some(entry_hash.hash),
+        hash_algo: Some(entry_hash.algo.to_owned()),
     }
 }
 
@@ -1251,14 +1329,11 @@ async fn run_batch_upload(
                 continue;
             }
             running_bytes = new_total;
-            let hash = fastio_cli::api::upload::sha256_hex(&raw);
-            items.push(BatchUploadItem {
-                filename: inp.filename.clone(),
-                relative_path: inp.relative_path.clone(),
-                data: bytes::Bytes::from(raw),
-                hash: Some(hash),
-                hash_algo: Some("sha256".to_owned()),
-            });
+            items.push(batch_item(
+                inp.filename.clone(),
+                inp.relative_path.clone(),
+                raw,
+            ));
             kept_inputs.push(inp.clone());
         }
 
@@ -1768,13 +1843,16 @@ async fn upload_text(
         .ok_or_else(|| anyhow::anyhow!("upload session did not return an ID"))?
         .to_owned();
 
-    // Upload as single chunk
+    // Upload as single chunk — it is also the last, so it carries the
+    // whole-file CRC-32C.
+    let integrity = ChunkIntegrity::for_only_chunk(content_bytes);
     api::upload::upload_chunk(
         &token_str,
         ctx.api_base,
         &upload_id,
         1,
         content_bytes.to_vec(),
+        &integrity,
     )
     .await
     .context("failed to upload content")?;
@@ -2259,5 +2337,243 @@ mod tests {
         let groups = pack_batches(&sizes, 200, 100 * 1024 * 1024);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 200);
+    }
+
+    // ─── CRC-32C on the sequential chunk loop ──────────────────────────────
+
+    use super::{ApiClient, ChunkPlan, ProgressBar, poll_upload_completion, send_chunks};
+
+    /// Minimal scripted loopback server: answers request `i` with
+    /// `responses[i]` (the last repeats) and records each request line.
+    async fn scripted_server(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&log);
+        tokio::spawn(async move {
+            let mut served = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut tmp = vec![0u8; 64 * 1024];
+                // Read headers, then the Content-Length body.
+                let header_end = loop {
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(p + 4);
+                    }
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break None,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                };
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+                let len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while buf.len() - header_end < len {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                let line = String::from_utf8_lossy(&buf[..header_end])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                sink.lock().expect("log lock").push(line);
+                let (status, body) = responses
+                    .get(served)
+                    .or_else(|| responses.last())
+                    .copied()
+                    .unwrap_or((200, r#"{"result":"yes"}"#));
+                served += 1;
+                let header = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), log)
+    }
+
+    fn query_value(request_line: &str, key: &str) -> Option<String> {
+        let target = request_line.split_whitespace().nth(1)?;
+        let (_, query) = target.split_once('?')?;
+        query.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k == key).then(|| v.to_owned())
+        })
+    }
+
+    /// Run `send_chunks` over a temp file of `len` bytes with `chunk_size`
+    /// chunks against a scripted server, returning the request lines.
+    async fn run_send_chunks(len: usize, chunk_size: usize) -> (Vec<u8>, Vec<String>) {
+        let (data, result, lines) = run_send_chunks_declared(len, len as u64, chunk_size).await;
+        result.expect("send_chunks succeeds");
+        (data, lines)
+    }
+
+    /// Like [`run_send_chunks`], but the session is declared as `declared`
+    /// bytes while the file on disk holds `len` — i.e. the file changed size
+    /// between session creation and the chunk loop.
+    async fn run_send_chunks_declared(
+        len: usize,
+        declared: u64,
+        chunk_size: usize,
+    ) -> (Vec<u8>, anyhow::Result<()>, Vec<String>) {
+        let data: Vec<u8> = (0..len)
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        let path = std::env::temp_dir().join(format!(
+            "fastio-crc32c-send-chunks-{}-{len}-{declared}-{chunk_size}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, &data).expect("write temp file");
+        let (base, log) = scripted_server(vec![(200, r#"{"result":"yes"}"#)]).await;
+        let mut handle = std::fs::File::open(&path).expect("open temp file");
+        let result = send_chunks(
+            &mut handle,
+            declared,
+            "tok",
+            &base,
+            "sess",
+            &ProgressBar::hidden(),
+            ChunkPlan { chunk_size },
+        )
+        .await;
+        let _ = std::fs::remove_file(&path);
+        let lines = log.lock().expect("log lock").clone();
+        (data, result, lines)
+    }
+
+    #[tokio::test]
+    async fn send_chunks_bails_when_file_grew_before_sending_extra_chunk() {
+        // Declared 2 chunks, file now holds 3: chunks 1-2 go out, chunk 3 is
+        // refused before it is sent.
+        let (_data, result, lines) = run_send_chunks_declared(3 * 64, 2 * 64, 64).await;
+        let msg = format!("{:#}", result.expect_err("a grown file must fail"));
+        assert!(
+            msg.contains("file changed during upload (grew past 128 bytes)"),
+            "{msg}"
+        );
+        assert_eq!(lines.len(), 2, "the overflowing chunk is never sent");
+    }
+
+    #[tokio::test]
+    async fn send_chunks_bails_when_file_shrank_before_sending_short_chunk() {
+        // Declared 128 bytes, file now holds 100: chunk 1 goes out, the short
+        // final read hits EOF below the declared size and is refused.
+        let (_data, result, lines) = run_send_chunks_declared(100, 128, 64).await;
+        let msg = format!("{:#}", result.expect_err("a shrunk file must fail"));
+        assert!(
+            msg.contains("file changed during upload (shrank to 100 of 128 bytes)"),
+            "{msg}"
+        );
+        assert_eq!(lines.len(), 1, "the truncated chunk is never sent");
+    }
+
+    #[test]
+    fn batch_item_carries_crc32c_of_its_bytes() {
+        let item = super::batch_item(
+            "a.txt".to_owned(),
+            Some("dir/a.txt".to_owned()),
+            b"123456789".to_vec(),
+        );
+        assert_eq!(item.hash.as_deref(), Some("e3069283"));
+        assert_eq!(item.hash_algo.as_deref(), Some("crc32c"));
+        assert_eq!(item.filename, "a.txt");
+        assert_eq!(item.relative_path.as_deref(), Some("dir/a.txt"));
+        assert_eq!(item.data.as_ref(), b"123456789");
+    }
+
+    #[test]
+    fn check_read_against_declared_accepts_exact_sizes() {
+        use super::check_read_against_declared;
+        // Exact multiple: the trailing 0-byte read at EOF is not an error.
+        assert!(check_read_against_declared(128, 128, true).is_ok());
+        assert!(check_read_against_declared(64, 128, false).is_ok());
+        // Zero-byte file: immediate EOF matches the declared size.
+        assert!(check_read_against_declared(0, 0, true).is_ok());
+        assert!(check_read_against_declared(129, 128, false).is_err());
+        assert!(check_read_against_declared(127, 128, true).is_err());
+    }
+
+    #[tokio::test]
+    async fn send_chunks_sends_chunk_crc_everywhere_and_file_crc_only_last() {
+        use fastio_cli::api::upload_integrity::crc32c_hex;
+        // Exact multiple, a 1-byte last chunk, and a single short chunk.
+        for (len, chunk_size) in [(4 * 64, 64), (3 * 64 + 1, 64), (10, 64)] {
+            let (data, lines) = run_send_chunks(len, chunk_size).await;
+            let pieces: Vec<&[u8]> = data.chunks(chunk_size).collect();
+            assert_eq!(
+                lines.len(),
+                pieces.len(),
+                "len {len}: one request per chunk"
+            );
+            for (i, (line, piece)) in lines.iter().zip(&pieces).enumerate() {
+                assert_eq!(query_value(line, "order"), Some((i + 1).to_string()));
+                assert_eq!(query_value(line, "hash_algo").as_deref(), Some("crc32c"));
+                assert_eq!(query_value(line, "hash"), Some(crc32c_hex(piece)));
+                let expected_file = (i + 1 == pieces.len()).then(|| crc32c_hex(&data));
+                assert_eq!(
+                    query_value(line, "file_crc32c"),
+                    expected_file,
+                    "len {len} chunk {i}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_treats_crc32c_assembly_failure_as_terminal() {
+        let (base, log) = scripted_server(vec![(
+            200,
+            r#"{"result":"yes","session":{"status":"assembly_failed","file_crc32c":"7a3c19e4","integrity_failure":{"reason":"file_crc32c_mismatch","expected_crc32c":"7a3c19e4","computed_crc32c":"1c2f9a07","error_code":10778}}}"#,
+        )])
+        .await;
+        let client = ApiClient::new(&base, Some("tok".to_owned())).expect("client");
+        let err = poll_upload_completion(&client, "sess", 5)
+            .await
+            .expect_err("assembly_failed is a failure");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("assembly_failed"), "{msg}");
+        assert!(
+            msg.contains("7a3c19e4") && msg.contains("1c2f9a07"),
+            "{msg}"
+        );
+        assert!(msg.contains("nothing was stored"), "{msg}");
+        assert_eq!(
+            log.lock().expect("log lock").len(),
+            1,
+            "terminal on first poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_never_reports_a_non_complete_status_as_success() {
+        let (base, _log) = scripted_server(vec![(
+            200,
+            r#"{"result":"yes","session":{"status":"uploading"}}"#,
+        )])
+        .await;
+        let client = ApiClient::new(&base, Some("tok".to_owned())).expect("client");
+        let err = poll_upload_completion(&client, "sess", 1)
+            .await
+            .expect_err("a non-terminal status is not success");
+        assert!(format!("{err:#}").contains("uploading"));
     }
 }

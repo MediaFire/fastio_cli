@@ -53,6 +53,8 @@ pub mod system;
 pub mod types;
 /// Upload session endpoints.
 pub mod upload;
+/// Upload integrity checksums (CRC-32C) attached to every upload path.
+pub mod upload_integrity;
 /// User profile endpoints.
 pub mod user;
 /// Workspace management endpoints.

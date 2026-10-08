@@ -3815,9 +3815,10 @@ pub enum UploadCommands {
         #[arg(long)]
         name: Option<String>,
         /// Pre-computed hash of the file content for integrity verification.
+        /// Optional: without it the CLI computes and sends the CRC-32C.
         #[arg(long, requires = "hash_algo")]
         hash: Option<String>,
-        /// Hash algorithm used (e.g. sha256). Requires --hash.
+        /// Hash algorithm used: crc32c, md5, sha1, sha256 or sha384. Requires --hash.
         #[arg(long, requires = "hash")]
         hash_algo: Option<String>,
     },
@@ -3849,10 +3850,11 @@ pub enum UploadCommands {
         /// Maximum file size in bytes (rejects before reading if exceeded).
         #[arg(long)]
         max_size: Option<u64>,
-        /// Pre-computed hash of the file content.
+        /// Pre-computed hash of the file content. Optional: without it the CLI
+        /// computes and sends the CRC-32C.
         #[arg(long, requires = "hash_algo")]
         hash: Option<String>,
-        /// Hash algorithm used (e.g. sha256). Requires --hash.
+        /// Hash algorithm used: crc32c, md5, sha1, sha256 or sha384. Requires --hash.
         #[arg(long, requires = "hash")]
         hash_algo: Option<String>,
     },

@@ -16,6 +16,7 @@ use reqwest::multipart;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 
+use crate::api::upload_integrity::{ChunkIntegrity, stream_body_hash, whole_body_hash};
 use crate::client::{ApiClient, build_password_header};
 use crate::error::CliError;
 
@@ -111,19 +112,27 @@ pub async fn single_call_upload(
         .build()
         .map_err(CliError::Http)?;
 
+    // Whole-body integrity hash, computed once and re-sent unchanged on retries.
+    let body_hash = whole_body_hash(&file_data);
+
     let mut attempt: u32 = 0;
     let mut backoff = CHUNK_INITIAL_BACKOFF;
 
     loop {
         let part = multipart::Part::bytes(file_data.clone()).file_name(filename.to_owned());
-        let form = multipart::Form::new()
+        let mut form = multipart::Form::new()
             .text("name", filename.to_owned())
             .text("size", file_size.to_string())
             .text("action", "create")
             .text("instance_id", instance_id.to_owned())
             .text("folder_id", folder_id.to_owned())
-            .text("profile_type", profile_type.to_owned())
-            .part("chunk", part);
+            .text("profile_type", profile_type.to_owned());
+        if let Some(hash) = &body_hash {
+            form = form
+                .text("hash", hash.hash.clone())
+                .text("hash_algo", hash.algo);
+        }
+        let form = form.part("chunk", part);
 
         let send_result = http_client
             .post(&url)
@@ -401,6 +410,10 @@ pub async fn single_shot_fileshare_writeback(
         file_size,
         if_version_id,
     );
+    // Whole-body integrity hash rides the multipart body only — it is NOT part
+    // of `writeback_form_fields`, which the chunked session-create path shares
+    // (a chunked session declares its whole-file value on the last chunk).
+    let body_hash = whole_body_hash(&file_data);
     let file_bytes = Bytes::from(file_data);
 
     let mut attempt: u32 = 0;
@@ -410,6 +423,11 @@ pub async fn single_shot_fileshare_writeback(
         let mut form = multipart::Form::new();
         for (key, value) in &writeback_fields {
             form = form.text(key.clone(), value.clone());
+        }
+        if let Some(hash) = &body_hash {
+            form = form
+                .text("hash", hash.hash.clone())
+                .text("hash_algo", hash.algo);
         }
         let chunk_len = file_bytes.len() as u64;
         let part = multipart::Part::stream_with_length(file_bytes.clone(), chunk_len)
@@ -560,28 +578,57 @@ fn writeback_send_error_is_retryable(is_timeout: bool, is_connect: bool) -> bool
     !is_timeout && is_connect
 }
 
+/// Build the chunk upload URL:
+/// `{api_base}/upload/{upload_id}/chunk/?order={n}&size={len}` followed by the
+/// chunk's integrity parameters (`hash_algo`, `hash`, and `file_crc32c` on the
+/// last chunk only). The same URL is re-used for every retry of the chunk, so a
+/// retry of the last chunk re-sends the same `file_crc32c`.
+#[must_use]
+fn chunk_url(
+    api_base: &str,
+    upload_id: &str,
+    chunk_number: u32,
+    chunk_size: usize,
+    integrity: &ChunkIntegrity,
+) -> String {
+    let mut url = format!(
+        "{}/upload/{}/chunk/?order={}&size={}",
+        api_base.trim_end_matches('/'),
+        urlencoding::encode(upload_id),
+        chunk_number,
+        chunk_size,
+    );
+    for (key, value) in integrity.query_pairs() {
+        let _ = write!(url, "&{key}={}", urlencoding::encode(&value));
+    }
+    url
+}
+
 /// Upload a single chunk of file data via multipart form.
 ///
 /// `POST /upload/{upload_id}/chunk/?order={chunk_number}&size={chunk_size}`
+/// plus the chunk's integrity parameters from `integrity` (see
+/// [`crate::api::upload_integrity`]).
 ///
 /// This uses a raw reqwest client because the API expects multipart/form-data
 /// with a binary `chunk` field, which differs from the standard form-encoded
 /// POST used elsewhere. Includes its own retry logic with exponential backoff
-/// for transient failures and rate limiting.
+/// for transient failures and rate limiting; 4xx answers (including the
+/// terminal whole-file CRC-32C mismatch) are never retried.
 pub async fn upload_chunk(
     token: &str,
     api_base: &str,
     upload_id: &str,
     chunk_number: u32,
     chunk_data: Vec<u8>,
+    integrity: &ChunkIntegrity,
 ) -> Result<Value, CliError> {
-    let chunk_size = chunk_data.len();
-    let url = format!(
-        "{}/upload/{}/chunk/?order={}&size={}",
-        api_base.trim_end_matches('/'),
-        urlencoding::encode(upload_id),
+    let url = chunk_url(
+        api_base,
+        upload_id,
         chunk_number,
-        chunk_size,
+        chunk_data.len(),
+        integrity,
     );
 
     let http_client = reqwest::Client::builder()
@@ -627,24 +674,25 @@ pub async fn upload_chunk(
 /// Upload a single chunk of a File Share write-back session, threading the
 /// optional `x-ve-password` header.
 ///
-/// Identical to [`upload_chunk`] but attaches the optional recipient link
-/// password (the share's read gate applies to every write-back step). Existing
-/// non-write-back chunk uploads stay on [`upload_chunk`] (zero blast radius).
+/// Identical to [`upload_chunk`] (including the integrity parameters) but
+/// attaches the optional recipient link password (the share's read gate
+/// applies to every write-back step). Existing non-write-back chunk uploads
+/// stay on [`upload_chunk`] (zero blast radius).
 pub async fn upload_chunk_with_password(
     token: &str,
     api_base: &str,
     upload_id: &str,
     chunk_number: u32,
     chunk_data: Vec<u8>,
+    integrity: &ChunkIntegrity,
     password: Option<&SecretString>,
 ) -> Result<Value, CliError> {
-    let chunk_size = chunk_data.len();
-    let url = format!(
-        "{}/upload/{}/chunk/?order={}&size={}",
-        api_base.trim_end_matches('/'),
-        urlencoding::encode(upload_id),
+    let url = chunk_url(
+        api_base,
+        upload_id,
         chunk_number,
-        chunk_size,
+        chunk_data.len(),
+        integrity,
     );
 
     // Built with `redirect(Policy::none())` unconditionally — this path is
@@ -1170,6 +1218,11 @@ pub async fn create_stream_session(
 /// `Content-Type: application/octet-stream`. The session auto-finalizes on
 /// completion — no `/complete/` call is needed.
 ///
+/// `hash` / `hash_algo` are sent as query parameters. A caller-supplied pair is
+/// passed through unchanged; exactly one of the two is rejected before any
+/// request; when neither is supplied the client sends the CRC-32C of `data` (see
+/// [`crate::api::upload_integrity::stream_body_hash`]).
+///
 /// Accepts [`Bytes`] for O(1) cloning across retry attempts. Only retries on
 /// rate-limiting (429) and pre-send connection errors — server errors and
 /// timeouts are *not* retried because the server may have already received
@@ -1188,12 +1241,14 @@ pub async fn stream_upload(
         urlencoding::encode(upload_id),
     );
 
+    // A caller-supplied hash/algo wins; otherwise the whole-body CRC-32C.
+    let (hash, hash_algo) = stream_body_hash(&data, hash, hash_algo)?;
     let mut has_query = false;
-    if let Some(h) = hash {
+    if let Some(h) = &hash {
         let _ = write!(url, "?hash={}", urlencoding::encode(h));
         has_query = true;
     }
-    if let Some(algo) = hash_algo {
+    if let Some(algo) = &hash_algo {
         let sep = if has_query { "&" } else { "?" };
         let _ = write!(url, "{sep}hash_algo={}", urlencoding::encode(algo));
     }
@@ -1381,7 +1436,9 @@ pub struct BatchUploadItem {
     pub data: Bytes,
     /// Optional hex digest; pairs with [`Self::hash_algo`].
     pub hash: Option<String>,
-    /// Optional hash algorithm (`md5`, `sha1`, `sha256`, `sha384`).
+    /// Optional hash algorithm (`crc32c`, `md5`, `sha1`, `sha256`, `sha384`).
+    /// The CLI's batch path sends `crc32c` (see
+    /// [`crate::api::upload_integrity::batch_entry_hash`]).
     pub hash_algo: Option<String>,
 }
 
